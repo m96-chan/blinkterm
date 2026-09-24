@@ -133,6 +133,12 @@ extern "C" fn on_winch(_signal: libc::c_int) {
 /// a `poll` that is interrupted is a `poll` that comes back and looks at the
 /// flags, which is the whole point of setting them.
 fn install_signals() {
+    // SAFETY: every pointer handed over below points at a live local that
+    // outlives its call -- `sigaction(2)` and `sigemptyset(3)` copy what they
+    // are given rather than keeping it. The handlers being installed do one
+    // atomic store each and nothing else, which is what a handler is allowed
+    // to do; `on_quit` and `on_winch` are `extern "C"`, so the kernel's idea
+    // of how to call them matches theirs.
     unsafe {
         for (signal, handler) in [
             (libc::SIGTERM, on_quit as *const () as usize),
@@ -197,6 +203,8 @@ struct Still {
 
 /// Run until the person quits or something goes wrong.
 pub fn run(options: Options) -> Result<(), String> {
+    // SAFETY: `isatty(3)` takes a descriptor, reads no memory, and only
+    // reports. 1 is stdout, which this program has by definition.
     if unsafe { libc::isatty(1) } != 1 {
         return Err("stdout is not a terminal, so there is nowhere to put a page".to_string());
     }

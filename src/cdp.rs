@@ -197,6 +197,8 @@ impl Client {
         let stop = Arc::new(AtomicBool::new(false));
 
         let mut fds = [0 as RawFd; 2];
+        // SAFETY: `pipe(2)` writes exactly two `int`s through the pointer, and
+        // `fds` is a live local of exactly that size and type.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(format!(
                 "cannot make a pipe to wake the loop: {}",
@@ -234,6 +236,12 @@ impl Client {
                         // One byte, best effort: a full pipe already means the
                         // main loop has been told.
                         let byte = b"\x01";
+                        // SAFETY: writes the single byte `byte` points at, and
+                        // `byte` is alive for the call. `wake_write` belongs to
+                        // the `Client` this thread was started by and is closed
+                        // only in its `Drop`, which joins this thread first.
+                        // The result is dropped on purpose: a full pipe means
+                        // the main loop has already been told.
                         unsafe {
                             libc::write(wake_write, byte.as_ptr() as *const libc::c_void, 1);
                         }
@@ -247,6 +255,8 @@ impl Client {
             }
             signal.notify_all();
             let byte = b"\x01";
+            // SAFETY: the same one-byte write, saying the connection has ended
+            // rather than that a message arrived.
             unsafe {
                 libc::write(wake_write, byte.as_ptr() as *const libc::c_void, 1);
             }
@@ -279,6 +289,9 @@ impl Client {
     /// Empty the wake pipe. What it held is only ever "look in the mailbox".
     pub fn drain_wake(&self) {
         let mut buf = [0u8; 256];
+        // SAFETY: reads at most `buf.len()` bytes into `buf`, a live local of
+        // exactly that size. The descriptor is non-blocking, so the loop ends
+        // on `EAGAIN` rather than waiting for a byte that is not coming.
         while unsafe {
             libc::read(
                 self.wake_read,
@@ -490,6 +503,10 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.close();
+        // SAFETY: both descriptors came from the `pipe(2)` in `connect` and are
+        // owned by this `Client`. `close` above has already joined the reader
+        // thread, so nothing is left that could use them, and this is `Drop`,
+        // so nothing will close them twice.
         unsafe {
             libc::close(self.wake_read);
             libc::close(self.wake_write);

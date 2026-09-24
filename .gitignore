@@ -1,2 +1,6 @@
 /target
 /target-docker
+
+# The tools in tools/ are run, not imported, but python3 leaves these behind
+# the moment anything imports cdp.py -- which kitty_stream.py and bench.py do.
+__pycache__/

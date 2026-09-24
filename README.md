@@ -118,6 +118,35 @@ builds the bookworm image with the engine and the fonts in it if you would
 rather not install a Chromium; `tools/` also holds the Python tools the design
 was measured with, and has its own README.
 
+## Checks
+
+What CI runs, and what to run before pushing:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo doc --no-deps --locked          # RUSTDOCFLAGS=-D warnings in CI
+cargo test --locked
+```
+
+The lint set is a `[lints]` table in `Cargo.toml` rather than a list of flags
+in the workflow, so a laptop and a runner disagree about `-D warnings` and
+nothing else. The one worth knowing about is
+`clippy::undocumented_unsafe_blocks`: there are twenty-three `unsafe` blocks in
+`src/`, all of them one-line `libc` calls, and each says what makes it sound.
+
+`--locked` throughout, because every dependency but `libc` is a git revision
+and `Cargo.lock` is the only record of which tree of tOS was built.
+
+The floor is Rust **1.87**, and it comes from the dependency closure rather
+than from anything in `src/` — `fontdue` calls `integer_sign_cast`. CI builds
+against exactly the `rust-version` in `Cargo.toml`, so the number stays true.
+
+`tools/` is checked too: `shellcheck --severity=warning tools/run.sh`, and
+`ruff check --select E9,F tools/` — syntax and pyflakes, not style, since
+those scripts are stdlib-only by design and some of what a style rule would
+object to is deliberate.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

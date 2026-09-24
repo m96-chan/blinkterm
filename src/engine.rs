@@ -113,6 +113,11 @@ fn signal_all(target: i32, signal: libc::c_int) {
     if target == 0 || target == -1 {
         return;
     }
+    // SAFETY: `kill(2)` takes two integers and reads no memory, so there is
+    // nothing here to keep alive or to have got wrong. It is also
+    // async-signal-safe, which is the property that matters: this runs from a
+    // signal handler. `target` has just been checked for the two values that
+    // would aim it at this program itself.
     unsafe {
         libc::kill(target, signal);
     }
@@ -127,6 +132,10 @@ fn signal_all(target: i32, signal: libc::c_int) {
 /// already leads its own group changes nothing, so doing both closes the
 /// window. The parent's call failing means the child's has already run.
 fn spawn_in_own_group(command: &mut Command) -> std::io::Result<(Child, i32)> {
+    // SAFETY: `pre_exec` is unsafe because its closure runs in the child
+    // between `fork` and `exec`, where a thread that held a lock in the parent
+    // will never release it, so only async-signal-safe calls are allowed. This
+    // closure calls `setpgid(2)` and reads `errno`, and both of those are.
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) != 0 {
@@ -137,6 +146,9 @@ fn spawn_in_own_group(command: &mut Command) -> std::io::Result<(Child, i32)> {
     }
     let child = command.spawn()?;
     let pid = child.id() as i32;
+    // SAFETY: two integers and no memory, as above. The result is dropped on
+    // purpose rather than missed: failure here is the expected case, and means
+    // the child reached its own `setpgid` first.
     unsafe {
         libc::setpgid(pid, pid);
     }
@@ -152,7 +164,11 @@ fn spawn_in_own_group(command: &mut Command) -> std::io::Result<(Child, i32)> {
 /// minus in front of it, and the group this program is in is one of the things
 /// that could be on the other end of that.
 fn group_target(pid: i32) -> i32 {
+    // SAFETY: `getpgid(2)` takes an integer, reads no memory and only reports.
+    // Answering -1 for a child that has already gone is handled by the
+    // comparison below, which then keeps `pid` rather than negating it.
     let group = unsafe { libc::getpgid(pid) };
+    // SAFETY: `getpgrp(2)` takes nothing, reads no memory and cannot fail.
     let ours = unsafe { libc::getpgrp() };
     if group == pid && group != ours {
         -pid
@@ -173,6 +189,8 @@ fn group_alive(target: i32) -> bool {
         // answer, and the caller has it.
         return false;
     }
+    // SAFETY: signal 0 sends nothing and only asks whether it could, and
+    // `kill(2)` reads no memory. `target` is negative here, checked above.
     if unsafe { libc::kill(target, 0) } == 0 {
         return true;
     }
@@ -260,6 +278,7 @@ impl Engine {
     /// its debugging port is.
     pub fn launch(timeout: Duration) -> Result<Engine, String> {
         let path = locate()?;
+        // SAFETY: `geteuid(2)` takes nothing, reads no memory and cannot fail.
         let as_root = unsafe { libc::geteuid() } == 0;
         let mut command = Command::new(&path);
         command
@@ -556,12 +575,14 @@ mod tests {
             .stderr(Stdio::null());
         let (mut child, target) = spawn_in_own_group(&mut command).expect("a shell starts");
         let pid = child.id() as i32;
+        // SAFETY: reports this program's own group; no arguments, no memory.
         let ours = unsafe { libc::getpgrp() };
 
         assert_eq!(
             target, -pid,
             "the target is the child's group, kill(2)'s way"
         );
+        // SAFETY: as above, and `pid` is the child this test has not yet reaped.
         assert_eq!(unsafe { libc::getpgid(pid) }, pid, "and the child leads it");
         assert_ne!(-target, ours, "a group of its own, not the one we are in");
         assert!(

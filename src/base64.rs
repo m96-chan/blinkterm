@@ -64,7 +64,7 @@ pub fn encode(input: &[u8]) -> String {
 
 /// Decode, refusing anything that is not exactly base64.
 pub fn decode(input: &[u8]) -> Result<Vec<u8>, Base64Error> {
-    if input.len() % 4 != 0 {
+    if !input.len().is_multiple_of(4) {
         return Err(Base64Error::Length);
     }
     let mut table = [0xffu8; 256];
