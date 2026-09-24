@@ -1,9 +1,12 @@
-# Two jobs, because they need two different machines.
+# Four jobs, because they need four different things.
 #
-# `check` is the ordinary one: format, lints, and the tests that need nothing
-# installed. `engine` is the reason this crate left the tOS repository — tOS's
-# CI has no Chromium and is not going to grow one, and the tests in
-# tests/engine.rs are worth nothing without a real engine behind them.
+# `check` is the ordinary one: format, lints, docs, and the tests that need
+# nothing installed. `engine` is the reason this crate left the tOS repository
+# -- tOS's CI has no Chromium and is not going to grow one, and the tests in
+# tests/engine.rs are worth nothing without a real engine behind them. `msrv`
+# holds the `rust-version` in Cargo.toml to something true. `tools` checks the
+# proof-of-concept scripts, which are the other half of the repository and were
+# until now the half nothing looked at.
 name: CI
 
 on:
@@ -13,9 +16,22 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# The default token can write to the repository. Nothing in this workflow
+# needs to: it reads the checkout and reports a status, and a job that cannot
+# push is a job that cannot be talked into pushing.
+permissions:
+  contents: read
+
+# A branch that is pushed twice in a minute does not need the first run
+# finished. `main` is excluded: those runs are the record of what the branch
+# did, and cancelling one leaves a commit nobody ever tested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   check:
-    name: fmt, clippy, test
+    name: fmt, clippy, docs, test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,11 +41,90 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
+      # --locked everywhere, on purpose. Every dependency here is a git
+      # revision, so Cargo.lock is the only thing recording which tree of tOS
+      # was built; without it cargo is free to re-resolve and quietly test
+      # something other than what is committed. It also makes a stale lock file
+      # a failure rather than a diff that appears in the next person's branch.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # The lint table in Cargo.toml is the same set a laptop gets; -D warnings
+      # is what CI adds on top.
+      #
+      # This crate is mostly prose -- the module documentation carries the
+      # measurements and the reasoning that the code assumes -- and it is full
+      # of intra-doc links. Nothing checked them until this line: a `[`motion`]`
+      # that stopped resolving rendered as literal brackets and no build noticed.
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
       # Without BLINKTERM_ENGINE every test in tests/engine.rs skips itself and
       # says so, which is the point: this job proves the code compiles and the
       # unit tests pass, and makes no claim about the engine.
-      - run: cargo test
+      - run: cargo test --locked
+
+  msrv:
+    name: builds on the oldest Rust it claims
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Read the floor out of Cargo.toml rather than repeating it here. Two
+      # copies of a version number is one copy that goes stale, and this job
+      # exists because the declared floor had already gone stale once: it said
+      # 1.75 for a tree that has never built below 1.87.
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "no rust-version in Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        run: |
+          rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+          rustup default ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # `check`, not `test`: this job is about whether the compiler accepts the
+      # tree, and whether the program works is `check`'s and `engine`'s
+      # business on a toolchain that can run them faster.
+      - run: cargo check --all-targets --locked
+
+  tools:
+    name: shell and python tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # run.sh already carries a `# shellcheck disable=SC2086` on the line that
+      # splits $flags deliberately. That directive was written for a shellcheck
+      # that never ran; this is it.
+      #
+      # --severity=warning, so this gates on warnings and errors and not on
+      # info. The one info it drops is SC2329 "this function is never invoked"
+      # for `cleanup`, which `trap 'cleanup' EXIT INT TERM` invokes -- through
+      # a string shellcheck does not read.
+      - name: shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck --severity=warning tools/run.sh
+      # E9 and F only: syntax errors and pyflakes -- undefined names, unused
+      # imports, a broken f-string. Deliberately not ruff's style rules. These
+      # are stdlib-only proof-of-concept scripts and some of what ruff would
+      # object to is intended, `encode_frame_shm(counter=[0])` being the plain
+      # case: a mutable default used as a counter, which is the idiom and not a
+      # mistake. The gate is "does it still run", not "is it to ruff's taste".
+      #
+      # setup-python rather than the runner's own interpreter, because a
+      # distribution Python is marked externally-managed (PEP 668) and refuses
+      # a plain `pip install` into it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3"
+      - name: ruff
+        run: |
+          python3 -m pip install --quiet ruff
+          python3 -m ruff check --select E9,F tools/
 
   engine:
     name: engine tests, real Chromium
@@ -69,6 +164,6 @@ jobs:
       # The job runs as root in the container, which the engine notices: it
       # adds --no-sandbox itself, because Chromium refuses to start as root
       # without it. See src/engine.rs.
-      - run: cargo test --release -- --test-threads=1
+      - run: cargo test --release --locked -- --test-threads=1
         env:
           BLINKTERM_ENGINE: chromium-shell

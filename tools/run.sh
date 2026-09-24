@@ -14,7 +14,12 @@
 # Everything after the recognised options is passed to bench.py.
 set -eu
 
-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# CDPATH='' rather than a bare CDPATH=, which is the same assignment and the
+# same one-command scope, but does not look to shellcheck (SC1007) like a
+# missing value. The variable is cleared because a CDPATH set in the
+# environment makes `cd` search it and print where it landed, which would end
+# up in $here.
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 port=9222
 mode=host
 png=""

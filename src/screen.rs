@@ -79,11 +79,18 @@ static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
 /// there is nothing left to report an error to.
 pub fn emergency() {
     let bytes = leave_sequence();
+    // SAFETY: `bytes` is alive for the call and `bytes.len()` is exactly how
+    // much of it there is. `write(2)` rather than `println!` because this runs
+    // from a panic hook, where the usual machinery may be the thing that
+    // broke; the result is dropped because there is nothing left to report to.
     unsafe {
         libc::write(1, bytes.as_ptr() as *const libc::c_void, bytes.len());
     }
     if let Ok(mut saved) = SAVED.lock() {
         if let Some(termios) = saved.take() {
+            // SAFETY: `tcsetattr(3)` only reads through the pointer, and
+            // `termios` is a live local. 0 is stdin, which is where the
+            // settings came from.
             unsafe {
                 libc::tcsetattr(0, libc::TCSANOW, &termios);
             }
@@ -105,14 +112,21 @@ impl Pane {
     /// because the settings have to be saved somewhere a panic hook can reach
     /// them, and a guard that owns its copy cannot be that place.
     pub fn enter(input: RawFd, output: RawFd) -> io::Result<Pane> {
+        // SAFETY: `termios` is a C struct of integers and byte arrays, and
+        // all-zero is a valid value of every one of its fields. It is handed
+        // straight to `tcgetattr` below, which overwrites it.
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: writes one `termios` through a pointer to a live local.
         if unsafe { libc::tcgetattr(input, &mut saved) } < 0 {
             return Err(io::Error::last_os_error());
         }
         let mut raw = saved;
+        // SAFETY: `cfmakeraw(3)` edits the struct in place; `raw` is a live
+        // local and is the copy, so `saved` still holds what to put back.
         unsafe { libc::cfmakeraw(&mut raw) };
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
+        // SAFETY: read-only through the pointer, and `raw` is a live local.
         if unsafe { libc::tcsetattr(input, libc::TCSANOW, &raw) } < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -159,6 +173,8 @@ impl Pane {
         let _ = self.write(&leave_sequence());
         if let Ok(mut saved) = SAVED.lock() {
             if let Some(termios) = saved.take() {
+                // SAFETY: as in `emergency`: read-only through a pointer to a
+                // live local, and the descriptor is the one `enter` took.
                 unsafe {
                     libc::tcsetattr(self.input, libc::TCSANOW, &termios);
                 }
@@ -192,7 +208,7 @@ pub fn status_line(cols: u32, text: &str, editing: Option<&str>) -> Vec<u8> {
             out.extend_from_slice(prompt.as_bytes());
             out.extend_from_slice(shown.as_bytes());
             let used = prompt.len() + width(&shown);
-            out.extend(std::iter::repeat(b' ').take(cols.saturating_sub(used)));
+            out.extend(std::iter::repeat_n(b' ', cols.saturating_sub(used)));
             out.extend_from_slice(b"\x1b[0m");
             // The cursor is put back where the typing is, and shown, because
             // this is the one moment the person is editing rather than
@@ -202,7 +218,10 @@ pub fn status_line(cols: u32, text: &str, editing: Option<&str>) -> Vec<u8> {
         None => {
             let shown = clip_to(text, cols);
             out.extend_from_slice(shown.as_bytes());
-            out.extend(std::iter::repeat(b' ').take(cols.saturating_sub(width(&shown))));
+            out.extend(std::iter::repeat_n(
+                b' ',
+                cols.saturating_sub(width(&shown)),
+            ));
             out.extend_from_slice(b"\x1b[0m\x1b[?25l");
         }
     }
@@ -244,7 +263,7 @@ pub fn tab_line(cols: u32, tabs: &[TabLabel], url: &str) -> Vec<u8> {
             out.extend_from_slice(text.as_bytes());
         }
     }
-    out.extend(std::iter::repeat(b' ').take(cols.saturating_sub(used)));
+    out.extend(std::iter::repeat_n(b' ', cols.saturating_sub(used)));
     out.extend_from_slice(b"\x1b[0m\x1b[?25l");
     out
 }

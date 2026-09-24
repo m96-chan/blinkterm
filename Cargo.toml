@@ -3,7 +3,18 @@ name = "blinkterm"
 description = "A real browser in a terminal pane: headless Chromium over the Kitty graphics protocol"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# 1.87 is measured, not guessed: 1.86 does not build this tree and 1.87 does.
+# The floor came from the dependency closure rather than from anything written
+# here -- `fontdue`, which `tos-font` pulls in, calls `integer_sign_cast`
+# (stable in 1.87), and `tos-ime` takes a mutable reference in a `const fn`
+# (stable in 1.83). `src/` then followed it: clippy gates its suggestions on
+# this number, and once it read 1.87 it asked for `is_multiple_of` (1.87) and
+# `repeat_n` (1.82), which base64.rs and screen.rs now use.
+#
+# This said 1.75 until it was checked, which is what an unchecked number does.
+# The `msrv` job in .github/workflows/ci.yml reads this line and builds against
+# exactly it, so lowering it is now a thing CI has an opinion about.
+rust-version = "1.87"
 license = "MIT"
 repository = "https://github.com/m96-chan/blinkterm"
 
@@ -56,3 +67,32 @@ tos-compositor = { git = "https://github.com/m96-chan/tOS", rev = "c7677bde" }
 opt-level = 3
 lto = "thin"
 panic = "abort"
+
+# The standard lives here rather than only in the CI invocation, so that
+# `cargo clippy` on a laptop and `cargo clippy` in the workflow are the same
+# command with the same answer. CI adds `-D warnings` on top; locally these
+# stay warnings so a work in progress still builds.
+[lints.rust]
+# The signal handling, the termios and the process groups are all `libc`, and
+# an FFI declaration that disagrees with the header is the kind of mistake that
+# survives every test and then corrupts a struct. These catch a few of them.
+improper_ctypes = "warn"
+improper_ctypes_definitions = "warn"
+# `unsafe` inside an `unsafe fn` is still `unsafe`; edition 2024 makes this the
+# default and this crate already writes it that way.
+unsafe_op_in_unsafe_fn = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+# The reason this table exists. There are 23 `unsafe` blocks in `src/`, all of
+# them one-line `libc` calls, and every one now says what makes it sound. A
+# crate that explains a 150 ms rest interval at four paragraphs should not be
+# asking anyone to take a `kill(2)` on faith.
+undocumented_unsafe_blocks = "warn"
+# Cheap, and none of them has ever had a false positive here: a `todo!` or a
+# stray `dbg!` reaching main is a mistake every time.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+mem_forget = "warn"
+empty_loop = "warn"

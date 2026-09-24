@@ -1,0 +1,23 @@
+# Only the actions, and deliberately only the actions.
+#
+# The workflow pins actions/checkout, actions/setup-python, Swatinem/rust-cache
+# by major tag. Those tags move under us, and when one is retired the job stops
+# with a message about an unsupported version rather than anything to do with
+# this program. A monthly pull request is the cheapest way to hear about that
+# from Dependabot instead of from a red build on an unrelated branch.
+#
+# There is no `cargo` entry on purpose. Every dependency in Cargo.toml but
+# `libc` is a git revision of tOS, pinned to the commit this crate was split
+# out of so that a build today is a build tomorrow -- see the long comment
+# there. Dependabot would either have nothing to say about those or want to
+# move them to tOS's `main`, which is exactly the thing the pin exists to
+# prevent: the protocol changes are taken by hand, all four revisions together,
+# with the engine tests run afterwards.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
