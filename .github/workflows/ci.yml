@@ -118,7 +118,7 @@ jobs:
       # setup-python rather than the runner's own interpreter, because a
       # distribution Python is marked externally-managed (PEP 668) and refuses
       # a plain `pip install` into it.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3"
       - name: ruff
