@@ -34,7 +34,7 @@ jobs:
     name: fmt, clippy, docs, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the stable toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -66,7 +66,7 @@ jobs:
     name: builds on the oldest Rust it claims
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Read the floor out of Cargo.toml rather than repeating it here. Two
       # copies of a version number is one copy that goes stale, and this job
       # exists because the declared floor had already gone stale once: it said
@@ -94,7 +94,7 @@ jobs:
     name: shell and python tools
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # run.sh already carries a `# shellcheck disable=SC2086` on the line that
       # splits $flags deliberately. That directive was written for a shellcheck
       # that never ran; this is it.
@@ -139,7 +139,7 @@ jobs:
       # enough -- and running at the default is the point, since it is what
       # anybody else's container will have too.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the engine and the fonts
         # chromium-shell is Debian's headless_shell. The CJK fonts are not
         # decoration: without them a page of Japanese renders as boxes and the
