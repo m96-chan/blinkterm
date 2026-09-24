@@ -1,17 +1,26 @@
-//! Browse the web in a tOS pane.
+//! Browse the web in a terminal pane.
 //!
-//! tOS owns the display: there is no X11 and no Wayland, and there never will
-//! be, so no browser can be ported to it in the ordinary sense — every engine
-//! worth having assumes a window system underneath. What tOS does have is a
-//! terminal that speaks the Kitty graphics protocol, SGR mouse reporting and
-//! the Kitty keyboard protocol, and those three together are enough to be a
-//! screen, a mouse and a keyboard. So `tos-browser` runs a headless Chromium
-//! as a child process, drives it over the Chrome DevTools Protocol on a
-//! hand-rolled WebSocket, takes its screencast, decodes each frame here, and
-//! hands the terminal raw pixels as graphics commands, turning the terminal's
-//! own reports of keys and mouse back into CDP input events. The engine
-//! renders; the compositor displays; this crate is the wire between them and
-//! nothing else.
+//! `blinkterm` runs a headless Chromium as a child process, drives it over the
+//! Chrome DevTools Protocol on a hand-rolled WebSocket, takes its screencast,
+//! decodes each frame here, and hands the terminal raw pixels as Kitty
+//! graphics commands, turning the terminal's own reports of keys and mouse
+//! back into CDP input events. The engine renders; the terminal displays; this
+//! crate is the wire between them and nothing else. It is Blink — Chromium's
+//! engine, the one the page was made for — in a terminal, which is where the
+//! name comes from.
+//!
+//! It asks three things of the terminal it runs in and nothing else: the Kitty
+//! graphics protocol, the Kitty keyboard protocol, and SGR mouse reporting.
+//! Kitty, WezTerm and Ghostty all speak them, and so does tOS, which is where
+//! this was written and why it exists. tOS owns the display: there is no X11
+//! and no Wayland, and there never will be, so no browser can be ported to it
+//! in the ordinary sense — every engine worth having assumes a window system
+//! underneath. What tOS does have is a terminal, and a terminal that speaks
+//! those three protocols is already a screen, a mouse and a keyboard, which is
+//! the whole of what an engine wants. Nothing in that argument is about tOS,
+//! so the same binary runs in any of them; the differences are in
+//! [`graphics`], where the frame transport is chosen by what the terminal
+//! turns out to support.
 //!
 //! The numbers it was built against: 57.8 frames a second at 1280x770, about
 //! 185 kB per frame on the engine's side, 8 ms to decode one here. The frames
@@ -34,9 +43,10 @@
 //! and panes and a tree to arrange them in, and a page per pane would put a
 //! browser's tabs under the same keys as everything else on the machine. It is
 //! not what this does, for two reasons. A pane program has no way to ask for
-//! another pane — there is no compositor API, no socket, and `apps/browser`
-//! having one would be this crate's second dependency after `libc` and the
-//! first that is on tOS itself. And the engine's own model *is* tabs: targets
+//! another pane — there is no compositor API and no socket, and inventing one
+//! would tie this program to a running tOS, which is the one thing it is not
+//! tied to: it is a pane program in Kitty too. And the engine's own model
+//! *is* tabs: targets
 //! are opened, closed and raised by a browser-level connection that knows
 //! nothing about panes, so a pane per page would be a second list to keep in
 //! step with the engine's. So the tabs live in the browser, on the row that
@@ -47,7 +57,7 @@
 //!
 //! This paragraph used to say "No JPEG", on the grounds that a baseline
 //! decoder is more code than PNG and inflate put together for a second format
-//! in a workspace whose one dependency is `libc`. It was measured and it was
+//! in a program whose one outside dependency is `libc`. It was measured and it was
 //! wrong — not about the code, which is nine hundred lines in
 //! `tos_term::jpeg`, but about what it buys.
 //!
@@ -80,20 +90,23 @@
 //! layout, the images and the video that are the reason for wanting a browser
 //! at all. The page arrives as pixels because it *is* pixels.
 //!
-//! **No place on the ISO.** `docs/design/applications.md` lists what every tOS
-//! image carries and says why: thirteen Debian packages, one upstream binary,
-//! and the rule that everything else is the person's. A Chromium is 482 MB
-//! installed — twice the ISO, measured in `docs/design/browser.md` — and a
-//! policy about which browser somebody uses. This crate builds
-//! into the tree, and the engine it drives is installed by the person who
-//! wants one — `$TOS_BROWSER_ENGINE`, or whichever of `chromium-shell`,
+//! **No engine in the box.** A Chromium is 482 MB installed — twice a tOS ISO,
+//! measured in tOS's `docs/design/browser.md` — and a choice about which
+//! browser somebody runs. tOS's rule for what an image carries is thirteen
+//! Debian packages, one upstream binary, and everything else is the person's
+//! (`docs/design/applications.md`), and that is this program's rule too: it is
+//! one small binary, and the engine it drives is installed by the person who
+//! wants one — `$BLINKTERM_ENGINE`, or whichever of `chromium-shell`,
 //! `chromium`, `chromium-browser` or `google-chrome` is on the path.
 //!
-//! **No dependencies.** The HTTP GET, the WebSocket client, the JSON, the
-//! base64 and the SHA-1 are all in this crate, each in its own module with its
-//! own tests, for the reason the rest of the workspace hand-rolled PNG and
-//! inflate: a browser is a large enough thing to want a crate for every part
-//! of it, and that is exactly how a one-dependency workspace stops being one.
+//! **No dependencies to speak of.** The HTTP GET, the WebSocket client, the
+//! JSON, the base64 and the SHA-1 are all in this crate, each in its own
+//! module with its own tests, for the reason tOS hand-rolled PNG and inflate:
+//! a browser is a large enough thing to want a crate for every part of it, and
+//! that is exactly how a one-dependency program stops being one. What is
+//! depended on is `libc` and three tOS crates that were already written for
+//! this: `tos-term` for the PNG and JPEG decoders, `tos-platform` for the
+//! terminal, `tos-preview` for the cell arithmetic.
 
 pub mod app;
 pub mod base64;

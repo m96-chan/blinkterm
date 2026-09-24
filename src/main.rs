@@ -1,23 +1,26 @@
-//! `tos-browser`: a web page in a pane.
+//! `blinkterm`: a web page in a terminal pane.
 
 use std::process::ExitCode;
 
-use tos_browser::app::{self, Options};
-use tos_browser::engine;
+use blinkterm::app::{self, Options};
+use blinkterm::engine;
 
 const USAGE: &str = "\
-tos-browser, the tOS web browser
+blinkterm, a real browser in a terminal pane
 
-usage: tos-browser [options] [url]
+usage: blinkterm [options] [url]
 
 options:
   -h, --help     show this message
   -V, --version  show the version
 
 The page is rendered by a headless Chromium, which this program starts and
-stops. It is looked for in $TOS_BROWSER_ENGINE first, then on PATH as
-chromium-shell, chromium, chromium-browser or google-chrome. tOS does not
-ship one; install the one you want.
+stops. It is looked for in $BLINKTERM_ENGINE first, then on PATH as
+chromium-shell, chromium, chromium-browser or google-chrome. blinkterm does
+not ship one; install the one you want.
+
+The terminal has to speak the Kitty graphics protocol, the Kitty keyboard
+protocol and SGR mouse reporting: a tOS pane, Kitty, WezTerm or Ghostty.
 
 keys:
   ctrl+l         type a url
@@ -39,19 +42,19 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("tos-browser {}", env!("CARGO_PKG_VERSION"));
+        println!("blinkterm {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
 
     let mut url = None;
     for arg in &args {
         if arg.starts_with('-') && arg.len() > 1 {
-            eprintln!("tos-browser: unknown option: {arg}");
-            eprintln!("try 'tos-browser --help'");
+            eprintln!("blinkterm: unknown option: {arg}");
+            eprintln!("try 'blinkterm --help'");
             return ExitCode::from(2);
         }
         if url.replace(arg.clone()).is_some() {
-            eprintln!("tos-browser: one page at a time");
+            eprintln!("blinkterm: one page at a time");
             return ExitCode::from(2);
         }
     }
@@ -63,10 +66,10 @@ fn main() -> ExitCode {
         Err(message) => {
             // The terminal has already been put back by the time this runs, so
             // the sentence lands in a shell the person can read it in.
-            eprintln!("tos-browser: {message}");
+            eprintln!("blinkterm: {message}");
             if message.contains(engine::ENGINE_ENV) || message.contains("PATH") {
                 eprintln!(
-                    "tos-browser: install a chromium, or set {}",
+                    "blinkterm: install a chromium, or set {}",
                     engine::ENGINE_ENV
                 );
             }

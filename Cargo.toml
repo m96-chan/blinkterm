@@ -1,25 +1,58 @@
 [package]
-name = "tos-browser"
-description = "Browse the web in a tOS pane, over the compositor's graphics and input protocols"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
+name = "blinkterm"
+description = "A real browser in a terminal pane: headless Chromium over the Kitty graphics protocol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/m96-chan/blinkterm"
 
 [[bin]]
-name = "tos-browser"
+name = "blinkterm"
 path = "src/main.rs"
 
 [lib]
-name = "tos_browser"
+name = "blinkterm"
 path = "src/lib.rs"
 
+# The tOS crates are git revisions rather than versions because none of them is
+# published to crates.io and none of them is going to be: they are parts of an
+# operating system, versioned with it. A revision rather than a branch so that
+# a build here is the same build tomorrow — tOS's `main` moves, and a browser
+# that decodes the frames itself would notice a decoder changing underneath it.
+#
+# `rev = "c7677bde"` is tOS `main` at the commit this crate was split out of,
+# so the tests below are running against exactly the code they passed against
+# inside that repository.
+#
+# Bumping the rev is how a protocol change is taken: when tOS's terminal learns
+# a graphics format, an escape sequence or a keyboard flag this program wants,
+# the way to get it is to move these revisions forward together and run the
+# engine tests, not to vendor or reimplement it here.
 [dependencies]
-tos-platform = { workspace = true }
-tos-preview = { workspace = true }
-tos-term = { workspace = true }
-libc = { workspace = true }
+libc = "0.2"
+# tos-term: the PNG and JPEG decoders, and the graphics-command parser the
+# tests check this program's output with. (compositor/tos-term)
+tos-term = { git = "https://github.com/m96-chan/tOS", rev = "c7677bde" }
+# tos-platform: raw mode, non-blocking descriptors, the tty odds and ends.
+# (compositor/tos-platform)
+tos-platform = { git = "https://github.com/m96-chan/tOS", rev = "c7677bde" }
+# tos-preview: cells-to-pixels arithmetic, shared with the image viewer.
+# (apps/preview)
+tos-preview = { git = "https://github.com/m96-chan/tOS", rev = "c7677bde" }
 
 [dev-dependencies]
-tos-compositor = { workspace = true }
+# tos-compositor, for `ImageFiles`: the `t=s` reader a real tOS pane installs,
+# so the engine tests exercise the shared-memory transport the way the
+# compositor does rather than a stand-in. (compositor/tos-compositor)
+tos-compositor = { git = "https://github.com/m96-chan/tOS", rev = "c7677bde" }
+
+# Copied from tOS's workspace profile, and `panic = "abort"` is the part that
+# matters: `engine.rs` kills the engine's process group from a panic hook
+# because `Drop` does not run on an abort, and `screen.rs` puts the terminal
+# back the same way. Both were written against this setting; turning it off
+# would leave them looking redundant and leave a stray Chromium behind.
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"

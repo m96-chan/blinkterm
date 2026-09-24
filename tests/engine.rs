@@ -8,7 +8,7 @@
 //! compared with a booted tOS is the renderer and the PTY, neither of which
 //! can say anything about whether the protocol is right.
 //!
-//! Every test here runs only when `TOS_BROWSER_ENGINE` names the engine to
+//! Every test here runs only when `BLINKTERM_ENGINE` names the engine to
 //! use, and skips otherwise — not when a Chromium happens to be on `PATH`.
 //! The program itself searches `PATH`, because a person who installed a
 //! browser wants it found; a test is different. A machine that builds tOS is
@@ -24,15 +24,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tos_browser::cdp::{Client, Pending};
-use tos_browser::engine::{self, Engine};
-use tos_browser::graphics::{Painter, Raw, IMAGE_ID};
-use tos_browser::input::{Key, KeyAction, KeyInput, Mods};
-use tos_browser::json::Json;
-use tos_browser::keys;
-use tos_browser::motion::{self, Motion};
-use tos_browser::scroll::{self, Animator, Dispatch, Step, Wheel};
-use tos_browser::tabs::{Outcome, Tab, Tabs};
+use blinkterm::cdp::{Client, Pending};
+use blinkterm::engine::{self, Engine};
+use blinkterm::graphics::{Painter, Raw, IMAGE_ID};
+use blinkterm::input::{Key, KeyAction, KeyInput, Mods};
+use blinkterm::json::Json;
+use blinkterm::keys;
+use blinkterm::motion::{self, Motion};
+use blinkterm::scroll::{self, Animator, Dispatch, Step, Wheel};
+use blinkterm::tabs::{Outcome, Tab, Tabs};
 use tos_compositor::ImageFiles;
 use tos_preview::fit::Cells;
 
@@ -201,7 +201,7 @@ fn take_frames(client: &mut Client) -> Vec<(Vec<u8>, Option<f64>)> {
             .params
             .path(&["metadata", "timestamp"])
             .and_then(Json::as_f64);
-        if let Ok(bytes) = tos_browser::base64::decode(data.as_bytes()) {
+        if let Ok(bytes) = blinkterm::base64::decode(data.as_bytes()) {
             frames.push((bytes, stamp));
         }
     }
@@ -225,7 +225,7 @@ fn cast(client: &mut Client, format: &str, quality: Option<u32>, width: u32, hei
 }
 
 fn temp_dir(what: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("tos-browser-it-{what}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("blinkterm-it-{what}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a directory");
     dir
 }
@@ -256,7 +256,7 @@ fn frames_reach_a_terminal_through_shared_memory() {
     while started.elapsed() < run_for {
         for (jpeg, stamp) in take_frames(&mut client) {
             assert_eq!(&jpeg[..2], b"\xff\xd8", "the engine promised JPEG");
-            // The clock the ordering rule in `tos_browser::motion` leans on:
+            // The clock the ordering rule in `blinkterm::motion` leans on:
             // CDP says seconds since the epoch, and the engine is a child of
             // this process, so it had better be this epoch.
             let stamp = stamp.expect("a frame says when it was captured");
@@ -327,7 +327,7 @@ fn frames_reach_a_terminal_through_shared_memory() {
 ///
 /// The fallback sends the decoded pixels rather than the encoded frame,
 /// because the encoded frame is a JPEG and no terminal's graphics path reads
-/// one. `apps/browser/src/graphics.rs` argues that; this measures it.
+/// one. `src/graphics.rs` argues that; this measures it.
 #[test]
 fn frames_also_reach_a_terminal_inline() {
     let Some((mut engine, mut client)) = connect() else {
@@ -349,7 +349,7 @@ fn frames_also_reach_a_terminal_inline() {
         for (jpeg, _) in take_frames(&mut client) {
             let image = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
             let raw = Raw::rgb(&image.rgb, image.width, image.height);
-            let sequence = tos_browser::graphics::inline_command(&raw, cells);
+            let sequence = blinkterm::graphics::inline_command(&raw, cells);
             terminal.advance(&sequence);
             frames += 1;
             escape_bytes += sequence.len();
@@ -465,15 +465,15 @@ fn a_click_lands_where_the_cell_was() {
 
     // Cell column 11, row 4 of a pane whose first row is the status line: the
     // middle of that cell, one row up.
-    let report = tos_browser::input::MouseInput {
-        kind: tos_browser::input::MouseKind::Press,
+    let report = blinkterm::input::MouseInput {
+        kind: blinkterm::input::MouseKind::Press,
         button: Some(0),
         mods: Mods::default(),
         x: 11,
         y: 4,
         wheel: (0, 0),
     };
-    let (x, y) = tos_browser::input::page_point(&report, false, CELL, 1);
+    let (x, y) = blinkterm::input::page_point(&report, false, CELL, 1);
     assert_eq!((x, y), (84, 40));
 
     client
@@ -711,7 +711,7 @@ fn a_link_that_wants_a_window_becomes_the_tab_in_front() {
     for index in 0..tabs.len() {
         let tab = tabs.get_mut(index).expect("a tab");
         titles.push(
-            tos_browser::app::page_title(&mut tab.connection).unwrap_or_else(|| "?".to_string()),
+            blinkterm::app::page_title(&mut tab.connection).unwrap_or_else(|| "?".to_string()),
         );
     }
     assert_eq!(titles, ["first", "second"]);
@@ -854,7 +854,7 @@ fn closing_a_tab_leaves_the_one_it_was_opened_from() {
     );
     let left = tabs.active_mut().expect("the tab that is left");
     assert_eq!(
-        tos_browser::app::page_title(&mut left.connection).as_deref(),
+        blinkterm::app::page_title(&mut left.connection).as_deref(),
         Some("first"),
         "what is left is not the page the link was on"
     );
@@ -915,7 +915,7 @@ fn wait_for_frame(client: &mut Client, timeout: Duration) -> Option<Vec<u8>> {
                 );
             }
             if let Some(data) = event.params.get("data").and_then(Json::as_str) {
-                if let Ok(png) = tos_browser::base64::decode(data.as_bytes()) {
+                if let Ok(png) = blinkterm::base64::decode(data.as_bytes()) {
                     return Some(png);
                 }
             }
@@ -1118,7 +1118,7 @@ fn screenshot(client: &mut Client, format: &str, quality: Option<u32>) -> Vec<u8
         .get("data")
         .and_then(Json::as_str)
         .expect("a screenshot carries its picture");
-    tos_browser::base64::decode(data.as_bytes()).expect("valid base64")
+    blinkterm::base64::decode(data.as_bytes()).expect("valid base64")
 }
 
 /// What quality 85 costs, against the lossless picture of the same frame.
@@ -1220,7 +1220,7 @@ fn png_through_the_terminal(
     cells: Cells,
 ) -> Vec<u8> {
     *counter += 1;
-    let name = format!("tos-browser-before-{}-{counter}", std::process::id());
+    let name = format!("blinkterm-before-{}-{counter}", std::process::id());
     let partial = dir.join(format!("{name}.part"));
     std::fs::write(&partial, png).expect("a frame file");
     std::fs::rename(&partial, dir.join(&name)).expect("renamed into place");
@@ -1228,7 +1228,7 @@ fn png_through_the_terminal(
         "a=T,f=100,i={IMAGE_ID},p=1,c={},r={},C=1,q=2",
         cells.cols, cells.rows
     );
-    let payload = tos_browser::base64::encode(format!("/{name}").as_bytes());
+    let payload = blinkterm::base64::encode(format!("/{name}").as_bytes());
     format!("\x1b[2;1H\x1b_G{control},t=s;{payload}\x1b\\").into_bytes()
 }
 
@@ -1455,11 +1455,11 @@ fn take_offsets(client: &mut Client) -> Vec<(f64, Option<f64>)> {
 
 /// The program's own dispatch, with a count of what went through it.
 ///
-/// `tos_browser::app::Wire` is the one implementation of
+/// `blinkterm::app::Wire` is the one implementation of
 /// `scroll::Dispatch` that is not a fake, so the events these tests put on the
 /// wire are the ones the program puts on it, built by the same code.
 struct Counted {
-    wire: tos_browser::app::Wire,
+    wire: blinkterm::app::Wire,
     sent: AtomicUsize,
 }
 
@@ -1535,7 +1535,7 @@ impl Roll {
     /// A frame that carries the same offset as the one before it is a frame in
     /// which the page did not move. One of those on its own is the screencast's
     /// cadence beating against the animation's: frames come every 16.7 ms on
-    /// this host and ticks every [`tos_browser::scroll::TICK`], so about twice
+    /// this host and ticks every [`blinkterm::scroll::TICK`], so about twice
     /// a second a frame falls in a gap and the next one carries two ticks.
     /// That is a sixtieth of a second, and on the machine this is really for —
     /// where a frame is 24 to 27 ms and every one of them holds a tick or two
@@ -1649,7 +1649,7 @@ impl Roll {
 fn roll(client: &mut Client, notches: u32, apart: Duration) -> Roll {
     let at = (WIDE as i32 / 2, TALL as i32 / 2);
     let counted = Arc::new(Counted {
-        wire: tos_browser::app::Wire::new(client.notifier()),
+        wire: blinkterm::app::Wire::new(client.notifier()),
         sent: AtomicUsize::new(0),
     });
     let wheel = Wheel::start();
@@ -1674,7 +1674,7 @@ fn roll(client: &mut Client, notches: u32, apart: Duration) -> Roll {
                 "the tab in front",
                 counted.clone(),
                 at,
-                (0.0, tos_browser::app::WHEEL_PIXELS),
+                (0.0, blinkterm::app::WHEEL_PIXELS),
             );
             rest.input(now);
             roll.notches.push(now);
@@ -1740,7 +1740,7 @@ fn still_picture(answer: Result<Json, String>) -> Option<Vec<u8>> {
     answer
         .ok()
         .and_then(|reply| reply.get("data").and_then(Json::as_str).map(str::to_string))
-        .and_then(|data| tos_browser::base64::decode(data.as_bytes()).ok())
+        .and_then(|data| blinkterm::base64::decode(data.as_bytes()).ok())
 }
 
 /// Twelve notches, 50 ms apart: a flick, faster than a hand really rolls —
@@ -1904,7 +1904,7 @@ fn one_notch_is_an_animation_and_not_a_jump() {
     );
     assert_eq!(
         scroll_y(&mut client),
-        tos_browser::app::WHEEL_PIXELS,
+        blinkterm::app::WHEEL_PIXELS,
         "an animated notch still ends exactly one notch down"
     );
     assert!(
@@ -1987,7 +1987,7 @@ fn a_steady_hand_moves_the_page_steadily() {
     );
     assert_eq!(
         scroll_y(&mut client),
-        STEADY as f64 * tos_browser::app::WHEEL_PIXELS,
+        STEADY as f64 * blinkterm::app::WHEEL_PIXELS,
         "the animation lost a notch, or invented one"
     );
     assert!(
@@ -2064,7 +2064,7 @@ fn a_hand_on_the_wheel_gets_no_still_until_it_stops() {
     );
     assert_eq!(
         scroll_y(&mut client),
-        NOTCHES as f64 * tos_browser::app::WHEEL_PIXELS,
+        NOTCHES as f64 * blinkterm::app::WHEEL_PIXELS,
         "the animation lost a notch, or invented one"
     );
     assert!(
@@ -2207,7 +2207,7 @@ fn nothing_is_kept_for_the_acknowledgements_and_the_wheel() {
     while Instant::now() < until {
         let now = Instant::now();
         if notches < NOTCHES && now >= next_notch {
-            animator.notch(at, (0.0, tos_browser::app::WHEEL_PIXELS), now);
+            animator.notch(at, (0.0, blinkterm::app::WHEEL_PIXELS), now);
             notches += 1;
             next_notch = now + EVERY;
         }

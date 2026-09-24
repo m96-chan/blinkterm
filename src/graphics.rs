@@ -174,7 +174,7 @@ impl Painter {
 
     /// The same, in a directory a test can watch.
     pub fn at(dir: &Path) -> Painter {
-        let prefix = format!("tos-browser-{}", std::process::id());
+        let prefix = format!("blinkterm-{}", std::process::id());
         let probe = dir.join(format!("{prefix}-probe"));
         let usable = std::fs::write(&probe, b"probe").is_ok();
         let _ = std::fs::remove_file(&probe);
@@ -400,7 +400,7 @@ mod tests {
     fn a_shared_memory_frame_names_an_object_and_says_nothing_back() {
         let pixels = rgb();
         let raw = Raw::rgb(&pixels, 640, 368);
-        let bytes = shared_memory_command("/tos-browser-1-2", &raw, cells(80, 23));
+        let bytes = shared_memory_command("/blinkterm-1-2", &raw, cells(80, 23));
         let bodies = apc_bodies(&bytes);
         assert_eq!(bodies.len(), 1);
         let cmd = GraphicsCommand::parse(&bodies[0]).expect("parses");
@@ -413,7 +413,7 @@ mod tests {
         assert_eq!((cmd.cols, cmd.rows), (80, 23));
         assert!(cmd.cursor_stays, "the status line is written after this");
         assert_eq!(cmd.quiet, 2, "nothing is reading a reply");
-        assert_eq!(cmd.payload, b"/tos-browser-1-2");
+        assert_eq!(cmd.payload, b"/blinkterm-1-2");
     }
 
     /// A still is RGBA because that is what the PNG decoder produces, and the
@@ -559,7 +559,7 @@ mod tests {
 
     fn temp_dir(what: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "tos-browser-{what}-{}-{:?}",
+            "blinkterm-{what}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

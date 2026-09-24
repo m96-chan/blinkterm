@@ -1,7 +1,7 @@
 //! Enough JSON for the Chrome DevTools Protocol, and no more.
 //!
 //! CDP is JSON in both directions, so something has to read and write it, and
-//! in this workspace that something is not a crate. What is here is the whole
+//! in this program that something is not a dependency. What is here is the whole
 //! grammar — objects, arrays, strings with escapes and surrogate pairs,
 //! numbers, the three literals — because a parser that handled "most" JSON
 //! would be a parser that fails on the one page whose title has an emoji in

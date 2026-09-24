@@ -1,7 +1,7 @@
 //! The Chromium that does the rendering, as a child process.
 //!
 //! tOS does not ship a browser engine and this crate does not contain one: the
-//! person installs a Chromium and `tos-browser` drives it. So the first thing
+//! person installs a Chromium and `blinkterm` drives it. So the first thing
 //! this program does is find one, and the second is start it in a way that
 //! cannot leave it running after the pane is gone.
 //!
@@ -64,7 +64,7 @@ pub const CANDIDATES: [&str; 4] = [
 ];
 
 /// The environment variable that overrides the search.
-pub const ENGINE_ENV: &str = "TOS_BROWSER_ENGINE";
+pub const ENGINE_ENV: &str = "BLINKTERM_ENGINE";
 
 /// How many lines of the engine's stderr are kept to explain a death: the
 /// first `HEAD` and the last `TAIL`, with whatever came between dropped.
@@ -80,7 +80,8 @@ const TAIL: usize = 12;
 /// What to kill to stop the engine, for the paths that cannot run a
 /// destructor.
 ///
-/// A panic in a release build aborts — the workspace sets `panic = "abort"` —
+/// A panic in a release build aborts — the release profile sets
+/// `panic = "abort"` —
 /// so `Drop` is not a way to be sure the child dies. This is read by the panic
 /// hook and by the signal path, both of which have to kill a process without
 /// owning anything.

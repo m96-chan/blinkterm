@@ -83,7 +83,7 @@ impl<C> Tab<C> {
             return note.clone();
         }
         match (self.title.is_empty(), self.url.is_empty()) {
-            (true, true) => "tos-browser".to_string(),
+            (true, true) => "blinkterm".to_string(),
             (true, false) => self.url.clone(),
             (false, true) => self.title.clone(),
             (false, false) => format!("{}  —  {}", self.title, self.url),

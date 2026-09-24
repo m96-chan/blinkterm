@@ -156,7 +156,7 @@ pub const INPUT_QUIET: Duration = Duration::from_millis(400);
 /// `fromSurface=false` makes no difference.
 ///
 /// So one frame inside a still's window is the still photographing itself, and
-/// anything more is the page moving. `apps/browser/tests/engine.rs` asserts
+/// anything more is the page moving. `tests/engine.rs` asserts
 /// the one, because it is the number this rule is built on and an engine that
 /// changed it would otherwise change the policy quietly.
 pub const SHUTTER_FRAMES: u32 = 1;
@@ -342,7 +342,7 @@ mod tests {
 
     /// The frame `Page.captureScreenshot` produces of its own accord: stamped
     /// a few milliseconds after the request and well before the reply, which
-    /// is what the probe in `apps/browser/tests/engine.rs` measured.
+    /// is what the probe in `tests/engine.rs` measured.
     fn shutter(motion: &mut Motion, requested_at: f64, at: Instant) -> bool {
         motion.motion_frame(Some(requested_at + 0.004), at)
     }

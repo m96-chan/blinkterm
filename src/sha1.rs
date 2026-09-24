@@ -11,9 +11,10 @@
 //! say so in a sentence instead of becoming a malformed frame ten seconds
 //! later.
 //!
-//! Sixty lines for that, rather than a crate, for the reason the whole
-//! workspace has one dependency: `tos_crypt` already hand-rolls SHA-512 for
-//! the installer's passwords, and this is the same trade one size down.
+//! Sixty lines for that, rather than a crate, for the reason tOS has one
+//! dependency across the whole of it: `tos_crypt` there already hand-rolls
+//! SHA-512 for the installer's passwords, and this is the same trade one size
+//! down.
 
 /// The twenty bytes of a SHA-1 digest.
 pub fn sha1(message: &[u8]) -> [u8; 20] {

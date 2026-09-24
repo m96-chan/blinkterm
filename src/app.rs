@@ -206,7 +206,7 @@ pub fn run(options: Options) -> Result<(), String> {
         // terminal back and stop the engine.
         screen::emergency();
         crate::engine::kill_engine();
-        eprintln!("tos-browser: {info}");
+        eprintln!("blinkterm: {info}");
     }));
 
     let mut engine = Engine::launch(ENGINE_TIMEOUT)?;
@@ -1731,7 +1731,7 @@ mod tests {
     #[test]
     fn the_status_line_says_what_is_known() {
         let mut tab: Tab<()> = Tab::new("t", (), "");
-        assert_eq!(tab.line(), "tos-browser");
+        assert_eq!(tab.line(), "blinkterm");
         tab.url = "https://example.com".to_string();
         assert_eq!(tab.line(), "https://example.com");
         tab.title = "Example".to_string();

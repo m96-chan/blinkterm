@@ -60,7 +60,7 @@
 //! ## What the additive curve gives, measured the same way
 //!
 //! Same engine, same page, same size, read off `metadata.scrollOffsetY` frame
-//! by frame. This is `apps/browser/tests/engine.rs`, which asserts the shape
+//! by frame. This is `tests/engine.rs`, which asserts the shape
 //! of all three and prints the numbers with `--nocapture`:
 //!
 //! ```text
@@ -194,7 +194,7 @@ pub struct Step {
 /// A trait rather than a connection, because this module has no business
 /// knowing what CDP is and because the thread underneath it is worth testing
 /// without an engine: a fake that records when it was called is all a test of
-/// the clock needs. `apps/browser/src/app.rs` has the one implementation that
+/// the clock needs. `src/app.rs` has the one implementation that
 /// is not a fake.
 pub trait Dispatch: Send + Sync {
     /// Put one step on the wire. An error is a socket that has gone, and it

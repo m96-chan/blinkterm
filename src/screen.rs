@@ -10,8 +10,9 @@
 //! is to close the pane.
 //!
 //! Which is why the terminal state lives in a static here as well as in a
-//! guard. A release build of tOS aborts on panic (`panic = "abort"` in the
-//! workspace profile), so `Drop` is not a guarantee; [`emergency`] is the same
+//! guard. A release build aborts on panic (`panic = "abort"`, kept in this
+//! crate's release profile for that reason), so `Drop` is not a guarantee;
+//! [`emergency`] is the same
 //! restoration written so it can run from a panic hook or a signal path, with
 //! nothing borrowed and one `write(2)`.
 
