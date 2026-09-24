@@ -19,6 +19,11 @@
 //! Naming the engine is the consent. The skips are not quiet: the reason is
 //! printed, so that a run which proved nothing does not read like a run which
 //! proved something.
+//!
+//! Run them one at a time — `--test-threads=1`. Each test here starts a
+//! Chromium, and the ones that assert on how smoothly a scroll moves are
+//! measuring an animation against the wall clock: a second engine painting on
+//! the same two cores is noise that reads as a lurch.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

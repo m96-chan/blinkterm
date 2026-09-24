@@ -58,9 +58,17 @@ jobs:
       # interval before a still, the frame rate under a steady wheel, the cost
       # of a decode. A debug build misses them all.
       #
+      # --test-threads=1 for the same reason. Each of these tests starts a
+      # Chromium of its own, and a standard runner has two cores; four engines
+      # painting at once makes the scroll tests measure the runner rather than
+      # the program, and they say so -- a_steady_hand_moves_the_page_steadily
+      # failed on a 3.6x swing between two frames on the first run of this
+      # workflow. One at a time gives each engine the machine the numbers were
+      # taken on, and the suite still finishes in half a minute.
+      #
       # The job runs as root in the container, which the engine notices: it
       # adds --no-sandbox itself, because Chromium refuses to start as root
       # without it. See src/engine.rs.
-      - run: cargo test --release
+      - run: cargo test --release -- --test-threads=1
         env:
           BLINKTERM_ENGINE: chromium-shell

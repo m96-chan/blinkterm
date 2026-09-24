@@ -108,10 +108,12 @@ when they skip — naming the engine is the consent, because a machine with a
 Chromium on it did not thereby agree to have it started.
 
 ```sh
-BLINKTERM_ENGINE=chromium-shell cargo test --release
+BLINKTERM_ENGINE=chromium-shell cargo test --release -- --test-threads=1
 ```
 
-`--release` because several of them assert on timings. `tools/Dockerfile`
+`--release` because several of them assert on timings, and one at a time
+because each starts a Chromium of its own: two engines painting at once on a
+small machine make the scroll tests measure the machine. `tools/Dockerfile`
 builds the bookworm image with the engine and the fonts in it if you would
 rather not install a Chromium; `tools/` also holds the Python tools the design
 was measured with, and has its own README.
