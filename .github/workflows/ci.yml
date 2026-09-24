@@ -1,0 +1,66 @@
+# Two jobs, because they need two different machines.
+#
+# `check` is the ordinary one: format, lints, and the tests that need nothing
+# installed. `engine` is the reason this crate left the tOS repository — tOS's
+# CI has no Chromium and is not going to grow one, and the tests in
+# tests/engine.rs are worth nothing without a real engine behind them.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # Without BLINKTERM_ENGINE every test in tests/engine.rs skips itself and
+      # says so, which is the point: this job proves the code compiles and the
+      # unit tests pass, and makes no claim about the engine.
+      - run: cargo test
+
+  engine:
+    name: engine tests, real Chromium
+    runs-on: ubuntu-latest
+    # bookworm because that is what the frames were measured on, and what a tOS
+    # rootfs is. Running in a container rather than apt-getting onto the runner
+    # keeps the engine a pinned Debian one instead of whatever the image ships.
+    container:
+      image: rust:1-bookworm
+      # /dev/shm on a GitHub container is 64 MB by default. The `t=s` frames
+      # are a few megabytes each and are unlinked as they are read, so 64 MB is
+      # enough -- and running at the default is the point, since it is what
+      # anybody else's container will have too.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the engine and the fonts
+        # chromium-shell is Debian's headless_shell. The CJK fonts are not
+        # decoration: without them a page of Japanese renders as boxes and the
+        # frames still look fine to an assertion.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends chromium-shell fonts-noto-cjk
+          rm -rf /var/lib/apt/lists/*
+      - uses: Swatinem/rust-cache@v2
+      # --release because several of these tests assert on timings: the rest
+      # interval before a still, the frame rate under a steady wheel, the cost
+      # of a decode. A debug build misses them all.
+      #
+      # The job runs as root in the container, which the engine notices: it
+      # adds --no-sandbox itself, because Chromium refuses to start as root
+      # without it. See src/engine.rs.
+      - run: cargo test --release
+        env:
+          BLINKTERM_ENGINE: chromium-shell

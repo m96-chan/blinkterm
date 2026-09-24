@@ -1,87 +1,121 @@
-# Browser proof-of-concept tools
+# blinkterm
 
-The Rust `tos-browser` client lives in `src/`; this page covers the earlier
-Python experiments and benchmark tools kept alongside it for reproduction.
+A real browser in a terminal pane. Not a text browser: the page is rendered by
+a headless Chromium — Blink, the engine the page was made for — and arrives in
+the pane as pixels, over the Kitty graphics protocol. Images, video, CSS,
+JavaScript, the lot, in a terminal.
 
-A page rendered by a headless Chromium, arriving in a tOS pane as kitty
-graphics. The reasoning, the measurements and the decisions are in
-[`docs/design/browser.md`](../../docs/design/browser.md); this file is how to run
-it.
+```sh
+blinkterm https://example.com
+```
 
-Nothing here requires a change to the compositor. The converter is an ordinary
-program writing escape sequences to stdout, which is what a pane is for.
+`blinkterm` starts a Chromium as a child process, drives it over the Chrome
+DevTools Protocol on a WebSocket it speaks itself, takes the page's screencast,
+decodes each frame, and hands the terminal raw pixels — turning the terminal's
+own reports of keys and mouse back into CDP input events. The engine renders;
+the terminal displays; this program is the wire between them and nothing else.
 
-## What is in here
+## The numbers
+
+Measured at 1280x770 on two cores, no GPU, no display server:
 
 | | |
 | --- | --- |
-| `Dockerfile` | headless Chromium on bookworm, pinned, with the CJK fonts |
-| `testpage.html` | a page whose every element makes one kind of failure visible |
-| `cdp.py` | a Chrome DevTools Protocol client, standard library only |
-| `bench.py` | how fast frames come out, and how big they are |
-| `kitty_stream.py` | CDP screencast → kitty graphics commands |
-| `run.sh` | start a browser, measure it, stop it |
+| screencast, JPEG at quality 85 | 57.8 frames a second |
+| the same, PNG | 33.8 frames a second |
+| `Page.captureScreenshot` in a loop | 10 to 12, in every format CDP offers |
+| a frame on the engine's side | about 185 kB |
+| decoding one here | 8 ms |
 
-`cdp.py` speaks enough WebSocket to talk to Chromium and nothing more. That is
-deliberate: a browser experiment for a system that ships thirteen packages
-should not open by asking for a `pip install`.
+So the frames are **JPEG while the page is moving, PNG when it stops**. After
+150 ms with no frame the tab in front is asked for one lossless still and that
+is what is left on the screen: text you are reading is always lossless, and the
+lossy frames are the ones scrolling past, which nobody reads. A page that never
+moves costs one still and then nothing.
 
-## Running it
+The frames are decoded here rather than by the terminal, and go over as raw
+pixels (`f=24`, `f=32`) rather than as a PNG the terminal has to decode on its
+parse loop. In a tOS pane they go through `/dev/shm` as a name (`t=s`) instead
+of base64 in the escape sequence, which is what keeps a 60 fps stream off a PTY
+that carries 240 KB/s. Where the terminal does not read shared memory,
+`blinkterm` notices the names piling up unread and falls back to sending the
+pixels inline: correct, obviously correct, and slow.
 
-With Docker, which needs nothing installed:
+## Where it runs
 
-```sh
-./run.sh --docker --png frame.png
-```
+Any terminal that speaks all three of the Kitty graphics protocol, the Kitty
+keyboard protocol and SGR mouse reporting — Kitty, WezTerm, Ghostty — and a
+[tOS](https://github.com/m96-chan/tOS) pane, which is where it was written.
+tOS owns the display: there is no X11 and no Wayland and there never will be,
+so no browser can be ported to it in the ordinary sense. But a terminal that
+speaks those three protocols is already a screen, a mouse and a keyboard, and
+that is the whole of what an engine wants. None of that argument is about tOS,
+so the same binary runs in the others. This repository exists because tOS's CI
+has no Chromium to test against and this program is nothing without one.
 
-With a browser already on the machine — `chrome-headless-shell`,
-`chromium-shell`, or `$CHROME_HEADLESS_SHELL` as the CI image sets it:
+## Installing
 
-```sh
-./run.sh --png frame.png
-```
-
-Either prints the numbers and leaves a PNG to look at. Look at it: a wrong
-frame and a right frame both exit zero, and missing CJK fonts turn every
-Japanese glyph into a box that only a human notices.
-
-## Putting it in a pane
-
-`kitty_stream.py` converts the screencast into kitty graphics commands. The
-default sends each frame inline as base64, which works in any terminal that
-speaks the protocol and is too slow to stream — the PTY carries about 240 KB/s
-into a tOS pane, and a 60 fps PNG stream wants seventeen times that.
-
-`--shm` sends the pixels through a POSIX shared memory object and puts only its
-name on the PTY, which is the transport the design settles on:
+Rust 1.75 or newer:
 
 ```sh
-# start a browser first, e.g. ./run.sh --docker in another pane
-python3 kitty_stream.py --shm --frames 300
+cargo install --git https://github.com/m96-chan/blinkterm
 ```
 
-Through tOS, end to end, with no display server anywhere:
+Then a browser engine, which `blinkterm` does not ship — a Chromium is 482 MB
+installed, twice a tOS ISO, and a choice about which browser somebody runs. On
+Debian or Ubuntu:
 
 ```sh
-cargo build --release
-./target/release/tos --backend headless --warmup 25 --screenshot /tmp/tos.ppm \
-    -e /bin/sh -c 'cd browser && python3 kitty_stream.py --shm --frames 40'
+apt-get install -y --no-install-recommends chromium-shell fonts-noto-cjk
 ```
 
-`--warmup` matters. A screenshot renders after that many frames, and the pane
-needs a few of them to read the picture in; the default of one will photograph
-an empty pane and tell you nothing is working when something is.
+`chromium-shell` is Debian's `headless_shell`: the same Chromium with no
+desktop browser UI compiled in, 76 packages against 112. The CJK fonts are not
+optional if you read any; without them every Japanese glyph is a box.
 
-## Checking it without a terminal
-
-The byte stream can be saved and checked on a machine with no terminal at all,
-which is what CI is:
+Anything Chromium-shaped will do. `blinkterm` looks at `$BLINKTERM_ENGINE`
+first, then on `PATH` for `chromium-shell`, `chromium`, `chromium-browser` and
+`google-chrome`, in that order.
 
 ```sh
-python3 kitty_stream.py --frames 60 --save frames.kitty
-python3 kitty_stream.py --verify frames.kitty
+BLINKTERM_ENGINE=/opt/chrome/chrome-headless-shell blinkterm
 ```
 
-`--verify` parses the commands back out, reassembles the base64 and checks that
-each frame really is a PNG of the size it claims. It reads the bytes rather
-than calling the encoder, so it would catch the encoder being wrong.
+## Keys
+
+| | |
+| --- | --- |
+| `ctrl+l` | type a url |
+| `ctrl+r` | reload |
+| `alt+left` / `alt+right` | back and forward |
+| `ctrl+t` | a new tab, with the cursor in the url bar |
+| `ctrl+w` | close this tab; closing the last one quits |
+| `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
+| `alt+1` … `alt+9` | the nth tab |
+| `ctrl+q` | quit |
+
+Everything else goes to the page, including the mouse. A link that asks for a
+new window gets a new tab, and the tab is switched to.
+
+## Tests
+
+`cargo test` runs the unit tests and skips everything that needs an engine.
+The tests in `tests/engine.rs` are the ones this repository is for: a real
+Chromium, real frames, and `tos_term::Terminal` with the compositor's own
+`ImageFiles` installed parsing what would go down the pane's pseudoterminal.
+They run only when `BLINKTERM_ENGINE` names the engine to use, and they say so
+when they skip — naming the engine is the consent, because a machine with a
+Chromium on it did not thereby agree to have it started.
+
+```sh
+BLINKTERM_ENGINE=chromium-shell cargo test --release
+```
+
+`--release` because several of them assert on timings. `tools/Dockerfile`
+builds the bookworm image with the engine and the fonts in it if you would
+rather not install a Chromium; `tools/` also holds the Python tools the design
+was measured with, and has its own README.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

@@ -80,7 +80,7 @@ def encode_frame_shm(png_bytes, image_id=1, counter=[0]):
     to clean up after a frame that was delivered -- only after one that was not.
     """
     counter[0] += 1
-    name = f"tos-browser-{os.getpid()}-{counter[0]}"
+    name = f"blinkterm-{os.getpid()}-{counter[0]}"
     path = f"/dev/shm/{name}"
     # Written whole and then named, so the terminal cannot read a partial file:
     # the rename is atomic within the same filesystem.

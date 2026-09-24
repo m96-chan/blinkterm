@@ -50,9 +50,9 @@ cleanup() { :; }
 trap 'cleanup' EXIT INT TERM
 
 if [ "$mode" = docker ]; then
-    image=tos-browser-poc:bookworm
+    image=blinkterm-poc:bookworm
     docker build -q -t "$image" "$here" >/dev/null
-    name=tos-browser-poc-$$
+    name=blinkterm-poc-$$
     # --shm-size=1g is the other half of --disable-dev-shm-usage: together they
     # keep a page from dying on a shared memory segment that is too small.
     docker run -d --rm --name "$name" --shm-size=1g \

@@ -1,13 +1,15 @@
-# Headless Chromium for the browser proof of concept (issue #147).
+# Headless Chromium, for the proof of concept and for anyone who would rather
+# not install one.
 #
-# Debian bookworm, because that is what a tOS rootfs is: iso/mkiso.sh
+# Debian bookworm, because that is what a tOS rootfs is: its iso/mkiso.sh
 # debootstraps bookworm, so a dependency closure measured here is the closure a
 # tOS machine would actually pay for. The host this builds on does not have to
 # be Debian, and the machine this was developed on is not.
 #
 # chromium-shell rather than chromium: the shell is the headless binary without
-# the desktop browser UI, 76 packages against 112, and the PoC never opens a
-# window. Nothing here is proposed for the ISO; see docs/design/browser.md.
+# the desktop browser UI, 76 packages against 112, and nothing here ever opens
+# a window. blinkterm does not ship an engine; see tOS's docs/design/browser.md
+# for why not.
 FROM debian:bookworm-slim
 
 # --no-install-recommends throughout, so that the package counts this image
