@@ -9,8 +9,19 @@
 # until now the half nothing looked at.
 name: CI
 
+# `push` is narrowed to main on purpose. With a bare `push:` every commit on a
+# branch with a pull request open ran the workflow twice -- once for the push
+# to `refs/heads/<branch>` and once for `refs/pull/<n>/merge` -- and the two
+# runs are not even the same commit: the pull_request one tests the merge with
+# main, which is the one worth having. Two engine jobs at two and a half
+# minutes each, to answer a question once.
+#
+# Nothing stops being checked. A branch is covered by its pull request, and
+# main is covered here, which is what makes the record on main a record of
+# what actually landed rather than of what was proposed.
 on:
   push:
+    branches: [main]
   pull_request:
 
 env:
