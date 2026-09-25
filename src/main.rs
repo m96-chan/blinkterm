@@ -52,7 +52,7 @@ options:
                    send requests through a proxy (loopback never is)
   --home <url>     the page opened when no url is given (default: about:blank)
   --restore        reopen the tabs the last run had (not yet: #18)
-  --normal-mode    start in keyboard navigation mode (not yet: #13)
+  --normal-mode    start in normal mode (ctrl+., below)
   --config <path>  read settings from <path> instead of
                    $XDG_CONFIG_HOME/blinkterm/config (~/.config/blinkterm/config)
   --no-config      read no settings file
@@ -107,6 +107,11 @@ keys:
                  open it in a tab behind this one
   alt+= / alt+-  zoom in, out (ctrl+= / ctrl+- where the terminal lets them
                  through); alt+0 / ctrl+0 back to 100%
+  ctrl+.         normal mode on or off; in it the letters are keys: f labels
+                 what can be clicked and typing a label clicks it (F opens a
+                 link in a tab behind), j/k scroll a notch, d/u half a
+                 screen, gg/G to the ends, H/L back and forward, r reload,
+                 o the url bar, O a new tab, / find, i back to the page
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no
 Everything else goes to the page. A link that asks for a new window gets a

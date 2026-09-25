@@ -179,8 +179,8 @@ none. A line the program does not understand stops it with the file and
 line number; a missing file is nothing. A flag is `true` or `false`
 (`force-dark = true`), and a path may start with `~/`. There is no `url`
 setting: the page to open is what the command line is for, and
-`home = <url>` is the page opened when none is given. `restore` and
-`normal-mode` are read and do nothing yet.
+`home = <url>` is the page opened when none is given. `normal-mode = true`
+starts in normal mode (`ctrl+.`); `restore` is read and does nothing yet.
 
 `--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
 repeatable. Four are refused because they would undo something this
@@ -281,6 +281,7 @@ not a thing a terminal has.
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
 | `esc` | while a page is loading and nothing else has the row, stop it |
+| `ctrl+.` | normal mode on or off. In normal mode the letters are keys of their own and the row says `normal`: `f` labels everything clickable on the screen and typing a label clicks it (`F` opens a link in a tab behind this one); `j`/`k` scroll a notch, `d`/`u` half a screen, `gg`/`G` to the top and bottom; `H`/`L` back and forward, `r` reload, `o` the url bar, `O` a new tab, `/` find; `i` goes back to typing into the page, as does clicking into a field. Off by default: nothing changes until you press it |
 
 Everything else goes to the page, including the mouse. A link that asks for a
 new window gets a new tab, and the tab is switched to.
@@ -307,6 +308,18 @@ The url bar is asked about every key first while it is open, so `alt+←`/`→`
 are back and forward only when it is closed — in the bar they move by a word —
 and `ctrl+w`, `ctrl+t` and the rest do nothing there; `esc` closes it. The
 find prompt and the tab list are the same.
+
+Normal mode is for browsing without a mouse. The labels are drawn by the
+page itself, in one element this program adds to the document while they
+show and takes away after; a page can see that element and could remove
+it, and the next key puts it back. Labelled: links, buttons, fields,
+anything with `onclick`, a `role`, or a pointer cursor, in the page and in
+its same-origin frames and open shadow roots; not hidden things, not what
+something else covers, not image-map areas, not cross-origin frames. In
+normal mode an unbound letter does nothing, so nothing is typed into a
+field by mistake; arrows, Tab, Enter, Space and every `ctrl`/`alt` key
+still reach the page. `esc` takes the labels off; `ctrl+.` turns the mode
+off.
 
 Find is case-insensitive, matches text as the page shows it — spaces
 collapsed, a word split across `<b>` still one word, never across a

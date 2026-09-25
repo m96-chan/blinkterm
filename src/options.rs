@@ -95,8 +95,8 @@ pub struct Options {
     /// `--restore`: reopen the last session's tabs (#18). Parsed here, acted
     /// on there; nothing reads it until then.
     pub restore: bool,
-    /// `--normal-mode`: start in keyboard-navigation mode (#13). Parsed
-    /// here, acted on there; nothing reads it until then.
+    /// `--normal-mode`: start in normal mode rather than insert: the letters
+    /// are the program's keys from the first one. See [`crate::normal`].
     pub normal_mode: bool,
     /// `key.<chord> = <action>` lines from the file; see [`crate::bindings`].
     /// Always empty until the loop looks them up: see [`NOT_REMAPPABLE_YET`].

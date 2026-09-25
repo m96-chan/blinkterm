@@ -43,6 +43,7 @@ use crate::download::{self, Downloads};
 use crate::engine::Engine;
 use crate::find;
 use crate::graphics::{Painter, Raw};
+use crate::hints;
 use crate::history::{self, History};
 use crate::hover::{self, Shape};
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
@@ -51,6 +52,7 @@ use crate::keys;
 use crate::line::{Edit, Line};
 use crate::load::{self, Loaded, Problem};
 use crate::motion::{self, Motion};
+use crate::normal;
 use crate::options::Options;
 use crate::profile::Profile;
 use crate::screen::{self, Pane};
@@ -171,6 +173,20 @@ const FIND_TIMEOUT: Duration = Duration::from_secs(5);
 /// person has just pressed `ctrl+f` and the first letter they type needs the
 /// world. Measured at 0.4 to 2.2 ms each.
 const WORLD_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the hint script's `collect` gets before the row gives up on it.
+///
+/// Sent and collected like a search, and for the same reason: the walk is
+/// 2 to 12 ms on an ordinary page and 30 to 60 on one of four thousand
+/// elements, but it asks every element that is not a candidate by selector
+/// for its computed cursor, so a page of forty thousand is about half a
+/// second. Five, like [`FIND_TIMEOUT`]. See [`crate::hints`].
+const HINT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the question after a click in normal mode — did focus land in
+/// something editable? — may be out. The hover ask's, which it is the same
+/// size as: one `Runtime.evaluate` of a few element reads.
+const FOCUS_TIMEOUT: Duration = hover::ASK_TIMEOUT;
 
 /// The largest frame either decoder may produce, in bytes of pixels.
 ///
@@ -300,6 +316,13 @@ struct Chrome {
     /// strip scrolls only when the tab in front leaves it. See
     /// [`screen::tab_line_from`].
     strip_first: Cell<usize>,
+    /// Insert or normal: whether an unmodified letter is the page's or the
+    /// program's. See [`crate::normal`].
+    mode: normal::Mode,
+    /// The link hints showing, or being collected, on the page in front.
+    hinting: Option<Hinting>,
+    /// The question out after a click in normal mode.
+    focus: Option<Focus>,
 }
 
 impl Chrome {
@@ -373,6 +396,35 @@ impl Find {
             None => ask,
         });
     }
+}
+
+/// Hints showing on the page in front, and the collect out for them.
+///
+/// The program's, beside its target, like [`Find`]: one keyboard, one set
+/// of labels on the screen. A tab that comes to the front by any route
+/// ([`switched`]) cancels them, as does everything else that would leave a
+/// label over the wrong thing: see [`cancel_hints`].
+struct Hinting {
+    target: String,
+    /// `f` or `F`.
+    new_tab: bool,
+    /// The world the script runs in; `None` for a page that did not answer.
+    context: Option<i64>,
+    /// The `collect` out with the engine, and when it went.
+    pending: Option<(Pending, Instant)>,
+    /// The hints, once collected and labelled; `None` while the collect is out.
+    hints: Option<hints::Hints>,
+    /// Whether a stale world has been remade once already.
+    remade: bool,
+}
+
+/// The one question asked after a click in normal mode: did focus land in
+/// something editable? See [`hints::FOCUSED`]. Beside its target, as the
+/// hover's [`Ask`] is, and never a `call`, for the same reasons.
+struct Focus {
+    target: String,
+    pending: Pending,
+    sent: Instant,
 }
 
 /// A `Page.navigate` that is out with the engine.
@@ -537,6 +589,9 @@ pub fn run(options: Options) -> Result<(), String> {
                 list: None,
                 list_first: Cell::new(0),
                 strip_first: Cell::new(0),
+                mode: normal::Mode::starting(options.normal_mode),
+                hinting: None,
+                focus: None,
             };
             let outcome = drive(
                 &mut pane,
@@ -673,8 +728,10 @@ fn drive(
             // the page's own pixels, which is what the point is sent in.
             chrome.wheel.resized((css.0 as i32, css.1 as i32));
             // The page is a different size under the same pointer, so what
-            // was under it is not known any more.
+            // was under it is not known any more; and the page has reflowed
+            // under any labels.
             forget_hover(pane, chrome)?;
+            cancel_hints(tabs, chrome);
             redraw_row(pane, tabs, chrome)?;
         }
 
@@ -769,6 +826,11 @@ fn drive(
         // was out. After the page's events, so that a navigation which took
         // the document away has already closed the prompt.
         if pump_find(tabs, chrome) {
+            redraw_row(pane, tabs, chrome)?;
+        }
+        // The same for the hints' collect, and for the question after a
+        // click in normal mode: whether it landed in a field.
+        if pump_hints(tabs, chrome) | pump_focus(tabs, chrome) {
             redraw_row(pane, tabs, chrome)?;
         }
         // And last, because it is the thing to do when nothing else happened:
@@ -1184,6 +1246,8 @@ fn switched(
     // that closes itself from under the pick, has made a list of something
     // else. The screen is cleared below either way.
     chrome.list = None;
+    // And the labels, which are over the page being left.
+    cancel_hints(tabs, chrome);
     // The same for the pointer: it is over a different page now, and an ask
     // in flight is the old page's, dropped the way the still is.
     forget_hover(pane, chrome)?;
@@ -1510,6 +1574,12 @@ fn page_cells(metrics: Metrics) -> Cells {
 /// place, for the same reason, and before the url when the url is there, so
 /// that it is the url that runs out of room first. Beside the title, never
 /// instead of it, and nothing of it under a line that owns the row.
+///
+/// Normal mode's word goes last with one tab, and with the strip last after
+/// the news or first before the level and the url, by the same rule — the
+/// url is what runs out of room: `normal`, `normal g` while a `g` waits for its second,
+/// or the hints' count while they show. Nothing at all in insert mode. See
+/// [`mode_words`].
 fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(), String> {
     let cols = chrome.metrics.cols;
     let Some(active) = tabs.active() else {
@@ -1523,6 +1593,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         .loading
         .then(|| load::loading_hint(active.loading_for(now)));
     let marker = active.zoom.marker();
+    let mode = mode_words(&chrome.mode, chrome.hinting.as_ref());
     let owner = row_owner(
         tabs,
         chrome.bar.as_ref(),
@@ -1541,7 +1612,11 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
     } else if tabs.len() < 2 {
         let left = pointing.unwrap_or_else(|| active.line());
         // The download's words or the loading hint, then the level.
-        match words(&[downloading.or(loading).as_deref(), marker.as_deref()]) {
+        match words(&[
+            downloading.or(loading).as_deref(),
+            marker.as_deref(),
+            mode.as_deref(),
+        ]) {
             Some(right) => screen::split_line(cols, &left, &right),
             None => screen::status_line(cols, &left),
         }
@@ -1565,8 +1640,13 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         // place and the level after it; or the level, the transport's warning
         // and the url, which is the one to run out of room.
         let right = match downloading.or(pointing).or(loading) {
-            Some(news) => words(&[Some(&news), marker.as_deref()]),
-            None => words(&[marker.as_deref(), active.trust.words(), Some(&active.url)]),
+            Some(news) => words(&[Some(&news), marker.as_deref(), mode.as_deref()]),
+            None => words(&[
+                mode.as_deref(),
+                marker.as_deref(),
+                active.trust.words(),
+                Some(&active.url),
+            ]),
         };
         // From where the strip's window started last time, so that it moves
         // only when the tab in front leaves it.
@@ -1608,6 +1688,16 @@ fn list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &TabList) -> Vec<u8> 
         })
         .collect();
     screen::list_rows(chrome.metrics.cols, PAGE_ROW, rows, &items)
+}
+
+/// The word for the keyboard's mode: the hints' count while they show,
+/// else the mode's own, else nothing — insert mode says nothing, so a person
+/// who never presses `ctrl+.` sees the row exactly as it was.
+fn mode_words(mode: &normal::Mode, hinting: Option<&Hinting>) -> Option<String> {
+    hinting
+        .and_then(|hinting| hinting.hints.as_ref())
+        .map(hints::Hints::words)
+        .or_else(|| mode.word().map(str::to_string))
 }
 
 /// The row as whichever of them owns it draws it.
@@ -1819,6 +1909,8 @@ fn handle_page_events(
     let mut redraw = false;
     // Whether the page the find prompt is searching has gone to another.
     let mut find_left = false;
+    // The same for the page the hints are over.
+    let mut hints_left = false;
     // Whether the page in front left or arrived, which takes away whatever
     // link was under the pointer.
     let mut left_page = false;
@@ -1900,6 +1992,10 @@ fn handle_page_events(
                             .find
                             .as_ref()
                             .is_some_and(|find| find.target == tab.target);
+                        hints_left |= chrome
+                            .hinting
+                            .as_ref()
+                            .is_some_and(|hinting| hinting.target == tab.target);
                         if index == active {
                             left_page = true;
                         }
@@ -2027,6 +2123,9 @@ fn handle_page_events(
 
     if find_left {
         close_find(tabs, chrome);
+    }
+    if hints_left {
+        cancel_hints(tabs, chrome);
     }
     if left_page {
         forget_hover(pane, chrome)?;
@@ -2565,6 +2664,29 @@ fn handle_input(
                 // after the program's own keys have had their say.
                 Some(Typing::Prompt | Typing::Upload) | None => {}
             }
+            // Hints showing take every key that is not one of the program's
+            // own; one of those cancels them and runs. So does a question
+            // that has come to the row since they went up, which the keys
+            // are for now — though not with this key, which was typed at a
+            // label and not at a question nobody had seen yet.
+            if chrome.hinting.is_some() {
+                let owned = row_owner(
+                    tabs,
+                    chrome.bar.as_ref(),
+                    chrome.find.as_ref(),
+                    chrome.list.as_ref(),
+                )
+                .is_some();
+                let own_key = command(&key).is_some();
+                if !own_key && !owned {
+                    return hint_key(pane, tabs, browser, chrome, key);
+                }
+                cancel_hints(tabs, chrome);
+                redraw_row(pane, tabs, chrome)?;
+                if !own_key {
+                    return Ok(true);
+                }
+            }
             let was = tabs.active_target().map(str::to_string);
             let command = command(&key);
             if asking(tabs) {
@@ -2615,8 +2737,36 @@ fn handle_input(
                     None => return answer_upload(pane, tabs, chrome, key),
                 }
             }
+            // Only now, with nothing on the row and no question up, is a key
+            // normal mode's to read. A command is read too — every one of
+            // them has ctrl or alt, so it is the page's as far as the mode
+            // is concerned — because any key between the two `g`s of a `gg`
+            // forgets the first. The letters that stand for one of the
+            // program's own commands become that command, and run its arm
+            // below unchanged.
+            let before = chrome.mode.word();
+            let action = chrome.mode.step(&key);
+            if chrome.mode.word() != before {
+                redraw_row(pane, tabs, chrome)?;
+            }
+            let command = command.or(match action {
+                normal::Action::Back => Some(Command::Back),
+                normal::Action::Forward => Some(Command::Forward),
+                normal::Action::Reload => Some(Command::Reload),
+                normal::Action::OpenUrl => Some(Command::EditUrl),
+                normal::Action::NewTab => Some(Command::NewTab),
+                normal::Action::Find => Some(Command::Find),
+                _ => None,
+            });
             match command {
                 Some(Command::Quit) => return Ok(false),
+                Some(Command::ToggleNormal) => {
+                    if chrome.mode.normal {
+                        cancel_hints(tabs, chrome);
+                    }
+                    chrome.mode.toggle();
+                    redraw_row(pane, tabs, chrome)?;
+                }
                 Some(Command::EditUrl) => {
                     chrome.bar = tabs
                         .active()
@@ -2753,26 +2903,41 @@ fn handle_input(
                     }
                     redraw_row(pane, tabs, chrome)?;
                 }
-                None => {
-                    let loading = tabs.active().is_some_and(|tab| tab.loading);
-                    let stops = key.key == Key::Escape
-                        && key.action != KeyAction::Release
-                        && escapes(
-                            row_owner(
-                                tabs,
-                                chrome.bar.as_ref(),
-                                chrome.find.as_ref(),
-                                chrome.list.as_ref(),
-                            )
-                            .as_ref(),
-                            loading,
-                        ) == Escapes::StopLoading;
-                    if stops {
-                        stop_loading(pane, tabs, chrome)?;
-                    } else if let Some(tab) = tabs.active_mut() {
-                        send_key(&mut tab.connection, &key);
+                None => match action {
+                    normal::Action::Scroll(scroll) => scroll_by_key(tabs, chrome, scroll),
+                    normal::Action::Hints { new_tab } => {
+                        open_hints(tabs, chrome, new_tab);
+                        redraw_row(pane, tabs, chrome)?;
                     }
-                }
+                    normal::Action::Insert => {
+                        chrome.mode.insert();
+                        redraw_row(pane, tabs, chrome)?;
+                    }
+                    // A stray letter, or the first `g`, whose word is
+                    // already on the row.
+                    normal::Action::Nothing => {}
+                    _ => {
+                        let loading = tabs.active().is_some_and(|tab| tab.loading);
+                        let stops = key.key == Key::Escape
+                            && key.action != KeyAction::Release
+                            && escapes(
+                                row_owner(
+                                    tabs,
+                                    chrome.bar.as_ref(),
+                                    chrome.find.as_ref(),
+                                    chrome.list.as_ref(),
+                                )
+                                .as_ref(),
+                                chrome.hinting.is_some(),
+                                loading,
+                            ) == Escapes::StopLoading;
+                        if stops {
+                            stop_loading(pane, tabs, chrome)?;
+                        } else if let Some(tab) = tabs.active_mut() {
+                            send_key(&mut tab.connection, &key);
+                        }
+                    }
+                },
             }
         }
         Input::Mouse(report) => {
@@ -2792,6 +2957,14 @@ fn handle_input(
             // question would land on the page the moment it was answered.
             if asking(tabs) {
                 return Ok(true);
+            }
+            // A press or a notch leaves every label where the thing it named
+            // no longer is, or clicks past them: they go.
+            if chrome.hinting.is_some()
+                && matches!(report.kind, MouseKind::Press | MouseKind::Wheel)
+            {
+                cancel_hints(tabs, chrome);
+                redraw_row(pane, tabs, chrome)?;
             }
             // Only the wheel. A hand on a wheel is what the still has to keep
             // out of the way of; a pointer drifting across a page is
@@ -2850,6 +3023,15 @@ fn handle_input(
                     report,
                 );
             }
+            // A click in normal mode that put the caret in a field is the
+            // person about to type there: the page is asked, once the
+            // button is up, whether focus landed in something editable, and
+            // [`pump_focus`] leaves the mode when it did. Without it the
+            // first letters typed into a search box would scroll the page.
+            let clicked = report.kind == MouseKind::Release && report.button == Some(0);
+            if chrome.mode.normal && clicked && point.1 >= 0 && chrome.focus.is_none() {
+                ask_focus(tabs, chrome);
+            }
         }
     }
     Ok(true)
@@ -2890,6 +3072,8 @@ enum Command {
     ZoomOut,
     /// `alt+0` or `ctrl+0`: back to 100%.
     ZoomReset,
+    /// `ctrl+.`: normal mode on or off. See [`crate::normal`].
+    ToggleNormal,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -2913,6 +3097,9 @@ enum Command {
 /// which [`handle_input`] does before it gets here. Find does not survive
 /// either, for the same reason: it asks the page.
 ///
+/// Normal mode's toggle survives: it touches no page, and a person can leave
+/// the mode while a question waits.
+///
 /// A zoom waits too. The page is stopped, so it would not lay itself out
 /// again or be photographed at the new level until it was answered, and the
 /// level then arrives with whatever else was queued — which is the reload
@@ -2934,7 +3121,8 @@ fn survives_dialog(command: Command) -> bool {
         | Command::LastTab
         | Command::ListTabs
         | Command::MoveTab(_)
-        | Command::CopyUrl => true,
+        | Command::CopyUrl
+        | Command::ToggleNormal => true,
         Command::EditUrl
         | Command::Reload
         | Command::Back
@@ -3120,6 +3308,8 @@ enum Escapes {
     /// The page in front is asking for a file input's path: nothing is sent,
     /// and the input is told `cancel` ([`cancel_chooser`]).
     Upload,
+    /// Link hints are showing: they are taken away ([`cancel_hints`]).
+    Hints,
     /// The page in front is loading: the load stops ([`stop_loading`]).
     StopLoading,
     /// Nothing of this program's wants it, so it is the page's key.
@@ -3127,7 +3317,7 @@ enum Escapes {
 }
 
 /// Who an Escape press is for: whatever has the row, by [`row_owner`]'s
-/// order; then a load; then the page.
+/// order; then link hints; then a load; then the page.
 ///
 /// Whatever has the row first, because Escape is how a line is abandoned and
 /// how a question is said no to, and the row is where the person can see
@@ -3140,6 +3330,10 @@ enum Escapes {
 /// path is half typed has the row, the page is stopped behind it, and an
 /// Escape that cancelled the path instead would close something the person
 /// cannot see and leave the question they can.
+///
+/// Then the hints, which are on the screen over the page and are the
+/// thing the person was about to type into; [`hint_key`] takes the key
+/// before this is asked, as [`edit_url`] does for the bar.
 ///
 /// Then a load, because a page that is loading and hung is the one thing on
 /// the screen the person cannot otherwise get out of, and Escape dispatched to
@@ -3156,13 +3350,14 @@ enum Escapes {
 /// treats Escape as this says. What is asked here, with the key nobody took,
 /// is whether it stops a load; the whole order is kept in one place all the
 /// same, so that the truth table in the tests is the order, not a guess at it.
-fn escapes(owner: Option<&RowOwner<'_>>, loading: bool) -> Escapes {
+fn escapes(owner: Option<&RowOwner<'_>>, hinting: bool, loading: bool) -> Escapes {
     match owner {
         Some(RowOwner::Bar(_)) => Escapes::UrlBar,
         Some(RowOwner::Find(_)) => Escapes::Find,
         Some(RowOwner::List(_)) => Escapes::List,
         Some(RowOwner::Dialog(_)) => Escapes::Dialog,
         Some(RowOwner::Upload(_)) => Escapes::Upload,
+        None if hinting => Escapes::Hints,
         None if loading => Escapes::StopLoading,
         None => Escapes::Page,
     }
@@ -3313,6 +3508,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('=' | '+') => Some(Command::ZoomIn),
             Key::Char('-' | '_') => Some(Command::ZoomOut),
             Key::Char('0') => Some(Command::ZoomReset),
+            Key::Char('.') => Some(Command::ToggleNormal),
             _ => None,
         };
     }
@@ -3383,6 +3579,8 @@ fn rezoom(
     // row stays until the answer says otherwise, as it does after a scroll.
     chrome.asking = None;
     chrome.hover.scrolled();
+    // The labels are where the old layout had the things they label.
+    cancel_hints(tabs, chrome);
     redraw_row(pane, tabs, chrome)
 }
 
@@ -3480,6 +3678,310 @@ fn open_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
         remade: false,
     });
     pump_find(tabs, chrome);
+}
+
+/// A scroll asked for from the keyboard: one notch on the animator, at the
+/// centre of the page in CSS pixels, the distance the mode named. The
+/// centre because a hand on the keyboard has put the pointer nowhere; the
+/// page's own scroller is under it on every page that has one, and an inner
+/// scroller there scrolls as it would under a wheel. See [`crate::normal`]
+/// for why a wheel and not keys, and [`normal::FAR`] for the top and the
+/// bottom.
+///
+/// The key press was already [`Motion::input`]; the thread's activity keeps
+/// the still away while the curve runs, as for the mouse.
+fn scroll_by_key(tabs: &Tabs<Client>, chrome: &mut Chrome, scroll: normal::Scroll) {
+    let Some(tab) = tabs.active() else {
+        return;
+    };
+    let viewport = viewport(chrome, tab);
+    let at = (viewport.css.0 as i32 / 2, viewport.css.1 as i32 / 2);
+    let distance = match scroll {
+        normal::Scroll::Notch(n) => viewport.notch((0, n), WHEEL_PIXELS),
+        normal::Scroll::HalfPage(n) => (0.0, f64::from(n) * f64::from(viewport.css.1) / 2.0),
+        normal::Scroll::End(n) => (0.0, f64::from(n) * normal::FAR),
+    };
+    chrome.wheel.notch(
+        &tab.target,
+        Arc::new(Wire::new(tab.connection.notifier())),
+        at,
+        distance,
+    );
+    // The page moves under a pointer that did not.
+    chrome.hover.scrolled();
+}
+
+/// How many CSS pixels one terminal cell is tall on the tab: what a label
+/// is sized from, so that it is a cell tall on the screen at every zoom.
+fn label_px(chrome: &Chrome, tab: &Tab<Client>) -> f64 {
+    f64::from(chrome.metrics.cell.1) / viewport(chrome, tab).factor
+}
+
+/// `f`/`F`: ask the page in front what can be clicked. The world is made
+/// now ([`make_world`], the find prompt's, shared by name), the collect is
+/// sent, and the labels go up when its answer comes ([`pump_hints`]). Not
+/// while a navigation has not committed: the question would be held until
+/// it did.
+fn open_hints(tabs: &mut Tabs<Client>, chrome: &mut Chrome, new_tab: bool) {
+    cancel_hints(tabs, chrome);
+    let Some(px) = tabs.active().map(|tab| label_px(chrome, tab)) else {
+        return;
+    };
+    let Some(tab) = tabs.active_mut() else {
+        return;
+    };
+    if tab.loading && !tab.committed {
+        tab.note = Some("the page has not come yet".to_string());
+        return;
+    }
+    let context = make_world(&mut tab.connection);
+    let pending = context.and_then(|context| {
+        tab.connection
+            .send("Runtime.callFunctionOn", hints::collect_params(context, px))
+            .ok()
+    });
+    let Some(pending) = pending else {
+        tab.note = Some("the page did not say what can be clicked".to_string());
+        return;
+    };
+    chrome.hinting = Some(Hinting {
+        target: tab.target.clone(),
+        new_tab,
+        context,
+        pending: Some((pending, Instant::now())),
+        hints: None,
+        remade: false,
+    });
+}
+
+/// A key while hints show. The letters narrow, backspace widens, Escape
+/// cancels; a label typed whole is a click (or, with `F` on a link, a tab).
+/// While the collect is still out the keys wait for the labels, except
+/// Escape, which does not have to.
+fn hint_key(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &mut Chrome,
+    key: KeyInput,
+) -> Result<bool, String> {
+    let Some(hinting) = chrome.hinting.as_mut() else {
+        return Ok(true);
+    };
+    let (context, new_tab) = (hinting.context, hinting.new_tab);
+    let step = match hinting.hints.as_mut() {
+        Some(hints) => hints.step(&key),
+        None if key.key == Key::Escape && key.action != KeyAction::Release => hints::Typed::Cancel,
+        None => hints::Typed::Nothing,
+    };
+    match step {
+        hints::Typed::Nothing => return Ok(true),
+        hints::Typed::Narrowed(_) => {
+            let typed = hinting
+                .hints
+                .as_ref()
+                .map(|hints| hints.typed.clone())
+                .unwrap_or_default();
+            if let (Some(context), Some(tab)) = (context, tabs.active_mut()) {
+                let _ = tab.connection.notify(
+                    "Runtime.callFunctionOn",
+                    hints::narrow_params(context, &typed),
+                );
+            }
+        }
+        hints::Typed::Cancel => cancel_hints(tabs, chrome),
+        hints::Typed::Chosen(hint) => {
+            // The clear goes first, so that the click is not under a label;
+            // the labels ignore the pointer anyway, but the page should not
+            // be photographed with them over what the click changed.
+            cancel_hints(tabs, chrome);
+            follow_hint(tabs, browser, chrome, hint, new_tab)?;
+        }
+    }
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
+/// Click the hint, or — `F` on a link — open its href in a new tab.
+///
+/// The new tab is this program's own `Target.createTarget`, [`open_behind`],
+/// rather than a modified click, so that a link whose page listens for
+/// clicks is opened by its href and not by whatever the listener does. It
+/// goes behind the tab in front, as a middle click on the same link would:
+/// `F` is the keyboard's way to read a link later. The caller redraws the
+/// row, which is where the new tab shows.
+///
+/// The click is three mouse events at the point the page gave, in its own
+/// pixels, through no mapping at all. A field clicked is the person about
+/// to type into it, so the mode goes back to insert.
+fn follow_hint(
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &mut Chrome,
+    hint: hints::Hint,
+    new_tab: bool,
+) -> Result<(), String> {
+    if new_tab && hint.kind == hints::Kind::Link && !hint.href.is_empty() {
+        let appearance = chrome.appearance;
+        match open_behind(tabs, browser, &appearance, &hint.href) {
+            Ok(_) => {}
+            Err(why) => note(tabs, why),
+        }
+        return Ok(());
+    }
+    if let Some(tab) = tabs.active_mut() {
+        for params in hints::click_params(hint.at) {
+            let _ = tab.connection.notify("Input.dispatchMouseEvent", params);
+        }
+    }
+    if hint.kind == hints::Kind::Edit {
+        chrome.mode.insert();
+    }
+    // What is under the pointer may have changed with what the click did.
+    chrome.hover.scrolled();
+    Ok(())
+}
+
+/// Collect the answer to a collect, label it and show it; drop it on a
+/// timeout; remake a world that went with its document once, as
+/// [`pump_find`] does. Never waits. Returns whether the row should be drawn
+/// again.
+///
+/// A question that has come to the row since the collect went — a dialog,
+/// a file input's path — cancels the hints: the page is stopped or the keys
+/// are the path's, and a label over either would be typed at nobody.
+fn pump_hints(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
+    let Some(hinting) = chrome.hinting.as_ref() else {
+        return false;
+    };
+    // A tab that is no longer in front is [`switched`]'s to cancel.
+    if tabs.active_target() != Some(hinting.target.as_str()) {
+        return false;
+    }
+    if tabs.active().is_some_and(Tab::asks) {
+        cancel_hints(tabs, chrome);
+        return true;
+    }
+    let Some(px) = tabs.active().map(|tab| label_px(chrome, tab)) else {
+        return false;
+    };
+    let (Some(hinting), Some(tab)) = (chrome.hinting.as_mut(), tabs.active_mut()) else {
+        return false;
+    };
+    let Some((pending, sent)) = hinting.pending.take() else {
+        return false;
+    };
+    let unanswered = "the page did not say what can be clicked";
+    let why = match tab.connection.take_reply(&pending) {
+        None if sent.elapsed() < HINT_TIMEOUT => {
+            hinting.pending = Some((pending, sent));
+            return false;
+        }
+        None => unanswered.to_string(),
+        Some(Ok(reply)) => match hints::Hints::from_reply(&reply, hinting.new_tab) {
+            Some(hints) if hints.hints.is_empty() => "nothing to click on".to_string(),
+            Some(hints) => {
+                if let Some(context) = hinting.context {
+                    let _ = tab.connection.notify(
+                        "Runtime.callFunctionOn",
+                        hints::show_params(context, &hints.labels, px),
+                    );
+                }
+                hinting.hints = Some(hints);
+                return true;
+            }
+            None => unanswered.to_string(),
+        },
+        Some(Err(why)) if find::stale_world(&why) && !hinting.remade => {
+            hinting.remade = true;
+            hinting.context = make_world(&mut tab.connection);
+            let resent = hinting.context.and_then(|context| {
+                tab.connection
+                    .send("Runtime.callFunctionOn", hints::collect_params(context, px))
+                    .ok()
+            });
+            match resent {
+                Some(pending) => {
+                    hinting.pending = Some((pending, Instant::now()));
+                    return false;
+                }
+                None => unanswered.to_string(),
+            }
+        }
+        Some(Err(why)) => why,
+    };
+    tab.note = Some(why);
+    chrome.hinting = None;
+    true
+}
+
+/// Take the labels off the page and forget them, from wherever: Escape, a
+/// label typed, a tab switch, a navigation, a resize, a zoom, the mouse, a
+/// question on the row, leaving the mode. The clear is a notification
+/// queued behind any collect still out, so the page ends clear whichever it
+/// reads first; dropping the collect withdraws the claim on its answer.
+/// Quitting does not come here: the engine is being stopped.
+fn cancel_hints(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(hinting) = chrome.hinting.take() else {
+        return;
+    };
+    let (Some(context), Some(index)) = (hinting.context, tabs.index_of(&hinting.target)) else {
+        return;
+    };
+    if let Some(tab) = tabs.get_mut(index) {
+        let _ = tab
+            .connection
+            .notify("Runtime.callFunctionOn", hints::clear_params(context));
+    }
+}
+
+/// Ask the page in front whether focus is in something editable: sent, and
+/// collected by [`pump_focus`]. Not while a navigation has not committed,
+/// when the engine would hold the question until it did.
+fn ask_focus(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(tab) = tabs.active_mut() else {
+        return;
+    };
+    if tab.loading && !tab.committed {
+        return;
+    }
+    if let Ok(pending) = tab
+        .connection
+        .send("Runtime.evaluate", hints::focused_params())
+    {
+        chrome.focus = Some(Focus {
+            target: tab.target.clone(),
+            pending,
+            sent: Instant::now(),
+        });
+    }
+}
+
+/// Take the answer to [`ask_focus`]: a field means insert mode. Dropped
+/// after [`FOCUS_TIMEOUT`], or when its tab is no longer in front — a click
+/// that navigated, or opened a dialog, is not a click into a field. Returns
+/// whether the row should be drawn again.
+fn pump_focus(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
+    let Some(focus) = chrome.focus.as_ref() else {
+        return false;
+    };
+    let Some(tab) = tabs.active().filter(|tab| tab.target == focus.target) else {
+        chrome.focus = None;
+        return false;
+    };
+    let Some(answer) = tab.connection.take_reply(&focus.pending) else {
+        if focus.sent.elapsed() >= FOCUS_TIMEOUT {
+            chrome.focus = None;
+        }
+        return false;
+    };
+    chrome.focus = None;
+    let editable = answer.ok().as_ref().and_then(hints::focused_editable);
+    if editable == Some(true) && chrome.mode.normal {
+        chrome.mode.insert();
+        return true;
+    }
+    false
 }
 
 /// The find script's world in the page's main frame: `Page.getFrameTree` for
@@ -4945,7 +5447,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_goes_to_whatever_has_the_row_then_the_load_then_the_page() {
+    fn escape_goes_to_whatever_has_the_row_then_the_hints_then_the_load_then_the_page() {
         let alert = Json::parse(r#"{"type":"alert","message":"m","url":"u"}"#).expect("JSON");
         let chooser = upload::Chooser {
             backend_node_id: 3,
@@ -4961,13 +5463,14 @@ mod tests {
             wanted: None,
             remade: false,
         };
-        // Every combination of the four things that can have the row, and a
-        // load under them or not: the answer is the first of them in
-        // `row_owner`'s order, and the load only when none of them is there.
+        // Every combination of the five things that can have the row, hints
+        // showing or not, and a load under them or not: the answer is the
+        // first of them in `row_owner`'s order, then the hints, and the load
+        // only when none of them is there.
         let list = TabList::open(0);
-        for mask in 0..64u32 {
-            let [open_bar, open_find, dialog, path, loading, open_list] =
-                [0, 1, 2, 3, 4, 5].map(|bit| mask & (1 << bit) != 0);
+        for mask in 0..128u32 {
+            let [open_bar, open_find, dialog, path, loading, open_list, hinting] =
+                [0, 1, 2, 3, 4, 5, 6].map(|bit| mask & (1 << bit) != 0);
             let mut tab = Tab::new("a", (), "https://a.example/");
             tab.loading = loading;
             if dialog {
@@ -4987,6 +5490,8 @@ mod tests {
                 Escapes::Dialog
             } else if path {
                 Escapes::Upload
+            } else if hinting {
+                Escapes::Hints
             } else if loading {
                 Escapes::StopLoading
             } else {
@@ -4999,15 +5504,60 @@ mod tests {
                 open_list.then_some(&list),
             );
             assert_eq!(
-                escapes(owner.as_ref(), loading),
+                escapes(owner.as_ref(), hinting, loading),
                 wanted,
                 "bar {open_bar}, find {open_find}, list {open_list}, dialog {dialog}, \
-                 path {path}, loading {loading}"
+                 path {path}, hinting {hinting}, loading {loading}"
             );
         }
         // Escape is not one of the program's commands: when nothing wants
         // it, it is the page's key, as it always was.
         assert_eq!(command(&key(Key::Escape, 0)), None);
+    }
+
+    #[test]
+    fn ctrl_period_toggles_normal_mode_and_survives_a_dialog() {
+        assert_eq!(
+            command(&key(Key::Char('.'), Mods::CTRL)),
+            Some(Command::ToggleNormal)
+        );
+        // The alt form is kept in reserve, not bound, and a bare period is
+        // typing.
+        assert_eq!(command(&key(Key::Char('.'), Mods::ALT)), None);
+        assert_eq!(command(&key(Key::Char('.'), 0)), None);
+        assert!(survives_dialog(Command::ToggleNormal));
+    }
+
+    #[test]
+    fn the_mode_word_is_at_the_end_of_the_row_and_nothing_in_insert_mode() {
+        let mut mode = normal::Mode::default();
+        assert_eq!(mode_words(&mode, None), None);
+        mode.toggle();
+        assert_eq!(mode_words(&mode, None).as_deref(), Some("normal"));
+        let reply = |n: usize| {
+            let entries = vec!["[0,0,1,1,\"click\",1,1,\"\"]"; n].join(",");
+            Json::parse(&format!(r#"{{"result":{{"value":[{entries}]}}}}"#)).expect("JSON")
+        };
+        let mut hinting = Hinting {
+            target: "a".to_string(),
+            new_tab: false,
+            context: Some(1),
+            pending: None,
+            hints: None,
+            remade: false,
+        };
+        // While the collect is out there is nothing to count yet.
+        assert_eq!(mode_words(&mode, Some(&hinting)).as_deref(), Some("normal"));
+        hinting.hints = hints::Hints::from_reply(&reply(12), false);
+        assert_eq!(
+            mode_words(&mode, Some(&hinting)).as_deref(),
+            Some("12 hints")
+        );
+        // And the words beside the rest, last with one tab.
+        assert_eq!(
+            words(&[Some("loading"), Some("150%"), Some("normal")]).as_deref(),
+            Some("loading  150%  normal")
+        );
     }
 
     #[test]

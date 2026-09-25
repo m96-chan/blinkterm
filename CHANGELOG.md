@@ -30,6 +30,11 @@ flag, a different default, a raised Rust floor all do.
   filter; `ctrl+shift+pageup`/`pagedown` (`alt+shift+…`) move the current
   tab; a middle click or `ctrl`+click on a link opens it in a tab behind
   ([#19](https://github.com/m96-chan/blinkterm/issues/19)).
+- Normal mode, `ctrl+.`: link hints (`f`/`F`), scrolling from the
+  keyboard (`j`/`k`/`d`/`u`/`gg`/`G`), `H`/`L`/`r`/`o`/`O`/`/`, `i` back to
+  the page. `F` opens a link in a tab behind. Off by default; nothing
+  changes until it is turned on, or `--normal-mode` starts in it
+  ([#13](https://github.com/m96-chan/blinkterm/issues/13)).
 
 ### Changed
 
