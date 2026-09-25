@@ -10,8 +10,9 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
-Nothing has been released yet. Everything below is what a first tag would
-carry, and the list is kept as things land rather than written at the end.
+## [0.1.0] - 2026-09-25
+
+The first tag.
 
 ### Added
 
@@ -121,4 +122,5 @@ carry, and the list is kept as things land rather than written at the end.
   sequence is shown as its letters and cannot set the terminal's title or
   clipboard ([#28](https://github.com/m96-chan/blinkterm/issues/28)).
 
-[Unreleased]: https://github.com/m96-chan/blinkterm/commits/main
+[Unreleased]: https://github.com/m96-chan/blinkterm/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/m96-chan/blinkterm/commits/v0.1.0
