@@ -26,6 +26,7 @@
 //! side is a notch handed over as it is read and a timestamp read back once a
 //! pass.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -53,6 +54,7 @@ use crate::motion::{self, Motion};
 use crate::profile::{Choice, Profile};
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
+use crate::tablist::{self, TabList};
 use crate::tabs::{Outcome, Tab, Tabs};
 use crate::upload::{self, Upload};
 use crate::zoom::{self, Scale, Viewport, Zoom, Zooms};
@@ -300,6 +302,23 @@ struct Chrome {
     /// The terminal's answer to `CSI 16 t`, for a pane whose kernel window
     /// size has no pixels in it. See [`crate::screen::ASK_CELL_SIZE`].
     cell_hint: Option<(u32, u32)>,
+    /// `Some` while the tab list is open. The person's, like the bar and the
+    /// find prompt, and exclusive with them by the keyboard: whichever is
+    /// open takes every key, so the other cannot be opened until it closes.
+    /// See [`crate::tablist`].
+    list: Option<TabList>,
+    /// The first match on the screen while the list is open, so that the
+    /// rows scroll only when the pick leaves them. See [`TabList::window`].
+    ///
+    /// A `Cell`, as [`Chrome::strip_first`] is, because what writes it is
+    /// [`redraw_row`], which every path through the loop calls with the
+    /// chrome borrowed for reading; the window is a fact about the last
+    /// draw, not a decision anybody else makes.
+    list_first: Cell<usize>,
+    /// The first tab in the strip's window, kept between draws so that the
+    /// strip scrolls only when the tab in front leaves it. See
+    /// [`screen::tab_line_from`].
+    strip_first: Cell<usize>,
 }
 
 impl Chrome {
@@ -534,6 +553,9 @@ pub fn run(options: Options) -> Result<(), String> {
                 },
                 appearance,
                 cell_hint: None,
+                list: None,
+                list_first: Cell::new(0),
+                strip_first: Cell::new(0),
             };
             let outcome = drive(
                 &mut pane,
@@ -1175,6 +1197,10 @@ fn switched(
     // page stops painting, so that the clear goes to it while it is still
     // the one on the screen.
     close_find(tabs, chrome);
+    // And the tab list, which a page that opens a window in front, or a tab
+    // that closes itself from under the pick, has made a list of something
+    // else. The screen is cleared below either way.
+    chrome.list = None;
     // The same for the pointer: it is over a different page now, and an ask
     // in flight is the old page's, dropped the way the still is.
     forget_hover(pane, chrome)?;
@@ -1206,10 +1232,53 @@ fn open_tab(
     appearance: &Appearance,
     url: &str,
 ) -> Result<(), String> {
-    let created = browser.call(
-        "Target.createTarget",
-        Json::object(vec![("url", Json::string(url))]),
-    )?;
+    create_tab(tabs, browser, appearance, url, false).map(|_| ())
+}
+
+/// Open `url` in a tab behind the one in front, and say where it went.
+///
+/// `Target.createTarget` with `background: true`, attached and set up as
+/// every tab is (`connect_tab`), and put at the end of the list without
+/// being switched to. The page in front keeps casting and keeps its input —
+/// measured against `chrome-headless-shell` 153, a page animating at sixty
+/// frames a second went on at sixty with a target opened behind it — and the
+/// new page loads and gets its title on its own session without ever being
+/// looked at. The flag is documented as Chrome's only; the headless shell
+/// accepts it and changes nothing observable, and it is passed because it is
+/// the documented word for what is meant.
+///
+/// What a middle click on a link ends up as, for callers that have a url and
+/// no link — a link hint, or anything else. The engine's own announcement of
+/// the target arrives with no opener, which would make it a tab behind too,
+/// and is ignored because the reply to this `call` came first and the tab is
+/// already in the list. The caller redraws the row.
+pub fn open_behind(
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    appearance: &Appearance,
+    url: &str,
+) -> Result<usize, String> {
+    create_tab(tabs, browser, appearance, url, true)
+}
+
+/// The body of [`open_tab`] and [`open_behind`], which differ only in the
+/// `background` flag and in where the tab goes: the index is where it went.
+///
+/// If the call fails after the engine has made the target — a timeout — its
+/// announcement makes it a tab behind on the next pass, which is better than
+/// a page nobody is attached to.
+fn create_tab(
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    appearance: &Appearance,
+    url: &str,
+    behind: bool,
+) -> Result<usize, String> {
+    let mut params = vec![("url", Json::string(url))];
+    if behind {
+        params.push(("background", Json::Bool(true)));
+    }
+    let created = browser.call("Target.createTarget", Json::object(params))?;
     let target = created
         .get("targetId")
         .and_then(Json::as_str)
@@ -1218,8 +1287,11 @@ fn open_tab(
     let (connection, frame) = connect_tab(browser, &target, appearance)?;
     let mut tab = Tab::new(target, connection, url);
     tab.frame = frame;
-    tabs.open(tab);
-    Ok(())
+    Ok(if behind {
+        tabs.open_behind(tab)
+    } else {
+        tabs.open(tab)
+    })
 }
 
 /// Attach to a target and start listening to its page, whether or not it is
@@ -1443,8 +1515,21 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         .loading
         .then(|| load::loading_hint(active.loading_for(now)));
     let marker = active.zoom.marker();
-    let bytes = if let Some(owner) = row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref()) {
-        owned_row(cols, owner)
+    let owner = row_owner(
+        tabs,
+        chrome.bar.as_ref(),
+        chrome.find.as_ref(),
+        chrome.list.as_ref(),
+    );
+    if let Some(RowOwner::List(list)) = &owner {
+        // The rows under the row are the list's while it is open, and are
+        // written first: the row after them is what puts the cursor back
+        // where the typing is.
+        pane.write(&list_screen(tabs, chrome, list))
+            .map_err(|e| e.to_string())?;
+    }
+    let bytes = if let Some(owner) = owner {
+        owned_row(cols, tabs, owner)
     } else if tabs.len() < 2 {
         let left = pointing.unwrap_or_else(|| active.line());
         // The download's words or the loading hint, then the level.
@@ -1475,18 +1560,61 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
             Some(news) => words(&[Some(&news), marker.as_deref()]),
             None => words(&[marker.as_deref(), active.trust.words(), Some(&active.url)]),
         };
-        screen::tab_line(cols, &labels, right.as_deref().unwrap_or_default())
+        // From where the strip's window started last time, so that it moves
+        // only when the tab in front leaves it.
+        let (bytes, first) = screen::tab_line_from(
+            cols,
+            &labels,
+            right.as_deref().unwrap_or_default(),
+            chrome.strip_first.get(),
+        );
+        chrome.strip_first.set(first);
+        bytes
     };
     pane.write(&bytes).map_err(|e| e.to_string())
 }
 
+/// The tab list's rows under the status row, for the list as it is now,
+/// keeping the window it chose for the next draw.
+///
+/// As many rows as the page had, which is every row but the status row:
+/// the picture is off the screen while the list is up (see
+/// [`open_list_screen`]), and text under a placement would not be seen.
+fn list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &TabList) -> Vec<u8> {
+    let rows = chrome.metrics.usable_rows();
+    let matches = list.matches(tabs);
+    let window = list.window(matches.len(), rows as usize, chrome.list_first.get());
+    chrome.list_first.set(window.first);
+    let picked = list.picked(matches.len());
+    let items: Vec<screen::ListItem> = matches
+        .iter()
+        .enumerate()
+        .skip(window.first)
+        .take(window.shown)
+        .map(|(at, entry)| screen::ListItem {
+            number: entry.index + 1,
+            title: &entry.label,
+            url: entry.url,
+            picked: picked == Some(at),
+            asks: entry.asks,
+        })
+        .collect();
+    screen::list_rows(chrome.metrics.cols, PAGE_ROW, rows, &items)
+}
+
 /// The row as whichever of them owns it draws it.
-fn owned_row(cols: u32, owner: RowOwner<'_>) -> Vec<u8> {
+fn owned_row<C>(cols: u32, tabs: &Tabs<C>, owner: RowOwner<'_>) -> Vec<u8> {
     match owner {
         RowOwner::Bar(bar) => typing_row(cols, "url: ", &bar.line),
         RowOwner::Find(find) => {
             typing_row_beside(cols, "find: ", &find.finder.line, &find.finder.count_text())
         }
+        RowOwner::List(list) => typing_row_beside(
+            cols,
+            "tabs: ",
+            &list.line,
+            &TabList::count_text(list.matches(tabs).len(), tabs.len()),
+        ),
         RowOwner::Dialog(dialog) if dialog.typing() => typing_row(
             cols,
             &screen::dialog_prompt(cols, &dialog.caption()),
@@ -1512,18 +1640,26 @@ enum RowOwner<'a> {
     Bar(&'a UrlBar),
     /// `ctrl+f`'s prompt: the person's, like the bar, and not any page's.
     Find(&'a Find),
+    /// `ctrl+shift+a`'s tab list: the person's, like the two before it, and
+    /// the one of them that has the rows under the row as well.
+    List(&'a TabList),
     /// Any dialog: a `prompt()` is a line with the cursor, the others are a
     /// question answered by a key.
     Dialog(&'a Dialog),
     Upload(&'a Upload),
 }
 
-/// Which line owns the row: the url bar, then the find prompt, then a dialog,
-/// then a file input's path — or nothing, and the row is the page's own.
+/// Which line owns the row: the url bar, then the find prompt, then the tab
+/// list, then a dialog, then a file input's path — or nothing, and the row
+/// is the page's own.
 ///
 /// The url bar first, because it was opened by the person, and a question
 /// that arrived while they were typing is there when they finish. The find
-/// prompt next, for the same reason; the keyboard cannot have both open. A dialog
+/// prompt next, for the same reason, and the tab list after it; the keyboard
+/// cannot have two of the three open, so the order among them is only ever a
+/// statement. The dialog is after the list because a page that asks while the
+/// list is up is a page the person is not looking at, and the list is what
+/// they are doing: the question is there when they pick, on its tab. A dialog
 /// next, because the page is stopped behind it — even behind an upload
 /// prompt, since a chooser does not stop the page and a script can
 /// `alert()` while a path is half typed; the path waits underneath and comes
@@ -1540,12 +1676,16 @@ fn row_owner<'a, C>(
     tabs: &'a Tabs<C>,
     bar: Option<&'a UrlBar>,
     find: Option<&'a Find>,
+    list: Option<&'a TabList>,
 ) -> Option<RowOwner<'a>> {
     if let Some(bar) = bar {
         return Some(RowOwner::Bar(bar));
     }
     if let Some(find) = find {
         return Some(RowOwner::Find(find));
+    }
+    if let Some(list) = list {
+        return Some(RowOwner::List(list));
     }
     let tab = tabs.active()?;
     if let Some(dialog) = &tab.dialog {
@@ -1910,6 +2050,12 @@ fn paint(
     chrome: &mut Chrome,
     raw: Raw<'_>,
 ) -> Result<(), String> {
+    // The tab list has the rows the picture would go on. The frame was
+    // acknowledged and counted already, so the motion policy's clock is
+    // right when the list closes; only the drawing stands down.
+    if chrome.list.is_some() {
+        return Ok(());
+    }
     let bytes = chrome
         .painter
         .frame(raw, page_cells(chrome.metrics), PAGE_ROW, 1);
@@ -1937,6 +2083,8 @@ enum Typing {
     Url,
     /// `ctrl+f`.
     Find,
+    /// `ctrl+shift+a`'s filter.
+    List,
     /// A page's `prompt()`.
     Prompt,
     /// A path for the page's file input.
@@ -1949,9 +2097,15 @@ enum Typing {
 /// than decided again, so that what the row shows and where the typing goes
 /// cannot disagree.
 fn typing_line(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<Typing> {
-    match row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref())? {
+    match row_owner(
+        tabs,
+        chrome.bar.as_ref(),
+        chrome.find.as_ref(),
+        chrome.list.as_ref(),
+    )? {
         RowOwner::Bar(_) => Some(Typing::Url),
         RowOwner::Find(_) => Some(Typing::Find),
+        RowOwner::List(_) => Some(Typing::List),
         RowOwner::Dialog(dialog) => dialog.typing().then_some(Typing::Prompt),
         RowOwner::Upload(_) => Some(Typing::Upload),
     }
@@ -2057,8 +2211,12 @@ fn collect_still(
 /// is stopped, and a still asked for then would sit out [`STILL_TIMEOUT`] and
 /// be marked a failure — which is a page that then never gets its lossless
 /// picture once it has been answered and has gone quiet again.
+///
+/// Nor while the tab list is open: the picture is off the screen, and one
+/// taken now would be painted over nothing. Closing the list resets the
+/// motion clock, which is what asks for the still then.
 fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
-    if asking(tabs) || !chrome.motion.wants_still(Instant::now()) {
+    if asking(tabs) || chrome.list.is_some() || !chrome.motion.wants_still(Instant::now()) {
         return;
     }
     let Some(target) = tabs.active_target().map(str::to_string) else {
@@ -2184,7 +2342,13 @@ fn scroll(tabs: &Tabs<Client>, chrome: &Chrome, report: &MouseInput) {
 /// it moves.
 fn tick_hover(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> Result<(), String> {
     collect_hover(pane, tabs, chrome)?;
-    let owned = row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref()).is_some();
+    let owned = row_owner(
+        tabs,
+        chrome.bar.as_ref(),
+        chrome.find.as_ref(),
+        chrome.list.as_ref(),
+    )
+    .is_some();
     if owned || tabs.active().is_none() {
         return forget_hover(pane, chrome);
     }
@@ -2388,6 +2552,7 @@ fn handle_input(
             match typing_line(tabs, chrome) {
                 Some(Typing::Url) => return edit_url(pane, tabs, chrome, key),
                 Some(Typing::Find) => return edit_find(pane, tabs, chrome, key),
+                Some(Typing::List) => return edit_list(pane, tabs, browser, chrome, key),
                 // A `prompt()` and a file input's path are answered below,
                 // after the program's own keys have had their say.
                 Some(Typing::Prompt | Typing::Upload) | None => {}
@@ -2454,6 +2619,12 @@ fn handle_input(
                     open_find(tabs, chrome);
                     redraw_row(pane, tabs, chrome)?;
                 }
+                Some(Command::ListTabs) => {
+                    chrome.list = Some(TabList::open(tabs.active_index()));
+                    chrome.list_first.set(0);
+                    open_list_screen(pane, chrome)?;
+                    redraw_row(pane, tabs, chrome)?;
+                }
                 Some(Command::Reload) => {
                     // A page that did not come has no document to reload, and
                     // `Page.reload` of the error page says nothing about why it
@@ -2518,15 +2689,28 @@ fn handle_input(
                     switched(pane, tabs, browser, chrome, was)?;
                     redraw_row(pane, tabs, chrome)?;
                 }
-                Some(what @ (Command::NextTab | Command::PreviousTab | Command::SelectTab(_))) => {
+                Some(
+                    what @ (Command::NextTab
+                    | Command::PreviousTab
+                    | Command::SelectTab(_)
+                    | Command::LastTab),
+                ) => {
                     let moved = match what {
                         Command::NextTab => tabs.select_next(),
                         Command::PreviousTab => tabs.select_previous(),
                         Command::SelectTab(number) => tabs.select(number),
+                        Command::LastTab => tabs.select_last(),
                         _ => false,
                     };
                     if moved {
                         switched(pane, tabs, browser, chrome, was)?;
+                        redraw_row(pane, tabs, chrome)?;
+                    }
+                }
+                Some(Command::MoveTab(direction)) => {
+                    // Nothing switched: the same page is in front, under a
+                    // different number.
+                    if tabs.move_active(direction) {
                         redraw_row(pane, tabs, chrome)?;
                     }
                 }
@@ -2566,7 +2750,13 @@ fn handle_input(
                     let stops = key.key == Key::Escape
                         && key.action != KeyAction::Release
                         && escapes(
-                            row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref()).as_ref(),
+                            row_owner(
+                                tabs,
+                                chrome.bar.as_ref(),
+                                chrome.find.as_ref(),
+                                chrome.list.as_ref(),
+                            )
+                            .as_ref(),
                             loading,
                         ) == Escapes::StopLoading;
                     if stops {
@@ -2578,6 +2768,16 @@ fn handle_input(
             }
         }
         Input::Mouse(report) => {
+            // The tab list has the screen: the page is not on it, so nothing
+            // on the page can be meant. A press on a row picks that row; the
+            // rest is dropped. Before the dialog's rule, because the list
+            // has the row over a dialog too.
+            if chrome.list.is_some() {
+                if routes_to_list(&report, true) {
+                    return click_list(pane, tabs, browser, chrome, &report);
+                }
+                return Ok(true);
+            }
             // A page with a question open is not a page to click on or
             // scroll. What was sent would not be lost — the engine queues it
             // behind the dialog — which is worse: a click meant for the
@@ -2661,6 +2861,13 @@ enum Command {
     PreviousTab,
     /// The nth tab, counted from one.
     SelectTab(usize),
+    /// `alt+9`: the last tab, however many there are.
+    LastTab,
+    /// `ctrl+shift+a` or `alt+a`: the tab list. See [`crate::tablist`].
+    ListTabs,
+    /// `ctrl+shift+pageup`/`pagedown` or `alt+shift+pageup`/`pagedown`: the
+    /// tab in front one place left (`-1`) or right (`+1`).
+    MoveTab(isize),
     /// `alt+c`: the page's selection to the host's clipboard — or, with the
     /// url bar, the find prompt, a `prompt()`'s line or a file input's path
     /// open, that line.
@@ -2682,7 +2889,9 @@ enum Command {
 ///
 /// Quitting, and everything about tabs: opening one, closing this one — which
 /// closes its dialog with it, see [`close_tab`] — and going to another, which
-/// leaves the question on its tab, marked in the strip, for later. What waits
+/// leaves the question on its tab, marked in the strip, for later; the list
+/// of them, which is a way of going to another; and moving this one, which
+/// reorders the strip around the question and does nothing to the page. What waits
 /// is everything that would do something to the page that is asking. The url
 /// bar would type over the question the person is meant to be reading; a
 /// reload, a back or a forward to a page that is stopped would be queued
@@ -2714,6 +2923,9 @@ fn survives_dialog(command: Command) -> bool {
         | Command::NextTab
         | Command::PreviousTab
         | Command::SelectTab(_)
+        | Command::LastTab
+        | Command::ListTabs
+        | Command::MoveTab(_)
         | Command::CopyUrl => true,
         Command::EditUrl
         | Command::Reload
@@ -2893,6 +3105,8 @@ enum Escapes {
     UrlBar,
     /// The find prompt is open: it closes, and the highlights go with it.
     Find,
+    /// The tab list is open: it closes, and the page comes back.
+    List,
     /// The page in front has a dialog up: it is dismissed.
     Dialog,
     /// The page in front is asking for a file input's path: nothing is sent,
@@ -2910,7 +3124,8 @@ enum Escapes {
 /// Whatever has the row first, because Escape is how a line is abandoned and
 /// how a question is said no to, and the row is where the person can see
 /// which of them it will be. Its order is [`row_owner`]'s and not one of its
-/// own — the url bar, the find prompt, a dialog, a file input's path — so
+/// own — the url bar, the find prompt, the tab list, a dialog, a file
+/// input's path — so
 /// that what Escape closes is always the thing on the screen, never one
 /// underneath it. That is why a dialog comes before a path here, which the
 /// design for this key had the other way round: an `alert()` opened while a
@@ -2937,6 +3152,7 @@ fn escapes(owner: Option<&RowOwner<'_>>, loading: bool) -> Escapes {
     match owner {
         Some(RowOwner::Bar(_)) => Escapes::UrlBar,
         Some(RowOwner::Find(_)) => Escapes::Find,
+        Some(RowOwner::List(_)) => Escapes::List,
         Some(RowOwner::Dialog(_)) => Escapes::Dialog,
         Some(RowOwner::Upload(_)) => Escapes::Upload,
         None if loading => Escapes::StopLoading,
@@ -3046,6 +3262,29 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// (`0x1f`). `ctrl+0` is the one ctrl-digit taken, because no page has ever
 /// been sent it by a browser; `ctrl+1`..`ctrl+9` stay the page's. What the
 /// alt forms shadow is an `accesskey` on `=`, `-` or `0`.
+///
+/// The tab keys past the digits argue the same way, and more strongly,
+/// because delivery is not the question — every chord below arrives
+/// distinctly under the flags this program pushes — but whether the terminal
+/// keeps the key for itself, and each default table was read:
+///
+/// | chord | tOS | Kitty | WezTerm | Ghostty (Linux) |
+/// | --- | --- | --- | --- | --- |
+/// | `ctrl+shift+pageup`/`pagedown` | scrolls a page | scrolls a page | moves its tab | moves its tab |
+/// | `ctrl+shift+a` | free | a chord prefix (opacity) | free | select all |
+/// | `alt+9` | free | free | free | its last tab |
+/// | `alt+shift+pageup`/`pagedown` | free | free | free | free |
+/// | `alt+a` | free | free | free | free |
+///
+/// So `ctrl+shift+pageup`/`pagedown`, which move the tab in front in Chrome,
+/// reach the pane in none of the four, and `ctrl+shift+a`, Chrome's tab
+/// search, in two. They are bound all the same, for a person who has rebound
+/// their terminal, and each has an `alt` form that reaches the program
+/// everywhere: `alt+a` for the list, `alt+shift+pageup`/`pagedown` for the
+/// move. `ctrl+a` without shift stays the page's select-all, and `alt+shift+a`
+/// is nobody's. `alt+9` is the last tab rather than the ninth, as it is in
+/// Chrome, Firefox and Ghostty — whose own `alt+9` means the same, so the
+/// meaning agrees even where the key does not arrive.
 fn command(key: &KeyInput) -> Option<Command> {
     if key.action == KeyAction::Release {
         return None;
@@ -3058,6 +3297,9 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('t') => Some(Command::NewTab),
             Key::Char('w') => Some(Command::CloseTab),
             Key::Char('f') => Some(Command::Find),
+            Key::Char('a' | 'A') if key.mods.shift() => Some(Command::ListTabs),
+            Key::PageUp if key.mods.shift() => Some(Command::MoveTab(-1)),
+            Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Tab if key.mods.shift() => Some(Command::PreviousTab),
             Key::Tab => Some(Command::NextTab),
             Key::Char('=' | '+') => Some(Command::ZoomIn),
@@ -3070,7 +3312,11 @@ fn command(key: &KeyInput) -> Option<Command> {
         return match key.key {
             Key::Left => Some(Command::Back),
             Key::Right => Some(Command::Forward),
-            Key::Char(digit @ '1'..='9') => Some(Command::SelectTab(digit as usize - '0' as usize)),
+            Key::Char('9') => Some(Command::LastTab),
+            Key::Char(digit @ '1'..='8') => Some(Command::SelectTab(digit as usize - '0' as usize)),
+            Key::Char('a') if !key.mods.shift() => Some(Command::ListTabs),
+            Key::PageUp if key.mods.shift() => Some(Command::MoveTab(-1)),
+            Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Char('c') => Some(Command::CopySelection),
             Key::Char('u') => Some(Command::CopyUrl),
             Key::Char('=' | '+') => Some(Command::ZoomIn),
@@ -3380,6 +3626,131 @@ fn close_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     }
 }
 
+/// Clear the page's rows for the tab list: the picture goes, and the rows
+/// are the list's until it closes.
+///
+/// A Kitty-protocol placement with no `z` is drawn above text, so text
+/// written under the page's picture would not be seen in Kitty, WezTerm or
+/// Ghostty. What a tab switch does is the right thing here too: delete the
+/// placement, clear the rows, and let the next frame or still put the page
+/// back — which [`close_list`] arranges. A negative `z` was the alternative,
+/// and would be a change to every frame for an overlay that is up for a
+/// second.
+fn open_list_screen(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> {
+    // A still in flight is of a picture that is not going to be drawn.
+    chrome.still = None;
+    pane.write(&crate::graphics::clear_command())
+        .map_err(|e| e.to_string())?;
+    pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())
+}
+
+/// Close the tab list and give the page its rows back. The caller redraws
+/// the row.
+///
+/// The same three things a resize does: the rows are cleared, and the
+/// motion clock is reset with no still out, so that a page at rest gets its
+/// still within [`crate::motion`]'s rest interval and a page in motion is
+/// repainted by its next frame.
+fn close_list(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> {
+    if chrome.list.take().is_none() {
+        return Ok(());
+    }
+    chrome.list_first.set(0);
+    chrome.motion.reset(Instant::now());
+    chrome.still = None;
+    pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())
+}
+
+/// Type into the tab list. Returns `false` only if the person quit.
+///
+/// Every key comes here first while the list is open, as it does to the url
+/// bar and the find prompt: the program's other keys do nothing until it
+/// closes. `alt+c` copies the filter and `alt+u` the url, as on the other
+/// lines.
+fn edit_list(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &mut Chrome,
+    key: KeyInput,
+) -> Result<bool, String> {
+    if key.action == KeyAction::Release {
+        return Ok(true);
+    }
+    let typed = chrome
+        .list
+        .as_ref()
+        .map(|list| list.line.text().to_string())
+        .unwrap_or_default();
+    if copy_from_row(pane, tabs, &key, &typed)? {
+        return Ok(true);
+    }
+    let page = chrome.metrics.usable_rows() as usize;
+    let Some(list) = chrome.list.as_mut() else {
+        return Ok(true);
+    };
+    let matched: Vec<usize> = list.matches(tabs).iter().map(|entry| entry.index).collect();
+    let step = list.step(&key, &matched, page);
+    list_step(pane, tabs, browser, chrome, step)
+}
+
+/// A press while the tab list is open: a row picks the tab on it, and
+/// anything else — the row itself, past the last match — is nothing.
+fn click_list(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &mut Chrome,
+    report: &MouseInput,
+) -> Result<bool, String> {
+    let cell = chrome.metrics.cell;
+    let point = crate::input::page_point(report, chrome.parser.pixel_coordinates(), cell, 1);
+    if point.1 < 0 {
+        return Ok(true);
+    }
+    let row = point.1 as usize / cell.1.max(1) as usize;
+    let rows = chrome.metrics.usable_rows() as usize;
+    let first = chrome.list_first.get();
+    let Some(list) = chrome.list.as_mut() else {
+        return Ok(true);
+    };
+    let matched: Vec<usize> = list.matches(tabs).iter().map(|entry| entry.index).collect();
+    let window = list.window(matched.len(), rows, first);
+    let step = list.click(row, &window, &matched);
+    list_step(pane, tabs, browser, chrome, step)
+}
+
+/// What a key or a click did to the tab list, done.
+fn list_step(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &mut Chrome,
+    step: tablist::Step,
+) -> Result<bool, String> {
+    match step {
+        tablist::Step::Typing => {}
+        tablist::Step::Quit => return Ok(false),
+        tablist::Step::Close | tablist::Step::Pick(None) => close_list(pane, chrome)?,
+        tablist::Step::Pick(Some(index)) => {
+            close_list(pane, chrome)?;
+            let was = tabs.active_target().map(str::to_string);
+            if tabs.switch_to(index) {
+                switched(pane, tabs, browser, chrome, was)?;
+            }
+        }
+    }
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
+/// Whether a mouse report is the tab list's while it is open: a press, which
+/// picks a row. Motion and the wheel are nobody's then, since the page is
+/// not on the screen to be pointed at.
+fn routes_to_list(report: &MouseInput, list_open: bool) -> bool {
+    list_open && report.kind == MouseKind::Press
+}
+
 /// A paste, put wherever the typing is.
 ///
 /// The url bar if it is open, because the person pressed `ctrl+l` and that
@@ -3429,6 +3800,12 @@ fn paste(
                 }
             }
             pump_find(tabs, chrome);
+            return redraw_row(pane, tabs, chrome);
+        }
+        Some(Typing::List) => {
+            if let Some(list) = chrome.list.as_mut() {
+                paste_into_line(&mut list.line, text);
+            }
             return redraw_row(pane, tabs, chrome);
         }
         Some(Typing::Prompt | Typing::Upload) | None => {}
@@ -3950,7 +4327,7 @@ mod tests {
             command(&key(Key::Tab, Mods::CTRL | Mods::SHIFT)),
             Some(Command::PreviousTab)
         );
-        for n in 1..=9usize {
+        for n in 1..=8usize {
             let digit = Key::Char((b'0' + n as u8) as char);
             assert_eq!(
                 command(&key(digit, Mods::ALT)),
@@ -3958,6 +4335,11 @@ mod tests {
                 "alt+{n}"
             );
         }
+        assert_eq!(
+            command(&key(Key::Char('9'), Mods::ALT)),
+            Some(Command::LastTab),
+            "alt+9 is the last tab"
+        );
         // There is no tab zero — alt+0 is back to 100% — and a digit on its
         // own is still typing.
         assert_eq!(
@@ -3970,6 +4352,59 @@ mod tests {
         assert_eq!(command(&key(Key::Char('1'), Mods::CTRL)), None);
         // alt+tab is the window manager's everywhere, and is not taken here.
         assert_eq!(command(&key(Key::Tab, Mods::ALT)), None);
+    }
+
+    #[test]
+    fn the_tab_keys_include_the_last_tab_the_list_and_moving_a_tab() {
+        assert_eq!(
+            command(&key(Key::Char('9'), Mods::ALT)),
+            Some(Command::LastTab)
+        );
+        for n in 1..=8u8 {
+            assert!(matches!(
+                command(&key(Key::Char((b'0' + n) as char), Mods::ALT)),
+                Some(Command::SelectTab(_))
+            ));
+        }
+        // The list: Chrome's chord in either spelling a terminal may send
+        // it, and the `alt` form every terminal lets through.
+        for (k, mods) in [
+            (Key::Char('a'), Mods::CTRL | Mods::SHIFT),
+            (Key::Char('A'), Mods::CTRL | Mods::SHIFT),
+            (Key::Char('a'), Mods::ALT),
+        ] {
+            assert_eq!(command(&key(k, mods)), Some(Command::ListTabs), "{k:?}");
+        }
+        // `ctrl+a` is the page's select-all, and the rest are nobody's.
+        for (k, mods) in [
+            (Key::Char('a'), Mods::CTRL),
+            (Key::Char('a'), Mods::ALT | Mods::SHIFT),
+            (Key::Char('a'), Mods::CTRL | Mods::ALT),
+        ] {
+            assert_eq!(command(&key(k, mods)), None, "{k:?} {mods}");
+        }
+        for mods in [Mods::CTRL | Mods::SHIFT, Mods::ALT | Mods::SHIFT] {
+            assert_eq!(command(&key(Key::PageUp, mods)), Some(Command::MoveTab(-1)));
+            assert_eq!(
+                command(&key(Key::PageDown, mods)),
+                Some(Command::MoveTab(1))
+            );
+        }
+        // A page key with one modifier is still the page's.
+        for mods in [Mods::CTRL, Mods::SHIFT, Mods::ALT] {
+            assert_eq!(command(&key(Key::PageUp, mods)), None, "{mods}");
+            assert_eq!(command(&key(Key::PageDown, mods)), None, "{mods}");
+        }
+        // And a release of any of them is nothing.
+        for (k, mods) in [
+            (Key::Char('9'), Mods::ALT),
+            (Key::Char('a'), Mods::ALT),
+            (Key::PageUp, Mods::ALT | Mods::SHIFT),
+        ] {
+            let mut released = key(k, mods);
+            released.action = KeyAction::Release;
+            assert_eq!(command(&released), None);
+        }
     }
 
     #[test]
@@ -3987,6 +4422,18 @@ mod tests {
                 Some(true)
             );
         }
+        // The list and moving a tab: going elsewhere, and reordering around
+        // the question, do nothing to the page that is asking.
+        assert_eq!(survives(Key::Char('a'), Mods::ALT), Some(true));
+        assert_eq!(
+            survives(Key::Char('a'), Mods::CTRL | Mods::SHIFT),
+            Some(true)
+        );
+        assert_eq!(survives(Key::PageUp, Mods::ALT | Mods::SHIFT), Some(true));
+        assert_eq!(
+            survives(Key::PageDown, Mods::CTRL | Mods::SHIFT),
+            Some(true)
+        );
         // Things done to the page that is asking wait until it has an answer.
         assert_eq!(survives(Key::Char('l'), Mods::CTRL), Some(false));
         assert_eq!(survives(Key::Char('r'), Mods::CTRL), Some(false));
@@ -4030,14 +4477,19 @@ mod tests {
     }
 
     #[test]
-    fn the_row_goes_to_the_url_bar_then_a_dialog_then_a_file_input() {
-        let owner = |tabs: &Tabs<()>, bar: Option<&UrlBar>| match row_owner(tabs, bar, None) {
-            Some(RowOwner::Bar(_)) => "bar",
-            Some(RowOwner::Find(_)) => "find",
-            Some(RowOwner::Dialog(_)) => "dialog",
-            Some(RowOwner::Upload(_)) => "upload",
-            None => "page",
-        };
+    fn the_row_goes_to_the_url_bar_then_find_then_the_list_then_a_dialog_then_a_file_input() {
+        let owner_with =
+            |tabs: &Tabs<()>, bar: Option<&UrlBar>, list: Option<&TabList>| match row_owner(
+                tabs, bar, None, list,
+            ) {
+                Some(RowOwner::Bar(_)) => "bar",
+                Some(RowOwner::Find(_)) => "find",
+                Some(RowOwner::List(_)) => "list",
+                Some(RowOwner::Dialog(_)) => "dialog",
+                Some(RowOwner::Upload(_)) => "upload",
+                None => "page",
+            };
+        let owner = |tabs: &Tabs<()>, bar: Option<&UrlBar>| owner_with(tabs, bar, None);
         let mut tabs = Tabs::new(Tab::new("a", (), "https://a.example/"));
         let bar = UrlBar::new(Line::empty());
         assert_eq!(owner(&tabs, None), "page");
@@ -4059,8 +4511,14 @@ mod tests {
         tab.dialog = Dialog::opening(&alert);
         assert_eq!(owner(&tabs, None), "dialog");
         assert_eq!(owner(&tabs, Some(&bar)), "bar");
+        // The list is the person's, over the dialog and the path; the bar is
+        // over it, although the keyboard never has both open.
+        let list = TabList::open(0);
+        assert_eq!(owner_with(&tabs, None, Some(&list)), "list");
+        assert_eq!(owner_with(&tabs, Some(&bar), Some(&list)), "bar");
         let tab = tabs.active_mut().expect("a tab");
         tab.dialog = None;
+        assert_eq!(owner_with(&tabs, None, Some(&list)), "list");
         assert_eq!(owner(&tabs, None), "upload", "and back when it is answered");
 
         // A tab behind with a prompt does not own the row in front.
@@ -4498,9 +4956,10 @@ mod tests {
         // Every combination of the four things that can have the row, and a
         // load under them or not: the answer is the first of them in
         // `row_owner`'s order, and the load only when none of them is there.
-        for mask in 0..32u32 {
-            let [open_bar, open_find, dialog, path, loading] =
-                [0, 1, 2, 3, 4].map(|bit| mask & (1 << bit) != 0);
+        let list = TabList::open(0);
+        for mask in 0..64u32 {
+            let [open_bar, open_find, dialog, path, loading, open_list] =
+                [0, 1, 2, 3, 4, 5].map(|bit| mask & (1 << bit) != 0);
             let mut tab = Tab::new("a", (), "https://a.example/");
             tab.loading = loading;
             if dialog {
@@ -4514,6 +4973,8 @@ mod tests {
                 Escapes::UrlBar
             } else if open_find {
                 Escapes::Find
+            } else if open_list {
+                Escapes::List
             } else if dialog {
                 Escapes::Dialog
             } else if path {
@@ -4523,11 +4984,17 @@ mod tests {
             } else {
                 Escapes::Page
             };
-            let owner = row_owner(&tabs, open_bar.then_some(&bar), open_find.then_some(&find));
+            let owner = row_owner(
+                &tabs,
+                open_bar.then_some(&bar),
+                open_find.then_some(&find),
+                open_list.then_some(&list),
+            );
             assert_eq!(
                 escapes(owner.as_ref(), loading),
                 wanted,
-                "bar {open_bar}, find {open_find}, dialog {dialog}, path {path}, loading {loading}"
+                "bar {open_bar}, find {open_find}, list {open_list}, dialog {dialog}, \
+                 path {path}, loading {loading}"
             );
         }
         // Escape is not one of the program's commands: when nothing wants
@@ -4551,6 +5018,33 @@ mod tests {
         assert!(!routes_to_hover(&report(b"\x1b[<0;10;5M")));
         assert!(!routes_to_hover(&report(b"\x1b[<0;10;5m")));
         assert!(!routes_to_hover(&report(b"\x1b[<64;10;5M")));
+    }
+
+    #[test]
+    fn a_click_while_the_list_is_open_is_the_lists() {
+        let report = |bytes: &[u8]| match Parser::new().feed(bytes).as_slice() {
+            [Input::Mouse(report)] => *report,
+            other => panic!("{bytes:?} is not one mouse report: {other:?}"),
+        };
+        let press = report(b"\x1b[<0;10;5M");
+        assert!(routes_to_list(&press, true));
+        assert!(!routes_to_list(&press, false), "the page's when it is shut");
+        assert!(
+            routes_to_list(&report(b"\x1b[<1;10;5M"), true),
+            "a middle press too"
+        );
+        assert!(
+            !routes_to_list(&report(b"\x1b[<64;10;5M"), true),
+            "the wheel"
+        );
+        assert!(
+            !routes_to_list(&report(b"\x1b[<35;10;5M"), true),
+            "a motion"
+        );
+        assert!(
+            !routes_to_list(&report(b"\x1b[<0;10;5m"), true),
+            "a release"
+        );
     }
 
     #[test]
