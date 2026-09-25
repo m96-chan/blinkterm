@@ -5693,3 +5693,716 @@ fn the_still_at_a_fractional_level_is_cut_to_the_pane() {
     client.close();
     engine.kill();
 }
+
+// ---------------------------------------------------------------------------
+// Normal mode: link hints and the scroll keys
+// ---------------------------------------------------------------------------
+
+use blinkterm::hints::{self, Hint, Hints, Kind};
+use blinkterm::normal;
+
+/// The frame the hint page puts beside its own links: a link, a button, and
+/// enough below them that the frame scrolls.
+fn hint_frame() -> String {
+    let filler: String = (0..60)
+        .map(|i| format!("<p>frame filler {i}</p>"))
+        .collect();
+    format!(
+        "<!doctype html><body style='margin:0;font:14px sans-serif'>\
+         <p><a id=inner href='/inner-target'>a link inside the frame</a></p>\
+         <p><button id=innerbtn>frame button</button></p>{filler}\
+         <p><a id=innerdeep href='/inner-deep'>deep in the frame</a></p></body>"
+    )
+}
+
+/// The page [`hints`]'s module doc was measured on: every kind of thing that
+/// is clickable, and every way of being clickable and not a hint — hidden
+/// three ways, inside a closed `<details>`, covered by another element, in a
+/// cross-origin frame, an image map's area, and below the fold. At `/`, with
+/// its frame at `/inner` and the same frame again on `localhost`, which is
+/// another origin.
+fn hint_pages(port: u16) -> Vec<(String, String)> {
+    let below: String = (0..80)
+        .map(|i| format!("<p><a href='/below/{i}'>below the fold link {i}</a></p>"))
+        .collect();
+    let page = format!(
+        "<!doctype html><meta charset=utf-8><title>loading</title>\
+         <body style='margin:0;font:14px sans-serif;background:#fff;color:#000'>\
+         <h1>Hint targets</h1>\
+         <p><a id=a1 href='/one'>plain link</a> and <a id=a2 href='/two'>another with <b>bold</b> inside</a>\
+          and <a id=a3 href='javascript:void(0)'>a javascript: link</a> and <a>an anchor with no href</a>\
+          and <a id=a4 href='#frag'>a fragment</a></p>\
+         <p><a id=wrap href='/wrap' style='display:inline'>a link that is long enough to wrap onto a \
+         second line when the viewport is six hundred and forty pixels wide, which this one is, so it \
+         has two client rects</a></p>\
+         <p><button id=b1>button</button> <button id=b2 disabled>disabled</button>\
+          <input id=i1 type=text placeholder=text> <input id=i2 type=checkbox> <input type=hidden value=x>\
+          <input id=i3 type=submit value=Go> <select id=s1><option>one</option></select> <textarea id=t1></textarea></p>\
+         <p><span id=oc onclick='1'>onclick span</span> <span id=rl role=link tabindex=0>role=link</span>\
+          <span id=rb role=button>role=button</span> <div id=ce contenteditable>editable div</div></p>\
+         <p><label for=i1 id=lab>label for the text input</label> <label id=lab2><input id=i4 type=radio> radio in a label</label></p>\
+         <div id=ptr style='cursor:pointer;width:100px;height:20px;background:#eee'><span>cursor:pointer div</span></div>\
+         <div style='cursor:pointer;width:100px;height:20px'><div style='cursor:pointer'>nested pointer (one hint)</div></div>\
+         <p style='display:none'><a id=hid1 href='/hidden'>display:none</a></p>\
+         <p style='visibility:hidden'><a id=hid2 href='/hidden2'>visibility:hidden</a></p>\
+         <p style='opacity:0'><a id=hid3 href='/hidden3'>opacity:0</a></p>\
+         <details><summary id=sum>a summary</summary><a id=hid4 href='/closed'>inside closed details</a></details>\
+         <div style='position:relative;height:30px'><a id=under href='/under' style='position:absolute;left:0;top:0'>covered link</a>\
+          <div id=cover style='position:absolute;left:0;top:0;width:200px;height:30px;background:#ccc'></div></div>\
+         <div id=sh></div>\
+         <iframe id=same src='/inner' style='width:300px;height:100px;border:2px solid #000'></iframe>\
+         <iframe id=cross src='http://localhost:{port}/inner' style='width:300px;height:100px'></iframe>\
+         <map name=m><area id=ar shape=rect coords='0,0,50,50' href='/area'></map>\
+         <img usemap='#m' width=60 height=60 alt='' style='display:block;background:#8cf'>\
+         {below}\
+         <script>\
+         var sh = document.getElementById('sh').attachShadow({{mode:'open'}});\
+         sh.innerHTML = '<a id=shadowlink href=\"/shadow\">a link in an open shadow root</a> <button id=shadowbtn>shadow button</button>';\
+         onload = function () {{ document.title = 'ready'; }};\
+         </script></body>"
+    );
+    vec![
+        ("/".to_string(), page),
+        ("/inner".to_string(), hint_frame()),
+    ]
+}
+
+/// An engine on the hint page at `WIDTH` by `height`, with the world the
+/// program makes for find and hints alike, and the page's url.
+fn hinting(height: u32) -> Option<(Engine, Client, String, i64, String)> {
+    let port = serve_pages(hint_pages);
+    let (engine, mut client, target) = connect_with_target()?;
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(WIDTH)),
+                ("height", Json::number(height)),
+                ("deviceScaleFactor", Json::number(1)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("the viewport");
+    let url = format!("http://127.0.0.1:{port}/");
+    open(&mut client, &url, "ready");
+    let context = find_world(&mut client);
+    Some((engine, client, target, context, url))
+}
+
+/// `f`'s question, waited for: the hints in view, labelled.
+fn collect(client: &mut Client, context: i64, px: f64) -> Hints {
+    let reply = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            hints::collect_params(context, px),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers the collect");
+    Hints::from_reply(&reply, false)
+        .unwrap_or_else(|| panic!("an answer of the script's shape: {reply}"))
+}
+
+/// Put the labels up, a cell of `px` CSS pixels tall.
+fn show(client: &mut Client, context: i64, hints: &Hints, px: f64) {
+    let reply = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            hints::show_params(context, &hints.labels, px),
+            Duration::from_secs(5),
+        )
+        .expect("the page draws the labels");
+    assert!(reply.get("exceptionDetails").is_none(), "{reply}");
+}
+
+/// Take them down.
+fn clear(client: &mut Client, context: i64) {
+    client
+        .call_within(
+            "Runtime.callFunctionOn",
+            hints::clear_params(context),
+            Duration::from_secs(5),
+        )
+        .expect("the page takes the labels away");
+}
+
+/// How many pixels of a PNG are the labels' yellow, `#ffd400`, within 8 of
+/// each channel.
+fn label_pixels(png: &[u8]) -> usize {
+    let image = tos_term::png::decode(png, 64 * 1024 * 1024).expect("the PNG decodes");
+    image
+        .rgba
+        .chunks_exact(4)
+        .filter(|pixel| {
+            pixel[..3]
+                .iter()
+                .zip([0xff, 0xd4, 0x00])
+                .all(|(&have, want): (&u8, u8)| have.abs_diff(want) <= 8)
+        })
+        .count()
+}
+
+/// A still once the labels have had a frame to paint in.
+fn labelled_still(client: &mut Client) -> Vec<u8> {
+    std::thread::sleep(Duration::from_millis(200));
+    screenshot(client, "png", None)
+}
+
+/// The three mouse events a typed label sends, as calls so that the test
+/// knows they have landed.
+fn click_hint(client: &mut Client, hint: &Hint) {
+    for params in hints::click_params(hint.at) {
+        client
+            .call("Input.dispatchMouseEvent", params)
+            .expect("the click is dispatched");
+    }
+}
+
+/// Type `hint`'s label into a fresh set of labels, a key at a time, and hand
+/// back what the typing chose — so that the label and the hint under it are
+/// the program's, not the test's.
+fn type_label(hints: &Hints, index: usize) -> Hint {
+    let mut typing = hints.clone();
+    let label = hints.labels[index].clone();
+    let mut chosen = None;
+    for c in label.chars() {
+        let key = KeyInput {
+            key: Key::Char(c),
+            mods: Mods::default(),
+            action: KeyAction::Press,
+            text: Some(c),
+        };
+        match typing.step(&key) {
+            hints::Typed::Chosen(hint) => chosen = Some(hint),
+            hints::Typed::Narrowed(n) => assert!(n >= 1),
+            other => panic!("{c} of {label}: {other:?}"),
+        }
+    }
+    chosen.unwrap_or_else(|| panic!("{label} chose nothing"))
+}
+
+/// The first hint whose `at` is on the element `id` in the page.
+fn hint_on(client: &mut Client, hints: &Hints, id: &str) -> usize {
+    let mut rect = |what: &str| {
+        page_number(
+            client,
+            &format!("document.getElementById('{id}').getBoundingClientRect().{what}"),
+        )
+    };
+    let (left, top, right, bottom) = (rect("left"), rect("top"), rect("right"), rect("bottom"));
+    hints
+        .hints
+        .iter()
+        .position(|hint| (left..=right).contains(&hint.at.0) && (top..=bottom).contains(&hint.at.1))
+        .unwrap_or_else(|| panic!("no hint on #{id}: {:?}", hints.hints))
+}
+
+/// The acceptance criterion of #13 for "collect the clickable elements in the
+/// viewport": the measured set, no more and no less.
+#[test]
+fn the_clickable_things_in_view_are_found_and_the_hidden_covered_and_offscreen_ones_are_not() {
+    let Some((mut engine, mut client, _, context, _)) = hinting(HEIGHT) else {
+        return;
+    };
+    let found = collect(&mut client, context, 16.0);
+    let count = |kind: Kind| found.hints.iter().filter(|hint| hint.kind == kind).count();
+    eprintln!(
+        "{} hints at {WIDTH}x{HEIGHT}: {:?}",
+        found.hints.len(),
+        found.hints
+    );
+    assert_eq!(found.hints.len(), 18, "{:?}", found.hints);
+    assert_eq!(
+        (count(Kind::Link), count(Kind::Edit), count(Kind::Click)),
+        (4, 4, 10)
+    );
+    let first = &found.hints[0];
+    assert!(
+        (first.at.0 - 27.0).abs() <= 1.0 && (first.at.1 - 78.0).abs() <= 1.0,
+        "the first hint, the first link, at {:?}",
+        first.at
+    );
+    assert!(found.hints[0].href.ends_with("/one"));
+    for hidden in [
+        "/hidden", "/hidden2", "/hidden3", "/closed", "/under", "/area",
+    ] {
+        assert!(
+            !found.hints.iter().any(|hint| hint.href.ends_with(hidden)),
+            "{hidden} is not a hint"
+        );
+    }
+    assert!(
+        !found.hints.iter().any(|hint| hint.href.contains("/below/")),
+        "nothing below the fold"
+    );
+    assert!(found
+        .hints
+        .iter()
+        .all(|hint| hint.kind == Kind::Link || hint.href.is_empty()));
+    assert!(
+        !found
+            .hints
+            .iter()
+            .any(|hint| hint.href.starts_with("javascript:")),
+        "a javascript: link is a click, not a link to open"
+    );
+
+    // Taller, and the shadow root, the frames and the summary come into view.
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(WIDTH)),
+                ("height", Json::number(HEIGHT * 2)),
+                ("deviceScaleFactor", Json::number(1)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("the viewport");
+    wait_until(&mut client, f64::from(HEIGHT * 2), |client| {
+        page_number(client, "innerHeight")
+    });
+    let tall = collect(&mut client, context, 16.0);
+    eprintln!("{} hints at {WIDTH}x{}", tall.hints.len(), HEIGHT * 2);
+    // 26: the eighteen, the summary and the details, the shadow root's link
+    // and button, the frame's link and button, and two links below the old
+    // fold. (27 is what the same page has at 1280x720, which is 50%.)
+    assert_eq!(tall.hints.len(), 26, "{:?}", tall.hints);
+    assert!(
+        tall.hints.iter().any(|hint| hint.href.ends_with("/shadow")),
+        "a link in an open shadow root"
+    );
+    let rect = |client: &mut Client, what: &str| {
+        page_number(
+            client,
+            &format!("document.getElementById('same').getBoundingClientRect().{what}"),
+        )
+    };
+    let (left, top) = (rect(&mut client, "left"), rect(&mut client, "top"));
+    let (right, bottom) = (rect(&mut client, "right"), rect(&mut client, "bottom"));
+    let framed = tall
+        .hints
+        .iter()
+        .find(|hint| hint.href.ends_with("/inner-target"))
+        .expect("the same-origin frame's link");
+    assert!(
+        (left..=right).contains(&framed.at.0) && (top..=bottom).contains(&framed.at.1),
+        "the frame's link is inside the frame's box: {:?} in {left},{top}..{right},{bottom}",
+        framed.at
+    );
+    assert!(
+        !tall
+            .hints
+            .iter()
+            .any(|hint| hint.href.contains("localhost")),
+        "nothing from the cross-origin frame"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn labels_are_drawn_by_the_page_and_taken_away_without_a_trace() {
+    let Some((mut engine, mut client, _, context, _)) = hinting(HEIGHT) else {
+        return;
+    };
+    let body = page_number(&mut client, "document.body.innerHTML.length");
+    assert_eq!(label_pixels(&labelled_still(&mut client)), 0);
+    let found = collect(&mut client, context, 16.0);
+    show(&mut client, context, &found, 16.0);
+    let shown = label_pixels(&labelled_still(&mut client));
+    eprintln!("{} labels, {shown} yellow pixels", found.labels.len());
+    assert!(shown > 1000, "the labels are on the screen: {shown}");
+    assert_eq!(
+        page_number(&mut client, "document.documentElement.children.length"),
+        3.0,
+        "one element, on <html>"
+    );
+    assert_eq!(
+        page_number(&mut client, "document.body.innerHTML.length"),
+        body,
+        "and nothing in the body"
+    );
+    assert_eq!(
+        evaluate(
+            &mut client,
+            "document.querySelector('blinkterm-hints').shadowRoot === null"
+        )
+        .as_bool(),
+        Some(true),
+        "the page cannot reach the labels"
+    );
+    assert_eq!(
+        evaluate(&mut client, "typeof __blinktermHints").as_str(),
+        Some("undefined"),
+        "nor the script's state"
+    );
+
+    // Narrowed to the labels starting with the first letter: fewer.
+    let prefix = &found.labels[0][..1];
+    client
+        .call_within(
+            "Runtime.callFunctionOn",
+            hints::narrow_params(context, prefix),
+            Duration::from_secs(5),
+        )
+        .expect("the page narrows");
+    let narrowed = label_pixels(&labelled_still(&mut client));
+    assert!(
+        narrowed > 0 && narrowed < shown,
+        "{narrowed} of {shown} after {prefix}"
+    );
+
+    clear(&mut client, context);
+    assert_eq!(label_pixels(&labelled_still(&mut client)), 0);
+    assert_eq!(
+        page_number(&mut client, "document.documentElement.children.length"),
+        2.0
+    );
+    assert_eq!(
+        page_number(&mut client, "document.body.innerHTML.length"),
+        body
+    );
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn typing_a_label_clicks_the_thing_under_it_and_a_field_is_insert_mode() {
+    let Some((mut engine, mut client, _, context, url)) = hinting(HEIGHT) else {
+        return;
+    };
+    let found = collect(&mut client, context, 16.0);
+    let link = type_label(&found, hint_on(&mut client, &found, "a1"));
+    assert_eq!(link.kind, Kind::Link);
+    click_hint(&mut client, &link);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut href = String::new();
+    while Instant::now() < deadline {
+        href = evaluate(&mut client, "location.href")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if href.ends_with("/one") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(href.ends_with("/one"), "the link was followed: {href}");
+
+    open(&mut client, &url, "ready");
+    let context = find_world(&mut client);
+    let found = collect(&mut client, context, 16.0);
+    let field = type_label(&found, hint_on(&mut client, &found, "i1"));
+    assert_eq!(field.kind, Kind::Edit, "a text input is typed into");
+    click_hint(&mut client, &field);
+    assert_eq!(
+        evaluate(&mut client, "document.activeElement.id").as_str(),
+        Some("i1")
+    );
+    // And the question asked after a click in normal mode says so.
+    let focused = client
+        .call("Runtime.evaluate", hints::focused_params())
+        .expect("the page answers");
+    assert_eq!(hints::focused_editable(&focused), Some(true));
+
+    let checkbox = type_label(&found, hint_on(&mut client, &found, "i2"));
+    assert_eq!(checkbox.kind, Kind::Click);
+    click_hint(&mut client, &checkbox);
+    assert_eq!(
+        evaluate(&mut client, "document.getElementById('i2').checked").as_bool(),
+        Some(true)
+    );
+    let focused = client
+        .call("Runtime.evaluate", hints::focused_params())
+        .expect("the page answers");
+    assert_eq!(
+        hints::focused_editable(&focused),
+        Some(false),
+        "a checkbox is not a field"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn a_hint_inside_a_same_origin_frame_is_clicked_in_the_frame() {
+    let Some((mut engine, mut client, _, context, url)) = hinting(HEIGHT * 2) else {
+        return;
+    };
+    let found = collect(&mut client, context, 16.0);
+    let index = found
+        .hints
+        .iter()
+        .position(|hint| hint.href.ends_with("/inner-target"))
+        .expect("the frame's link");
+    let hint = type_label(&found, index);
+    click_hint(&mut client, &hint);
+    let inner = |client: &mut Client| {
+        evaluate(
+            client,
+            "document.getElementById('same').contentWindow.location.href",
+        )
+        .as_str()
+        .unwrap_or_default()
+        .ends_with("/inner-target")
+    };
+    assert!(wait_until(&mut client, true, inner), "the frame navigated");
+    assert_eq!(
+        evaluate(&mut client, "location.href").as_str(),
+        Some(url.as_str()),
+        "and the page did not"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// `F`: the href goes to a tab this program opens, the way `open_tab` opens
+/// one. And the reason it is not a ctrl+click: the target that makes has no
+/// opener, and the tab list does not take it.
+#[test]
+fn a_hint_opened_in_a_new_tab_is_a_target_this_program_made() {
+    let Some((mut engine, mut client, target, context, _)) = hinting(HEIGHT) else {
+        return;
+    };
+    let found = collect(&mut client, context, 16.0);
+    let hint = type_label(&found, hint_on(&mut client, &found, "a1"));
+    assert!(hint.href.ends_with("/one"));
+    let (mut browser, mut tabs) = tabbed(&engine, client, target);
+
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string(&hint.href))]),
+        )
+        .expect("a new target");
+    let opened = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("the engine says which")
+        .to_string();
+    let connection = browser
+        .attach(&opened, Duration::from_secs(10))
+        .expect("a session on the new page");
+    tabs.open(Tab::new(opened, connection, &hint.href));
+    assert!(!pump(
+        &mut browser,
+        &mut tabs,
+        Duration::from_secs(2),
+        |tabs| tabs.len() > 2
+    ));
+    assert_eq!(tabs.len(), 2);
+    let tab = tabs.active_mut().expect("the new tab");
+    let arrived = |client: &mut Client| {
+        evaluate(client, "location.href")
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("/one")
+    };
+    assert!(
+        wait_until(&mut tab.connection, true, arrived),
+        "the new tab is at the href"
+    );
+
+    // Now the ctrl+click, on the other link, from the first tab.
+    assert!(tabs.select(1));
+    let two = found
+        .hints
+        .iter()
+        .find(|hint| hint.href.ends_with("/two"))
+        .expect("the second link")
+        .clone();
+    let page = &mut tabs.active_mut().expect("the first tab").connection;
+    for params in hints::click_params(two.at) {
+        let Json::Object(mut fields) = params else {
+            panic!("the params are an object");
+        };
+        for (name, value) in fields.iter_mut() {
+            if name == "modifiers" {
+                *value = Json::number(2);
+            }
+        }
+        page.call("Input.dispatchMouseEvent", Json::Object(fields))
+            .expect("the ctrl+click is dispatched");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut unowned = None;
+    while unowned.is_none() && Instant::now() < deadline {
+        for event in browser.events() {
+            let created = event.method == "Target.targetCreated"
+                && event
+                    .params
+                    .path(&["targetInfo", "type"])
+                    .and_then(Json::as_str)
+                    == Some("page");
+            if !created {
+                continue;
+            }
+            let id = event
+                .params
+                .path(&["targetInfo", "targetId"])
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if tabs.index_of(&id).is_some() {
+                continue;
+            }
+            let opener = event.params.path(&["targetInfo", "openerId"]).is_some();
+            let outcome = tabs.take(&event, |target| {
+                browser.attach(target, Duration::from_secs(5))
+            });
+            unowned = Some((opener, matches!(outcome, Outcome::Ignored)));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!("a ctrl+click's target: (has an opener, ignored) = {unowned:?}");
+    assert_eq!(
+        unowned,
+        Some((false, true)),
+        "a ctrl+click makes a target with no opener, which is nobody's tab"
+    );
+    assert_eq!(tabs.len(), 2);
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// The scroll keys through the program's own wheel thread and dispatch, with
+/// the distances [`normal::Scroll`] names: a notch, half a screen, and the two
+/// ends, which the engine clamps.
+#[test]
+fn the_scroll_keys_move_the_page_through_the_wheel() {
+    let Some((mut engine, mut client, target)) = connect_with_target() else {
+        return;
+    };
+    a_page_to_scroll(&mut client);
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    let viewport = blinkterm::zoom::Viewport::fit((WIDE, TALL), 1.0);
+    let at = (WIDE as i32 / 2, TALL as i32 / 2);
+    let wheel = Wheel::start();
+    let wire = Arc::new(blinkterm::app::Wire::new(client.notifier()));
+    let key = |client: &mut Client, scroll: normal::Scroll, wanted: f64| {
+        let distance = match scroll {
+            normal::Scroll::Notch(n) => viewport.notch((0, n), blinkterm::app::WHEEL_PIXELS),
+            normal::Scroll::HalfPage(n) => (0.0, f64::from(n) * f64::from(viewport.css.1) / 2.0),
+            normal::Scroll::End(n) => (0.0, f64::from(n) * normal::FAR),
+        };
+        wheel.notch(&target, wire.clone(), at, distance);
+        let landed = wait_until(client, wanted, scroll_y);
+        assert_eq!(landed, wanted, "{scroll:?}");
+        // The page is where it was sent, but a curve for one of the ends
+        // pays out the rest of its ten million pixels for the rest of
+        // `scroll::D`, clamped by the engine; the next key waits it out, as
+        // a person's would.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while wheel.owed() != (0.0, 0.0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    key(&mut client, normal::Scroll::Notch(1), 120.0);
+    key(
+        &mut client,
+        normal::Scroll::HalfPage(1),
+        120.0 + f64::from(TALL) / 2.0,
+    );
+    let bottom = page_number(
+        &mut client,
+        "document.documentElement.scrollHeight - innerHeight",
+    );
+    key(&mut client, normal::Scroll::End(1), bottom);
+    key(&mut client, normal::Scroll::Notch(-1), bottom - 120.0);
+    key(&mut client, normal::Scroll::End(-1), 0.0);
+
+    client.close();
+    engine.kill();
+}
+
+/// A label is about a cell tall on the screen at every level, because it is
+/// sized from the CSS pixels a cell is: at 50% the page's text is half the
+/// height and the labels are not.
+#[test]
+fn labels_stay_a_cell_tall_at_every_zoom_level() {
+    let Some((mut engine, mut client, _, context, _)) = hinting(HEIGHT) else {
+        return;
+    };
+    for factor in [1.0, 0.5, 2.0] {
+        zoom_to(&mut client, factor);
+        wait_until(&mut client, factor, |client| page_metrics(client).2);
+        let px = f64::from(CELL.1) / factor;
+        let found = collect(&mut client, context, px);
+        show(&mut client, context, &found, px);
+        let yellow = label_pixels(&labelled_still(&mut client));
+        let each = yellow / found.hints.len().max(1);
+        eprintln!(
+            "at {factor}: {} hints, {yellow} yellow pixels, {each} a label",
+            found.hints.len()
+        );
+        assert!(!found.hints.is_empty(), "at {factor}");
+        assert!(
+            (100..=300).contains(&each),
+            "{each} pixels a label at {factor}"
+        );
+        clear(&mut client, context);
+    }
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn hints_on_about_blank_and_the_error_page_are_none_and_no_exception() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("about:blank");
+    let context = find_world(&mut client);
+    assert!(collect(&mut client, context, 16.0).hints.is_empty());
+
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string("http://127.0.0.1:1/"))]),
+        )
+        .expect("the navigation is answered");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        // As for find: until the error page's document has arrived, the world
+        // asked for may be the one about to go.
+        let context = find_world(&mut client);
+        match client.call_within(
+            "Runtime.callFunctionOn",
+            hints::collect_params(context, 16.0),
+            Duration::from_secs(5),
+        ) {
+            Ok(reply) => break Hints::from_reply(&reply, false),
+            Err(why) if find::stale_world(&why) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(why) => panic!("{why}"),
+        }
+    };
+    let error_page = answer.expect("the script's answer, not an exception");
+    assert!(
+        error_page.hints.is_empty(),
+        "the error page: {:?}",
+        error_page.hints
+    );
+
+    client.close();
+    engine.kill();
+}

@@ -10,6 +10,13 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Added
+
+- Normal mode, `ctrl+.`: link hints (`f`/`F`), scrolling from the
+  keyboard (`j`/`k`/`d`/`u`/`gg`/`G`), `H`/`L`/`r`/`o`/`O`/`/`, `i` back to
+  the page. Off by default; nothing changes until it is turned on
+  ([#13](https://github.com/m96-chan/blinkterm/issues/13)).
+
 ### Changed
 
 - `brew install m96-chan/tap/blinkterm` installs the tagged release; `--HEAD`
