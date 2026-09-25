@@ -2,12 +2,12 @@
 //! between.
 //!
 //! A program that takes the alternate screen, hides the cursor, turns on mouse
-//! reporting and pushes keyboard flags has made four changes to a terminal
-//! that belongs to somebody else. Every one of them has to be undone on every
-//! way out — a clean quit, a `SIGTERM`, a panic, the engine dying — because
-//! the thing left behind otherwise is a shell with no cursor that reports
-//! every mouse move as garbage on the command line, and the person's next move
-//! is to close the pane.
+//! reporting and bracketed paste and pushes keyboard flags has made five
+//! changes to a terminal that belongs to somebody else. Every one of them has
+//! to be undone on every way out — a clean quit, a `SIGTERM`, a panic, the
+//! engine dying — because the thing left behind otherwise is a shell with no
+//! cursor that reports every mouse move as garbage on the command line, and
+//! the person's next move is to close the pane.
 //!
 //! Which is why the terminal state lives in a static here as well as in a
 //! guard. A release build aborts on panic (`panic = "abort"`, kept in this
@@ -34,6 +34,15 @@ use tos_preview::fit::Metrics;
 pub const KEYBOARD_FLAGS: u8 = 1 | 2 | 4 | 16;
 
 /// Everything turned on at the start.
+///
+/// Bracketed paste (`?2004h`) is the one here that is not about drawing or
+/// pointing. Without it a terminal delivers a paste as though it had been
+/// typed, and a browser cannot afford that: every newline in the clipboard is
+/// an Enter, which in a form's `<input>` is a submission per line, and every
+/// escape byte is the start of a key. With it the terminal wraps the paste in
+/// `CSI 200 ~` and `CSI 201 ~`, [`crate::input`] hands over what is between
+/// them as one piece of text, and the page is given it as text — one
+/// `Input.insertText`, which fires no key at all.
 pub fn enter_sequence() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[?1049h"); // the alternate screen
@@ -42,6 +51,7 @@ pub fn enter_sequence() -> Vec<u8> {
     out.extend_from_slice(b"\x1b[?1002h"); // and motion while one is held
     out.extend_from_slice(b"\x1b[?1006h"); // in SGR, which has no 223 limit
     out.extend_from_slice(b"\x1b[?1016h"); // in pixels, if the terminal can
+    out.extend_from_slice(b"\x1b[?2004h"); // a paste as a paste, not as keys
     out.extend_from_slice(format!("\x1b[>{KEYBOARD_FLAGS}u").as_bytes());
     out.extend_from_slice(b"\x1b[2J"); // an empty screen to draw on
     out
@@ -59,6 +69,7 @@ pub const ASK_PIXEL_MOUSE: &[u8] = b"\x1b[?1016$p";
 pub fn leave_sequence() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[<u"); // pop the keyboard flags
+    out.extend_from_slice(b"\x1b[?2004l");
     out.extend_from_slice(b"\x1b[?1016l");
     out.extend_from_slice(b"\x1b[?1006l");
     out.extend_from_slice(b"\x1b[?1002l");
@@ -563,6 +574,7 @@ mod tests {
             ("?1002h", "?1002l"),
             ("?1006h", "?1006l"),
             ("?1016h", "?1016l"),
+            ("?2004h", "?2004l"),
         ] {
             assert!(on.contains(set), "{set} is never set");
             assert!(off.contains(reset), "{set} is never unset");
@@ -587,6 +599,7 @@ mod tests {
         assert!(terminal.modes.alt_screen);
         assert!(!terminal.modes.cursor_visible);
         assert_eq!(terminal.keyboard_flags().0, KEYBOARD_FLAGS);
+        assert!(terminal.modes.bracketed_paste, "a paste comes bracketed");
 
         terminal.advance(ASK_PIXEL_MOUSE);
         let answer = String::from_utf8(terminal.take_output()).expect("ascii");
@@ -600,6 +613,7 @@ mod tests {
         terminal.advance(&leave_sequence());
         assert!(!terminal.modes.alt_screen);
         assert!(terminal.modes.cursor_visible);
+        assert!(!terminal.modes.bracketed_paste);
         assert_eq!(terminal.keyboard_flags().0, 0);
     }
 

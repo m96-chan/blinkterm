@@ -34,7 +34,8 @@ use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::{Cells, Metrics};
 
 use crate::cdp::{Client, Event, Notifier, Pending};
-use crate::dialog::{Answer, Kind};
+use crate::clipboard;
+use crate::dialog::{Answer, Dialog, Kind};
 use crate::download::{self, Downloads};
 use crate::engine::Engine;
 use crate::graphics::{Painter, Raw};
@@ -98,6 +99,24 @@ const DOUBLE_CLICK_SLOP: i32 = 4;
 /// it is 400 ms — see [`motion::INPUT_QUIET`] — so fifty is eight times as
 /// often as it needs to be.
 const POLL_MS: i32 = 50;
+
+/// How long a paste that has been opened and not closed may go without a byte
+/// before it is given up on.
+///
+/// A terminal that sent `CSI 200 ~` and then nothing is a terminal that will
+/// never send the end marker, and until it is given up on every key typed is
+/// more paste. Forty times [`POLL_MS`], which is longer than any stall of an
+/// ssh connection a person would sit through with a paste half-arrived; and it
+/// is a silence, not a total, so a 64 KiB paste that trickles in over a slow
+/// line for longer than this is not cut while it is still coming.
+const PASTE_IDLE: Duration = Duration::from_secs(2);
+
+/// How long the page gets to say what is selected.
+///
+/// The same two seconds as [`page_loaded`], and waited for, for the same
+/// reason: the person has just pressed a key and is waiting on the answer,
+/// which is a few hundred bytes from a page that is not stopped.
+const SELECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The row the page starts on, one-based: the first is this program's.
 const PAGE_ROW: u32 = 2;
@@ -403,6 +422,9 @@ fn drive(
 
     let mut last_check = Instant::now();
     let mut buf = [0u8; 8192];
+    // When the terminal last sent a byte of a paste that is still open; see
+    // [`PASTE_IDLE`].
+    let mut paste_heard: Option<Instant> = None;
 
     while !QUIT.load(Ordering::SeqCst) {
         if tabs.is_empty() {
@@ -462,6 +484,7 @@ fn drive(
             match tty::read_available(pane.input_fd(), &mut buf) {
                 Ok(ReadOutcome::Data(n)) => {
                     let inputs = chrome.parser.feed(&buf[..n]);
+                    paste_heard = chrome.parser.pasting().then(Instant::now);
                     for input in inputs {
                         if !handle_input(pane, tabs, browser, chrome, input)? {
                             return Ok(());
@@ -471,6 +494,14 @@ fn drive(
                 Ok(ReadOutcome::Eof) => return Ok(()),
                 Ok(ReadOutcome::WouldBlock) => {}
                 Err(err) => return Err(format!("cannot read the terminal: {err}")),
+            }
+        } else if paste_heard.is_some_and(|at| at.elapsed() > PASTE_IDLE) {
+            // A paste that was opened and has gone quiet: the end marker is
+            // not coming, and what arrived is half of something.
+            paste_heard = None;
+            if chrome.parser.abandon_paste() {
+                note(tabs, "paste cut short; try again");
+                redraw_row(pane, tabs, chrome)?;
             }
         } else if let Some(input) = chrome.parser.flush() {
             // Nothing arrived, so a held escape was the Escape key after all.
@@ -1509,6 +1540,22 @@ fn handle_input(
 ) -> Result<bool, String> {
     match input {
         Input::Mode { .. } => {}
+        Input::PasteRefused { bytes } => {
+            note(
+                tabs,
+                format!(
+                    "paste refused: {} KiB is over {} KiB",
+                    bytes.div_ceil(1024),
+                    crate::input::PASTE_LIMIT / 1024
+                ),
+            );
+            redraw_row(pane, tabs, chrome)?;
+        }
+        Input::Paste(text) => {
+            // A paste is a person working on this page, as a key is.
+            chrome.motion.input(Instant::now());
+            paste(pane, tabs, chrome, &text)?;
+        }
         Input::Key(key) => {
             // A key is a person working on this page, which is a reason not to
             // interrupt them with a screenshot — see [`motion::INPUT_QUIET`].
@@ -1528,6 +1575,21 @@ fn handle_input(
                 // tab it is on — is an answer too; the rest wait for it, and
                 // every key that is not one of the program's is the answer.
                 match command {
+                    // On a `prompt()` the line being typed is the only text
+                    // on the screen the person can mean; on the others there
+                    // is nothing, and the page cannot be asked.
+                    Some(Command::CopySelection) => {
+                        let typed = tabs
+                            .active()
+                            .and_then(|tab| tab.dialog.as_ref())
+                            .filter(|dialog| dialog.typing())
+                            .map(|dialog| dialog.line.text.clone());
+                        if let Some(typed) = typed {
+                            copy_out(pane, tabs, &typed, Copied::Text)?;
+                            redraw_row(pane, tabs, chrome)?;
+                        }
+                        return Ok(true);
+                    }
                     Some(command) if survives_dialog(command) => {}
                     Some(_) => return Ok(true),
                     None => return answer_dialog(pane, tabs, chrome, key),
@@ -1616,6 +1678,28 @@ fn handle_input(
                         redraw_row(pane, tabs, chrome)?;
                     }
                 }
+                Some(Command::CopyUrl) => {
+                    let url = tabs.active().map(|tab| tab.url.clone()).unwrap_or_default();
+                    copy_out(pane, tabs, &url, Copied::Url)?;
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(Command::CopySelection) => {
+                    let answer = tabs.active_mut().map(|tab| {
+                        tab.connection.call_within(
+                            "Runtime.evaluate",
+                            clipboard::selection_params(),
+                            SELECTION_TIMEOUT,
+                        )
+                    });
+                    match answer.map(|reply| reply.map(|reply| clipboard::selection(&reply))) {
+                        Some(Ok(Some(text))) if !text.is_empty() => {
+                            copy_out(pane, tabs, &text, Copied::Text)?;
+                        }
+                        Some(Err(_)) => note(tabs, "the page did not answer"),
+                        _ => note(tabs, "nothing selected"),
+                    }
+                    redraw_row(pane, tabs, chrome)?;
+                }
                 None => {
                     if let Some(tab) = tabs.active_mut() {
                         send_key(&mut tab.connection, &key);
@@ -1675,6 +1759,11 @@ enum Command {
     PreviousTab,
     /// The nth tab, counted from one.
     SelectTab(usize),
+    /// `alt+c`: the page's selection to the host's clipboard — or, with the
+    /// url bar or a `prompt()`'s line open, that line.
+    CopySelection,
+    /// `alt+u`: the current url to the host's clipboard.
+    CopyUrl,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -1688,6 +1777,12 @@ enum Command {
 /// reload, a back or a forward to a page that is stopped would be queued
 /// behind its dialog and done the moment it was answered, which is a
 /// navigation nobody would remember asking for by then.
+///
+/// Copying the url survives too: it reads what this program already knows and
+/// touches the page not at all. Copying the selection does not, because it
+/// asks the page, and a page stopped behind a dialog answers nothing until the
+/// deadline — except on a `prompt()`, where it copies the line being typed,
+/// which [`handle_input`] does before it gets here.
 fn survives_dialog(command: Command) -> bool {
     match command {
         Command::Quit
@@ -1695,8 +1790,13 @@ fn survives_dialog(command: Command) -> bool {
         | Command::CloseTab
         | Command::NextTab
         | Command::PreviousTab
-        | Command::SelectTab(_) => true,
-        Command::EditUrl | Command::Reload | Command::Back | Command::Forward => false,
+        | Command::SelectTab(_)
+        | Command::CopyUrl => true,
+        Command::EditUrl
+        | Command::Reload
+        | Command::Back
+        | Command::Forward
+        | Command::CopySelection => false,
     }
 }
 
@@ -1786,6 +1886,23 @@ fn stayed(tab: &mut Tab<Client>) {
 /// terminal that does not speak it, ctrl+tab arrives as a plain tab and goes
 /// to the page — which is the right failure, since the page is where tab
 /// usually belongs.
+///
+/// Copying is `alt+c` and `alt+u`, not `ctrl+shift+c`, because a key the
+/// terminal never sends is not a key this program can bind. Every terminal it
+/// runs in takes `ctrl+shift+c` and `ctrl+shift+v` for its own copy and paste
+/// before a pane sees a byte: Kitty, WezTerm and Ghostty on Linux, and tOS
+/// since #153 (`compositor/tos-session/src/keys.rs`, where "a program in a
+/// pane can no longer be sent ctrl+shift+c or ctrl+shift+v by any means").
+/// That is also how a paste gets in: the terminal's own paste key sends it,
+/// bracketed, and it goes wherever the typing is — see [`paste`]. `ctrl+c`
+/// and `ctrl+v` stay the page's, as they were: the engine copies and pastes
+/// within itself with them, which is how a page expects them to work, and a
+/// page's editor would lose them otherwise. `ctrl+y` is an editor's redo and
+/// `ctrl+insert` is WezTerm's copy. `alt` is the modifier this program
+/// already uses for its own movement and the compositor uses for nothing, and
+/// `alt+letter` is left to the program by Kitty, WezTerm and Ghostty alike.
+/// What it shadows on a page is an `accesskey` on `c` or `u`, on the same
+/// terms `alt+1`..`alt+9` already shadow the digits.
 fn command(key: &KeyInput) -> Option<Command> {
     if key.action == KeyAction::Release {
         return None;
@@ -1807,6 +1924,8 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Left => Some(Command::Back),
             Key::Right => Some(Command::Forward),
             Key::Char(digit @ '1'..='9') => Some(Command::SelectTab(digit as usize - '0' as usize)),
+            Key::Char('c') => Some(Command::CopySelection),
+            Key::Char('u') => Some(Command::CopyUrl),
             _ => None,
         };
     }
@@ -1822,6 +1941,22 @@ fn edit_url(
 ) -> Result<bool, String> {
     if key.action == KeyAction::Release {
         return Ok(true);
+    }
+    // The copy keys, before the editor sees them: they leave the line as it
+    // is, the selection included. What is on the row while the line is open
+    // is the line, so that is what `alt+c` copies.
+    match command(&key) {
+        Some(Command::CopySelection) => {
+            let typed = chrome.editing.clone().unwrap_or_default();
+            copy_out(pane, tabs, &typed, Copied::Text)?;
+            return Ok(true);
+        }
+        Some(Command::CopyUrl) => {
+            let url = tabs.active().map(|tab| tab.url.clone()).unwrap_or_default();
+            copy_out(pane, tabs, &url, Copied::Url)?;
+            return Ok(true);
+        }
+        _ => {}
     }
     let whole = std::mem::take(&mut chrome.editing_whole);
     let Some(buffer) = chrome.editing.as_mut() else {
@@ -1848,6 +1983,142 @@ fn edit_url(
     }
     redraw_row(pane, tabs, chrome)?;
     Ok(true)
+}
+
+/// A paste, put wherever the typing is.
+///
+/// The url bar if it is open, because the person pressed `ctrl+l` and that
+/// is where they are typing; then a `prompt()`'s line on the page in front;
+/// then the page. A paste on an alert, a confirm or a "leave this page?" is
+/// dropped: a paste is not "any key", and answering "delete these files?"
+/// with the clipboard's contents would be worse than not pasting at all.
+///
+/// Into the page it is one `Input.insertText` carrying the whole paste, and
+/// never keystrokes. Measured against `chrome-headless-shell` 153, that is
+/// the engine doing exactly what a paste should: a `<textarea>` keeps the
+/// newlines and the tabs, an `<input>` turns each newline into a space, `\r\n`
+/// and `\r` come out as `\n`, and nothing anywhere fires a `keydown`, a
+/// `keypress` or a form's `submit` — where the Enter key into the same
+/// `<input>` fires all three. It goes into the focused element, in whichever
+/// frame has the focus, which is where the person's last click put it. A
+/// notification rather than a call, because the most a paste within
+/// [`crate::input::PASTE_LIMIT`] costs is about five seconds of renderer (the
+/// table is in [`crate::input`]), and a loop sitting in a call for them would
+/// be a loop not reading the terminal.
+fn paste(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    text: &str,
+) -> Result<(), String> {
+    if let Some(buffer) = chrome.editing.as_mut() {
+        let whole = std::mem::take(&mut chrome.editing_whole);
+        paste_into_line(buffer, whole, text);
+        return redraw_row(pane, tabs, chrome);
+    }
+    if asking(tabs) {
+        let pasted = tabs
+            .active_mut()
+            .and_then(|tab| tab.dialog.as_mut())
+            .is_some_and(|dialog| paste_into_dialog(dialog, text));
+        if pasted {
+            redraw_row(pane, tabs, chrome)?;
+        }
+        return Ok(());
+    }
+    if let Some(tab) = tabs.active_mut() {
+        let _ = tab
+            .connection
+            .notify("Input.insertText", keys::insert_text(text));
+    }
+    Ok(())
+}
+
+/// A paste into a line being typed: the url bar's, or a `prompt()`'s.
+///
+/// What is kept of it is [`clipboard::one_line`], and it goes at the end,
+/// where a key's character goes. A line still offered whole is replaced by
+/// it, as the first key would replace it — a url pasted over the address
+/// `ctrl+l` showed is the url, not the two glued together. A paste that is
+/// nothing once it is one line changes nothing, the selection included.
+fn paste_into_line(buffer: &mut String, whole: bool, text: &str) {
+    let text = clipboard::one_line(text);
+    if text.is_empty() {
+        return;
+    }
+    if whole {
+        buffer.clear();
+    }
+    buffer.push_str(&text);
+}
+
+/// A paste into a dialog: into its line if it is a `prompt()`, and `false`,
+/// with nothing changed, for every other kind.
+fn paste_into_dialog(dialog: &mut Dialog, text: &str) -> bool {
+    if !dialog.typing() {
+        return false;
+    }
+    let whole = std::mem::take(&mut dialog.line.whole);
+    paste_into_line(&mut dialog.line.text, whole, text);
+    true
+}
+
+/// What a copy was of, for the sentence that says it happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Copied {
+    Url,
+    Text,
+}
+
+/// Put `text` on the host's clipboard, by way of the terminal, and say so on
+/// the active tab's row.
+///
+/// The sentence says what was copied and how much, never the text itself.
+/// The row is the one place a page's words could talk to the terminal, and a
+/// copy has no reason to put a selection there. Over
+/// [`clipboard::MAX_COPY`] nothing is written and the sentence says why. Nor
+/// for nothing at all — an empty line, a page with no url yet — because an
+/// empty OSC 52 is, to some terminals, an instruction to clear the clipboard,
+/// and a copy of nothing is not a request for that.
+fn copy_out(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    text: &str,
+    what: Copied,
+) -> Result<(), String> {
+    if text.is_empty() {
+        note(tabs, "nothing to copy");
+        return Ok(());
+    }
+    let Some(bytes) = clipboard::osc52(text) else {
+        note(
+            tabs,
+            format!("copy refused: over {} KiB", clipboard::MAX_COPY / 1024),
+        );
+        return Ok(());
+    };
+    pane.write(&bytes).map_err(|e| e.to_string())?;
+    note(tabs, copied(text, what));
+    Ok(())
+}
+
+/// The sentence for a copy that went out.
+fn copied(text: &str, what: Copied) -> String {
+    match what {
+        Copied::Url => "copied url".to_string(),
+        Copied::Text => match text.chars().count() {
+            1 => "copied 1 character".to_string(),
+            n => format!("copied {n} characters"),
+        },
+    }
+}
+
+/// A sentence on the active tab's row, in place of its title until the next
+/// landing, as "nothing to go back to" is.
+fn note(tabs: &mut Tabs<Client>, sentence: impl Into<String>) {
+    if let Some(tab) = tabs.active_mut() {
+        tab.note = Some(sentence.into());
+    }
 }
 
 /// Walk the active tab's history by one entry.
@@ -2131,6 +2402,81 @@ mod tests {
         assert_eq!(survives(Key::Char('y'), 0), None);
         assert_eq!(survives(Key::Enter, 0), None);
         assert_eq!(survives(Key::Escape, 0), None);
+    }
+
+    #[test]
+    fn copying_is_alt_c_and_alt_u_and_ctrl_c_and_ctrl_v_stay_the_pages() {
+        assert_eq!(
+            command(&key(Key::Char('c'), Mods::ALT)),
+            Some(Command::CopySelection)
+        );
+        assert_eq!(
+            command(&key(Key::Char('u'), Mods::ALT)),
+            Some(Command::CopyUrl)
+        );
+        // The engine's own copy and paste, within the page.
+        assert_eq!(command(&key(Key::Char('c'), Mods::CTRL)), None);
+        assert_eq!(command(&key(Key::Char('v'), Mods::CTRL)), None);
+        assert_eq!(command(&key(Key::Char('v'), Mods::ALT)), None);
+        assert_eq!(command(&key(Key::Char('c'), Mods::CTRL | Mods::ALT)), None);
+        assert_eq!(command(&key(Key::Char('c'), 0)), None);
+
+        // The url is this program's to copy whatever the page is doing; the
+        // selection has to be asked of a page that may be stopped.
+        assert!(survives_dialog(Command::CopyUrl));
+        assert!(!survives_dialog(Command::CopySelection));
+    }
+
+    #[test]
+    fn a_paste_into_a_line_is_one_line_and_replaces_what_was_offered() {
+        let mut buffer = "https://example.com/offered".to_string();
+        paste_into_line(&mut buffer, true, "https://pasted.example/\r\n");
+        assert_eq!(buffer, "https://pasted.example/");
+        paste_into_line(&mut buffer, false, "a\tb\x1b[2J");
+        assert_eq!(buffer, "https://pasted.example/ab[2J");
+        // A paste that is nothing once it is one line changes nothing.
+        let mut buffer = "offered".to_string();
+        paste_into_line(&mut buffer, true, "\r\n");
+        assert_eq!(buffer, "offered");
+    }
+
+    #[test]
+    fn a_prompt_takes_a_paste_and_the_other_dialogs_do_not() {
+        let asked = |kind: &str| {
+            Dialog::opening(
+                &Json::parse(&format!(
+                    r#"{{"type":"{kind}","message":"m","url":"u","defaultPrompt":"default"}}"#
+                ))
+                .expect("the test's own JSON"),
+            )
+            .expect("a dialog")
+        };
+        let mut prompt = asked("prompt");
+        assert!(paste_into_dialog(&mut prompt, "pasted\n"));
+        assert_eq!(prompt.line.text, "pasted", "over the default, as a key");
+        assert!(!prompt.line.whole);
+        assert!(paste_into_dialog(&mut prompt, " more"));
+        assert_eq!(prompt.line.text, "pasted more");
+        // And it is still a question waiting on a key: a paste is not Enter.
+        assert_eq!(
+            prompt.step(&key(Key::Char('x'), Mods::SHIFT)),
+            Answer::Waiting
+        );
+
+        for kind in ["alert", "confirm", "beforeunload"] {
+            let mut dialog = asked(kind);
+            let before = dialog.clone();
+            assert!(!paste_into_dialog(&mut dialog, "y\n"), "{kind}");
+            assert_eq!(dialog, before, "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_copy_says_how_much_and_never_what() {
+        assert_eq!(copied("https://example.com", Copied::Url), "copied url");
+        assert_eq!(copied("日本語", Copied::Text), "copied 3 characters");
+        assert_eq!(copied("a", Copied::Text), "copied 1 character");
+        assert!(!copied("\x1b]0;secret\x07", Copied::Text).contains("secret"));
     }
 
     #[test]

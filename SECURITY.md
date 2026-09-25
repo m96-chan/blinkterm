@@ -64,6 +64,16 @@ machine. It prints a warning when it does. Do not browse as root.
   by construction: it arrives as decoded pixels and is written as a graphics
   payload, never as text.
 
+  A paste is page-adjacent in the same sense — a page's "copy" button may be
+  what put it on your clipboard — so pasted text shown on the row, in the url
+  bar or a `prompt()`'s line, is kept to one line of plain text as it is
+  pasted and goes through the same `text::sanitize` as the title as the row is
+  built. Nothing on the row is ever the text of a copy: `alt+c` says how many
+  characters it copied, not which. The copy itself is written as OSC 52 with
+  a base64 payload, an alphabet a terminal cannot be spoken to in, and
+  `blinkterm` never sends the OSC 52 query that would ask your terminal to
+  hand your clipboard back ([#9](https://github.com/m96-chan/blinkterm/issues/9)).
+
 - **Files a page hands over.** A download's name is the page's
   (`Content-Disposition`, the `download` attribute, the url). The engine
   sanitizes it once and `blinkterm` again: one path component, control and

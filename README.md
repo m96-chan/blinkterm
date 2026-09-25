@@ -157,11 +157,21 @@ directory, which is the engine's partial file and is safe to delete.
 | `ctrl+w` | close this tab; closing the last one quits |
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
 | `alt+1` … `alt+9` | the nth tab |
+| your terminal's paste key | pastes into the page, the url bar, or a `prompt()` — whichever has the cursor |
+| `alt+c` | copy the page's selection to your clipboard; with the url bar or a `prompt()` open, copy that line |
+| `alt+u` | copy the page's url to your clipboard |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 
 Everything else goes to the page, including the mouse. A link that asks for a
 new window gets a new tab, and the tab is switched to.
+
+`ctrl+c` and `ctrl+v` are the page's own: they copy and paste within the
+engine, not with your clipboard. Your terminal's paste key (`ctrl+shift+v`, a
+middle click) is how text gets in, and `alt+c` is how it gets out. A paste
+reaches the page as text, never as keys, so the newlines in it do not submit
+a form; one over 64 KiB is refused whole rather than cut. Copying goes out as
+OSC 52, which your terminal may need to be told to allow.
 
 While a page is waiting on its dialog, only the tab keys and `ctrl+q` still
 work, and the page gets no keys or mouse until it has its answer. A tab behind

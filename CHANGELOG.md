@@ -39,6 +39,11 @@ carry, and the list is kept as things land rather than written at the end.
   (1).pdf` rather than an overwrite when the name is taken, progress and
   where it went on the status row, and the page left where it was
   ([#10](https://github.com/m96-chan/blinkterm/issues/10)).
+- The clipboard: the terminal's paste key pastes into the page, the url bar or
+  a `prompt()` as text rather than keystrokes (bracketed paste; a newline no
+  longer submits a form, and a paste over 64 KiB is refused whole), `alt+c`
+  copies the page's selection and `alt+u` the url to the host's clipboard over
+  OSC 52 ([#9](https://github.com/m96-chan/blinkterm/issues/9)).
 
 ### Changed
 

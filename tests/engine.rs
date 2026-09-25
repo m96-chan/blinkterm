@@ -519,6 +519,198 @@ fn a_click_lands_where_the_cell_was() {
 }
 
 // ---------------------------------------------------------------------------
+// The clipboard
+// ---------------------------------------------------------------------------
+
+/// A form with a textarea and a one-line input, a paragraph to select, and a
+/// log of every key and every submission, which is what a paste must not
+/// cause.
+const FORM: &str = "data:text/html,<body style='margin:0'>\
+<form id=f><textarea id=t></textarea><input id=i></form>\
+<p id=p style='font:16px monospace'>Some paragraph text to select, and more after it.</p>\
+<script>window.log=[];\
+f.addEventListener('submit',function(e){e.preventDefault();log.push('submit')});\
+document.addEventListener('keydown',function(){log.push('keydown')});\
+document.title='ready';</script></body>";
+
+/// Evaluate an expression in the page and hand back its value.
+fn evaluate(client: &mut Client, expression: &str) -> Json {
+    client
+        .call_within(
+            "Runtime.evaluate",
+            Json::object(vec![
+                ("expression", Json::string(expression)),
+                ("returnByValue", Json::Bool(true)),
+            ]),
+            Duration::from_secs(5),
+        )
+        .ok()
+        .and_then(|reply| reply.path(&["result", "value"]).cloned())
+        .unwrap_or(Json::Null)
+}
+
+fn form(client: &mut Client) {
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(FORM))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+}
+
+/// A paste is one `Input.insertText`, exactly as the loop sends it, and the
+/// engine takes it as text: kept whole in a textarea, one line in an input,
+/// and not a key or a submission in either.
+#[test]
+fn a_multi_line_paste_lands_in_a_textarea_and_submits_nothing() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    form(&mut client);
+
+    let pasted = "line one\nline two\n\nline four\ttabbed";
+    evaluate(&mut client, "t.focus()");
+    client
+        .call("Input.insertText", keys::insert_text(pasted))
+        .expect("the paste is sent");
+    assert_eq!(evaluate(&mut client, "t.value").as_str(), Some(pasted));
+
+    // tOS sends every newline as `\r`, and Kitty what the clipboard held; the
+    // engine makes them all `\n`.
+    evaluate(&mut client, "t.value=''");
+    client
+        .call("Input.insertText", keys::insert_text("a\r\nb\rc"))
+        .expect("the paste is sent");
+    assert_eq!(evaluate(&mut client, "t.value").as_str(), Some("a\nb\nc"));
+
+    evaluate(&mut client, "i.focus()");
+    client
+        .call("Input.insertText", keys::insert_text("first\nsecond\n"))
+        .expect("the paste is sent");
+    // The input's value is read after whatever the paste might have queued.
+    assert_eq!(
+        evaluate(&mut client, "i.value").as_str(),
+        Some("first second")
+    );
+    assert_eq!(
+        evaluate(&mut client, "log.join(',')").as_str(),
+        Some(""),
+        "a paste fired no key and submitted nothing"
+    );
+
+    // The control: an Enter key into the same input does both, so the log
+    // was listening. With its `\r`, which is what makes the engine run the
+    // form's implicit submission; a `keyDown` without text is only a keydown.
+    let enter = KeyInput {
+        key: Key::Enter,
+        mods: Mods::default(),
+        action: KeyAction::Press,
+        text: Some('\r'),
+    };
+    client
+        .call(
+            "Input.dispatchKeyEvent",
+            keys::dispatch(&enter).expect("enter has a name"),
+        )
+        .expect("the key is sent");
+    assert_eq!(
+        evaluate(&mut client, "log.join(',')").as_str(),
+        Some("keydown,submit")
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// What the person dragged over is what `alt+c` asks the page for, and the
+/// bytes it becomes are read by a terminal as that text on its clipboard.
+#[test]
+fn a_selection_copies_out_as_the_bytes_a_terminal_reads_as_a_clipboard() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    form(&mut client);
+
+    let number = |json: Json| json.as_f64().expect("a number");
+    let top = number(evaluate(&mut client, "p.getBoundingClientRect().top"));
+    let left = number(evaluate(&mut client, "p.getBoundingClientRect().left"));
+    let (y, from) = (top + 8.0, left + 1.0);
+    for (kind, x, buttons) in [
+        ("mousePressed", from, 1),
+        ("mouseMoved", from + 60.0, 1),
+        ("mouseMoved", from + 120.0, 1),
+        ("mouseReleased", from + 120.0, 0),
+    ] {
+        client
+            .call(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(x)),
+                    ("y", Json::number(y)),
+                    ("button", Json::string("left")),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(0)),
+                ]),
+            )
+            .expect("the drag is sent");
+    }
+    let reply = client
+        .call_within(
+            "Runtime.evaluate",
+            blinkterm::clipboard::selection_params(),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers");
+    let selected = blinkterm::clipboard::selection(&reply).expect("a string");
+    assert!(
+        selected.starts_with("Some para") && selected.len() < 30,
+        "{selected:?}"
+    );
+
+    let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+    terminal.advance(&blinkterm::clipboard::osc52(&selected).expect("under the limit"));
+    let stored: Vec<_> = terminal
+        .take_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            tos_term::TermEvent::ClipboardStore { selection, data } => Some((selection, data)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stored, vec![('c', selected.into_bytes())]);
+
+    // A range selected inside a textarea is the same question's answer.
+    evaluate(
+        &mut client,
+        "getSelection().removeAllRanges();t.value='alpha beta gamma';t.focus();\
+         t.setSelectionRange(6,10)",
+    );
+    let reply = client
+        .call_within(
+            "Runtime.evaluate",
+            blinkterm::clipboard::selection_params(),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers");
+    assert_eq!(
+        blinkterm::clipboard::selection(&reply).as_deref(),
+        Some("beta")
+    );
+
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
 // Tabs
 // ---------------------------------------------------------------------------
 

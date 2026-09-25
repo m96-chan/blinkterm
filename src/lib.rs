@@ -119,6 +119,7 @@
 pub mod app;
 pub mod base64;
 pub mod cdp;
+pub mod clipboard;
 pub mod dialog;
 pub mod download;
 pub mod engine;
