@@ -171,14 +171,18 @@ jobs:
       # It goes in the log rather than into a pin because pinning it would mean
       # testing against an engine nobody is running.
       #
-      # --no-sandbox even here. This job is root in a container, and Chromium
-      # refuses to start as root without it for *any* invocation, `--version`
-      # included -- which tools/run.sh has said in a comment since it was
-      # written. Doubling as a smoke test: if the binary will not report its
-      # own version, the two and a half minutes of tests below are not going
-      # to tell anybody anything they do not already know.
+      # Asked of dpkg rather than of the binary. `chromium-shell --version`
+      # looks like the obvious way to do this and is not: Chromium refuses to
+      # run as root without --no-sandbox even to print its version, and then
+      # still initialises Ozone, picks X11 and dies on "Missing X server or
+      # $DISPLAY" unless --ozone-platform=headless is there too. Both of those
+      # are written down in tools/run.sh, and both were rediscovered here the
+      # expensive way. The package version is what apt installed, which is the
+      # thing that changes underneath this job anyway, and dpkg cannot fail to
+      # report it -- a line that exists to say what happened should not be
+      # able to decide whether the job passes.
       - name: Say which engine this is
-        run: chromium-shell --no-sandbox --version
+        run: dpkg-query -W -f='chromium-shell ${Version}\n' chromium-shell
       - uses: Swatinem/rust-cache@v2
       # --release because several of these tests assert on timings: the rest
       # interval before a still, the frame rate under a steady wheel, the cost
