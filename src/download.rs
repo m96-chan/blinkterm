@@ -675,6 +675,36 @@ impl Downloads {
         self.quitting = true;
     }
 
+    /// The engine is gone: every download still coming is over, and did not
+    /// arrive. Each becomes `Failed(Some("the engine died"))`, and the newest
+    /// of them is the row's notice for [`NOTICE_FOR`], as a `canceled` would
+    /// be. `true` when the row's words changed.
+    ///
+    /// Not [`quit`]: the program goes on, on a new engine, and a download
+    /// that begins there is news like any other. The partial files are the
+    /// caller's to remove — this never touches the file system on an event —
+    /// and they stay in [`partials`] until they are.
+    ///
+    /// [`quit`]: Downloads::quit
+    /// [`partials`]: Downloads::partials
+    pub fn engine_died(&mut self, now: Instant) -> bool {
+        const WHY: &str = "the engine died";
+        let before = self.line(now);
+        let mut newest = None;
+        for download in self
+            .list
+            .iter_mut()
+            .filter(|download| download.state == State::InProgress)
+        {
+            download.state = State::Failed(Some(WHY.to_string()));
+            newest = Some(screen::clip_to(&download.name, NAME_CELLS));
+        }
+        if let Some(name) = newest {
+            self.notice = Some((format!("couldn't save {name}: {WHY}"), now + NOTICE_FOR));
+        }
+        self.line(now) != before
+    }
+
     /// Ask the engine to stop every download still coming, and [`quit`].
     ///
     /// One `Browser.cancelDownload` each, all of them within a second: the
@@ -1234,6 +1264,39 @@ mod tests {
         let line = downloads.line(now).expect("a sentence");
         assert!(line.starts_with("couldn't save gone.bin: "), "{line}");
         assert!(!dir.join("gone.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_download_in_flight_when_the_engine_dies_is_a_failure_that_says_so() {
+        let dir = scratch("died");
+        let now = Instant::now();
+        let mut downloads = Downloads::new(dir.clone());
+        downloads.take(&began(GUID, "a"), now);
+        downloads.take(&began(GUID_2, "b"), now);
+        assert!(downloads.engine_died(now));
+        let died = State::Failed(Some("the engine died".to_string()));
+        assert!(downloads
+            .all()
+            .iter()
+            .all(|download| download.state == died));
+        assert_eq!(
+            downloads.line(now).as_deref(),
+            Some("couldn't save b: the engine died")
+        );
+        assert_eq!(
+            downloads.partials(),
+            [
+                dir.join(format!("{GUID}.crdownload")),
+                dir.join(format!("{GUID_2}.crdownload"))
+            ]
+        );
+        assert!(!downloads.engine_died(now), "nothing left in flight");
+
+        // A relaunch is not a quit: the next download is news.
+        downloads.take(&began(GUID_3, "c"), now);
+        assert_eq!(downloads.all()[2].state, State::InProgress);
+        assert_eq!(downloads.line(now).as_deref(), Some("downloading c 0 B"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
