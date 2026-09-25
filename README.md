@@ -200,6 +200,7 @@ not a thing a terminal has.
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
+| `esc` | while a page is loading and nothing else has the row, stop it |
 
 Everything else goes to the page, including the mouse. A link that asks for a
 new window gets a new tab, and the tab is switched to.
@@ -254,6 +255,34 @@ stop the page, and the mouse still reaches it. A tab behind with a path
 waiting is marked `!` as one with a dialog is. A dialog the page opens while a
 path is half typed takes the row first; the path is there again once it is
 answered.
+
+## The status row
+
+The top row is the page's title and url, and four other things when they
+apply. A link under the pointer shows where it goes — `link: https://…` —
+which is the one defence against a link whose text says one place and whose
+href says another; the url shown is the one the engine resolved, with
+control characters and invisible characters removed. A plain `http://` page
+on a host that is not this machine is marked `not secure` before its title;
+`https://`, `file:` and `localhost` get nothing, as in a desktop browser. A
+page that is loading says `esc stops` at the right, and after a second how
+many seconds it has been going — no percentage, because without the
+engine's network domain there is nothing honest to compute one from, and
+that domain costs more than the row is worth (`src/load.rs` has the
+numbers). `esc` stops the load and leaves the page where it was: the
+previous page if nothing had arrived, the half-loaded page if something had.
+A terminal that understands OSC 22 (Kitty, Ghostty) also gets a hand over a
+link and an I-beam over a text field; the rest ignore it.
+
+The url bar, the find prompt, a page's dialog and a file input's path take
+the whole row while they are open, and `esc` goes to whichever of them has it
+before it stops a load; no link is shown while one of them is there.
+
+To know what is under the pointer the terminal is asked to report every
+mouse movement, not only presses (`?1003h`), so the page now sees the
+pointer move — hover styling and tooltips work — at the cost of one small
+command to the engine per screen refresh while it moves and nothing while
+it rests.
 
 ## Tests
 

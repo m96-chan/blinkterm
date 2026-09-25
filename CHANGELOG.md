@@ -66,6 +66,12 @@ carry, and the list is kept as things land rather than written at the end.
   clears. Case-insensitive, CJK included, same-origin frames included,
   hidden text excluded; nothing in the page is modified
   ([#12](https://github.com/m96-chan/blinkterm/issues/12)).
+- The status row: a link under the pointer shows where it goes (`link:
+  https://…`), a plain-http page on a named host is marked `not secure`, a
+  loading page says `esc stops` and counts the seconds, and `esc` stops it.
+  The terminal is asked for all mouse motion (mode 1003) and, where it
+  understands OSC 22, told the pointer's shape
+  ([#15](https://github.com/m96-chan/blinkterm/issues/15)).
 
 ### Changed
 
@@ -79,6 +85,7 @@ carry, and the list is kept as things land rather than written at the end.
   `http://`, not `https://`.
 - `ctrl+u` in the url bar deletes to the start of the line rather than the
   whole line — the same thing until the cursor could move.
+- Pages now see the pointer move, not only click and drag.
 
 - The minimum Rust is **1.87**. It was documented as 1.75, which had never been
   true: the dependency closure has not built below 1.87. It is checked by CI

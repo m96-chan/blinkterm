@@ -126,6 +126,7 @@ pub mod engine;
 pub mod find;
 pub mod graphics;
 pub mod history;
+pub mod hover;
 pub mod input;
 pub mod json;
 pub mod keys;

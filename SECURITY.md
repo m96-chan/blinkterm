@@ -74,6 +74,12 @@ machine. It prints a warning when it does. Do not browse as root.
   `blinkterm` never sends the OSC 52 query that would ask your terminal to
   hand your clipboard back ([#9](https://github.com/m96-chan/blinkterm/issues/9)).
 
+  The hover url is the page's string and goes through the same sanitizer as
+  the title (#28). The pointer shape sent to the terminal is one of a fixed
+  table of names this program owns — the page's `cursor` value chooses among
+  them and is never itself written
+  ([#15](https://github.com/m96-chan/blinkterm/issues/15)).
+
 - **Files a page hands over.** A download's name is the page's
   (`Content-Disposition`, the `download` attribute, the url). The engine
   sanitizes it once and `blinkterm` again: one path component, control and

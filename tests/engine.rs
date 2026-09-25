@@ -2667,6 +2667,7 @@ fn a_temporary_profile_leaves_nothing_on_disk() {
 // Failed loads
 // ---------------------------------------------------------------------------
 
+use blinkterm::hover;
 use blinkterm::load::{self, Landing, Loaded, Problem};
 
 /// A server with the troubles a page can have, and a port that has none of
@@ -2679,6 +2680,12 @@ use blinkterm::load::{self, Landing, Loaded, Problem};
 /// is one the kernel handed out and this test gave back, so nothing is on it
 /// and nothing will be while the test runs. The base comes back without a
 /// trailing slash, so that `base + "/404"` is the url.
+///
+/// And the slow ones: `/hang` accepts and never answers, `/slowbody` sends
+/// its headers and half a body and then nothing, and `/leave` is a page
+/// whose top-left corner is a link into `/hang`. `/links` is the hover's
+/// page: links of several kinds at known places. Each connection is served
+/// on a thread of its own, so a hang holds its own socket and nobody else's.
 fn serve_troubles() -> (String, u16) {
     use std::io::{Read, Write};
     let closed = {
@@ -2689,44 +2696,69 @@ fn serve_troubles() -> (String, u16) {
     let address = listener.local_addr().expect("an address");
     std::thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            let mut head = [0u8; 2048];
-            let read = stream.read(&mut head).unwrap_or(0);
-            let request = String::from_utf8_lossy(&head[..read]).to_string();
-            let path = request.split(' ').nth(1).unwrap_or("/").to_string();
-            let dead = format!("http://127.0.0.1:{closed}/");
-            let (status, extra, body) = match path.as_str() {
-                "/404" => (
-                    "404 Not Found",
-                    String::new(),
-                    "<!doctype html><title>nope</title><p>not here".to_string(),
-                ),
-                "/500" => (
-                    "500 Internal Server Error",
-                    String::new(),
-                    "<!doctype html><title>broken</title><p>broken".to_string(),
-                ),
-                "/redir" => ("302 Found", format!("Location: {dead}\r\n"), String::new()),
-                "/link" => (
-                    "200 OK",
-                    String::new(),
-                    format!(
-                        "<!doctype html><title>link</title><body style='margin:0'>\
+            std::thread::spawn(move || {
+                let mut head = [0u8; 2048];
+                let read = stream.read(&mut head).unwrap_or(0);
+                let request = String::from_utf8_lossy(&head[..read]).to_string();
+                let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+                let dead = format!("http://127.0.0.1:{closed}/");
+                if path == "/hang" {
+                    std::thread::sleep(Duration::from_secs(60));
+                    return;
+                }
+                if path == "/slowbody" {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 100000\r\n\
+                      Connection: close\r\n\r\n<!doctype html><title>slowbody</title>\
+                      <p>the first half of a page that never finishes ",
+                    );
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_secs(60));
+                    return;
+                }
+                let (status, extra, body) = match path.as_str() {
+                    "/404" => (
+                        "404 Not Found",
+                        String::new(),
+                        "<!doctype html><title>nope</title><p>not here".to_string(),
+                    ),
+                    "/500" => (
+                        "500 Internal Server Error",
+                        String::new(),
+                        "<!doctype html><title>broken</title><p>broken".to_string(),
+                    ),
+                    "/redir" => ("302 Found", format!("Location: {dead}\r\n"), String::new()),
+                    "/link" => (
+                        "200 OK",
+                        String::new(),
+                        format!(
+                            "<!doctype html><title>link</title><body style='margin:0'>\
                          <a href='{dead}' style='display:block;position:absolute;\
                          left:0;top:0;width:240px;height:80px;background:#cc3'>dead</a>"
+                        ),
                     ),
-                ),
-                _ => (
-                    "200 OK",
-                    String::new(),
-                    "<!doctype html><title>fine</title><p>fine".to_string(),
-                ),
-            };
-            let answer = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{extra}\
+                    "/leave" => (
+                        "200 OK",
+                        String::new(),
+                        "<!doctype html><title>leave</title><body style='margin:0'>\
+                     <a href='/hang' style='display:block;position:absolute;\
+                     left:0;top:0;width:240px;height:80px;background:#cc3'>hang</a>"
+                            .to_string(),
+                    ),
+                    "/links" => ("200 OK", String::new(), LINKS.to_string()),
+                    _ => (
+                        "200 OK",
+                        String::new(),
+                        "<!doctype html><title>fine</title><p>fine".to_string(),
+                    ),
+                };
+                let answer = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{extra}\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(answer.as_bytes());
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes());
+            });
         }
     });
     (format!("http://{address}"), closed)
@@ -3033,6 +3065,405 @@ fn the_status_of_the_document_comes_with_its_title() {
         }),
         "an error page has no title and no status"
     );
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// The hover's page: a link with markup inside it at the top left, a
+/// `javascript:` link under it, a `<div>` that only looks like one, a text
+/// field, and a link whose href tries to speak to the terminal.
+const LINKS: &str = "<!doctype html><title>links</title><body style='margin:0'>\
+<a id=a href='/target?x=1' style='position:absolute;left:0;top:0;width:100px;height:40px;\
+background:#cc3'><span><b>nested</b> text</span></a>\
+<a id=b href='javascript:void(0)' style='position:absolute;left:0;top:50px;width:100px;\
+height:40px;background:#3cc'>js</a>\
+<div id=d style='position:absolute;left:0;top:150px;width:100px;height:40px;\
+background:#999;cursor:pointer'>div pointer</div>\
+<input id=e style='position:absolute;left:0;top:200px;width:100px;height:30px'>\
+<a id=g href='http://\u{202e}evil.example/\u{1b}]0;x\u{7}' style='position:absolute;\
+left:200px;top:50px;width:100px;height:40px;background:#cc3'>hostile</a>";
+
+/// Tell the page the pointer is at `(x, y)` as `tick_hover` does, ask it
+/// what is there as `tick_hover` does — sent, and collected rather than
+/// waited on — and read the answer. With how long the answer took.
+fn hover_at(client: &mut Client, x: i32, y: i32) -> (hover::Hover, Duration) {
+    client
+        .notify(
+            "Input.dispatchMouseEvent",
+            Json::object(vec![
+                ("type", Json::string("mouseMoved")),
+                ("x", Json::number(x)),
+                ("y", Json::number(y)),
+                ("modifiers", Json::number(0)),
+                ("button", Json::string("none")),
+                ("buttons", Json::number(0)),
+            ]),
+        )
+        .expect("the move is sent");
+    let asked = Instant::now();
+    let pending = client
+        .send("Runtime.evaluate", hover::ask(x, y))
+        .expect("the ask is sent");
+    let deadline = asked + Duration::from_secs(2);
+    loop {
+        if let Some(reply) = client.take_reply(&pending) {
+            let took = asked.elapsed();
+            let reply = reply.expect("the page answers");
+            let answer = hover::answer(&reply)
+                .unwrap_or_else(|| panic!("not an answer at ({x}, {y}): {reply}"));
+            return (answer, took);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no answer about ({x}, {y}) in 2 s"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// What the row says for a link is the engine's resolved href, and the shape
+/// the terminal is told is one of the table's. A nested element inside an
+/// anchor is the anchor; a pointer cursor on something that is not a link is
+/// a hand and no href; empty page is nothing at all.
+#[test]
+fn hovering_a_link_reports_its_href_and_a_hand_and_a_plain_spot_reports_neither() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, _) = serve_troubles();
+    navigate_tab(&mut tab, &format!("{base}/links"));
+    follow(&mut tab, Duration::from_secs(10));
+    assert_eq!(tab.title, "links");
+
+    let (link, _) = hover_at(&mut tab.connection, 50, 20);
+    assert_eq!(
+        link,
+        hover::Hover {
+            href: format!("{base}/target?x=1"),
+            shape: hover::Shape::Pointer
+        }
+    );
+    assert_eq!(hover::words(&link.href), format!("link: {base}/target?x=1"));
+
+    let (script, _) = hover_at(&mut tab.connection, 50, 70);
+    assert_eq!(script.href, "javascript:void(0)", "shown as written");
+
+    let (div, _) = hover_at(&mut tab.connection, 50, 170);
+    assert_eq!(
+        div,
+        hover::Hover {
+            href: String::new(),
+            shape: hover::Shape::Pointer
+        },
+        "a hand, and no link"
+    );
+    let (field, _) = hover_at(&mut tab.connection, 50, 215);
+    assert_eq!(field.shape, hover::Shape::Text);
+    let (nothing, _) = hover_at(&mut tab.connection, 500, 340);
+    assert_eq!(nothing, hover::Hover::default());
+
+    let (hostile, _) = hover_at(&mut tab.connection, 250, 70);
+    eprintln!("the hostile href came back as {:?}", hostile.href);
+    // The engine IDNA-encodes the host with the override in it and
+    // percent-encodes the escape; either way it is a link, and plain.
+    assert!(hostile.href.contains(".example/"), "{hostile:?}");
+    assert_eq!(hostile.shape, hover::Shape::Pointer);
+    assert_eq!(
+        blinkterm::text::sanitize(&hostile.href),
+        hostile.href.as_str(),
+        "plain text already"
+    );
+    assert!(!hostile.href.chars().any(char::is_control));
+
+    // Timing, printed to be read against the table in `hover.rs`.
+    let mut took: Vec<Duration> = (0..30)
+        .map(|n| hover_at(&mut tab.connection, 10 + n, 20).1)
+        .collect();
+    took.sort();
+    eprintln!("median of thirty asks: {:?}", took[took.len() / 2]);
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// Where the tab's main frame is, as `connect_tab` reads it.
+fn learn_frame(tab: &mut Tab<Client>) {
+    let tree = tab
+        .connection
+        .call("Page.getFrameTree", Json::empty())
+        .expect("the frame tree");
+    tab.frame = load::main_frame(&tree);
+    assert!(tab.frame.is_some(), "no main frame in {tree}");
+}
+
+/// What `app::navigate` does after `edit_url` has set the tab up: sent, not
+/// waited for, with the clock started.
+fn send_navigation(tab: &mut Tab<Client>, url: &str) -> Pending {
+    let _ = tab.connection.events();
+    tab.url = url.to_string();
+    tab.note = Some(format!("loading {url}"));
+    tab.loading = true;
+    tab.problem = None;
+    tab.since = Some(Instant::now());
+    tab.committed = false;
+    tab.connection
+        .send(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the navigation is sent")
+}
+
+/// What `handle_page_events` does with the loading events, for `within`:
+/// the methods seen, in order.
+fn watch_loading(tab: &mut Tab<Client>, within: Duration) -> Vec<String> {
+    let deadline = Instant::now() + within;
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        for event in tab.connection.events() {
+            let main = load::is_main(&event.params, tab.frame.as_deref());
+            match event.method.as_str() {
+                "Page.frameStartedNavigating" => {
+                    if let Some(url) = load::started(&event.params, tab.frame.as_deref()) {
+                        tab.started(url, Instant::now());
+                    }
+                }
+                "Page.frameNavigated" => {
+                    if let Some(landing) = load::landing(&event.params) {
+                        tab.trust = load::trust(&event.params);
+                        tab.landed(landing);
+                    }
+                }
+                "Page.frameStoppedLoading" if main => tab.stopped_loading(),
+                _ => {}
+            }
+            // The load event names no frame; it is only ever the page's.
+            if main
+                || matches!(
+                    event.method.as_str(),
+                    "Page.frameNavigated" | "Page.loadEventFired"
+                )
+            {
+                seen.push(event.method);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    seen
+}
+
+/// `esc` on a page whose next page never comes: the load stops, and the tab
+/// is the page it was — its url, its title, its history — rather than a url
+/// that was typed and a note that it is loading. And past the commit, where
+/// no load event is ever coming: the half page, with its title.
+#[test]
+fn escape_while_a_page_hangs_stops_the_load_and_leaves_the_page_where_it_was() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, _) = serve_troubles();
+    navigate_tab(&mut tab, &format!("{base}/"));
+    follow(&mut tab, Duration::from_secs(10));
+    learn_frame(&mut tab);
+    assert_eq!(tab.title, "fine");
+    let entries = history_length(&mut tab.connection);
+
+    let hang = format!("{base}/hang");
+    let pending = send_navigation(&mut tab, &hang);
+    let before = watch_loading(&mut tab, Duration::from_millis(500));
+    eprintln!("before the stop: {before:?}");
+    assert!(
+        before
+            .iter()
+            .any(|method| method == "Page.frameStartedNavigating"
+                || method == "Page.frameStartedLoading"),
+        "the departure is announced: {before:?}"
+    );
+    assert!(
+        !before.iter().any(|method| method == "Page.frameNavigated"),
+        "nothing landed: {before:?}"
+    );
+    assert!(tab.loading);
+    assert!(!tab.committed);
+    assert_eq!(tab.line(), format!("loading {hang}"));
+    assert!(
+        tab.connection.take_reply(&pending).is_none(),
+        "the navigation is held"
+    );
+
+    let stopped = Instant::now();
+    blinkterm::app::stop(&mut tab);
+    let after = watch_loading(&mut tab, Duration::from_secs(1));
+    eprintln!("after the stop, {:?}: {after:?}", stopped.elapsed());
+    assert!(
+        after
+            .iter()
+            .any(|method| method == "Page.frameStoppedLoading"),
+        "the main frame stopped: {after:?}"
+    );
+    let reply = tab
+        .connection
+        .take_reply(&pending)
+        .expect("the navigation answered once stopped")
+        .expect("with a reply, not an error");
+    assert_eq!(
+        reply.get("errorText").and_then(Json::as_str),
+        Some("net::ERR_ABORTED")
+    );
+    assert_eq!(load::failed(&reply), None, "which is not a failure to say");
+    assert!(!tab.loading);
+    assert_eq!(tab.note, None);
+    assert_eq!(tab.url, format!("{base}/"));
+    assert_eq!(tab.title, "fine");
+    assert_eq!(tab.line(), format!("fine  —  {base}/"));
+    assert_eq!(history_length(&mut tab.connection), entries);
+
+    // Past the commit: headers and half a body, and then nothing.
+    let slow = format!("{base}/slowbody");
+    let _pending = send_navigation(&mut tab, &slow);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !tab.committed && Instant::now() < deadline {
+        watch_loading(&mut tab, Duration::from_millis(50));
+    }
+    assert!(tab.committed, "the half page committed");
+    assert!(tab.loading);
+    blinkterm::app::stop(&mut tab);
+    let after = watch_loading(&mut tab, Duration::from_secs(1));
+    eprintln!("after stopping the half page: {after:?}");
+    assert!(
+        after
+            .iter()
+            .any(|method| method == "Page.frameStoppedLoading"),
+        "{after:?}"
+    );
+    assert!(
+        !after.iter().any(|method| method == "Page.loadEventFired"),
+        "no load event is coming: {after:?}"
+    );
+    assert!(!tab.loading);
+    assert_eq!(tab.url, slow);
+    assert_eq!(tab.title, "slowbody");
+
+    // And a stop on a page that is not loading is nothing at all.
+    tab.connection
+        .call("Page.stopLoading", Json::empty())
+        .expect("a stop with nothing to stop is answered");
+    let idle = watch_loading(&mut tab, Duration::from_millis(300));
+    assert!(
+        !idle
+            .iter()
+            .any(|method| method == "Page.frameStoppedLoading"),
+        "{idle:?}"
+    );
+    engine.check().expect("the engine is still there");
+    assert!(blinkterm::app::page_loaded(&mut tab.connection).is_some());
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// A link clicked into a host that says nothing is announced, with its url,
+/// before any byte comes back — which is what puts `loading …` on the row at
+/// once rather than never — and `esc` takes it back off.
+#[test]
+fn a_click_that_leaves_is_announced_before_anything_comes_back() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, _) = serve_troubles();
+    navigate_tab(&mut tab, &format!("{base}/leave"));
+    follow(&mut tab, Duration::from_secs(10));
+    learn_frame(&mut tab);
+    assert_eq!(tab.title, "leave");
+    let _ = tab.connection.events();
+
+    for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+        tab.connection
+            .notify(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(20)),
+                    ("y", Json::number(20)),
+                    ("button", Json::string("left")),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(0)),
+                ]),
+            )
+            .expect("the click is dispatched");
+    }
+    let seen = watch_loading(&mut tab, Duration::from_millis(500));
+    eprintln!("after the click: {seen:?}");
+    if seen
+        .iter()
+        .any(|method| method == "Page.frameStartedNavigating")
+    {
+        assert_eq!(tab.line(), format!("loading {base}/hang"));
+        assert!(!tab.committed);
+    } else {
+        eprintln!(
+            "skipped the url: this engine sent no Page.frameStartedNavigating \
+             (older than Chromium 132)"
+        );
+    }
+    assert!(tab.loading, "either way the tab is loading: {seen:?}");
+
+    blinkterm::app::stop(&mut tab);
+    let after = watch_loading(&mut tab, Duration::from_secs(1));
+    assert!(
+        after
+            .iter()
+            .any(|method| method == "Page.frameStoppedLoading"),
+        "{after:?}"
+    );
+    assert!(!tab.loading);
+    assert_eq!(tab.line(), format!("leave  —  {base}/leave"));
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// A page on this machine over plain http is left unmarked, as a desktop
+/// browser leaves it, and the reason is the engine's: it calls loopback a
+/// secure context. The named-host case needs DNS or a resolver flag this
+/// program does not pass, so the `Insecure` branch is the unit test on the
+/// measured JSON; what this checks is that the event still has the shape
+/// that JSON has, so that a Chromium that renamed the field fails here
+/// rather than quietly un-marking every page.
+#[test]
+fn an_http_page_on_this_machine_is_not_marked_and_the_engine_says_why() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, _) = serve_troubles();
+    let _ = send_navigation(&mut tab, &format!("{base}/"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut landed = None;
+    while landed.is_none() && Instant::now() < deadline {
+        for event in tab.connection.events() {
+            if event.method == "Page.frameNavigated" && load::landing(&event.params).is_some() {
+                landed = Some(event.params);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let params = landed.expect("the page landed");
+    let context = params
+        .path(&["frame", "secureContextType"])
+        .and_then(Json::as_str);
+    assert_eq!(context, Some("SecureLocalhost"), "{params}");
+    assert_eq!(load::trust(&params), load::Trust::Plain);
+    tab.trust = load::trust(&params);
+    if let Some(landing) = load::landing(&params) {
+        tab.landed(landing);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    if let Some(loaded) = blinkterm::app::page_loaded(&mut tab.connection) {
+        tab.loaded(loaded);
+    }
+    assert!(!tab.line().contains("not secure"), "{}", tab.line());
 
     tab.connection.close();
     engine.kill();
@@ -3965,16 +4396,33 @@ fn an_attachment_is_saved_under_its_own_name_with_its_contents() {
         REPORT
     );
     let tab = tabs.active_mut().expect("the tab");
-    let navigated: Vec<_> = tab
-        .connection
-        .events()
-        .into_iter()
+    let events = tab.connection.events();
+    let navigated: Vec<_> = events
+        .iter()
         .filter(|event| event.method == "Page.frameNavigated")
         .collect();
     assert!(
         navigated.is_empty(),
         "the page went somewhere: {navigated:?}"
     );
+    // The click was announced as a departure, and the departure that turned
+    // into a file ends like any load: nothing on the row says it is still
+    // going (#15).
+    for event in &events {
+        match event.method.as_str() {
+            "Page.frameStartedNavigating" => {
+                if let Some(url) = load::started(&event.params, None) {
+                    tab.started(url, Instant::now());
+                }
+            }
+            "Page.frameStoppedLoading" => tab.stopped_loading(),
+            _ => {}
+        }
+    }
+    let methods: Vec<&str> = events.iter().map(|event| event.method.as_str()).collect();
+    eprintln!("the click that became a file: {methods:?}");
+    assert!(!tab.loading, "{methods:?}");
+    assert_eq!(tab.note, None, "{methods:?}");
     assert_eq!(tab.url, page);
 
     // Only the three, under their names: no guid left over, no partial.

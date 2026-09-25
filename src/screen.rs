@@ -43,12 +43,25 @@ pub const KEYBOARD_FLAGS: u8 = 1 | 2 | 4 | 16;
 /// `CSI 200 ~` and `CSI 201 ~`, [`crate::input`] hands over what is between
 /// them as one piece of text, and the page is given it as text — one
 /// `Input.insertText`, which fires no key at all.
+///
+/// Every motion is asked for (`?1003h`), not only motion with a button held
+/// (`?1002h`, which it includes): a link under a pointer at rest is what the
+/// row names ([`crate::hover`]), and a page that sees the pointer move is a
+/// page whose hover styling and tooltips work. What it costs is on the pty.
+/// tOS's compositor forwards every pointer event evdev gives it to the pane
+/// under the pointer, with no "same cell" check, so a 1000 Hz mouse moving is
+/// a thousand sixteen-byte reports a second — 16 kB/s into an 8 KiB read, a
+/// few hundred reports a pass — and none while it rests. Parsing them is
+/// microseconds; what matters is what is sent on for each, which is why the
+/// page is told and asked at most once a pass and not once a report. Kitty,
+/// WezTerm and Ghostty in cell mode report a motion only when the cell
+/// changes.
 pub fn enter_sequence() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[?1049h"); // the alternate screen
     out.extend_from_slice(b"\x1b[?25l"); // no cursor
     out.extend_from_slice(b"\x1b[?1000h"); // report buttons
-    out.extend_from_slice(b"\x1b[?1002h"); // and motion while one is held
+    out.extend_from_slice(b"\x1b[?1003h"); // and every motion, held or not
     out.extend_from_slice(b"\x1b[?1006h"); // in SGR, which has no 223 limit
     out.extend_from_slice(b"\x1b[?1016h"); // in pixels, if the terminal can
     out.extend_from_slice(b"\x1b[?2004h"); // a paste as a paste, not as keys
@@ -66,16 +79,36 @@ pub fn enter_sequence() -> Vec<u8> {
 pub const ASK_PIXEL_MOUSE: &[u8] = b"\x1b[?1016$p";
 
 /// Everything turned off at the end, in the reverse order.
+///
+/// With the pointer's shape put back to the arrow as well: it is not set at
+/// the start, but a hand left over from a link the pointer was on when the
+/// program ended — or panicked, since [`emergency`] writes this too — would
+/// be the shell's pointer from then on, in a terminal that understands it.
 pub fn leave_sequence() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[<u"); // pop the keyboard flags
     out.extend_from_slice(b"\x1b[?2004l");
     out.extend_from_slice(b"\x1b[?1016l");
     out.extend_from_slice(b"\x1b[?1006l");
-    out.extend_from_slice(b"\x1b[?1002l");
+    out.extend_from_slice(b"\x1b[?1003l");
     out.extend_from_slice(b"\x1b[?1000l");
+    out.extend_from_slice(&pointer_shape("default"));
     out.extend_from_slice(b"\x1b[?25h"); // the cursor comes back
     out.extend_from_slice(b"\x1b[?1049l"); // and so does the screen
+    out
+}
+
+/// Tell the terminal what the pointer should look like: `OSC 22 ; name ST`.
+///
+/// Kitty's pointer-shape protocol, which Ghostty speaks too; every terminal
+/// that does not know OSC 22 drops it, tOS's included, so it is sent without
+/// asking. The name is a `&'static str` on purpose: it is always one of
+/// [`crate::hover::Shape::name`]'s, a table this program owns, and never the
+/// page's `cursor` string, which only chooses among them.
+pub fn pointer_shape(name: &'static str) -> Vec<u8> {
+    let mut out = b"\x1b]22;".to_vec();
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(b"\x1b\\");
     out
 }
 
@@ -808,7 +841,7 @@ mod tests {
             ("?1049h", "?1049l"),
             ("?25l", "?25h"),
             ("?1000h", "?1000l"),
-            ("?1002h", "?1002l"),
+            ("?1003h", "?1003l"),
             ("?1006h", "?1006l"),
             ("?1016h", "?1016l"),
             ("?2004h", "?2004l"),
@@ -837,6 +870,14 @@ mod tests {
         assert!(!terminal.modes.cursor_visible);
         assert_eq!(terminal.keyboard_flags().0, KEYBOARD_FLAGS);
         assert!(terminal.modes.bracketed_paste, "a paste comes bracketed");
+        assert_eq!(
+            terminal.mouse().tracking,
+            tos_term::MouseTracking::AnyEvent,
+            "every motion is reported, held or not"
+        );
+        terminal.advance(b"\x1b[?1003$p");
+        let answer = String::from_utf8(terminal.take_output()).expect("ascii");
+        assert_eq!(answer, "\x1b[?1003;1$y");
 
         terminal.advance(ASK_PIXEL_MOUSE);
         let answer = String::from_utf8(terminal.take_output()).expect("ascii");
@@ -852,6 +893,19 @@ mod tests {
         assert!(terminal.modes.cursor_visible);
         assert!(!terminal.modes.bracketed_paste);
         assert_eq!(terminal.keyboard_flags().0, 0);
+        assert_eq!(terminal.mouse().tracking, tos_term::MouseTracking::None);
+    }
+
+    #[test]
+    fn a_pointer_shape_is_an_osc_22_of_one_of_the_tables_names() {
+        assert_eq!(pointer_shape("pointer"), b"\x1b]22;pointer\x1b\\");
+        // A terminal that does not know it says nothing back and draws
+        // nothing: tOS's parser drops an OSC it has no arm for.
+        let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+        terminal.advance(&pointer_shape(crate::hover::Shape::Pointer.name()));
+        assert!(terminal.take_output().is_empty());
+        assert_eq!(terminal.title(), "");
+        assert!(terminal.grid().row(0).to_text().trim().is_empty());
     }
 
     #[test]
@@ -1409,6 +1463,13 @@ mod tests {
                     );
                 }
             }
+        }
+        // A page's `cursor` value chooses a pointer shape and is never the
+        // name written: every hostile string is the arrow.
+        for hostile in HOSTILE {
+            let shape = crate::hover::shape(hostile);
+            assert_eq!(shape, crate::hover::Shape::Default, "{hostile:?}");
+            assert_eq!(pointer_shape(shape.name()), b"\x1b]22;default\x1b\\");
         }
         // And what is left is the letters, which is what the person reads.
         assert!(row_body(&text(&status_line(80, "\x1b]0;x\x07"))).starts_with("]0;x "));

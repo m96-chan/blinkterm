@@ -70,6 +70,72 @@
 //! [`LOADED`] asks for both in the one `Runtime.evaluate`, so knowing the
 //! status costs nothing that was not already being spent.
 //!
+//! # What the engine says about trust, and what it does not
+//!
+//! Measured against `chrome-headless-shell` 153 with `Page.enable` and nothing
+//! else, over plain and TLS servers on loopback and on a named host mapped to
+//! loopback, a self-signed certificate refused and accepted, a page with real
+//! mixed content, `data:`, `about:blank`, `file:` and a closed port: the
+//! `Security` domain has nothing to add. `Security.enable` answers at once and
+//! then `Security.visibleSecurityStateChanged` never fires, nor the deprecated
+//! `securityStateChanged`; the one event it does send is
+//! `Security.certificateError`, whose code is the same `ERR_CERT_*` the
+//! `Page.navigate` reply already carries and [`reason`] already words. It is
+//! not enabled.
+//!
+//! What is free is a field of the `Page.frameNavigated` that [`landing`]
+//! already reads, `frame.secureContextType`:
+//!
+//! ```text
+//! http://127.0.0.1:…/          SecureLocalhost
+//! http://insecure.test:…/      InsecureScheme
+//! https://127.0.0.1:…/         SecureLocalhost
+//! https://secure.test:…/       Secure
+//! data:text/html,…             InsecureScheme
+//! about:blank                  InsecureScheme
+//! file:///etc/hostname         Secure
+//! the error page               InsecureScheme
+//! ```
+//!
+//! So [`trust`] marks a page only when both agree: the scheme is `http` (or
+//! `ws`) and the engine says `InsecureScheme`. Loopback is left unmarked, as a
+//! desktop browser leaves it; `data:` and `about:` are not marked because
+//! there is no server whose transport could have been secure; and a
+//! certificate error is already a [`Problem::Unreachable`] with its reason.
+//!
+//! Mixed content is the one thing left, and the only place the engine says it
+//! is the `Log` domain: two `Log.entryAdded` with `source: "security"` and a
+//! text starting `Mixed Content:` per resource (Chromium now upgrades mixed
+//! images to `https` and blocks them if that fails, except on an IP-address
+//! host). `Log` is cheap — no entries at all for console output, one per
+//! failed subresource — and a `Trust::Mixed` set from it, cleared by the next
+//! landing, would be a third variant here. It is not built, because the
+//! engine test for it needs an `https` page and this crate's tests serve with
+//! `std`, which has no TLS: a parser tested and an enabling untested is the
+//! wrong way round.
+//!
+//! # What a load says about itself
+//!
+//! A navigation announces itself before any byte comes back:
+//! `Page.frameStartedNavigating`, with the url, three milliseconds after a
+//! typed `Page.navigate` and four after a click on a link — and for a server
+//! that never answers, that is the last thing said until somebody stops it.
+//! `Page.frameStartedLoading` comes beside it with no url, and
+//! `Page.frameStoppedLoading` ends every load however it ends: in the same
+//! millisecond as the load event, after `Page.stopLoading`, and a millisecond
+//! after a `pushState`, which sends the pair and nothing else. Every one of
+//! them names a frame, and an iframe's load sends the same sequence under its
+//! own id, so the main frame's id is read off `Page.getFrameTree` when a tab is
+//! attached ([`main_frame`]) and off every main-frame landing since
+//! ([`landed_frame`]).
+//!
+//! None of it is a fraction. `Page.setLifecycleEventsEnabled` adds a dozen
+//! events a load, and its `networkAlmostIdle` fired at 795 ms of a 1512 ms
+//! load and would fire at the same point of a thirty-second one; a percentage
+//! would need the `Network` domain's byte counts, which the section above says
+//! are not paid for. What is true, and free, is how long a load has been
+//! going, which is what [`loading_hint`] says.
+//!
 //! # What is not here
 //!
 //! A way past a certificate error. The error is said — the `ERR_CERT_*` codes
@@ -168,6 +234,141 @@ pub fn current_url(history: &Json) -> Option<String> {
         .get("url")
         .and_then(Json::as_str)?;
     Some(text::sanitize(url).into_owned())
+}
+
+/// Whether the document's transport is one to warn about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Trust {
+    /// Nothing known, or nothing to say: `https`, `file:`, `about:`, `data:`,
+    /// loopback, an error page.
+    #[default]
+    Plain,
+    /// `http://` on a host the engine calls an insecure scheme: anybody on
+    /// the way could have read it or changed it.
+    Insecure,
+}
+
+impl Trust {
+    /// The words the row says for it, if any. ASCII and not a padlock: a
+    /// glyph like that is ambiguous-width in East Asian terminals, and a row
+    /// one cell out is a row that wraps.
+    pub fn words(self) -> Option<&'static str> {
+        match self {
+            Trust::Plain => None,
+            Trust::Insecure => Some("not secure"),
+        }
+    }
+}
+
+/// The trust of the document a `Page.frameNavigated` lands, from its url's
+/// scheme and the engine's `secureContextType` together (the table is in the
+/// module documentation).
+///
+/// `Plain` for an iframe, which is not the page; for an error page, whose
+/// `InsecureScheme` is about `chrome-error:` and not about anything the
+/// person asked for; and for every shape that is not the one measured — a
+/// Chromium that renamed the field would un-mark pages rather than mark all
+/// of them, and the engine test that asserts the field is there is what
+/// notices.
+pub fn trust(params: &Json) -> Trust {
+    let Some(frame) = params.get("frame") else {
+        return Trust::Plain;
+    };
+    if frame.get("parentId").is_some() {
+        return Trust::Plain;
+    }
+    let unreachable = frame.get("unreachableUrl").and_then(Json::as_str);
+    if unreachable.is_some_and(|url| !url.is_empty()) {
+        return Trust::Plain;
+    }
+    let url = frame.get("url").and_then(Json::as_str).unwrap_or_default();
+    let scheme = url.split_once(':').map_or("", |(scheme, _)| scheme);
+    let plain = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("ws");
+    let context = frame.get("secureContextType").and_then(Json::as_str);
+    if plain && context == Some("InsecureScheme") {
+        Trust::Insecure
+    } else {
+        Trust::Plain
+    }
+}
+
+/// Where a `Page.frameStartedNavigating` says the main frame is going, if it
+/// is the main frame.
+///
+/// `frame` is the tab's main frame's id, or `None` when the tab does not know
+/// it yet — and then the departure is taken as the main frame's, because a
+/// fresh tab's first navigation is. The url is the page's choice (a link's
+/// href, a script's `location`) and is about to be on the row, so it comes
+/// out as plain text ([`crate::text::sanitize`]).
+///
+/// `None` too for a navigation within the document — a fragment, a history
+/// step between two `pushState`s — whose `navigationType` says so: nothing
+/// is going to land for it (the engine says `navigatedWithinDocument`
+/// instead of `frameNavigated`), so a "loading" said for it would be said
+/// until the next real load.
+pub fn started(params: &Json, frame: Option<&str>) -> Option<String> {
+    if !is_main(params, frame) {
+        return None;
+    }
+    let kind = params
+        .get("navigationType")
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    if kind.contains("sameDocument") || kind.contains("SameDocument") {
+        return None;
+    }
+    let url = params.get("url").and_then(Json::as_str)?;
+    Some(text::sanitize(url).into_owned())
+}
+
+/// Whether an event that names a frame by `frameId` is about the main frame:
+/// the tab's own, or any at all while the tab does not know its own.
+pub fn is_main(params: &Json, frame: Option<&str>) -> bool {
+    match (frame_id(params), frame) {
+        (Some(id), Some(main)) => id == main,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// The frame a `Page.frameStartedLoading`, `Page.frameStoppedLoading`,
+/// `Page.frameStartedNavigating` or `Page.navigate` reply names.
+pub fn frame_id(params: &Json) -> Option<&str> {
+    params.get("frameId").and_then(Json::as_str)
+}
+
+/// The main frame's id out of a `Page.getFrameTree` reply.
+pub fn main_frame(reply: &Json) -> Option<String> {
+    reply
+        .path(&["frameTree", "frame", "id"])
+        .and_then(Json::as_str)
+        .map(str::to_string)
+}
+
+/// The main frame's id out of a `Page.frameNavigated`, when it is the main
+/// frame's. A main frame kept its id across every navigation measured, but
+/// which process a frame lives in is the engine's business, so every landing
+/// refreshes it rather than trusting the one read at attach.
+pub fn landed_frame(params: &Json) -> Option<String> {
+    let frame = params.get("frame")?;
+    if frame.get("parentId").is_some() {
+        return None;
+    }
+    frame.get("id").and_then(Json::as_str).map(str::to_string)
+}
+
+/// The right-hand words while a load is going: `esc stops`, and once it has
+/// been going a second, for how long — `4s  esc stops`.
+///
+/// Seconds and not a percentage, because nothing free is a fraction (see the
+/// module documentation); whole seconds counted up, because a person
+/// compares them against their own patience, and a tenth of a second
+/// changing would redraw the row ten times as often to say nothing more.
+pub fn loading_hint(seconds: Option<u64>) -> String {
+    match seconds {
+        Some(seconds) => format!("{seconds}s  esc stops"),
+        None => "esc stops".to_string(),
+    }
 }
 
 /// A `net::ERR_` code in words.
@@ -541,6 +742,146 @@ mod tests {
             None
         );
         assert_eq!(current_url(&json(r#"{"entries":[{"url":"x"}]}"#)), None);
+    }
+
+    /// A `Page.frameNavigated` for the main frame, in the shape the engine
+    /// sent for each document in the module documentation's table.
+    fn navigated(url: &str, context: &str, unreachable: Option<&str>) -> Json {
+        let unreachable = unreachable
+            .map(|url| format!(r#""unreachableUrl":"{url}","#))
+            .unwrap_or_default();
+        json(&format!(
+            r#"{{"frame":{{"id":"31FA","loaderId":"5B26","url":"{url}","domainAndRegistry":"",
+                "securityOrigin":"x","securityOriginDetails":{{"isLocalhost":false}},
+                "mimeType":"text/html",{unreachable}"adFrameStatus":{{"adFrameType":"none"}},
+                "secureContextType":"{context}","crossOriginIsolatedContextType":"NotIsolated",
+                "gatedAPIFeatures":[]}},"type":"Navigation"}}"#
+        ))
+    }
+
+    #[test]
+    fn a_plain_http_page_on_a_named_host_is_not_secure_and_the_rest_are_plain() {
+        let measured = [
+            (
+                "http://127.0.0.1:34189/",
+                "SecureLocalhost",
+                None,
+                Trust::Plain,
+            ),
+            (
+                "http://insecure.test:37589/",
+                "InsecureScheme",
+                None,
+                Trust::Insecure,
+            ),
+            (
+                "https://127.0.0.1:33805/",
+                "SecureLocalhost",
+                None,
+                Trust::Plain,
+            ),
+            ("https://secure.test:43745/", "Secure", None, Trust::Plain),
+            (
+                "data:text/html,<title>d</title>",
+                "InsecureScheme",
+                None,
+                Trust::Plain,
+            ),
+            ("about:blank", "InsecureScheme", None, Trust::Plain),
+            ("file:///etc/hostname", "Secure", None, Trust::Plain),
+            (
+                "chrome-error://chromewebdata/",
+                "InsecureScheme",
+                Some("http://insecure.test:33767/"),
+                Trust::Plain,
+            ),
+        ];
+        for (url, context, unreachable, wanted) in measured {
+            assert_eq!(
+                trust(&navigated(url, context, unreachable)),
+                wanted,
+                "{url} {context}"
+            );
+        }
+        // A scheme is read without regard to case, as a url's is.
+        assert_eq!(
+            trust(&navigated("HTTP://wiki.corp/", "InsecureScheme", None)),
+            Trust::Insecure
+        );
+        // An iframe on plain http is not the page.
+        let iframe = json(
+            r#"{"frame":{"id":"9","parentId":"31FA","url":"http://ads.example/",
+                "secureContextType":"InsecureScheme"}}"#,
+        );
+        assert_eq!(trust(&iframe), Trust::Plain);
+        assert_eq!(landed_frame(&iframe), None);
+        // And a frame without the field is nothing to say, not a warning.
+        assert_eq!(
+            trust(&json(r#"{"frame":{"id":"1","url":"http://wiki.corp/"}}"#)),
+            Trust::Plain
+        );
+        assert_eq!(Trust::Insecure.words(), Some("not secure"));
+        assert_eq!(Trust::Plain.words(), None);
+        assert_eq!(
+            landed_frame(&navigated("about:blank", "InsecureScheme", None)),
+            Some("31FA".to_string())
+        );
+    }
+
+    #[test]
+    fn the_main_frames_departure_names_where_it_is_going() {
+        // Exactly what the engine sent for a typed navigation to a server that
+        // never answered.
+        let departure = json(
+            r#"{"frameId":"55101129AF7BCC483B7F40316B8D789D","url":"http://127.0.0.1:36913/hang",
+                "loaderId":"F850C8E9C75CF1C284B1AEE143EEE8DC","navigationType":"differentDocument"}"#,
+        );
+        assert_eq!(
+            started(&departure, Some("55101129AF7BCC483B7F40316B8D789D")),
+            Some("http://127.0.0.1:36913/hang".to_string())
+        );
+        assert_eq!(
+            started(&departure, Some("C98A215D9979FB477396B8A1716121E1")),
+            None,
+            "an iframe leaving is not the page leaving"
+        );
+        assert_eq!(
+            started(&departure, None),
+            Some("http://127.0.0.1:36913/hang".to_string()),
+            "a tab that does not know its frame yet takes the first it hears"
+        );
+        let hostile =
+            json(r#"{"frameId":"F","url":"http://evil.example/\u202emoc.knab\u001b]0;x\u0007"}"#);
+        assert_eq!(
+            started(&hostile, Some("F")),
+            Some("http://evil.example/moc.knab]0;x".to_string())
+        );
+        for within in ["sameDocument", "historySameDocument"] {
+            let fragment = json(&format!(
+                r#"{{"frameId":"F","url":"http://a.example/#top","navigationType":"{within}"}}"#
+            ));
+            assert_eq!(started(&fragment, Some("F")), None, "{within}");
+        }
+        assert_eq!(frame_id(&json(r#"{"frameId":"F"}"#)), Some("F"));
+        assert_eq!(frame_id(&json(r#"{"frame":"F"}"#)), None);
+        assert!(!is_main(&json("{}"), None), "no frame named is no frame");
+    }
+
+    #[test]
+    fn the_frame_tree_names_the_main_frame() {
+        let reply = json(
+            r#"{"frameTree":{"frame":{"id":"A","loaderId":"L","url":"about:blank"},
+                "childFrames":[{"frame":{"id":"B","parentId":"A","url":"x"}}]}}"#,
+        );
+        assert_eq!(main_frame(&reply), Some("A".to_string()));
+        assert_eq!(main_frame(&json(r#"{"frameTree":{}}"#)), None);
+    }
+
+    #[test]
+    fn the_loading_hint_says_esc_and_then_the_seconds() {
+        assert_eq!(loading_hint(None), "esc stops");
+        assert_eq!(loading_hint(Some(4)), "4s  esc stops");
+        assert_eq!(loading_hint(Some(120)), "120s  esc stops");
     }
 
     #[test]
