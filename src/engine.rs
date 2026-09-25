@@ -286,6 +286,16 @@ fn group_target(pid: i32) -> i32 {
 /// `ESRCH` is the answer that the group is empty. A process nobody has waited
 /// for is still a member of it, which is why the wrapper is reaped before this
 /// is believed.
+///
+/// And why a yes from `kill(2)` is checked against `/proc`. The browser's
+/// renderers and zygotes are not this program's children; once the browser
+/// has gone they belong to whatever is pid 1, and are only removed when it
+/// waits for them. A real init does at once. The pid 1 of a container often
+/// does not — CI's is one — and there the group keeps its zombies for as long
+/// as the container lives, `kill(2)` goes on saying yes, and an engine that
+/// closed in two seconds looked to [`Engine::wait_for_exit`] like one that was
+/// still running at five. A zombie runs nothing and holds nothing open, so a
+/// group whose members are all zombies is a group that has gone.
 fn group_alive(target: i32) -> bool {
     if target >= 0 {
         // No group of its own; the child's own exit status is the whole
@@ -295,9 +305,37 @@ fn group_alive(target: i32) -> bool {
     // SAFETY: signal 0 sends nothing and only asks whether it could, and
     // `kill(2)` reads no memory. `target` is negative here, checked above.
     if unsafe { libc::kill(target, 0) } == 0 {
-        return true;
+        return group_has_living_member(-target);
     }
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Whether any process in `group` is something other than a zombie, read out
+/// of `/proc`. A `/proc` that cannot be read is taken to say yes, which leaves
+/// `kill(2)`'s answer standing.
+fn group_has_living_member(group: i32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    entries.flatten().any(|entry| {
+        std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .and_then(|stat| state_and_group(&stat))
+            .is_some_and(|(state, pgrp)| pgrp == group && state != 'Z')
+    })
+}
+
+/// The state and the process group out of a `/proc/<pid>/stat` line.
+///
+/// The command name is the second field, in parentheses, and may itself hold
+/// spaces and parentheses, so the fields are counted from the last `)`.
+fn state_and_group(stat: &str) -> Option<(char, i32)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _parent = fields.next()?;
+    let group = fields.next()?.parse().ok()?;
+    Some((state, group))
 }
 
 /// Where the engine is, or a sentence about why there is none.
@@ -808,6 +846,49 @@ mod tests {
             !group_alive(0),
             "a pid with no group of its own is not a group"
         );
+    }
+
+    #[test]
+    fn a_stat_line_gives_its_state_and_group_whatever_the_command_is_called() {
+        assert_eq!(
+            state_and_group("4082 (chrome-headless) S 4079 4079 4079 0 -1"),
+            Some(('S', 4079))
+        );
+        // A command name may hold spaces and parentheses of its own.
+        assert_eq!(
+            state_and_group("17 (a (b) c) Z 1 4079 4079 0 -1"),
+            Some(('Z', 4079))
+        );
+        assert_eq!(state_and_group("17 (cut off"), None);
+    }
+
+    #[test]
+    fn a_group_of_zombies_is_a_group_that_has_gone() {
+        // A child in a group of its own that exits and is not waited for: a
+        // zombie, which is what a container's pid 1 leaves of the engine's
+        // renderers. `kill(2)` still finds the group; this must not.
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("exit 0");
+        let (mut child, target) = spawn_in_own_group(&mut command).expect("a shell starts");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let zombie = loop {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.id()))
+                .expect("an unreaped child keeps its /proc entry");
+            if state_and_group(&stat).map(|(state, _)| state) == Some('Z') {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(zombie, "the shell never finished");
+        // SAFETY: signal 0 sends nothing and `kill(2)` reads no memory;
+        // `target` is the child's own group.
+        let found = unsafe { libc::kill(target, 0) };
+        assert_eq!(found, 0, "the kernel still has it");
+        assert!(!group_alive(target), "and the group is gone all the same");
+        child.wait().expect("the shell is reaped");
     }
 
     #[test]
