@@ -82,6 +82,9 @@ carry, and the list is kept as things land rather than written at the end.
   asking the terminal its background (`OSC 11`); `--force-dark` paints even
   pages with no dark style dark
   ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
+- Over ssh, or in a terminal whose `winsize` has no pixels, the cell size is
+  asked with `CSI 16 t`, so the picture is the pane's size there too
+  ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
 
 ### Changed
 

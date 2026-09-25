@@ -90,6 +90,21 @@ pub const ASK_PIXEL_MOUSE: &[u8] = b"\x1b[?1016$p";
 /// way it was asked, and `ST` cannot ring.
 pub const ASK_BACKGROUND: &[u8] = b"\x1b]11;?\x1b\\";
 
+/// The question for a terminal whose kernel window size has no pixels in
+/// it: how big is a cell?
+///
+/// Over ssh `TIOCGWINSZ` carries rows and columns and zeroes for the
+/// pixels, because that is all the protocol forwards, and some terminals
+/// never fill the pixels in at all. Without them the cell is guessed at 8x16,
+/// the page is sized for that guess, and every frame is a picture the
+/// terminal resamples into cells of a different size — and the HiDPI scale,
+/// which is read off the cell, is guessed wrong with it. `CSI 16 t` is
+/// xterm's window operation for the cell size, answered `CSI 6 ; height ;
+/// width t` by tOS, Kitty, WezTerm, Ghostty, foot and xterm, over any number
+/// of hops, since it is only bytes. See [`Pane::metrics`] for when the answer
+/// is used.
+pub const ASK_CELL_SIZE: &[u8] = b"\x1b[16t";
+
 /// Everything turned off at the end, in the reverse order.
 ///
 /// With the pointer's shape put back to the arrow as well: it is not set at
@@ -199,6 +214,7 @@ impl Pane {
         pane.write(&enter_sequence())?;
         pane.write(ASK_PIXEL_MOUSE)?;
         pane.write(ASK_BACKGROUND)?;
+        pane.write(ASK_CELL_SIZE)?;
         Ok(pane)
     }
 
@@ -218,8 +234,19 @@ impl Pane {
     }
 
     /// Measure the pane again, which is what a `SIGWINCH` means.
-    pub fn metrics(&self) -> io::Result<Metrics> {
-        Metrics::probe(self.output)
+    ///
+    /// `cell_hint` is the terminal's own answer to [`ASK_CELL_SIZE`], once it
+    /// has given one. It is used only when the kernel's window size has no
+    /// pixels in it — which is when the cell would otherwise be a guess —
+    /// and never over a size the kernel does know, which is the one that
+    /// follows a font being changed.
+    pub fn metrics(&self, cell_hint: Option<(u32, u32)>) -> io::Result<Metrics> {
+        let metrics = Metrics::probe(self.output)?;
+        let size = tos_platform::tty::terminal_size(self.output)?;
+        Ok(match cell_hint {
+            Some(cell) if size.width_px == 0 || size.height_px == 0 => metrics.with_cell(cell),
+            _ => metrics,
+        })
     }
 
     /// Put everything back, now.
@@ -936,6 +963,27 @@ mod tests {
             [crate::input::Input::Colour { slot: 11, .. }] => {}
             other => panic!("{:?} read as {other:?}", text(&answer)),
         }
+    }
+
+    /// The same for the cell's size: the one the terminal draws with.
+    #[test]
+    fn a_terminal_answers_how_big_a_cell_is_and_the_answer_is_a_cell_size() {
+        let config = tos_term::TerminalConfig::default();
+        let wanted = crate::input::Input::CellSize {
+            width: config.cell_width,
+            height: config.cell_height,
+        };
+        let mut terminal = tos_term::Terminal::new(80, 24, config);
+        terminal.advance(&enter_sequence());
+        let _ = terminal.take_output();
+        terminal.advance(ASK_CELL_SIZE);
+        let answer = terminal.take_output();
+        assert_eq!(
+            crate::input::Parser::new().feed(&answer),
+            vec![wanted],
+            "{:?}",
+            text(&answer)
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! to parse here into the event it came from — which is the only way to keep a
 //! decoder honest about a protocol with this many optional fields.
 //!
-//! Four grammars arrive down the same descriptor:
+//! Five grammars arrive down the same descriptor:
 //!
 //! - the Kitty keyboard protocol, `CSI key[:shifted:base] [; mods[:event]]
 //!   [; text] u` and its cousins that end in `A`-`H`, `P`-`S` and `~`;
@@ -15,6 +15,9 @@
 //!   cells or pixels depending on whether mode 1016 took;
 //! - the DECRPM answer `CSI ? mode ; state $ y`, which is how that question
 //!   gets answered;
+//! - the cell size, `CSI 6 ; height ; width t`, which is how `CSI 16 t` is
+//!   answered by a terminal whose kernel window size has no pixels in it —
+//!   see [`Input::CellSize`];
 //! - a colour report, `OSC 11 ; rgb:rrrr/gggg/bbbb ST`, which is the
 //!   terminal's answer to being asked its background — see the section on
 //!   it below.
@@ -274,6 +277,18 @@ pub enum Input {
     Colour {
         slot: u32,
         rgb: (u8, u8, u8),
+    },
+    /// `CSI 6 ; height ; width t`: a cell's size in pixels, the answer to
+    /// `CSI 16 t` ([`crate::screen::ASK_CELL_SIZE`]).
+    ///
+    /// Over ssh the kernel's window size carries no pixels — the protocol
+    /// forwards rows and columns and nothing else — and some terminals never
+    /// fill them in locally either, so without this a pane's cell is guessed
+    /// at 8x16 and every picture is placed at a size the terminal then
+    /// resamples. Every other `t` report is dropped, as all of them were.
+    CellSize {
+        width: u32,
+        height: u32,
     },
 }
 
@@ -639,6 +654,17 @@ impl Parser {
                     self.pixels = true;
                 }
                 Step::Produced(Input::Mode { mode, state })
+            }
+            // `CSI 6 ; height ; width t`, and nothing else that ends in `t`:
+            // the window's size in pixels (`4`) and in cells (`8`) are
+            // answers to questions this program does not ask.
+            (None, None, b't') if number(&params, 0, 0) == 6 => {
+                let (height, width) = (number(&params, 1, 0), number(&params, 2, 0));
+                if width == 0 || height == 0 {
+                    Step::Consumed
+                } else {
+                    Step::Produced(Input::CellSize { width, height })
+                }
             }
             (None, _, b'u' | b'~' | b'A'..=b'H' | b'P'..=b'S' | b'Z') => {
                 match key_event(&params, final_byte) {
@@ -1583,6 +1609,32 @@ mod tests {
         assert_eq!(
             feed(b"\x1b[200~hi\rthere\x1b[201~"),
             vec![Input::Paste("hi\rthere".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_cell_size_report_is_an_input() {
+        assert_eq!(
+            feed(b"\x1b[6;32;16t"),
+            vec![Input::CellSize {
+                width: 16,
+                height: 32
+            }]
+        );
+        // The window's size in pixels and in cells are not asked for, and a
+        // cell of nothing is not a cell.
+        assert_eq!(feed(b"\x1b[4;768;1280t"), vec![]);
+        assert_eq!(feed(b"\x1b[8;24;80t"), vec![]);
+        assert_eq!(feed(b"\x1b[6;0;16t"), vec![]);
+        assert_eq!(
+            feed(b"\x1b[6;32;16tx"),
+            vec![
+                Input::CellSize {
+                    width: 16,
+                    height: 32
+                },
+                typed('x')
+            ]
         );
     }
 

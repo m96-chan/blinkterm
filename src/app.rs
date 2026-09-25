@@ -297,6 +297,9 @@ struct Chrome {
     /// What every page is told about light and dark, once the terminal has
     /// said. See [`crate::appearance`] and [`prepare_session`].
     appearance: Appearance,
+    /// The terminal's answer to `CSI 16 t`, for a pane whose kernel window
+    /// size has no pixels in it. See [`crate::screen::ASK_CELL_SIZE`].
+    cell_hint: Option<(u32, u32)>,
 }
 
 impl Chrome {
@@ -495,7 +498,7 @@ pub fn run(options: Options) -> Result<(), String> {
     // downloads is still here when `drive` is over and the engine is being
     // stopped. The rest of it goes at the end of this block, before the pane
     // is given back, as it always did.
-    let (outcome, downloads) = match pane.metrics() {
+    let (outcome, downloads) = match pane.metrics(None) {
         Ok(metrics) => {
             let mut chrome = Chrome {
                 painter: Painter::new(),
@@ -530,6 +533,7 @@ pub fn run(options: Options) -> Result<(), String> {
                     Zooms::load(engine.profile().dir())
                 },
                 appearance,
+                cell_hint: None,
             };
             let outcome = drive(
                 &mut pane,
@@ -636,7 +640,7 @@ fn drive(
         }
         if RESIZED.swap(false, Ordering::SeqCst) {
             chrome.metrics = pane
-                .metrics()
+                .metrics(chrome.cell_hint)
                 .map_err(|e| format!("cannot measure the pane: {e}"))?;
             // A font made bigger in the terminal is a resize too, and a cell
             // that has grown past 28 pixels is a HiDPI answer that follows it.
@@ -2339,6 +2343,19 @@ fn handle_input(
         }
         // Another colour is nothing this program asked about.
         Input::Colour { .. } => {}
+        // How big the terminal says a cell is. The pane is measured again
+        // on the next pass, as if it had been resized, which it has as far
+        // as the page is concerned when the kernel had no pixels to go on:
+        // the page, the placement and the HiDPI guess were all made from
+        // 8x16. A hint that changes nothing measured — a kernel that knew
+        // the pixels all along — is not a resize.
+        Input::CellSize { width, height } => {
+            chrome.cell_hint = Some((width, height));
+            let measured = pane.metrics(chrome.cell_hint);
+            if measured.is_ok_and(|metrics| metrics.cell != chrome.metrics.cell) {
+                RESIZED.store(true, Ordering::SeqCst);
+            }
+        }
         Input::PasteRefused { bytes } => {
             note(
                 tabs,
