@@ -515,7 +515,29 @@ pub fn flags(as_root: bool) -> Vec<&'static str> {
 }
 
 /// A running engine, killed when this is dropped and when the program dies.
+///
+/// Two values rather than one, because the process and the profile do not
+/// always end together. When the engine dies under a running session the
+/// program starts another on the same `--user-data-dir` ([`Engine::retire`]),
+/// and a kept profile's lock is a `flock` on an open file description: the
+/// same process cannot take it again while the dead engine's [`Profile`] is
+/// alive, and dropping that first would let the lock go for a moment, long
+/// enough for another `blinkterm` to take the profile out from under the
+/// relaunch. So the process is a field with its own `Drop`, and the profile
+/// can be moved out of an engine whose process has been stopped, the lock
+/// never released.
 pub struct Engine {
+    /// The process, its pipe and its stderr; killed when this is dropped.
+    process: Process,
+    /// The `--user-data-dir` it was given. Declared after the process so that
+    /// it is dropped after it: a kept profile's lock is let go, or a temporary
+    /// one's directory removed, only once the process is gone.
+    profile: Profile,
+}
+
+/// What an [`Engine`] is without its profile: everything that dies with the
+/// process. Its `Drop` is the kill.
+struct Process {
     child: Child,
     /// What to kill, in `kill(2)`'s notation; see [`TARGET`].
     target: i32,
@@ -523,10 +545,6 @@ pub struct Engine {
     /// the holder that shuts it.
     exchange: Arc<Exchange>,
     tail: Arc<Mutex<Vec<String>>>,
-    /// The `--user-data-dir` it was given. Declared last so that it is dropped
-    /// last: [`Engine`]'s own `Drop` kills the engine first, and only then is a
-    /// kept profile's lock let go or a temporary one's directory removed.
-    profile: Profile,
 }
 
 impl Engine {
@@ -621,37 +639,39 @@ impl Engine {
         });
 
         let exchange = Exchange::over(ours_read.into_raw_fd(), ours_write.into_raw_fd());
-        let mut engine = Engine {
+        let mut process = Process {
             child,
             target,
             exchange,
             tail,
-            profile,
         };
         // The first thing asked, and the readiness signal: an engine that is
         // up answers it, and one that died on the way up closes the pipe,
         // which fails the call at once rather than at the deadline.
-        let ready = Client::browser(&engine.exchange).and_then(|mut browser| {
+        let ready = Client::browser(&process.exchange).and_then(|mut browser| {
             browser.call_within("Browser.getVersion", Json::empty(), timeout)
         });
         if let Err(err) = ready {
-            engine.kill();
-            // After the kill, so that whatever the engine said on its way out
+            process.stop();
+            // The profile goes with the error, as it always has: a temporary
+            // one's directory is removed as it drops, a kept one's lock let go.
+            drop(profile);
+            // After the stop, so that whatever the engine said on its way out
             // has been read by the time it is quoted.
-            let why = describe_tail(&engine.tail);
+            let why = describe_tail(&process.tail);
             return Err(format!(
                 "{} did not answer on its debugging pipe within {} seconds ({err}){why}",
                 path.display(),
                 timeout.as_secs()
             ));
         }
-        Ok(engine)
+        Ok(Engine { process, profile })
     }
 
     /// A client for the browser's own messages: the one that opens, closes,
     /// raises and attaches to pages. One at a time; see [`Client::browser`].
     pub fn browser(&self) -> Result<Client, String> {
-        Client::browser(&self.exchange)
+        Client::browser(&self.process.exchange)
     }
 
     /// The profile it was started with.
@@ -664,7 +684,7 @@ impl Engine {
     /// `None` means the group could not be made and the wrapper's pid is all
     /// there is to kill, which is the case this module exists to avoid.
     pub fn group(&self) -> Option<i32> {
-        (self.target < 0).then_some(-self.target)
+        (self.process.target < 0).then_some(-self.process.target)
     }
 
     /// The last lines the engine wrote, for an error message.
@@ -676,16 +696,17 @@ impl Engine {
     /// terminal has been given back, where an escape works as well as on the
     /// row.
     pub fn tail(&self) -> Vec<String> {
-        plain_lines(&self.tail)
+        plain_lines(&self.process.tail)
     }
 
     /// `Ok` while the engine is running; the reason, with its own last words,
     /// once it is not.
     pub fn check(&mut self) -> Result<(), String> {
-        match self.child.try_wait() {
+        let process = &mut self.process;
+        match process.child.try_wait() {
             Ok(Some(status)) => Err(format!(
                 "the browser engine exited ({status}){}",
-                describe_tail(&self.tail)
+                describe_tail(&process.tail)
             )),
             Ok(None) => Ok(()),
             Err(err) => Err(format!("cannot tell whether the engine is running: {err}")),
@@ -699,7 +720,7 @@ impl Engine {
     /// Nothing is signalled. `false` means it is still running, and
     /// [`Engine::kill`] is what comes next.
     pub fn wait_for_exit(&mut self, timeout: Duration) -> bool {
-        self.gone_by(Instant::now() + timeout)
+        self.process.gone_by(Instant::now() + timeout)
     }
 
     /// Stop it, politely and then not — and the group, not the pid.
@@ -726,6 +747,31 @@ impl Engine {
     /// running at that point — so the signals to the group stay, and they are
     /// what this is sure of.
     pub fn kill(&mut self) {
+        self.process.stop();
+        self.profile.remove();
+    }
+
+    /// Stop the process and hand the profile back — a kept one's lock still
+    /// held, a temporary one's directory still there — for a second engine to
+    /// be started on it. What [`Engine::kill`] does, less the profile's
+    /// removal; see the type's doc for why the lock must never be let go in
+    /// between. On an engine that has already died it is over in about a
+    /// millisecond and a half: the pipe is at end of file and the group gone.
+    pub fn retire(self) -> Profile {
+        let Engine {
+            mut process,
+            profile,
+        } = self;
+        process.stop();
+        profile
+    }
+}
+
+impl Process {
+    /// [`Engine::kill`] up to the profile: the pipe shut, the group asked and
+    /// then told, the wrapper reaped. Safe to repeat; the second time there is
+    /// no target left to signal.
+    fn stop(&mut self) {
         TARGET.store(0, Ordering::SeqCst);
         self.exchange.shutdown();
         signal_all(self.target, libc::SIGTERM);
@@ -737,7 +783,6 @@ impl Engine {
             let _ = self.child.wait();
             self.target = 0;
         }
-        self.profile.remove();
     }
 
     /// Whether the engine and everything it started are gone, waiting until
@@ -766,9 +811,9 @@ impl Engine {
     }
 }
 
-impl Drop for Engine {
+impl Drop for Process {
     fn drop(&mut self) {
-        self.kill();
+        self.stop();
     }
 }
 
