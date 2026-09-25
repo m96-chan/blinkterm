@@ -76,7 +76,7 @@ jobs:
       # commit. Pinned by commit because Homebrew/actions has no major-version
       # tag to follow, only a dated tag per release; Dependabot moves a commit
       # pin with a version comment the way it moves a tag.
-      - uses: Homebrew/actions/setup-homebrew@1e34f2e2acaa766b7efacb8c26352e6abbb023f9 # 2026.09.13.1
+      - uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6 # 2026.09.21.1
       # `brew audit` and `brew install` take formula names, not paths, so the
       # formula is put in a local tap named as the real one. `brew --repository
       # m96-chan/tap` is where that tap would live; making the directory is all
