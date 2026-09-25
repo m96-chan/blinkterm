@@ -102,10 +102,7 @@ impl Dialog {
         };
         let line = match kind {
             Kind::Prompt => Line::selected(text("defaultPrompt")),
-            _ => Line {
-                text: String::new(),
-                whole: false,
-            },
+            _ => Line::empty(),
         };
         Some(Dialog {
             kind,
@@ -150,7 +147,7 @@ impl Dialog {
                 }
             }
             Kind::Prompt => match self.line.step(key) {
-                Edit::Typing => Answer::Waiting,
+                Edit::Typing | Edit::Inserted | Edit::Previous | Edit::Next => Answer::Waiting,
                 Edit::Go => Answer::Accept,
                 Edit::Cancel => Answer::Dismiss,
                 Edit::Quit => Answer::Quit,
@@ -168,7 +165,7 @@ impl Dialog {
         let accept = answer == Answer::Accept;
         let mut fields = vec![("accept", Json::Bool(accept))];
         if accept && self.kind == Kind::Prompt {
-            fields.push(("promptText", Json::string(&self.line.text)));
+            fields.push(("promptText", Json::string(self.line.text())));
         }
         Json::object(fields)
     }
@@ -293,8 +290,8 @@ mod tests {
         assert_eq!(of("beforeunload").kind, Kind::BeforeUnload);
         // Only a prompt has a line; the others' is empty and not selected, so
         // nothing about them looks like typing.
-        assert_eq!(of("confirm").line.text, "");
-        assert!(!of("confirm").line.whole);
+        assert_eq!(of("confirm").line.text(), "");
+        assert!(!of("confirm").line.whole());
 
         // A kind nobody has keys for is not a dialog this program shows.
         let odd = Json::parse(r#"{"type":"payment","message":"x","url":"y"}"#).expect("JSON");
@@ -376,14 +373,14 @@ mod tests {
             prompt.step(&key(Key::Other(LEFT_SHIFT), Mods::SHIFT)),
             Answer::Waiting
         );
-        assert!(prompt.line.whole);
+        assert!(prompt.line.whole());
         for c in ['X', 'y'] {
             assert_eq!(prompt.step(&typed(c)), Answer::Waiting);
         }
-        assert_eq!(prompt.line.text, "Xy");
+        assert_eq!(prompt.line.text(), "Xy");
         // A y in a prompt is a letter, not a yes.
         assert_eq!(prompt.step(&key(Key::Backspace, 0)), Answer::Waiting);
-        assert_eq!(prompt.line.text, "X");
+        assert_eq!(prompt.line.text(), "X");
         assert_eq!(prompt.step(&key(Key::Enter, 0)), Answer::Accept);
         assert_eq!(
             prompt.reply(Answer::Accept).to_string(),
@@ -462,7 +459,7 @@ mod tests {
             r#"{"url":"u","type":"prompt","message":"name?",
                 "defaultPrompt":"\u001b[2Jdefault"}"#,
         );
-        assert_eq!(prompt.line.text, "[2Jdefault");
+        assert_eq!(prompt.line.text(), "[2Jdefault");
         assert_eq!(
             prompt.reply(Answer::Accept).to_string(),
             r#"{"accept":true,"promptText":"[2Jdefault"}"#

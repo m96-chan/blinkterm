@@ -23,6 +23,10 @@ options:
   --download-dir <dir>  save files a page offers in <dir>
                    (default: $XDG_DOWNLOAD_DIR, the XDG_DOWNLOAD_DIR of
                    ~/.config/user-dirs.dirs, or ~/Downloads)
+  --search-url <url>
+                   send what is typed in the url bar and is not a url to
+                   <url>, with %s where the words go (off by default: nothing
+                   typed leaves the machine unless you say so)
 
 The page is rendered by a headless Chromium, which this program starts and
 stops. It is looked for in $BLINKTERM_ENGINE first, then on PATH as
@@ -42,7 +46,10 @@ The terminal has to speak the Kitty graphics protocol, the Kitty keyboard
 protocol and SGR mouse reporting: a tOS pane, Kitty, WezTerm or Ghostty.
 
 keys:
-  ctrl+l         type a url
+  ctrl+l         type a url; in the url bar, left/right, home/end, ctrl+a/e
+                 and alt+b/f move, ctrl+w and alt+d delete a word, ctrl+u/k
+                 to either end, up/down walk the pages visited, and tab takes
+                 the suggestion
   ctrl+r         reload
   alt+left/right back and forward
   ctrl+t         a new tab, with the cursor in the url bar
@@ -104,10 +111,15 @@ fn main() -> ExitCode {
 /// is refused instead of one of them quietly winning, and so is either one
 /// twice. `--download-dir` is taken the same two ways and refused twice for
 /// the same reason.
+///
+/// `--search-url` is taken the same two ways, and refused without a `%s`,
+/// which is where the words go: a search url without one would send every
+/// search to the same page, and the person would find that out by searching.
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut url = None;
     let mut profile = None;
     let mut downloads = None;
+    let mut search_url = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let dir = if arg == "--download-dir" {
@@ -128,6 +140,23 @@ fn parse(args: &[String]) -> Result<Options, String> {
         if let Some(dir) = dir {
             if downloads.replace(PathBuf::from(dir)).is_some() {
                 return Err("one download directory at a time".to_string());
+            }
+            continue;
+        }
+        let search = if arg == "--search-url" {
+            Some(args.next().map(String::as_str).unwrap_or_default())
+        } else {
+            arg.strip_prefix("--search-url=")
+        };
+        if let Some(search) = search {
+            if search.is_empty() {
+                return Err("--search-url needs a url: --search-url <url with %s>".to_string());
+            }
+            if !search.contains("%s") {
+                return Err("--search-url needs a %s where the words go".to_string());
+            }
+            if search_url.replace(search.to_string()).is_some() {
+                return Err("one search url at a time".to_string());
             }
             continue;
         }
@@ -163,6 +192,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         url: url.unwrap_or_else(|| "about:blank".to_string()),
         profile: profile.unwrap_or(Choice::Default),
         download: downloads.map_or(download::Choice::Default, download::Choice::At),
+        search_url,
     })
 }
 
@@ -183,6 +213,41 @@ mod tests {
         assert_eq!(options.profile, Choice::Default);
         assert_eq!(options.download, download::Choice::Default);
         assert_eq!(options.url, "about:blank");
+        assert_eq!(options.search_url, None, "nothing typed is searched");
+    }
+
+    #[test]
+    fn a_search_url_can_be_named_either_way_round_the_equals_sign() {
+        let search = "https://duckduckgo.com/?q=%s";
+        for args in [
+            &["--search-url", search, "example.com"][..],
+            &["--search-url=https://duckduckgo.com/?q=%s", "example.com"][..],
+            &["example.com", "--search-url", search][..],
+        ] {
+            let options = parsed(args).expect("a search url");
+            assert_eq!(options.search_url.as_deref(), Some(search), "{args:?}");
+            assert_eq!(options.url, "example.com", "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_search_url_needs_a_percent_s() {
+        let why = parsed(&["--search-url", "https://duckduckgo.com/"])
+            .err()
+            .expect("refused");
+        assert!(why.contains("%s"), "{why}");
+        for args in [&["--search-url"][..], &["--search-url="][..]] {
+            let why = parsed(args).err().expect("refused");
+            assert!(why.contains("--search-url"), "{args:?}: {why}");
+        }
+    }
+
+    #[test]
+    fn two_search_urls_are_one_too_many() {
+        let why = parsed(&["--search-url=a%s", "--search-url", "b%s"])
+            .err()
+            .expect("refused");
+        assert_eq!(why, "one search url at a time");
     }
 
     #[test]

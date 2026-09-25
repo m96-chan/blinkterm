@@ -59,8 +59,8 @@ machine. It prints a warning when it does. Do not browse as root.
   ([#28](https://github.com/m96-chan/blinkterm/issues/28)). What is
   deliberately not filtered is visible text: a title in Cyrillic that looks
   like Latin is the page's to write and yours to read, as in any browser's tab
-  strip, and a character the row measures wrongly — a combining mark — is a
-  row one cell short, not an escape. The page *body* is safe in this respect
+  strip, and a character the row measures wrongly — a keycap sequence, a
+  Hangul jamo — is a row one cell short, not an escape. The page *body* is safe in this respect
   by construction: it arrives as decoded pixels and is written as a graphics
   payload, never as text.
 
@@ -92,6 +92,12 @@ machine. It prints a warning when it does. Do not browse as root.
   the window between write and unlink — that is a picture of whatever you are
   looking at. `Painter` falls back to inline base64 when `/dev/shm` is not
   usable, but it does not currently tighten the mode.
+
+- **The history.** The url bar's history is a record of the pages you
+  visited — url, title, how often, when — kept in the profile as `history`,
+  made readable by you alone (0600) like the cookies beside it, and never
+  written for a `--temp-profile`. It is read by nothing but the url bar, and
+  deleting the file forgets it.
 
 - **The engine's lifetime.** `blinkterm` starts Chromium in a process group of
   its own and kills the group on exit, on a signal, and from a panic hook.

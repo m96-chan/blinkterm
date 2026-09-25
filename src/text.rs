@@ -50,8 +50,8 @@
 //! and the person's to read, as in any browser's tab strip: a Cyrillic `а`
 //! that looks like a Latin `a` is not this program's problem any more than it
 //! is Firefox's, since the page body shows the same page. Combining marks
-//! stay and are counted a cell each, which is a row one cell short —
-//! cosmetic, and older than this module. U+FFFD, the no-break space, the
+//! stay, and [`crate::screen::width`] counts them with the letter they sit
+//! on. U+FFFD, the no-break space, the
 //! ideographic space and the private-use characters that a patched font draws
 //! as icons all stay.
 //!

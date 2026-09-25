@@ -3093,7 +3093,7 @@ document.title=String.fromCharCode(27)+']0;pwned'+String.fromCharCode(7)\
     assert_eq!(loaded.title, "]0;pwned a b moc.elpmaxe");
     assert_eq!(tab.title, loaded.title, "and that is what the tab holds");
 
-    let status = screen::status_line(80, &tab.line(), None);
+    let status = screen::status_line(80, &tab.line());
     let text = a_terminal_reads_only_text_in(&status);
     assert!(text.starts_with("]0;pwned a b moc.elpmaxe"), "{text:?}");
 
@@ -3124,7 +3124,7 @@ document.title=String.fromCharCode(27)+']0;pwned'+String.fromCharCode(7)\
     );
     let dialog = wait_for_dialog(&tab.connection, Duration::from_secs(5));
     assert_eq!(dialog.caption(), "alert: ]0;pwned");
-    let row = screen::dialog_line(80, &dialog.caption(), dialog.hint(), None);
+    let row = screen::dialog_line(80, &dialog.caption(), dialog.hint());
     let text = a_terminal_reads_only_text_in(&row);
     assert!(text.starts_with("alert: ]0;pwned"), "{text:?}");
     answer(&mut tab.connection, dialog, &[press(Key::Enter)]);
@@ -3350,8 +3350,12 @@ fn a_prompt_sends_back_what_was_typed_or_nothing() {
         );
         let dialog = wait_for_dialog(&client, Duration::from_secs(5));
         assert_eq!(dialog.kind, blinkterm::dialog::Kind::Prompt);
-        assert_eq!(dialog.line.text, "default", "the page's default is offered");
-        assert!(dialog.line.whole, "and selected");
+        assert_eq!(
+            dialog.line.text(),
+            "default",
+            "the page's default is offered"
+        );
+        assert!(dialog.line.whole(), "and selected");
         answer(&mut client, dialog, &keys);
         assert_eq!(
             wait_for_title(&mut client, returned, Duration::from_secs(5)),

@@ -7,6 +7,7 @@ JavaScript, the lot, in a terminal.
 
 ```sh
 blinkterm https://example.com
+blinkterm localhost:3000       # this machine gets http://, everything else https://
 ```
 
 `blinkterm` starts a Chromium as a child process, drives it over the Chrome
@@ -117,6 +118,15 @@ other way of stopping it — `SIGTERM` included — loses what was not yet
 written. So a `blinkterm` that is itself `SIGKILL`ed can lose the last thirty
 seconds or so of cookies, which is Chromium's own flush interval.
 
+### History
+
+The pages you visit are remembered in the profile, in a file called
+`history`: each page's url, its title, how many times you have been there and
+when last — a page that loaded, not one that failed, and not `about:` or
+`data:`. It is readable by you alone (0600), like the cookies beside it, and
+keeps the last 2000 pages. `--temp-profile` keeps it in memory for the run and
+writes none. Deleting the file is how to forget it; nothing else reads it.
+
 A full `chromium` rather than the headless shell still writes
 `~/.config/chromium/Crash Reports` whatever profile it is given; that
 directory is Chromium's, not `blinkterm`'s.
@@ -150,7 +160,7 @@ directory, which is the engine's partial file and is safe to delete.
 
 | | |
 | --- | --- |
-| `ctrl+l` | type a url |
+| `ctrl+l` | type a url. In the url bar, `←`/`→`, `home`/`end`, `ctrl+a`/`ctrl+e` and `alt+b`/`alt+f` (or `ctrl+←`/`ctrl+→`) move; `ctrl+w`/`alt+backspace` and `alt+d` delete a word; `ctrl+u`/`ctrl+k` delete to either end; `↑`/`↓` walk the pages visited; a dim suggestion after what you typed is taken with `tab` or `→` |
 | `ctrl+r` | reload |
 | `alt+left` / `alt+right` | back and forward |
 | `ctrl+t` | a new tab, with the cursor in the url bar |
@@ -172,6 +182,27 @@ middle click) is how text gets in, and `alt+c` is how it gets out. A paste
 reaches the page as text, never as keys, so the newlines in it do not submit
 a form; one over 64 KiB is refused whole rather than cut. Copying goes out as
 OSC 52, which your terminal may need to be told to allow.
+
+The url bar is asked about every key first while it is open, so `alt+←`/`→`
+are back and forward only when it is closed — in the bar they move by a word —
+and `ctrl+w`, `ctrl+t` and the rest do nothing there; `esc` closes it.
+
+### Searching
+
+Nothing you type in the url bar is sent anywhere but where it names. With
+`--search-url`, words are sent to the search you choose:
+
+```sh
+blinkterm --search-url 'https://duckduckgo.com/?q=%s'
+```
+
+What counts as words: anything with a space in it, or a single word with no
+dot that is not `localhost` and has no port (`rust`, `what?`), or a number
+that is not an address (`3.14`). `example.com`, `localhost:3000`, `myhost:8080`,
+`192.168.1.1` and anything with a scheme or starting with `/` are still places.
+Without the flag, `rust` goes to `https://rust`, and that is the point: a
+mistyped intranet name or a half-pasted token is not handed to a third party
+unless you said so, once, on the command line.
 
 While a page is waiting on its dialog, only the tab keys and `ctrl+q` still
 work, and the page gets no keys or mouse until it has its answer. A tab behind

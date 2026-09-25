@@ -39,10 +39,11 @@ use crate::dialog::{Answer, Dialog, Kind};
 use crate::download::{self, Downloads};
 use crate::engine::Engine;
 use crate::graphics::{Painter, Raw};
+use crate::history::{self, History};
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
 use crate::json::Json;
 use crate::keys;
-use crate::line::{self, Edit};
+use crate::line::{Edit, Line};
 use crate::load::{self, Loaded, Problem};
 use crate::motion::{self, Motion};
 use crate::profile::{Choice, Profile};
@@ -198,6 +199,10 @@ pub struct Options {
     pub profile: Choice,
     /// Where a file a page offers is saved; see [`crate::download`].
     pub download: download::Choice,
+    /// `--search-url`: where words typed into the url bar are sent, with `%s`
+    /// where they go; or none, in which case what is typed is always a url.
+    /// See [`destination`].
+    pub search_url: Option<String>,
 }
 
 /// Everything the loop owns that is not the terminal, the tabs or the engine.
@@ -215,15 +220,12 @@ struct Chrome {
     /// did and asks it what it has sent; it does the rest on its own clock.
     wheel: scroll::Wheel,
     /// `Some` while the url is being typed.
-    editing: Option<String>,
-    /// Whether that url is still the one the page had, untouched.
-    ///
-    /// A browser's `ctrl+l` selects the whole address, so the next thing typed
-    /// replaces it and a backspace deletes it. There is no selection to draw in
-    /// a status line, but the behaviour is what the reflex expects, and keeping
-    /// the old url until then is what makes `ctrl+l` also a way to read where
-    /// you are.
-    editing_whole: bool,
+    bar: Option<UrlBar>,
+    /// The pages visited, which the url bar offers back; kept in the profile,
+    /// or only in memory for a temporary one. See [`crate::history`].
+    history: History,
+    /// `--search-url`, for [`destination`].
+    search_url: Option<String>,
     /// The `Page.navigate` that has been sent and not yet answered.
     navigation: Option<Navigation>,
     /// Every file a page has handed over this run, and what the row says
@@ -231,6 +233,28 @@ struct Chrome {
     /// the tab it started in, and its events come on the browser's
     /// connection. See [`crate::download`].
     downloads: Downloads,
+}
+
+/// The url bar while it is open.
+///
+/// The line starts as the page's url with all of it selected, because a
+/// browser's `ctrl+l` selects the whole address: the next thing typed replaces
+/// it and a backspace deletes it, while an arrow keeps it to edit. There is no
+/// selection to draw in a status line, but the behaviour is what the reflex
+/// expects, and keeping the old url until then is what makes `ctrl+l` also a
+/// way to read where you are.
+struct UrlBar {
+    line: Line,
+    /// Up and Down in progress through the history. No suggestion is offered
+    /// while walking: what is in the bar was put there whole, and the next
+    /// letter typed ends the walk.
+    walk: Option<history::Walk>,
+}
+
+impl UrlBar {
+    fn new(line: Line) -> UrlBar {
+        UrlBar { line, walk: None }
+    }
 }
 
 /// A `Page.navigate` that is out with the engine.
@@ -339,8 +363,13 @@ pub fn run(options: Options) -> Result<(), String> {
                 motion: Motion::new(Instant::now()),
                 still: None,
                 wheel: scroll::Wheel::start(),
-                editing: None,
-                editing_whole: false,
+                bar: None,
+                history: if engine.profile().is_temporary() {
+                    History::in_memory()
+                } else {
+                    History::load(engine.profile().dir())
+                },
+                search_url: options.search_url.clone(),
                 navigation: None,
                 downloads: Downloads::new(downloads_dir),
             };
@@ -1068,15 +1097,22 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         return Ok(());
     };
     let downloading = chrome.downloads.line(Instant::now());
-    let bytes = if chrome.editing.is_some() {
-        screen::status_line(cols, &active.line(), chrome.editing.as_deref())
+    let bytes = if let Some(bar) = &chrome.bar {
+        typing_row(cols, "url: ", &bar.line)
     } else if let Some(dialog) = &active.dialog {
-        let typed = dialog.typing().then_some(dialog.line.text.as_str());
-        screen::dialog_line(cols, &dialog.caption(), dialog.hint(), typed)
+        if dialog.typing() {
+            typing_row(
+                cols,
+                &screen::dialog_prompt(cols, &dialog.caption()),
+                &dialog.line,
+            )
+        } else {
+            screen::dialog_line(cols, &dialog.caption(), dialog.hint())
+        }
     } else if tabs.len() < 2 {
         match &downloading {
             Some(words) => screen::split_line(cols, &active.line(), words),
-            None => screen::status_line(cols, &active.line(), None),
+            None => screen::status_line(cols, &active.line()),
         }
     } else {
         // Held here first, because a label can be a sentence made on the spot
@@ -1096,6 +1132,13 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         screen::tab_line(cols, &labels, right)
     };
     pane.write(&bytes).map_err(|e| e.to_string())
+}
+
+/// The row as `line` being typed after `prompt`: as much of it as fits, with
+/// the cursor in sight.
+fn typing_row(cols: u32, prompt: &str, line: &Line) -> Vec<u8> {
+    let view = line.view(screen::prompt_room(cols, prompt));
+    screen::prompt_line(cols, prompt, &view.text, &view.hint, view.cursor)
 }
 
 /// Everything the browser connection said: which pages there are.
@@ -1282,6 +1325,16 @@ fn handle_page_events(
         if ask_title && tab.dialog.is_none() {
             if let Some(loaded) = page_loaded(&mut tab.connection) {
                 tab.loaded(loaded);
+                // The one moment the page's final url, after its redirects,
+                // and its title are both known: this is a visit. A page that
+                // did not come has a problem and is not one; `about:` and
+                // `data:` are refused by the history itself. A tab behind is
+                // in this loop too, so a page opened in a new window counts.
+                // What it costs is one line appended to a file, and a history
+                // that cannot be written is not a reason to stop.
+                if tab.problem.is_none() && History::records(&tab.url) {
+                    let _ = chrome.history.visited(&tab.url, &tab.title, unix_now());
+                }
             }
         }
     }
@@ -1329,7 +1382,7 @@ fn paint(
 /// Whether the row is a line being typed into: the url bar, or the answer to
 /// a `prompt()` on the page in front.
 fn row_owns_cursor(tabs: &Tabs<Client>, chrome: &Chrome) -> bool {
-    chrome.editing.is_some()
+    chrome.bar.is_some()
         || tabs
             .active()
             .and_then(|tab| tab.dialog.as_ref())
@@ -1564,7 +1617,7 @@ fn handle_input(
             if key.action != KeyAction::Release {
                 chrome.motion.input(Instant::now());
             }
-            if chrome.editing.is_some() {
+            if chrome.bar.is_some() {
                 return edit_url(pane, tabs, chrome, key);
             }
             let was = tabs.active_target().map(str::to_string);
@@ -1583,7 +1636,7 @@ fn handle_input(
                             .active()
                             .and_then(|tab| tab.dialog.as_ref())
                             .filter(|dialog| dialog.typing())
-                            .map(|dialog| dialog.line.text.clone());
+                            .map(|dialog| dialog.line.text().to_string());
                         if let Some(typed) = typed {
                             copy_out(pane, tabs, &typed, Copied::Text)?;
                             redraw_row(pane, tabs, chrome)?;
@@ -1598,8 +1651,9 @@ fn handle_input(
             match command {
                 Some(Command::Quit) => return Ok(false),
                 Some(Command::EditUrl) => {
-                    chrome.editing = tabs.active().map(|tab| tab.url.clone());
-                    chrome.editing_whole = true;
+                    chrome.bar = tabs
+                        .active()
+                        .map(|tab| UrlBar::new(Line::selected(tab.url.clone())));
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(Command::Reload) => {
@@ -1645,8 +1699,7 @@ fn handle_input(
                             // address into, so it opens with the cursor in the
                             // url bar — and with nothing in it, because there
                             // is no address here to replace.
-                            chrome.editing = Some(String::new());
-                            chrome.editing_whole = false;
+                            chrome.bar = Some(UrlBar::new(Line::empty()));
                         }
                         Err(why) => {
                             if let Some(tab) = tabs.active_mut() {
@@ -1947,7 +2000,11 @@ fn edit_url(
     // is the line, so that is what `alt+c` copies.
     match command(&key) {
         Some(Command::CopySelection) => {
-            let typed = chrome.editing.clone().unwrap_or_default();
+            let typed = chrome
+                .bar
+                .as_ref()
+                .map(|bar| bar.line.text().to_string())
+                .unwrap_or_default();
             copy_out(pane, tabs, &typed, Copied::Text)?;
             return Ok(true);
         }
@@ -1958,17 +2015,16 @@ fn edit_url(
         }
         _ => {}
     }
-    let whole = std::mem::take(&mut chrome.editing_whole);
-    let Some(buffer) = chrome.editing.as_mut() else {
+    let Some(bar) = chrome.bar.as_mut() else {
         return Ok(true);
     };
-    match line::edit_step(buffer, whole, &key) {
-        Edit::Typing => {}
+    match bar_step(bar, &chrome.history, &key) {
+        Edit::Typing | Edit::Inserted | Edit::Previous | Edit::Next => {}
         Edit::Quit => return Ok(false),
-        Edit::Cancel => chrome.editing = None,
+        Edit::Cancel => chrome.bar = None,
         Edit::Go => {
-            let url = normalise(buffer);
-            chrome.editing = None;
+            let url = destination(bar.line.text(), chrome.search_url.as_deref());
+            chrome.bar = None;
             if let Some(tab) = tabs.active_mut() {
                 tab.url = url.clone();
                 tab.note = Some(format!("loading {url}"));
@@ -2011,9 +2067,13 @@ fn paste(
     chrome: &mut Chrome,
     text: &str,
 ) -> Result<(), String> {
-    if let Some(buffer) = chrome.editing.as_mut() {
-        let whole = std::mem::take(&mut chrome.editing_whole);
-        paste_into_line(buffer, whole, text);
+    if let Some(bar) = chrome.bar.as_mut() {
+        if paste_into_line(&mut bar.line, text) {
+            // As a typed character does: the walk through history ends, and
+            // what was there to take is asked for again.
+            bar.walk = None;
+            bar.line.suggest(chrome.history.complete(bar.line.text()));
+        }
         return redraw_row(pane, tabs, chrome);
     }
     if asking(tabs) {
@@ -2036,20 +2096,14 @@ fn paste(
 
 /// A paste into a line being typed: the url bar's, or a `prompt()`'s.
 ///
-/// What is kept of it is [`clipboard::one_line`], and it goes at the end,
-/// where a key's character goes. A line still offered whole is replaced by
-/// it, as the first key would replace it — a url pasted over the address
-/// `ctrl+l` showed is the url, not the two glued together. A paste that is
-/// nothing once it is one line changes nothing, the selection included.
-fn paste_into_line(buffer: &mut String, whole: bool, text: &str) {
+/// What is kept of it is [`clipboard::one_line`], put in at the cursor by
+/// [`Line::insert_str`] — which replaces a line still offered whole, as the
+/// first key would: a url pasted over the address `ctrl+l` showed is the url,
+/// not the two glued together. A paste that is nothing once it is one line
+/// changes nothing, the selection included, and says so by returning `false`.
+fn paste_into_line(line: &mut Line, text: &str) -> bool {
     let text = clipboard::one_line(text);
-    if text.is_empty() {
-        return;
-    }
-    if whole {
-        buffer.clear();
-    }
-    buffer.push_str(&text);
+    !text.is_empty() && line.insert_str(&text)
 }
 
 /// A paste into a dialog: into its line if it is a `prompt()`, and `false`,
@@ -2058,8 +2112,7 @@ fn paste_into_dialog(dialog: &mut Dialog, text: &str) -> bool {
     if !dialog.typing() {
         return false;
     }
-    let whole = std::mem::take(&mut dialog.line.whole);
-    paste_into_line(&mut dialog.line.text, whole, text);
+    paste_into_line(&mut dialog.line, text);
     true
 }
 
@@ -2119,6 +2172,42 @@ fn note(tabs: &mut Tabs<Client>, sentence: impl Into<String>) {
     if let Some(tab) = tabs.active_mut() {
         tab.note = Some(sentence.into());
     }
+}
+
+/// What one key does to the url bar, given the pages visited: the part of
+/// [`edit_url`] that talks to nothing, so that it can be tested a key at a
+/// time.
+///
+/// A suggestion is asked for when text went in and at no other time — a
+/// suggestion made again after a backspace is one the backspace cannot
+/// delete. Up and Down walk the pages that match what was typed when the
+/// walk began; any edit that changes the text ends the walk, so that the
+/// next Up walks what is there now.
+fn bar_step(bar: &mut UrlBar, history: &History, key: &KeyInput) -> Edit {
+    let before = bar.line.text().len();
+    let edit = bar.line.step(key);
+    match edit {
+        Edit::Inserted => {
+            bar.walk = None;
+            bar.line.suggest(history.complete(bar.line.text()));
+        }
+        Edit::Previous | Edit::Next => {
+            let walk = bar
+                .walk
+                .get_or_insert_with(|| history::Walk::new(history, bar.line.text()));
+            let moved = if edit == Edit::Previous {
+                walk.up()
+            } else {
+                walk.down()
+            };
+            if let Some(url) = moved {
+                bar.line.set_text(url);
+            }
+        }
+        Edit::Typing if bar.line.text().len() != before => bar.walk = None,
+        _ => {}
+    }
+    edit
 }
 
 /// Walk the active tab's history by one entry.
@@ -2277,10 +2366,11 @@ fn send_mouse(
 ///
 /// A scheme is left alone. Anything else gets `https://`, because a bare
 /// `example.com` is what people type and a `Page.navigate` without a scheme
-/// fails with an error rather than guessing. What is deliberately not here is
-/// a search engine: sending what somebody typed to a third party because it
-/// did not parse as a host is a decision about their privacy, and it is not
-/// this program's to make.
+/// fails with an error rather than guessing — except a host that can only be
+/// this machine: `localhost`, anything under `.localhost`, `127.0.0.0/8` and
+/// `[::1]`, with or without a port, get `http://`. Nothing on a loopback has a
+/// certificate, and `https://localhost:3000` is a connection refused where
+/// the development server a person typed that for is answering plain http.
 ///
 /// What comes out is plain text first ([`crate::text::sanitize`]), because
 /// it is going to be both shown on the row and sent to the engine, and what
@@ -2291,13 +2381,140 @@ pub fn normalise(input: &str) -> String {
     if text.is_empty() {
         return "about:blank".to_string();
     }
-    if text.contains("://") || text.starts_with("about:") || text.starts_with("data:") {
+    if spelled_out(text) {
         return text.to_string();
     }
     if text.starts_with('/') {
         return format!("file://{text}");
     }
+    if local_host(host_of(text).0) {
+        return format!("http://{text}");
+    }
     format!("https://{text}")
+}
+
+/// Where the url bar goes with what was typed: [`normalise`], unless a
+/// search url was given and what was typed is words rather than a place.
+///
+/// Off unless `--search-url` names one. Sending what somebody typed to a
+/// third party because it did not parse as a host is a decision about their
+/// privacy — a mistyped intranet name, a half-pasted token — and it is theirs
+/// to make, once, on the command line; without it, nothing typed is sent
+/// anywhere but where it names. With it, the words replace the first `%s` in
+/// the search url, percent-encoded. What counts as words is decided by `is_search`, below.
+pub fn destination(input: &str, search_url: Option<&str>) -> String {
+    let Some(search_url) = search_url else {
+        return normalise(input);
+    };
+    let text = crate::text::sanitize(input);
+    let text = text.trim();
+    if text.is_empty() || spelled_out(text) || text.starts_with('/') || !is_search(text) {
+        return normalise(input);
+    }
+    search_url.replacen("%s", &percent_encode(text), 1)
+}
+
+/// Whether `text` already says what it is: a scheme, or `about:` or `data:`.
+fn spelled_out(text: &str) -> bool {
+    text.contains("://") || text.starts_with("about:") || text.starts_with("data:")
+}
+
+/// Whether `text` — trimmed, not empty, no scheme and not a path — is
+/// something to search for rather than somewhere to go.
+///
+/// A place, in order: nothing with a space in it is one, since a url has no
+/// spaces. This machine is one ([`local_host`]), and so is anything in
+/// brackets, which is an IPv6 address. A host made only of numbers is one if
+/// it is an IPv4 address and words otherwise — `3.14` is a number somebody
+/// wants explained. Otherwise a host of two or more labels, each of letters,
+/// digits and hyphens (any script's letters, for an internationalised name),
+/// the last with a letter in it, is a place: `example.com`, `例え.jp`,
+/// `a.b/c?d`; and `rust`, `what?`, `foo.123`, `.com` and `a..b` are words. A
+/// single label is a place only with a port, which nobody types by accident:
+/// `myhost:8080`.
+fn is_search(text: &str) -> bool {
+    if text.chars().any(char::is_whitespace) {
+        return true;
+    }
+    let (host, port) = host_of(text);
+    if local_host(host) || host.starts_with('[') {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let number = |label: &&str| !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit());
+    if labels.iter().all(number) {
+        let ipv4 = labels.len() == 4 && labels.iter().all(|label| label.parse::<u8>().is_ok());
+        return !ipv4;
+    }
+    if labels.len() < 2 {
+        return !port;
+    }
+    let label_ok =
+        |label: &&str| !label.is_empty() && label.chars().all(|c| c.is_alphanumeric() || c == '-');
+    let last_has_letter = labels
+        .last()
+        .is_some_and(|label| label.chars().any(char::is_alphabetic));
+    !(labels.iter().all(label_ok) && last_has_letter)
+}
+
+/// The host of something typed without a scheme — what comes before the
+/// first `/`, `?` or `#` — without its port, and whether it had one. An IPv6
+/// address keeps its brackets, and the colons inside them are not a port.
+fn host_of(text: &str) -> (&str, bool) {
+    let end = text.find(['/', '?', '#']).unwrap_or(text.len());
+    let authority = &text[..end];
+    if authority.starts_with('[') {
+        return match authority.find(']') {
+            Some(close) => (
+                &authority[..=close],
+                authority[close + 1..].starts_with(':'),
+            ),
+            None => (authority, false),
+        };
+    }
+    match authority.split_once(':') {
+        Some((host, _)) => (host, true),
+        None => (authority, false),
+    }
+}
+
+/// Whether a host can only be this machine: `localhost` and its subdomains
+/// (which RFC 6761 reserves for loopback, and which Chromium resolves there
+/// without asking), `127.0.0.0/8`, and `[::1]`.
+fn local_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") || host == "[::1]" {
+        return true;
+    }
+    let octets: Vec<&str> = host.split('.').collect();
+    octets.len() == 4
+        && octets[0] == "127"
+        && octets.iter().all(|octet| {
+            !octet.is_empty()
+                && octet.bytes().all(|b| b.is_ascii_digit())
+                && octet.parse::<u8>().is_ok()
+        })
+}
+
+/// Words made safe to put in a url's query: the unreserved characters of
+/// RFC 3986 as they are, and every other byte of the UTF-8 as `%XX`.
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Seconds since the epoch, for the history; 0 on a clock set before it.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 #[cfg(test)]
@@ -2429,15 +2646,17 @@ mod tests {
 
     #[test]
     fn a_paste_into_a_line_is_one_line_and_replaces_what_was_offered() {
-        let mut buffer = "https://example.com/offered".to_string();
-        paste_into_line(&mut buffer, true, "https://pasted.example/\r\n");
-        assert_eq!(buffer, "https://pasted.example/");
-        paste_into_line(&mut buffer, false, "a\tb\x1b[2J");
-        assert_eq!(buffer, "https://pasted.example/ab[2J");
-        // A paste that is nothing once it is one line changes nothing.
-        let mut buffer = "offered".to_string();
-        paste_into_line(&mut buffer, true, "\r\n");
-        assert_eq!(buffer, "offered");
+        let mut line = Line::selected("https://example.com/offered");
+        assert!(paste_into_line(&mut line, "https://pasted.example/\r\n"));
+        assert_eq!(line.text(), "https://pasted.example/");
+        assert!(paste_into_line(&mut line, "a\tb\x1b[2J"));
+        assert_eq!(line.text(), "https://pasted.example/ab[2J");
+        // A paste that is nothing once it is one line changes nothing, and
+        // leaves the line still offered whole.
+        let mut line = Line::selected("offered");
+        assert!(!paste_into_line(&mut line, "\r\n"));
+        assert_eq!(line.text(), "offered");
+        assert!(line.whole());
     }
 
     #[test]
@@ -2453,10 +2672,10 @@ mod tests {
         };
         let mut prompt = asked("prompt");
         assert!(paste_into_dialog(&mut prompt, "pasted\n"));
-        assert_eq!(prompt.line.text, "pasted", "over the default, as a key");
-        assert!(!prompt.line.whole);
+        assert_eq!(prompt.line.text(), "pasted", "over the default, as a key");
+        assert!(!prompt.line.whole());
         assert!(paste_into_dialog(&mut prompt, " more"));
-        assert_eq!(prompt.line.text, "pasted more");
+        assert_eq!(prompt.line.text(), "pasted more");
         // And it is still a question waiting on a key: a paste is not Enter.
         assert_eq!(
             prompt.step(&key(Key::Char('x'), Mods::SHIFT)),
@@ -2482,6 +2701,10 @@ mod tests {
     #[test]
     fn what_a_person_types_becomes_a_url_the_engine_takes() {
         assert_eq!(normalise("example.com"), "https://example.com");
+        assert_eq!(
+            normalise("example.com:8443/a"),
+            "https://example.com:8443/a"
+        );
         assert_eq!(normalise("  example.com/a b "), "https://example.com/a b");
         assert_eq!(normalise("http://example.com"), "http://example.com");
         assert_eq!(normalise("https://example.com"), "https://example.com");
@@ -2498,6 +2721,159 @@ mod tests {
             "https://]0;xexample.com"
         );
         assert_eq!(normalise("example.com\r\n"), "https://example.com");
+        // This machine has no certificate: plain http, port or no port.
+        for local in [
+            "localhost",
+            "localhost:3000",
+            "LocalHost:3000/app",
+            "app.localhost/x",
+            "127.0.0.1:8000/",
+            "127.1.2.3",
+            "[::1]:8080",
+            "[::1]",
+        ] {
+            assert_eq!(normalise(local), format!("http://{local}"), "{local}");
+        }
+        // A name that only starts like one is somebody else's machine.
+        for remote in [
+            "localhost.example.com",
+            "mylocalhost",
+            "127.0.0.1.example.com",
+            "128.0.0.1",
+            "[::2]",
+        ] {
+            assert_eq!(normalise(remote), format!("https://{remote}"), "{remote}");
+        }
+        // And a scheme typed is a scheme kept.
+        assert_eq!(
+            normalise("https://localhost:3000"),
+            "https://localhost:3000"
+        );
+    }
+
+    /// What is typed, and whether a search url makes it a search.
+    const TYPED: [(&str, bool); 24] = [
+        ("example.com", false),
+        ("example.com/a b", true),
+        ("rust borrow checker", true),
+        ("rust", true),
+        ("what?", true),
+        ("3.14", true),
+        ("foo.123", true),
+        (".com", true),
+        ("a..b", true),
+        ("\u{4f8b}\u{3048}.jp", false),
+        ("a.b/c?d", false),
+        ("my-site.co.uk", false),
+        ("192.168.1.1", false),
+        ("192.168.1.300", true),
+        ("localhost", false),
+        ("localhost:3000", false),
+        ("app.localhost", false),
+        ("[::1]:8080", false),
+        ("[2001:db8::1]", false),
+        ("myhost:8080", false),
+        ("https://example.com/?q=a b", false),
+        ("about:blank", false),
+        ("/etc/hostname", false),
+        ("", false),
+    ];
+
+    #[test]
+    fn with_a_search_url_words_are_searched_and_hosts_are_still_hosts() {
+        let search = Some("https://search.example/?q=%s&x=%s");
+        for (typed, words) in TYPED {
+            let went = destination(typed, search);
+            if words {
+                assert!(
+                    went.starts_with("https://search.example/?q="),
+                    "{typed:?}: {went}"
+                );
+                assert!(went.ends_with("&x=%s"), "the first %s only: {went}");
+            } else {
+                assert_eq!(went, normalise(typed), "{typed:?}");
+            }
+        }
+        assert_eq!(
+            destination("  a b&c  ", search),
+            "https://search.example/?q=a%20b%26c&x=%s"
+        );
+        assert_eq!(
+            destination("caf\u{e9}?", Some("https://s.example/%s")),
+            "https://s.example/caf%C3%A9%3F"
+        );
+        // What is searched is the plain text of it, as what is sent always is.
+        assert_eq!(
+            destination("a\u{202e} b", Some("https://s.example/%s")),
+            "https://s.example/a%20b"
+        );
+    }
+
+    #[test]
+    fn without_a_search_url_nothing_typed_leaves_for_a_third_party() {
+        for (typed, _) in TYPED {
+            assert_eq!(destination(typed, None), normalise(typed), "{typed:?}");
+        }
+        assert_eq!(destination("rust", None), "https://rust");
+    }
+
+    fn typed(c: char) -> KeyInput {
+        KeyInput {
+            key: Key::Char(c),
+            mods: Mods::default(),
+            action: KeyAction::Press,
+            text: Some(c),
+        }
+    }
+
+    #[test]
+    fn the_url_bar_offers_what_was_visited_and_walks_it_with_up_and_down() {
+        let mut history = History::in_memory();
+        let _ = history.visited("https://example.com/docs", "Docs", 1);
+        let _ = history.visited("https://rust-lang.org/", "Rust", 2);
+        let mut bar = UrlBar::new(Line::selected("https://old.example/"));
+
+        // Typing over the offered url asks for a suggestion.
+        for c in "exa".chars() {
+            assert_eq!(bar_step(&mut bar, &history, &typed(c)), Edit::Inserted);
+        }
+        assert_eq!(bar.line.text(), "exa");
+        assert_eq!(bar.line.hint(), "mple.com/docs");
+        // A backspace takes it away and does not bring it back.
+        bar_step(&mut bar, &history, &key(Key::Backspace, 0));
+        assert_eq!(bar.line.text(), "ex");
+        assert_eq!(bar.line.hint(), "");
+        // Typing again does, and Tab takes it.
+        bar_step(&mut bar, &history, &typed('a'));
+        bar_step(&mut bar, &history, &key(Key::Tab, 0));
+        assert_eq!(bar.line.text(), "example.com/docs");
+        assert_eq!(bar.line.hint(), "");
+
+        // Up on an empty bar walks back through where you have been, and Down
+        // comes back to what was typed.
+        let mut bar = UrlBar::new(Line::empty());
+        bar_step(&mut bar, &history, &key(Key::Up, 0));
+        assert_eq!(bar.line.text(), "https://rust-lang.org/");
+        assert_eq!(bar.line.hint(), "", "no suggestion while walking");
+        bar_step(&mut bar, &history, &key(Key::Up, 0));
+        assert_eq!(bar.line.text(), "https://example.com/docs");
+        bar_step(&mut bar, &history, &key(Key::Up, 0));
+        assert_eq!(bar.line.text(), "https://example.com/docs", "the oldest");
+        bar_step(&mut bar, &history, &key(Key::Down, 0));
+        bar_step(&mut bar, &history, &key(Key::Down, 0));
+        assert_eq!(bar.line.text(), "");
+
+        // Up after typing walks what matches it.
+        let mut bar = UrlBar::new(Line::empty());
+        for c in "docs".chars() {
+            bar_step(&mut bar, &history, &typed(c));
+        }
+        bar_step(&mut bar, &history, &key(Key::Up, 0));
+        assert_eq!(bar.line.text(), "https://example.com/docs");
+        assert!(bar.walk.is_some());
+        // And an edit ends the walk, so the next Up walks what is there now.
+        bar_step(&mut bar, &history, &key(Key::Backspace, 0));
+        assert!(bar.walk.is_none());
     }
 
     #[test]

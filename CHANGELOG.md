@@ -44,6 +44,18 @@ carry, and the list is kept as things land rather than written at the end.
   longer submits a form, and a paste over 64 KiB is refused whole), `alt+c`
   copies the page's selection and `alt+u` the url to the host's clipboard over
   OSC 52 ([#9](https://github.com/m96-chan/blinkterm/issues/9)).
+- The url bar is an editor: a cursor that moves by character — a letter and
+  its accent, a flag, an emoji are one — readline's keys (`ctrl+a`/`ctrl+e`,
+  `alt+b`/`alt+f`, `ctrl+w`, `alt+d`, `ctrl+u`/`ctrl+k`, Delete), and a row
+  that scrolls sideways when the url is wider than the pane. A page's
+  `prompt()` gets the same editor
+  ([#14](https://github.com/m96-chan/blinkterm/issues/14)).
+- Pages visited are remembered in the profile (`history`, 0600, the last
+  2000); `↑`/`↓` in the url bar walk them, and a match is offered dim after
+  what is typed, taken with `tab` or `→`. A temporary profile keeps none on
+  disk.
+- `--search-url <url with %s>`: words typed in the url bar go to that search.
+  Off by default; without it nothing typed is sent anywhere it does not name.
 
 ### Changed
 
@@ -53,6 +65,10 @@ carry, and the list is kept as things land rather than written at the end.
 - The engine is looked for as `chrome-headless-shell` first and
   `chromium-shell` last. Debian's `chromium-shell` is `content_shell`: it keeps
   a DevTools port open, answers dialogs itself and does not close when asked.
+- `localhost`, `*.localhost`, `127.*` and `[::1]` typed without a scheme get
+  `http://`, not `https://`.
+- `ctrl+u` in the url bar deletes to the start of the line rather than the
+  whole line — the same thing until the cursor could move.
 
 - The minimum Rust is **1.87**. It was documented as 1.75, which had never been
   true: the dependency closure has not built below 1.87. It is checked by CI
