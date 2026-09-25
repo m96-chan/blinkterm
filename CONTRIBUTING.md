@@ -40,7 +40,8 @@ down a pane's pseudoterminal.
 They run only when you name an engine:
 
 ```sh
-BLINKTERM_ENGINE=chromium-shell cargo test --release -- --test-threads=1
+BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
+  cargo test --release -- --test-threads=1
 ```
 
 **Naming the engine is the consent.** A machine with a Chromium on it did not

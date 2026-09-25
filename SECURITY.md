@@ -33,12 +33,14 @@ machine. It prints a warning when it does. Do not browse as root.
 **`blinkterm`'s.** The wire between the engine and the terminal:
 
 - **The DevTools transport.** The engine is started with
-  `--remote-debugging-port=0` and `--remote-allow-origins=*`. The port is
-  chosen by the kernel and bound to localhost, but *any local process running
-  as you* can connect to it and drive the browser — read pages, take
-  screenshots, execute script. This is a known weakness, tracked in
-  [#5](https://github.com/m96-chan/blinkterm/issues/5), and it is the reason
-  this program should not be run on a machine you share a uid with somebody on.
+  `--remote-debugging-pipe` and driven over two inherited pipes, its
+  descriptors 3 and 4, which nobody else holds. It opens no port, and the
+  engine tests check that no process in its group is listening on one
+  ([#5](https://github.com/m96-chan/blinkterm/issues/5)). That holds for a
+  real headless shell — `chrome-headless-shell`, or Chromium itself. It does
+  not hold for Debian's `chromium-shell`, which is Chromium's `content_shell`
+  and opens its DevTools port whatever it is told; with that engine any local
+  process running as you can still attach, and the README says so.
 
 - **What gets written to your terminal.** A terminal executes the bytes it is
   sent, so anything page-derived that reaches the status row is a place where a
@@ -58,14 +60,16 @@ machine. It prints a warning when it does. Do not browse as root.
 
 - **The engine's lifetime.** `blinkterm` starts Chromium in a process group of
   its own and kills the group on exit, on a signal, and from a panic hook.
-  A Chromium left running with an open debugging port after `blinkterm` has
-  gone would be a security problem, so failures of that machinery count here.
+  A Chromium left running after `blinkterm` has gone — holding your profile,
+  and with `chromium-shell` an open debugging port — would be a security
+  problem, so failures of that machinery count here.
 
 ## Out of scope
 
 - Bugs in Chromium itself — report upstream.
-- Anything that needs the attacker to already run code as your user; that is
-  the DevTools port's threat model above, and it is already conceded.
+- Anything that needs the attacker to already run code as your user. Such an
+  attacker can read the profile directory and ptrace the engine; the pipe
+  keeps them from driving it through a port, not from everything.
 - Running as root after being told not to.
 - The proof-of-concept scripts in `tools/`. `tools/Dockerfile` binds the
   debugging port to `0.0.0.0` and says so in a comment: it is a development

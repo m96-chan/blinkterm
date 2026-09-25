@@ -56,8 +56,9 @@ are part of what the release *is*:
 - **the tOS revision** the dependencies are pinned to — `c7677bde` at the time
   of writing, from `Cargo.toml`. It is the PNG and JPEG decoders, the terminal
   handling and the cell arithmetic, so it is as much of the program as `src/`.
-- **the Chromium the engine tests passed against**. The `engine` job prints
-  `chromium-shell --version`; take it from that run's log. The program does not
+- **the Chromium the engine tests passed against**. The `engine` job pins a
+  `chrome-headless-shell` by version and checksum and prints its `--version`;
+  take it from that run's log. The program does not
   ship an engine, so "it works" is always "it worked against this one".
 
 ## Not on crates.io
