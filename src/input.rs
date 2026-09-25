@@ -1674,6 +1674,17 @@ mod tests {
         assert!(page_point(&MouseInput { y: 3, ..corner }, true, (8, 16), 1).1 < 0);
     }
 
+    #[test]
+    fn ctrl_period_arrives_in_the_kitty_form_as_the_period_with_ctrl() {
+        // Normal mode's toggle: `CSI 46;5u`, with no text, because the text a
+        // key implies is dropped when ctrl is held.
+        let key = one_key(b"\x1b[46;5u");
+        assert_eq!(key.key, Key::Char('.'));
+        assert!(key.mods.ctrl());
+        assert!(!key.mods.alt());
+        assert_eq!(key.text, None);
+    }
+
     fn bytes_as_text(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).escape_debug().to_string()
     }
