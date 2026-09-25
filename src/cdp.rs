@@ -854,14 +854,16 @@ impl Client {
 
     /// Send a command and come back for the reply later.
     ///
-    /// [`Client::call`] is the right shape for everything on a person's
-    /// critical path — a navigation, a history entry — because there is
-    /// nothing useful to do until the engine has answered. It is the wrong
-    /// shape for the lossless still: that is tens of milliseconds of engine at
-    /// a pane's size, and a loop that sits in `call` for them is a loop that
-    /// is not reading the terminal. So the command goes out here and the reply
-    /// is collected by [`Client::take_reply`] on whichever pass it has
-    /// arrived on.
+    /// [`Client::call`] is the right shape for most of a person's critical
+    /// path — a history entry, a reload — because there is nothing useful to
+    /// do until the engine has answered. It is the wrong shape for the
+    /// lossless still: that is tens of milliseconds of engine at a pane's
+    /// size, and a loop that sits in `call` for them is a loop that is not
+    /// reading the terminal. And it is the wrong shape for `Page.navigate`,
+    /// whose reply the engine holds until a "leave this page?" is answered —
+    /// a loop waiting for it could never show the question. So those go out
+    /// here and the reply is collected by [`Client::take_reply`] on whichever
+    /// pass it has arrived on.
     ///
     /// Nothing new is needed underneath: a reply is filed in the mailbox under
     /// its own id by the same reader thread, and the same wake pipe knocks for

@@ -118,11 +118,13 @@
 pub mod app;
 pub mod base64;
 pub mod cdp;
+pub mod dialog;
 pub mod engine;
 pub mod graphics;
 pub mod input;
 pub mod json;
 pub mod keys;
+pub mod line;
 pub mod load;
 pub mod motion;
 pub mod profile;

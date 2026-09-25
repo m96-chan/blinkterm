@@ -2844,3 +2844,379 @@ fn the_status_of_the_document_comes_with_its_title() {
     tab.connection.close();
     engine.kill();
 }
+
+// ---------------------------------------------------------------------------
+// Dialogs
+// ---------------------------------------------------------------------------
+//
+// A page with a dialog open is a page whose renderer is stopped inside the
+// script that opened it, so nothing below asks it anything while one is up:
+// not its title, not a screenshot. Those would sit out their deadlines and
+// prove only that the page was stopped, which is the one thing already known.
+// What is asked is the engine — the dialog opening, the dialog closing, and
+// what the page did with the answer once it had one.
+
+/// A page with nothing on it but a title, which is where the scripts below
+/// write what their dialogs returned.
+const QUIET_PAGE: &str = "data:text/html,<title>ready</title><body>";
+
+/// Load a page that can be asked to open dialogs.
+fn a_page_that_asks(client: &mut Client, url: &str, title: &str) {
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(client, title, Duration::from_secs(10)),
+        title
+    );
+    let _ = client.events();
+}
+
+/// Run a script that opens a dialog.
+///
+/// `notify` rather than `call`: the evaluation does not answer until the
+/// script is over, and the script is not over until the dialog is answered —
+/// a `call` here would wait out its own deadline and then report the page as
+/// broken.
+fn raise(client: &mut Client, expression: &str) {
+    client
+        .notify(
+            "Runtime.evaluate",
+            Json::object(vec![("expression", Json::string(expression))]),
+        )
+        .expect("the script is sent");
+}
+
+/// The next dialog the page opens, read the way the program reads it.
+fn wait_for_dialog(client: &Client, timeout: Duration) -> blinkterm::dialog::Dialog {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for event in client.events() {
+            if event.method == "Page.javascriptDialogOpening" {
+                return blinkterm::dialog::Dialog::opening(&event.params)
+                    .unwrap_or_else(|| panic!("a dialog of no known kind: {}", event.params));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("no dialog opened in {timeout:?}");
+}
+
+/// Press `keys` at a dialog until one of them answers it, tell the engine
+/// what the program would tell it, and wait for the engine to say the dialog
+/// has closed with that answer.
+fn answer(
+    client: &mut Client,
+    mut dialog: blinkterm::dialog::Dialog,
+    keys: &[KeyInput],
+) -> blinkterm::dialog::Answer {
+    use blinkterm::dialog::Answer;
+    let mut answered = Answer::Waiting;
+    for key in keys {
+        answered = dialog.step(key);
+        if answered != Answer::Waiting {
+            break;
+        }
+    }
+    assert!(
+        matches!(answered, Answer::Accept | Answer::Dismiss),
+        "{keys:?} did not answer the {:?}",
+        dialog.kind
+    );
+    client
+        .call("Page.handleJavaScriptDialog", dialog.reply(answered))
+        .expect("the engine takes the answer");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        for event in client.events() {
+            if event.method == "Page.javascriptDialogClosed" {
+                assert_eq!(
+                    event.params.get("result").and_then(Json::as_bool),
+                    Some(answered == Answer::Accept),
+                    "the engine closed it with a different answer: {}",
+                    event.params
+                );
+                return answered;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("the dialog never said it had closed");
+}
+
+fn press(key: Key) -> KeyInput {
+    KeyInput::press(key)
+}
+
+fn letter(c: char) -> KeyInput {
+    KeyInput {
+        key: Key::Char(c),
+        mods: Mods::default(),
+        action: KeyAction::Press,
+        text: Some(c),
+    }
+}
+
+/// `alert()` used to be answered no on the page's behalf and never seen. Now
+/// it is seen, it says what it said, and the key that dismisses it is what
+/// lets the rest of the script run.
+#[test]
+fn an_alert_is_seen_and_any_key_lets_the_page_carry_on() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    a_page_that_asks(&mut client, QUIET_PAGE, "ready");
+
+    raise(
+        &mut client,
+        "alert('saved\\nthree files'); document.title = 'after the alert'",
+    );
+    let dialog = wait_for_dialog(&client, Duration::from_secs(5));
+    assert_eq!(dialog.kind, blinkterm::dialog::Kind::Alert);
+    assert_eq!(dialog.message, "saved\nthree files");
+    assert_eq!(dialog.caption(), "alert: saved three files");
+    assert!(dialog.url.starts_with("data:text/html"), "{}", dialog.url);
+
+    // Shift on its own is not an answer; the x after it is.
+    let shift = KeyInput {
+        key: Key::Other(57441),
+        mods: Mods(Mods::SHIFT),
+        action: KeyAction::Press,
+        text: None,
+    };
+    answer(&mut client, dialog, &[shift, letter('x')]);
+    assert_eq!(
+        wait_for_title(&mut client, "after the alert", Duration::from_secs(5)),
+        "after the alert",
+        "the script that opened the alert never finished"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// `confirm()` returns what the person said, which is the thing that was
+/// broken: a "delete this?" was a silent no.
+#[test]
+fn a_confirm_answered_both_ways_reaches_the_page() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    a_page_that_asks(&mut client, QUIET_PAGE, "ready");
+
+    for (keys, returned) in [
+        (vec![letter('x'), letter('y')], "true"),
+        (vec![letter('n')], "false"),
+        (vec![press(Key::Escape)], "false"),
+        (vec![press(Key::Enter)], "true"),
+    ] {
+        raise(
+            &mut client,
+            "document.title = 'confirm ' + confirm('Delete three files?')",
+        );
+        let dialog = wait_for_dialog(&client, Duration::from_secs(5));
+        assert_eq!(dialog.kind, blinkterm::dialog::Kind::Confirm);
+        assert_eq!(dialog.caption(), "Delete three files?");
+        answer(&mut client, dialog, &keys);
+        let wanted = format!("confirm {returned}");
+        assert_eq!(
+            wait_for_title(&mut client, &wanted, Duration::from_secs(5)),
+            wanted,
+            "{keys:?}"
+        );
+    }
+
+    client.close();
+    engine.kill();
+}
+
+/// `prompt()` returns what was typed, the default when nothing was, and
+/// `null` when it was dismissed — the three answers a page can tell apart.
+#[test]
+fn a_prompt_sends_back_what_was_typed_or_nothing() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    a_page_that_asks(&mut client, QUIET_PAGE, "ready");
+
+    for (keys, returned) in [
+        (
+            vec![letter('x'), letter('y'), press(Key::Enter)],
+            "prompt xy",
+        ),
+        (vec![press(Key::Enter)], "prompt default"),
+        (vec![letter('z'), press(Key::Escape)], "prompt null"),
+    ] {
+        raise(
+            &mut client,
+            "document.title = 'prompt ' + prompt('Your name?', 'default')",
+        );
+        let dialog = wait_for_dialog(&client, Duration::from_secs(5));
+        assert_eq!(dialog.kind, blinkterm::dialog::Kind::Prompt);
+        assert_eq!(dialog.line.text, "default", "the page's default is offered");
+        assert!(dialog.line.whole, "and selected");
+        answer(&mut client, dialog, &keys);
+        assert_eq!(
+            wait_for_title(&mut client, returned, Duration::from_secs(5)),
+            returned,
+            "{keys:?}"
+        );
+    }
+
+    client.close();
+    engine.kill();
+}
+
+/// A page with something unsaved asks before it is left, and the answer
+/// decides whether it is.
+///
+/// The navigation goes out with `send`, as `app::navigate` sends it, because
+/// this is the case that made it stop being a `call`: the engine holds the
+/// reply to `Page.navigate` until the question has been answered, and a
+/// program that waited for the reply would never draw the question.
+#[test]
+fn a_page_that_asks_before_unloading_is_asked_and_answered() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    const DIRTY: &str = "data:text/html,<title>stay</title>\
+        <body style='height:100vh'>a form with something typed in it<script>\
+        addEventListener('beforeunload', function (e) { e.preventDefault(); e.returnValue = ''; })\
+        </script>";
+    const AWAY: &str = "data:text/html,<title>left</title><body>";
+    a_page_that_asks(&mut client, DIRTY, "stay");
+
+    // Chromium asks only on behalf of a page somebody has touched, so it is
+    // touched: a click, dispatched as the program would dispatch one.
+    let touch = |client: &mut Client| {
+        for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+            client
+                .call(
+                    "Input.dispatchMouseEvent",
+                    Json::object(vec![
+                        ("type", Json::string(kind)),
+                        ("x", Json::number(40)),
+                        ("y", Json::number(20)),
+                        ("button", Json::string("left")),
+                        ("buttons", Json::number(buttons)),
+                        ("clickCount", Json::number(1)),
+                        ("modifiers", Json::number(0)),
+                    ]),
+                )
+                .expect("the click is dispatched");
+        }
+    };
+    let reply_to = |client: &Client, pending: &Pending| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(reply) = client.take_reply(pending) {
+                return reply;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("Page.navigate was never answered after its dialog was");
+    };
+
+    for (key, stays) in [(letter('n'), true), (letter('y'), false)] {
+        touch(&mut client);
+        let _ = client.events();
+        let pending = client
+            .send(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(AWAY))]),
+            )
+            .expect("the navigation is sent");
+        let dialog = wait_for_dialog(&client, Duration::from_secs(5));
+        assert_eq!(dialog.kind, blinkterm::dialog::Kind::BeforeUnload);
+        // Whatever the page put in `returnValue`, the engine does not pass it
+        // on, which is why the row asks its own question.
+        assert_eq!(dialog.message, "");
+        assert_eq!(dialog.caption(), "leave this page?");
+        assert!(
+            client.take_reply(&pending).is_none(),
+            "the engine answered the navigation before the question, so it \
+             would not have held a program that waited for it"
+        );
+
+        answer(&mut client, dialog, &[key]);
+        let reply = reply_to(&client, &pending);
+        let wanted = if stays { "stay" } else { "left" };
+        assert_eq!(
+            wait_for_title(&mut client, wanted, Duration::from_secs(5)),
+            wanted,
+            "the navigation's reply was {reply:?}"
+        );
+    }
+
+    client.close();
+    engine.kill();
+}
+
+/// A tab that is not in front can open a dialog too. It is heard — its queue
+/// is drained every pass, and the dialog kept on the tab — and it is still
+/// there to be answered when the person goes to it.
+#[test]
+fn a_dialog_on_a_tab_that_is_not_in_front_is_still_heard() {
+    let Some((mut engine, mut browser, mut tabs)) = two_tabs() else {
+        return;
+    };
+    assert_eq!(tabs.active_index(), 1, "the second tab is in front");
+    {
+        let first = tabs.get_mut(0).expect("the first tab");
+        let _ = first.connection.events();
+        raise(
+            &mut first.connection,
+            "document.title = 'confirm ' + confirm('Leave the others?')",
+        );
+    }
+
+    // What `app::handle_page_events` does with every tab's queue, with the
+    // drawing left out.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tabs.iter().all(|tab| tab.dialog.is_none()) {
+        assert!(
+            Instant::now() < deadline,
+            "the tab behind never said it had a question"
+        );
+        for index in 0..tabs.len() {
+            let tab = tabs.get_mut(index).expect("a tab");
+            for event in tab.connection.events() {
+                tab.dialog_event(&event);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let asking: Vec<bool> = tabs.iter().map(|tab| tab.dialog.is_some()).collect();
+    assert_eq!(
+        asking,
+        [true, false],
+        "the question is on the tab that asked"
+    );
+    assert_eq!(
+        tabs.active_index(),
+        1,
+        "and asking did not bring it forward"
+    );
+
+    // The person goes to it, and answers.
+    assert!(tabs.select(1));
+    let tab = tabs.active_mut().expect("the first tab");
+    let dialog = tab.dialog.take().expect("still waiting");
+    assert_eq!(dialog.caption(), "Leave the others?");
+    answer(&mut tab.connection, dialog, &[letter('y')]);
+    assert_eq!(
+        wait_for_title(&mut tab.connection, "confirm", Duration::from_secs(5)),
+        "confirm true"
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}

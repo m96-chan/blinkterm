@@ -34,11 +34,13 @@ use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::{Cells, Metrics};
 
 use crate::cdp::{Client, Event, Notifier, Pending};
+use crate::dialog::{Answer, Kind};
 use crate::engine::Engine;
 use crate::graphics::{Painter, Raw};
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
 use crate::json::Json;
 use crate::keys;
+use crate::line::{self, Edit};
 use crate::load::{self, Loaded, Problem};
 use crate::motion::{self, Motion};
 use crate::profile::{Choice, Profile};
@@ -200,6 +202,38 @@ struct Chrome {
     /// the old url until then is what makes `ctrl+l` also a way to read where
     /// you are.
     editing_whole: bool,
+    /// The `Page.navigate` that has been sent and not yet answered.
+    navigation: Option<Navigation>,
+}
+
+/// A `Page.navigate` that is out with the engine.
+///
+/// Kept beside its target, as [`Still`] is, and for the same reason: a reply
+/// collected against a tab that is no longer in front would put one page's
+/// failure under another page's name.
+///
+/// It used to be a `call`, and a navigation is on a person's critical path, so
+/// that looked right. What made it wrong is a page that asks before it is
+/// left. The engine runs the page's `beforeunload` before it answers
+/// `Page.navigate` at all, and if that handler wants the person asked, the
+/// reply is held until somebody has answered the dialog — which, from inside a
+/// `call`, nobody can: the loop that would draw the question is the loop
+/// sitting in the `call`. So a url typed over a half-filled form froze the
+/// pane for the fifteen seconds of [`crate::cdp::CALL_TIMEOUT`] and then
+/// reported a timeout, with the dialog only drawn afterwards. Sent and
+/// collected later, the dialog is on the row on the next pass. There is no
+/// deadline here either, for the same reason: the reply takes as long as the
+/// person takes to read the question, and a timeout would be a guess at that.
+///
+/// `Page.reload` and `Page.navigateToHistoryEntry` are still `call`s. They were
+/// measured against the same page and both answer at once, with the dialog
+/// arriving as an event afterwards.
+struct Navigation {
+    target: String,
+    /// What was asked for, which is what a failure in the reply is about:
+    /// see [`navigated`].
+    url: String,
+    pending: Pending,
 }
 
 /// A `Page.captureScreenshot` that is out with the engine.
@@ -302,6 +336,7 @@ fn drive(
         wheel: scroll::Wheel::start(),
         editing: None,
         editing_whole: false,
+        navigation: None,
     };
 
     activate(tabs, browser, &mut chrome)?;
@@ -313,7 +348,7 @@ fn drive(
         tab.loading = true;
     }
     redraw_row(pane, tabs, &chrome)?;
-    if let Some(why) = navigate(tabs, &url) {
+    if let Some(why) = navigate(tabs, &mut chrome, &url) {
         if let Some(tab) = tabs.active_mut() {
             tab.note = Some(why);
         }
@@ -338,8 +373,9 @@ fn drive(
             pane.write(b"\x1b[2J").map_err(|e| e.to_string())?;
             let metrics = chrome.metrics;
             if let Some(tab) = tabs.active_mut() {
-                emulate(&mut tab.connection, metrics)?;
-                restart_screencast(&mut tab.connection, metrics)?;
+                let stopped = tab.dialog.is_some();
+                emulate(&mut tab.connection, metrics, stopped)?;
+                restart_screencast(&mut tab.connection, metrics, stopped)?;
             }
             // The screen was cleared and the page is a different size, so
             // nothing that was captured before this is worth painting and the
@@ -421,6 +457,16 @@ fn drive(
         // and never from one that has just been left behind.
         handle_target_events(pane, tabs, browser, &mut chrome)?;
         handle_page_events(pane, tabs, &mut chrome)?;
+        // The answer to a navigation, which may have been held for as long as
+        // a page's "leave this page?" was on the row. After the page's events,
+        // so that a dialog which arrived on the same pass is already drawn.
+        if chrome.navigation.is_some() {
+            let before = tabs.active().map(Tab::line);
+            collect_navigation(tabs, &mut chrome);
+            if tabs.active().map(Tab::line) != before {
+                redraw_row(pane, tabs, &chrome)?;
+            }
+        }
         // And last, because it is the thing to do when nothing else happened:
         // a page that has stopped moving gets its lossless picture.
         rest_shot(pane, tabs, &mut chrome)?;
@@ -428,10 +474,43 @@ fn drive(
     Ok(())
 }
 
+/// Put a command to a page: waited for, unless the page is `stopped`.
+///
+/// A page with a dialog open answers nothing that has to reach its renderer,
+/// and that is more than `Runtime.evaluate` and the still. Measured against
+/// `chromium-shell` with an `alert()` up, `Page.enable`,
+/// `Emulation.setDeviceMetricsOverride`, `Page.startScreencast` and
+/// `Page.stopScreencast` all went three seconds without a word — which is
+/// every command a switch to or from that tab sends, and every one a resize
+/// sends. What the same measurement found is that nothing is lost: each of
+/// them sent as a notification while the dialog was up was done the moment it
+/// was answered, the viewport at the size it was told and the frames coming.
+///
+/// So a stopped page is told rather than asked. The command goes on the wire
+/// and the loop carries on, and the page that wakes up is already the size
+/// the pane is and already casting — rather than a loop that sat out a
+/// deadline per command before it could draw the question that is stopping
+/// the page.
+fn tell(
+    client: &mut Client,
+    stopped: bool,
+    method: &str,
+    params: Json,
+    within: Duration,
+) -> Result<(), String> {
+    if stopped {
+        client.notify(method, params)
+    } else {
+        client.call_within(method, params, within).map(|_| ())
+    }
+}
+
 /// Tell the engine how big the page is.
-fn emulate(client: &mut Client, metrics: Metrics) -> Result<(), String> {
+fn emulate(client: &mut Client, metrics: Metrics, stopped: bool) -> Result<(), String> {
     let (width, height) = page_pixels(metrics);
-    client.call(
+    tell(
+        client,
+        stopped,
         "Emulation.setDeviceMetricsOverride",
         Json::object(vec![
             ("width", Json::number(width)),
@@ -439,14 +518,16 @@ fn emulate(client: &mut Client, metrics: Metrics) -> Result<(), String> {
             ("deviceScaleFactor", Json::number(1)),
             ("mobile", Json::Bool(false)),
         ]),
-    )?;
-    Ok(())
+        crate::cdp::CALL_TIMEOUT,
+    )
 }
 
 /// Start the frames coming, in the format [`crate::motion`] argues for.
-fn start_screencast(client: &mut Client, metrics: Metrics) -> Result<(), String> {
+fn start_screencast(client: &mut Client, metrics: Metrics, stopped: bool) -> Result<(), String> {
     let (width, height) = page_pixels(metrics);
-    client.call(
+    tell(
+        client,
+        stopped,
         "Page.startScreencast",
         Json::object(vec![
             ("format", Json::string("jpeg")),
@@ -455,13 +536,19 @@ fn start_screencast(client: &mut Client, metrics: Metrics) -> Result<(), String>
             ("maxHeight", Json::number(height)),
             ("everyNthFrame", Json::number(1)),
         ]),
-    )?;
-    Ok(())
+        crate::cdp::CALL_TIMEOUT,
+    )
 }
 
-fn restart_screencast(client: &mut Client, metrics: Metrics) -> Result<(), String> {
-    let _ = client.call("Page.stopScreencast", Json::empty());
-    start_screencast(client, metrics)
+fn restart_screencast(client: &mut Client, metrics: Metrics, stopped: bool) -> Result<(), String> {
+    let _ = tell(
+        client,
+        stopped,
+        "Page.stopScreencast",
+        Json::empty(),
+        crate::cdp::CALL_TIMEOUT,
+    );
+    start_screencast(client, metrics, stopped)
 }
 
 /// What a page calls itself, and the status its document came with, asked of
@@ -499,30 +586,39 @@ pub fn page_title(client: &mut Client) -> Option<String> {
 /// Send the active tab somewhere. The sentence, if it would not go.
 ///
 /// A navigation fails in one of two ways, and only one of them comes back as
-/// an error here. A url the engine cannot parse is refused outright, and that
-/// is the `Err`. A url it can parse but not reach — a host that does not
-/// resolve, a port nobody listens on — is a command that *succeeded*: the
-/// engine navigated, to its own error page, and the reply carries the reason
-/// as `errorText`. That is what [`navigated`] reads. It is quick, too: a
-/// `.invalid` host answers in 10 ms, because the resolver refuses the name
-/// without asking anyone. The error page's own events follow the reply, and
-/// [`Tab::landed`] takes the url from them.
+/// an error on the wire. A url the engine cannot parse is refused outright. A
+/// url it can parse but not reach — a host that does not resolve, a port
+/// nobody listens on — is a command that *succeeded*: the engine navigated,
+/// to its own error page, and the reply carries the reason as `errorText`,
+/// which [`navigated`] reads. It is quick, too: a `.invalid` host answers in
+/// 10 ms, because the resolver refuses the name without asking anyone. The
+/// error page's own events follow the reply, and [`Tab::landed`] takes the
+/// url from them.
+///
+/// Neither is waited for here. Only a command that could not be put on the
+/// wire is a sentence from here; the engine's answer — its refusal or its
+/// `errorText` — arrives later and is collected by [`collect_navigation`].
+/// See [`Navigation`] for why this does not wait for it. A navigation still
+/// out when another is asked for is dropped, which is what the person asked
+/// for by typing a second url.
 ///
 /// The problem the tab had is cleared before anything is sent, so that a
-/// reason from an earlier navigation — one whose reply timed out here and
-/// whose failure landed afterwards — cannot be pinned on this one.
-///
-/// This blocks the loop until the engine answers, as it always has; a host
-/// that takes its time to refuse is a loop that takes its time too.
-fn navigate(tabs: &mut Tabs<Client>, url: &str) -> Option<String> {
+/// reason from an earlier navigation — one whose reply was dropped and whose
+/// failure landed afterwards — cannot be pinned on this one.
+fn navigate(tabs: &mut Tabs<Client>, chrome: &mut Chrome, url: &str) -> Option<String> {
     let tab = tabs.active_mut()?;
     tab.problem = None;
-    match tab.connection.call(
+    let sent = tab.connection.send(
         "Page.navigate",
         Json::object(vec![("url", Json::string(url))]),
-    ) {
-        Ok(reply) => {
-            navigated(tab, url, &reply);
+    );
+    match sent {
+        Ok(pending) => {
+            chrome.navigation = Some(Navigation {
+                target: tab.target.clone(),
+                url: url.to_string(),
+                pending,
+            });
             None
         }
         Err(why) => Some(why),
@@ -538,6 +634,44 @@ fn navigate(tabs: &mut Tabs<Client>, url: &str) -> Option<String> {
 pub fn navigated(tab: &mut Tab<Client>, url: &str, reply: &Json) {
     if let Some(code) = load::failed(reply) {
         tab.failed_to_reach(url, &code);
+    }
+}
+
+/// Take the answer to the navigation, if it has come back.
+///
+/// Mirrors [`collect_still`]: a tab that is no longer in front is a tab this
+/// reply is not for any more, and dropping the [`Navigation`] drops its
+/// [`Pending`], which tells the mailbox not to keep the answer. What an answer
+/// that did come says goes where the `call` used to put it — on the tab's
+/// note, which is what the row shows in place of the title.
+fn collect_navigation(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(navigation) = chrome.navigation.as_ref() else {
+        return;
+    };
+    if tabs.active_target() != Some(navigation.target.as_str()) {
+        chrome.navigation = None;
+        return;
+    }
+    let Some(tab) = tabs.active_mut() else {
+        return;
+    };
+    let Some(answer) = tab.connection.take_reply(&navigation.pending) else {
+        return;
+    };
+    let url = chrome
+        .navigation
+        .take()
+        .map(|navigation| navigation.url)
+        .unwrap_or_default();
+    match answer {
+        Err(why) => tab.note = Some(why),
+        // A reply can carry a failure and still be a reply: an unreachable
+        // host, a refused connection. [`navigated`] reads it. One that is not
+        // a failure to report is `net::ERR_ABORTED` after a "leave this
+        // page?" was answered no — the page stayed, the note was already
+        // cleared by `stayed`, and measured against `chromium-shell` that is
+        // exactly what this reply carries then; `load::failed` passes over it.
+        Ok(reply) => navigated(tab, &url, &reply),
     }
 }
 
@@ -568,9 +702,28 @@ fn activate(
     let Some(tab) = tabs.active_mut() else {
         return Ok(());
     };
-    tab.connection
-        .call_within("Page.enable", Json::empty(), SWITCH_TIMEOUT)?;
-    emulate(&mut tab.connection, metrics)?;
+    // First, whether the page is stopped behind a dialog, because that
+    // decides whether anything below can be waited for. See [`tell`].
+    bin_events(tab);
+    let mut stopped = tab.dialog.is_some();
+    if let Err(why) = tell(
+        &mut tab.connection,
+        stopped,
+        "Page.enable",
+        Json::empty(),
+        SWITCH_TIMEOUT,
+    ) {
+        // A page that opened its dialog between that look and this command
+        // is the one way to get here with a page that is fine. The command is
+        // queued behind the dialog like everything else, so the rest is told
+        // rather than asked; anything else is a page that is not answering.
+        bin_events(tab);
+        if tab.dialog.is_none() {
+            return Err(why);
+        }
+        stopped = true;
+    }
+    emulate(&mut tab.connection, metrics, stopped)?;
     // Whatever this tab queued and nobody has read goes in the bin, frames
     // above all: the newest of them is older than the tab was, and painting it
     // would put the page as it looked before it was left behind on screen
@@ -585,11 +738,17 @@ fn activate(
     // pass, known and left, because the frames in the same queue are the
     // greater harm; the load event after it still asks the page, below and
     // then again when it fires.
-    let _ = tab.connection.events();
-    if let Some(loaded) = page_loaded(&mut tab.connection) {
-        tab.loaded(loaded);
+    //
+    // Except while a dialog is up, when the page cannot say what it is called
+    // and a question would cost the two seconds of [`page_loaded`] for
+    // nothing. The page is asked when the dialog closes instead.
+    bin_events(tab);
+    if tab.dialog.is_none() {
+        if let Some(loaded) = page_loaded(&mut tab.connection) {
+            tab.loaded(loaded);
+        }
     }
-    start_screencast(&mut tab.connection, metrics)?;
+    start_screencast(&mut tab.connection, metrics, stopped)?;
     // A different page, so a different clock: nothing this tab sends can be
     // compared against what the last one had on screen, and a page that is
     // already loaded and still gets its lossless picture a rest interval
@@ -598,15 +757,37 @@ fn activate(
     Ok(())
 }
 
+/// Throw away what a tab has queued, except what it says about a dialog.
+///
+/// A queue that is binned is binned for its frames, which are older than the
+/// moment they would be painted in. A dialog is not like that: the page opened
+/// it and is stopped until it is answered, however long ago that was, and a
+/// `Page.javascriptDialogOpening` that went in the bin would be a tab that
+/// had stopped with nothing on the row to say why and nothing to answer.
+fn bin_events(tab: &mut Tab<Client>) {
+    for event in tab.connection.events() {
+        tab.dialog_event(&event);
+    }
+}
+
 /// Stop a tab painting, if it is still in the list.
+///
+/// Told rather than asked when the tab has a dialog open, because it would
+/// not answer: leaving a tab that is waiting on a question is one of the ways
+/// the person is expected to deal with it. See [`tell`].
 fn deactivate(tabs: &mut Tabs<Client>, target: &str) {
     let Some(index) = tabs.index_of(target) else {
         return;
     };
     if let Some(tab) = tabs.get_mut(index) {
-        let _ = tab
-            .connection
-            .call_within("Page.stopScreencast", Json::empty(), SWITCH_TIMEOUT);
+        let stopped = tab.dialog.is_some();
+        let _ = tell(
+            &mut tab.connection,
+            stopped,
+            "Page.stopScreencast",
+            Json::empty(),
+            SWITCH_TIMEOUT,
+        );
     }
 }
 
@@ -693,6 +874,14 @@ fn connect_tab(browser: &mut Client, target: &str) -> Result<Client, String> {
 /// harmless: it is in that client's mailbox, and the mailbox goes with the
 /// client. Nothing can paint it over the tab that comes next, because nothing
 /// will ever read it.
+///
+/// A page is not asked first. `Target.closeTarget` does not run `beforeunload`,
+/// so a tab with a half-filled form closes without a "leave this page?", and a
+/// tab stopped behind a dialog closes with its dialog — the engine answers the
+/// command at once either way, measured with an `alert()` up. That is what
+/// makes `ctrl+w` the way out of a page that asks the same question forever,
+/// and it is why the README says so rather than leaving somebody to find out
+/// with their form.
 fn close_tab(tabs: &mut Tabs<Client>, browser: &mut Client, index: usize) {
     let Some(mut tab) = tabs.close(index) else {
         return;
@@ -763,29 +952,42 @@ fn page_cells(metrics: Metrics) -> Cells {
 
 /// Draw the top row.
 ///
-/// Three things share it, and which one is showing is a decision rather than a
+/// Four things share it, and which one is showing is a decision rather than a
 /// layout. A url being typed takes the whole row however many tabs are open:
 /// it is the one moment the person is writing rather than reading, and half a
-/// url beside a strip would be neither. One tab is the row this program had
-/// before it had tabs, byte for byte — a browser showing one page should not
-/// look like a browser with a tab bar in it. More than one is the strip.
+/// url beside a strip would be neither. A dialog on the page in front comes
+/// next and takes the whole row too — the page has stopped until it is
+/// answered, so the question is the most important thing on the screen — but
+/// after the url bar, because a person who pressed `ctrl+l` before the page
+/// asked is in the middle of typing, and the question is there when they
+/// finish. One tab is the row this program had before it had tabs, byte for
+/// byte — a browser showing one page should not look like a browser with a
+/// tab bar in it. More than one is the strip, where a tab behind with a dialog
+/// of its own is marked.
 fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(), String> {
     let cols = chrome.metrics.cols;
     let Some(active) = tabs.active() else {
         return Ok(());
     };
-    let bytes = if chrome.editing.is_some() || tabs.len() < 2 {
+    let bytes = if chrome.editing.is_some() {
         screen::status_line(cols, &active.line(), chrome.editing.as_deref())
+    } else if let Some(dialog) = &active.dialog {
+        let typed = dialog.typing().then_some(dialog.line.text.as_str());
+        screen::dialog_line(cols, &dialog.caption(), dialog.hint(), typed)
+    } else if tabs.len() < 2 {
+        screen::status_line(cols, &active.line(), None)
     } else {
         // Held here first, because a label can be a sentence made on the spot
         // — a tab whose page did not come — and the strip only borrows.
         let names: Vec<_> = tabs.iter().map(|tab| tab.label()).collect();
         let labels: Vec<screen::TabLabel> = names
             .iter()
+            .zip(tabs.iter())
             .enumerate()
-            .map(|(index, name)| screen::TabLabel {
+            .map(|(index, (name, tab))| screen::TabLabel {
                 title: name,
                 active: index == tabs.active_index(),
+                dialog: tab.dialog.is_some(),
             })
             .collect();
         screen::tab_line(cols, &labels, &active.url)
@@ -935,19 +1137,41 @@ fn handle_page_events(
                     ask_title = true;
                     redraw = true;
                 }
-                "Page.javascriptDialogOpening" => {
-                    // Nothing here can show an alert, and a page whose dialog
-                    // is never answered stops rendering.
-                    let _ = tab.connection.notify(
-                        "Page.handleJavaScriptDialog",
-                        Json::object(vec![("accept", Json::Bool(false))]),
-                    );
+                "Page.javascriptDialogOpening" | "Page.javascriptDialogClosed" => {
+                    // The question goes on the tab it was asked on, in front
+                    // or not, and waits there for the person; what answers it
+                    // is a key, in `answer_dialog`. A page with a question
+                    // open is stopped, so it is not asked its title until the
+                    // question has gone.
+                    let closed = method == "Page.javascriptDialogClosed";
+                    // Whether this was a page asking to be left and being
+                    // told no, read before the event clears what it was. The
+                    // engine can close a dialog itself, and a "stay" that was
+                    // not typed here is a stay all the same.
+                    let stay = closed
+                        && params.get("result").and_then(Json::as_bool) == Some(false)
+                        && tab
+                            .dialog
+                            .as_ref()
+                            .is_some_and(|dialog| dialog.kind == Kind::BeforeUnload);
+                    if tab.dialog_event(&Event { method, params }) {
+                        redraw = true;
+                    }
+                    if stay {
+                        stayed(tab);
+                    }
+                    // A script that carries on after its dialog often
+                    // renames the page, and the row shows the name.
+                    if closed {
+                        ask_title = true;
+                        redraw = true;
+                    }
                 }
                 _ => {}
             }
         }
 
-        if ask_title {
+        if ask_title && tab.dialog.is_none() {
             if let Some(loaded) = page_loaded(&mut tab.connection) {
                 tab.loaded(loaded);
             }
@@ -986,12 +1210,27 @@ fn paint(
         .frame(raw, page_cells(chrome.metrics), PAGE_ROW, 1);
     pane.write(&bytes).map_err(|e| e.to_string())?;
     // The picture does not move the cursor (`C=1`), but the status line owns
-    // the cursor's position when the url is being typed, so it is written
-    // again rather than left where the last frame found it.
-    if chrome.editing.is_some() {
+    // the cursor's position when something is being typed on it, so it is
+    // written again rather than left where the last frame found it.
+    if row_owns_cursor(tabs, chrome) {
         redraw_row(pane, tabs, chrome)?;
     }
     Ok(())
+}
+
+/// Whether the row is a line being typed into: the url bar, or the answer to
+/// a `prompt()` on the page in front.
+fn row_owns_cursor(tabs: &Tabs<Client>, chrome: &Chrome) -> bool {
+    chrome.editing.is_some()
+        || tabs
+            .active()
+            .and_then(|tab| tab.dialog.as_ref())
+            .is_some_and(|dialog| dialog.typing())
+}
+
+/// Whether the page in front is stopped behind a dialog.
+fn asking(tabs: &Tabs<Client>) -> bool {
+    tabs.active().is_some_and(|tab| tab.dialog.is_some())
 }
 
 /// A page that has stopped moving gets one lossless picture of itself.
@@ -1076,8 +1315,13 @@ fn collect_still(
 ///
 /// A failure to send is a failure of the still and not of the program: the
 /// session going is heard on the next pass by everything that cares.
+///
+/// Not while the page has a dialog open. The engine does not draw a page that
+/// is stopped, and a still asked for then would sit out [`STILL_TIMEOUT`] and
+/// be marked a failure — which is a page that then never gets its lossless
+/// picture once it has been answered and has gone quiet again.
 fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
-    if !chrome.motion.wants_still(Instant::now()) {
+    if asking(tabs) || !chrome.motion.wants_still(Instant::now()) {
         return;
     }
     let Some(target) = tabs.active_target().map(str::to_string) else {
@@ -1200,7 +1444,19 @@ fn handle_input(
                 return edit_url(pane, tabs, chrome, key);
             }
             let was = tabs.active_target().map(str::to_string);
-            match command(&key) {
+            let command = command(&key);
+            if asking(tabs) {
+                // The page is waiting on an answer. The tab keys still work,
+                // because leaving the question where it is — or closing the
+                // tab it is on — is an answer too; the rest wait for it, and
+                // every key that is not one of the program's is the answer.
+                match command {
+                    Some(command) if survives_dialog(command) => {}
+                    Some(_) => return Ok(true),
+                    None => return answer_dialog(pane, tabs, chrome, key),
+                }
+            }
+            match command {
                 Some(Command::Quit) => return Ok(false),
                 Some(Command::EditUrl) => {
                     chrome.editing = tabs.active().map(|tab| tab.url.clone());
@@ -1226,7 +1482,7 @@ fn handle_input(
                                 tab.loading = true;
                             }
                             redraw_row(pane, tabs, chrome)?;
-                            if let Some(why) = navigate(tabs, &url) {
+                            if let Some(why) = navigate(tabs, chrome, &url) {
                                 if let Some(tab) = tabs.active_mut() {
                                     tab.note = Some(why);
                                 }
@@ -1291,6 +1547,13 @@ fn handle_input(
             }
         }
         Input::Mouse(report) => {
+            // A page with a question open is not a page to click on or
+            // scroll. What was sent would not be lost — the engine queues it
+            // behind the dialog — which is worse: a click meant for the
+            // question would land on the page the moment it was answered.
+            if asking(tabs) {
+                return Ok(true);
+            }
             // Only the wheel. A hand on a wheel is what the still has to keep
             // out of the way of; a pointer drifting across a page is
             // not, and counting moves would mean a page nobody had scrolled
@@ -1335,6 +1598,100 @@ enum Command {
     PreviousTab,
     /// The nth tab, counted from one.
     SelectTab(usize),
+}
+
+/// Whether a key the program keeps for itself still works while the page in
+/// front has a dialog open.
+///
+/// Quitting, and everything about tabs: opening one, closing this one — which
+/// closes its dialog with it, see [`close_tab`] — and going to another, which
+/// leaves the question on its tab, marked in the strip, for later. What waits
+/// is everything that would do something to the page that is asking. The url
+/// bar would type over the question the person is meant to be reading; a
+/// reload, a back or a forward to a page that is stopped would be queued
+/// behind its dialog and done the moment it was answered, which is a
+/// navigation nobody would remember asking for by then.
+fn survives_dialog(command: Command) -> bool {
+    match command {
+        Command::Quit
+        | Command::NewTab
+        | Command::CloseTab
+        | Command::NextTab
+        | Command::PreviousTab
+        | Command::SelectTab(_) => true,
+        Command::EditUrl | Command::Reload | Command::Back | Command::Forward => false,
+    }
+}
+
+/// A key, as the answer to the dialog on the page in front.
+///
+/// The dialog is taken off the tab as soon as it is answered rather than when
+/// the engine says it has closed. The row is the person's, and a question they
+/// have just answered should not still be on it for the round trip; the
+/// `Page.javascriptDialogClosed` that follows finds nothing to clear, and is
+/// what asks the page its title again. Nothing here waits for the engine,
+/// either: `Page.handleJavaScriptDialog` is a notification, and one that
+/// crossed a dialog the engine closed itself — "No dialog is showing" — has
+/// nothing to say that anyone needs to hear.
+fn answer_dialog(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    key: KeyInput,
+) -> Result<bool, String> {
+    let Some(tab) = tabs.active_mut() else {
+        return Ok(true);
+    };
+    let Some(dialog) = tab.dialog.as_mut() else {
+        return Ok(true);
+    };
+    match dialog.step(&key) {
+        Answer::Waiting => {}
+        Answer::Quit => return Ok(false),
+        answer => {
+            let params = dialog.reply(answer);
+            let stay = dialog.kind == Kind::BeforeUnload && answer == Answer::Dismiss;
+            tab.dialog = None;
+            let _ = tab.connection.notify("Page.handleJavaScriptDialog", params);
+            if stay {
+                stayed(tab);
+            }
+        }
+    }
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
+/// A page that asked before it was left and was told no.
+///
+/// It is where it was, and nothing about the tab should say otherwise: not
+/// the "loading" note that went up when the url was typed, not that url in
+/// place of the one the page still has. So the note goes, the tab is not
+/// loading, and the url is asked of the engine's own history — which answers
+/// at once, dialog or none, because it is the browser's rather than the
+/// page's.
+fn stayed(tab: &mut Tab<Client>) {
+    tab.note = None;
+    tab.loading = false;
+    let Ok(history) =
+        tab.connection
+            .call_within("Page.getNavigationHistory", Json::empty(), SWITCH_TIMEOUT)
+    else {
+        return;
+    };
+    let index = history
+        .get("currentIndex")
+        .and_then(Json::as_i64)
+        .unwrap_or(-1);
+    let url = history
+        .get("entries")
+        .and_then(Json::as_array)
+        .and_then(|entries| entries.get(usize::try_from(index).ok()?))
+        .and_then(|entry| entry.get("url"))
+        .and_then(Json::as_str);
+    if let Some(url) = url {
+        tab.url = url.to_string();
+    }
 }
 
 /// Which keys this program answers, and which it hands to the page.
@@ -1386,50 +1743,6 @@ fn command(key: &KeyInput) -> Option<Command> {
     None
 }
 
-/// What a keystroke in the url bar did to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Edit {
-    /// Still typing.
-    Typing,
-    /// Escape: leave the url alone.
-    Cancel,
-    /// Enter: go to what is in the buffer.
-    Go,
-    /// `ctrl+q`, which quits even from the url bar.
-    Quit,
-}
-
-/// Apply one keystroke to the buffer. The whole of the url bar's behaviour,
-/// with nothing to talk to, so that it can be tested a key at a time.
-fn edit_step(buffer: &mut String, whole: bool, key: &KeyInput) -> Edit {
-    match key.key {
-        Key::Escape => Edit::Cancel,
-        Key::Enter => Edit::Go,
-        Key::Char('q') if key.mods.ctrl() => Edit::Quit,
-        Key::Char('u') if key.mods.ctrl() => {
-            buffer.clear();
-            Edit::Typing
-        }
-        Key::Backspace => {
-            if whole {
-                buffer.clear();
-            } else {
-                buffer.pop();
-            }
-            Edit::Typing
-        }
-        _ => {
-            if let Some(c) = key.text {
-                if whole {
-                    buffer.clear();
-                }
-                buffer.push(c);
-            }
-            Edit::Typing
-        }
-    }
-}
-
 /// Type into the url bar. Returns `false` only if the person quit.
 fn edit_url(
     pane: &mut Pane,
@@ -1444,7 +1757,7 @@ fn edit_url(
     let Some(buffer) = chrome.editing.as_mut() else {
         return Ok(true);
     };
-    match edit_step(buffer, whole, &key) {
+    match line::edit_step(buffer, whole, &key) {
         Edit::Typing => {}
         Edit::Quit => return Ok(false),
         Edit::Cancel => chrome.editing = None,
@@ -1456,7 +1769,7 @@ fn edit_url(
                 tab.note = Some(format!("loading {url}"));
                 tab.loading = true;
             }
-            if let Some(why) = navigate(tabs, &url) {
+            if let Some(why) = navigate(tabs, chrome, &url) {
                 if let Some(tab) = tabs.active_mut() {
                     tab.note = Some(why);
                 }
@@ -1646,15 +1959,6 @@ mod tests {
     use super::*;
     use crate::input::Mods;
 
-    fn typed(c: char) -> KeyInput {
-        KeyInput {
-            key: Key::Char(c),
-            mods: Mods::default(),
-            action: KeyAction::Press,
-            text: Some(c),
-        }
-    }
-
     fn key(k: Key, mods: u32) -> KeyInput {
         KeyInput {
             key: k,
@@ -1728,6 +2032,33 @@ mod tests {
     }
 
     #[test]
+    fn the_tab_keys_and_quit_survive_a_dialog_and_the_rest_wait() {
+        let survives = |k: Key, mods: u32| command(&key(k, mods)).map(survives_dialog);
+        // Away from the question, or out of the program.
+        assert_eq!(survives(Key::Char('q'), Mods::CTRL), Some(true));
+        assert_eq!(survives(Key::Char('t'), Mods::CTRL), Some(true));
+        assert_eq!(survives(Key::Char('w'), Mods::CTRL), Some(true));
+        assert_eq!(survives(Key::Tab, Mods::CTRL), Some(true));
+        assert_eq!(survives(Key::Tab, Mods::CTRL | Mods::SHIFT), Some(true));
+        for n in 1..=9u8 {
+            assert_eq!(
+                survives(Key::Char((b'0' + n) as char), Mods::ALT),
+                Some(true)
+            );
+        }
+        // Things done to the page that is asking wait until it has an answer.
+        assert_eq!(survives(Key::Char('l'), Mods::CTRL), Some(false));
+        assert_eq!(survives(Key::Char('r'), Mods::CTRL), Some(false));
+        assert_eq!(survives(Key::Left, Mods::ALT), Some(false));
+        assert_eq!(survives(Key::Right, Mods::ALT), Some(false));
+        // And a key that is not the program's is not a command at all: it is
+        // what answers the dialog.
+        assert_eq!(survives(Key::Char('y'), 0), None);
+        assert_eq!(survives(Key::Enter, 0), None);
+        assert_eq!(survives(Key::Escape, 0), None);
+    }
+
+    #[test]
     fn what_a_person_types_becomes_a_url_the_engine_takes() {
         assert_eq!(normalise("example.com"), "https://example.com");
         assert_eq!(normalise("  example.com/a b "), "https://example.com/a b");
@@ -1779,48 +2110,6 @@ mod tests {
         assert_eq!(button_bit(Some(2)), 2, "right is two, not four");
         assert_eq!(button_bit(Some(1)), 4);
         assert_eq!(button_bit(None), 0);
-    }
-
-    #[test]
-    fn the_url_bar_starts_with_the_whole_address_selected() {
-        // ctrl+l, then typing: what is there goes, the way it would in a
-        // browser where the address was selected.
-        let mut buffer = "https://example.com/a".to_string();
-        assert_eq!(edit_step(&mut buffer, true, &typed('x')), Edit::Typing);
-        assert_eq!(buffer, "x");
-        // And from then on it is ordinary typing.
-        edit_step(&mut buffer, false, &typed('y'));
-        assert_eq!(buffer, "xy");
-        edit_step(&mut buffer, false, &key(Key::Backspace, 0));
-        assert_eq!(buffer, "x");
-
-        // A backspace as the first thing deletes the lot, not one character.
-        let mut buffer = "https://example.com/a".to_string();
-        edit_step(&mut buffer, true, &key(Key::Backspace, 0));
-        assert!(buffer.is_empty());
-
-        // ctrl+u empties it whenever.
-        let mut buffer = "half typed".to_string();
-        edit_step(&mut buffer, false, &key(Key::Char('u'), Mods::CTRL));
-        assert!(buffer.is_empty());
-    }
-
-    #[test]
-    fn the_url_bar_knows_when_it_is_finished() {
-        let mut buffer = "example.com".to_string();
-        assert_eq!(edit_step(&mut buffer, false, &key(Key::Enter, 0)), Edit::Go);
-        assert_eq!(
-            buffer, "example.com",
-            "enter does not change what was typed"
-        );
-        assert_eq!(
-            edit_step(&mut buffer, false, &key(Key::Escape, 0)),
-            Edit::Cancel
-        );
-        assert_eq!(
-            edit_step(&mut buffer, false, &key(Key::Char('q'), Mods::CTRL)),
-            Edit::Quit
-        );
     }
 
     #[test]

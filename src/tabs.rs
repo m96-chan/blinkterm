@@ -48,6 +48,7 @@
 use std::borrow::Cow;
 
 use crate::cdp::Event;
+use crate::dialog::Dialog;
 use crate::json::Json;
 use crate::load::{self, Landing, Loaded, Problem};
 
@@ -79,6 +80,14 @@ pub struct Tab<C> {
     /// failure the moment it was said. [`Tabs::take`] does not touch this;
     /// only the tab's own `Page` events do. See [`crate::load`].
     pub problem: Option<Problem>,
+    /// The dialog this page has open and nobody has answered.
+    ///
+    /// The page is stopped until somebody does: its renderer is inside the
+    /// `alert()` that opened it, so it paints nothing and answers no
+    /// `Runtime.evaluate`. It is kept on the tab rather than on the loop
+    /// because a tab that is not in front can open one too, and it has to be
+    /// there — marked in the strip — when the person goes to look.
+    pub dialog: Option<Dialog>,
 }
 
 impl<C> Tab<C> {
@@ -91,6 +100,7 @@ impl<C> Tab<C> {
             loading: false,
             note: None,
             problem: None,
+            dialog: None,
         }
     }
 
@@ -146,8 +156,23 @@ impl<C> Tab<C> {
 
     /// `Page.navigate` answered with an `errorText`: the landing is on its way,
     /// ten to sixty milliseconds behind, and this is why.
+    ///
+    /// Or it has already come. The reply is collected a pass after it is sent
+    /// rather than waited for — a navigation away from a page with a "leave
+    /// this page?" is held by the engine until somebody answers, and a loop
+    /// that waited could not show the question — so the error page's own
+    /// events can be read first. Then the tab already says where it ended up
+    /// and has had its load event, and all this adds is the reason: the url
+    /// stays the landing's, which is the truer one after a redirect, and
+    /// `loading` is left alone, since the load event it would wait for has
+    /// been and gone. An unreachable problem on the tab can only be this
+    /// navigation's, because `navigate` cleared it before sending.
     pub fn failed_to_reach(&mut self, url: &str, code: &str) {
         self.note = None;
+        if let Some(Problem::Unreachable { reason, .. }) = &mut self.problem {
+            reason.get_or_insert_with(|| code.to_string());
+            return;
+        }
         self.loading = true;
         self.problem = Some(Problem::Unreachable {
             url: url.to_string(),
@@ -169,6 +194,27 @@ impl<C> Tab<C> {
                     self.problem = None;
                 }
             }
+        }
+    }
+
+    /// What a `Page.javascriptDialog*` event does to this tab. True when the
+    /// row is now out of date.
+    ///
+    /// Opening replaces whatever was there, because a page has one dialog at
+    /// a time: a second can only open once the first has been answered, and
+    /// if the close of the first was lost the second is the truth. Closing
+    /// clears it whoever answered — this program, or the engine itself when
+    /// the page navigated or its renderer went away — so a dialog that was
+    /// answered somewhere else is not left on the row as a question with
+    /// nobody to ask.
+    pub fn dialog_event(&mut self, event: &Event) -> bool {
+        match event.method.as_str() {
+            "Page.javascriptDialogOpening" => {
+                self.dialog = Dialog::opening(&event.params);
+                self.dialog.is_some()
+            }
+            "Page.javascriptDialogClosed" => self.dialog.take().is_some(),
+            _ => false,
         }
     }
 
@@ -410,7 +456,10 @@ impl<C> Tabs<C> {
     fn gone(&mut self, target: &str, why: Option<String>) -> Outcome<C> {
         match self.index_of(target) {
             Some(index) => match self.close(index) {
-                Some(tab) => Outcome::Gone { tab, why },
+                Some(tab) => Outcome::Gone {
+                    tab: Box::new(tab),
+                    why,
+                },
                 None => Outcome::Ignored,
             },
             None => Outcome::Ignored,
@@ -429,7 +478,10 @@ pub enum Outcome<C> {
     /// A tab is no longer in the list. Its connection comes back with it, to
     /// be closed by the caller, and `why` is the sentence to put on the row
     /// when the page did not simply close itself.
-    Gone { tab: Tab<C>, why: Option<String> },
+    Gone {
+        tab: Box<Tab<C>>,
+        why: Option<String>,
+    },
     /// A target that should have become a tab could not be connected to.
     Failed(String),
 }
@@ -774,6 +826,48 @@ mod tests {
     }
 
     #[test]
+    fn a_dialog_stays_with_the_tab_it_opened_on() {
+        let mut tabs = three();
+        let opening = event(
+            "Page.javascriptDialogOpening",
+            r#"{"url":"https://c.example","message":"sure?","type":"confirm",
+                "hasBrowserHandler":false,"defaultPrompt":""}"#,
+        );
+        // The third tab asks while the first is in front.
+        assert!(tabs.get_mut(2).expect("c").dialog_event(&opening));
+        assert_eq!(tabs.active_target(), Some("a"), "a dialog does not switch");
+        assert!(tabs.active().expect("a").dialog.is_none());
+
+        // Going to it and away again leaves the question where it was asked.
+        tabs.select(3);
+        assert!(tabs.active().expect("c").dialog.is_some());
+        tabs.select(2);
+        assert!(tabs.active().expect("b").dialog.is_none());
+        let asking: Vec<bool> = tabs.iter().map(|tab| tab.dialog.is_some()).collect();
+        assert_eq!(asking, [false, false, true]);
+
+        // Something else about the page is not about the dialog.
+        let loaded = event("Page.loadEventFired", r#"{"timestamp":1}"#);
+        assert!(!tabs.get_mut(2).expect("c").dialog_event(&loaded));
+        assert!(tabs.iter().nth(2).expect("c").dialog.is_some());
+
+        // Closed, by whoever answered it; and closed again is nothing new.
+        let closed = event(
+            "Page.javascriptDialogClosed",
+            r#"{"result":true,"userInput":""}"#,
+        );
+        assert!(tabs.get_mut(2).expect("c").dialog_event(&closed));
+        assert!(tabs.iter().nth(2).expect("c").dialog.is_none());
+        assert!(!tabs.get_mut(2).expect("c").dialog_event(&closed));
+
+        // And closing the tab takes its dialog with it.
+        tabs.get_mut(1).expect("b").dialog_event(&opening);
+        let gone = tabs.close(1).expect("b");
+        assert!(gone.dialog.is_some());
+        assert!(tabs.iter().all(|tab| tab.dialog.is_none()));
+    }
+
+    #[test]
     fn an_event_about_something_else_entirely() {
         let frame = event("Page.screencastFrame", r#"{"data":"x","sessionId":1}"#);
         assert_eq!(change(&frame), None);
@@ -818,6 +912,23 @@ mod tests {
         load_finished(&mut tab, "Example", None);
         assert_eq!(tab.problem, None);
         assert_eq!(tab.line(), "Example  —  https://example.com/");
+    }
+
+    #[test]
+    fn a_reason_that_comes_after_its_landing_is_added_to_it() {
+        // The reply read a pass late: the error page has landed and loaded
+        // already, under the url the redirect ended at.
+        let mut tab: Tab<u32> = Tab::new("a", 0, "about:blank");
+        tab.loading = true;
+        tab.landed(Landing::Unreachable("http://127.0.0.1:1/".to_string()));
+        load_finished(&mut tab, "", None);
+        assert!(!tab.loading);
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:1");
+
+        tab.failed_to_reach("http://127.0.0.1:2/redir", "net::ERR_CONNECTION_REFUSED");
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:1: connection refused");
+        assert_eq!(tab.url, "http://127.0.0.1:1/", "the landing's url stays");
+        assert!(!tab.loading, "its load event has been and gone");
     }
 
     #[test]

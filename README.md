@@ -129,9 +129,16 @@ directory is Chromium's, not `blinkterm`'s.
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
 | `alt+1` … `alt+9` | the nth tab |
 | `ctrl+q` | quit |
+| a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 
 Everything else goes to the page, including the mouse. A link that asks for a
 new window gets a new tab, and the tab is switched to.
+
+While a page is waiting on its dialog, only the tab keys and `ctrl+q` still
+work, and the page gets no keys or mouse until it has its answer. A tab behind
+that opens one is marked `!` in the strip — `2! Title` — and keeps its question
+until you go to it. `ctrl+w` closes a tab without asking the page, so a tab
+with something unsaved in it is closed without a "leave this page?".
 
 ## Tests
 

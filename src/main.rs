@@ -41,6 +41,7 @@ keys:
   ctrl+tab       the next tab, ctrl+shift+tab the one before
   alt+1 .. alt+9 the nth tab
   ctrl+q         quit
+  a dialog       takes the top row: any key, y/n, or type and enter; esc is no
 Everything else goes to the page. A link that asks for a new window gets a
 new tab, and the tab is switched to.
 ";
