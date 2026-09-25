@@ -6,6 +6,11 @@
 # this program. A monthly pull request is the cheapest way to hear about that
 # from Dependabot instead of from a red build on an unrelated branch.
 #
+# The `Homebrew` workflow pins `Homebrew/actions/setup-homebrew` by commit
+# instead, with the dated tag in a comment, since that repository has no
+# major-version tag to follow. Dependabot moves a commit pin the same way, and
+# the entry below already covers every workflow file.
+#
 # There is no `cargo` entry on purpose. Every dependency in Cargo.toml but
 # `libc` is a git revision of tOS, pinned to the commit this crate was split
 # out of so that a build today is a build tomorrow -- see the long comment

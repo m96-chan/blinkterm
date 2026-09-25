@@ -64,6 +64,21 @@ anything in `src/`; see [Checks](#checks):
 cargo install --git https://github.com/m96-chan/blinkterm
 ```
 
+Or, on Linux, with [Homebrew](https://brew.sh):
+
+```sh
+brew install --HEAD m96-chan/tap/blinkterm    # --HEAD until the first tag
+```
+
+That builds from source too — the tap's formula asks Homebrew for a Rust and
+runs the same `cargo install --locked` — so it is the same binary by a shorter
+command, not a prebuilt one; prebuilt binaries are
+[#22](https://github.com/m96-chan/blinkterm/issues/22). The engine below is
+still yours to install, and `brew` says so when it is done. The formula lives
+in this repository, at `packaging/homebrew/blinkterm.rb`, and
+[m96-chan/homebrew-tap](https://github.com/m96-chan/homebrew-tap) carries a
+copy.
+
 Then a browser engine, which `blinkterm` does not ship — a Chromium is 482 MB
 installed, twice a tOS ISO, and a choice about which browser somebody runs.
 The one it is tested against is `chrome-headless-shell` from
