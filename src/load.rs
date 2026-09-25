@@ -113,7 +113,8 @@ pub enum Problem {
 /// `None` for a reply with no `errorText`, an empty one, or
 /// `net::ERR_ABORTED` — which is not a failure but a navigation that was
 /// superseded by another before it committed, or a url that turned out to be
-/// a download. Neither is anything the person needs telling about.
+/// a download — which [`crate::download::became_download`] tells apart.
+/// Neither is anything the person needs telling about.
 ///
 /// The code is the engine's and not the page's, but it is a string off the
 /// pipe that [`reason`] prints when it does not know it, so it comes out as

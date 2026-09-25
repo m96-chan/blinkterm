@@ -64,6 +64,18 @@ machine. It prints a warning when it does. Do not browse as root.
   by construction: it arrives as decoded pixels and is written as a graphics
   payload, never as text.
 
+- **Files a page hands over.** A download's name is the page's
+  (`Content-Disposition`, the `download` attribute, the url). The engine
+  sanitizes it once and `blinkterm` again: one path component, control and
+  bidi characters replaced, no leading dot, at most 255 bytes, and the file
+  it renames is `<dir>/<guid>` with the guid checked, never a path the page
+  spelled. Nothing outside the download directory is ever written, and
+  nothing in it is removed except this run's own `<guid>.crdownload`
+  partials. What is *not* done: no prompt before saving, so a page can put a
+  file into that directory without a click, as it can in any browser; and
+  nothing is opened or run — the row says a file arrived and that is all
+  ([#10](https://github.com/m96-chan/blinkterm/issues/10)).
+
 - **`/dev/shm`.** Frames go through POSIX shared memory objects named
   `blinkterm-<pid>-...`, created with your umask and unlinked by the terminal
   as it reads them. On a default umask another local user can read a frame in

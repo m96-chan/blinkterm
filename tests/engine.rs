@@ -3318,3 +3318,468 @@ fn a_dialog_on_a_tab_that_is_not_in_front_is_still_heard() {
     drop(tabs);
     engine.kill();
 }
+
+use blinkterm::download::{self, Downloads};
+
+/// What `/report.pdf` sends, which is what the saved file must hold.
+const REPORT: &[u8] = b"%PDF-1.4 hello report\n";
+
+/// How big `/big` is, and how it is paced: 128 kB every 100 ms, so that the
+/// whole takes about a second and a half and the engine's half-second
+/// progress events land in the middle of it.
+const BIG: usize = 2 * 1024 * 1024;
+const BIG_STEP: usize = 128 * 1024;
+
+/// A server with files to offer: a page with a link to one, the file, a big
+/// one that comes slowly, and one that breaks off. Every connection has a
+/// thread of its own, because the slow one would otherwise hold up the engine
+/// asking for anything else. The base comes back without a trailing slash.
+fn serve_files() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
+    let address = listener.local_addr().expect("an address");
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut head = [0u8; 2048];
+                let read = stream.read(&mut head).unwrap_or(0);
+                let request = String::from_utf8_lossy(&head[..read]).to_string();
+                let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+                let attachment = |name: &str, kind: &str, length: usize| {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\n\
+                         Content-Disposition: attachment; filename=\"{name}\"\r\n\
+                         Content-Length: {length}\r\nConnection: close\r\n\r\n"
+                    )
+                };
+                match path.as_str() {
+                    "/report.pdf" => {
+                        let head = attachment("report.pdf", "application/pdf", REPORT.len());
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(REPORT);
+                    }
+                    "/big" => {
+                        let head = attachment("big.bin", "application/octet-stream", BIG);
+                        let _ = stream.write_all(head.as_bytes());
+                        let chunk = vec![b'b'; BIG_STEP];
+                        for _ in 0..BIG / BIG_STEP {
+                            if stream.write_all(&chunk).is_err() {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                    "/broken" => {
+                        let head =
+                            attachment("broken.bin", "application/octet-stream", 4 * 1024 * 1024);
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&vec![b'x'; 100_000]);
+                        // And the socket closes with four megabytes promised.
+                    }
+                    _ => {
+                        let body = "<!doctype html><title>page</title>\
+                             <body style='margin:0'><a href='/report.pdf' \
+                             style='display:block;position:absolute;left:0;top:0;\
+                             width:240px;height:80px;background:#cc3'>report</a>";
+                        let answer = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(answer.as_bytes());
+                    }
+                }
+            });
+        }
+    });
+    format!("http://{address}")
+}
+
+/// A directory for downloads to go to that does not exist yet, under one
+/// that does and that the test removes: never the person's `~/Downloads`.
+fn download_dir(what: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!(
+        "blinkterm-it-download-{what}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("a directory");
+    let dir = base.join("Downloads");
+    (base, dir)
+}
+
+/// An engine told to save into `dir`, as `app::run` tells it, with its tab
+/// ready the way the program has one: enabled and sized.
+fn downloading(dir: &std::path::Path) -> Option<(Engine, Client, Tabs<Client>, Downloads)> {
+    let (engine, page, target) = connect_with_target()?;
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+    download::enable(&mut browser, dir).expect("the engine is told where");
+    let tab = tabs.active_mut().expect("the tab");
+    tab.connection
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut tab.connection);
+    Some((engine, browser, tabs, Downloads::new(dir.to_path_buf())))
+}
+
+/// [`pump`], with what `app::handle_target_events` does with a download's
+/// events first: every event the browser connection has is handed to the
+/// downloads, and `seen` is told what the row says each time the downloads
+/// say it changed. Until `done` or the time is up.
+fn pump_downloads(
+    browser: &mut Client,
+    tabs: &mut Tabs<Client>,
+    downloads: &mut Downloads,
+    timeout: Duration,
+    mut seen: impl FnMut(Option<String>),
+    done: impl Fn(&Downloads) -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        for event in browser.events() {
+            if downloads.take(&event, Instant::now()) {
+                seen(downloads.line(Instant::now()));
+            }
+            let outcome = tabs.take(&event, |target| {
+                browser.attach(target, Duration::from_secs(5))
+            });
+            if let Outcome::Gone { mut tab, .. } = outcome {
+                tab.connection.close();
+            }
+        }
+        if done(downloads) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The names in a directory, sorted; none for one that is not there.
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// The names in a directory once it has emptied, or when the time is up.
+///
+/// The engine removes a cancelled download's partial file itself, but after
+/// it has sent `canceled` rather than before — measured, the file is still
+/// there when the event is read — so an empty directory is waited for.
+fn emptied(dir: &std::path::Path, timeout: Duration) -> Vec<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let names = names_in(dir);
+        if names.is_empty() || Instant::now() >= deadline {
+            return names;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn saved(downloads: &Downloads) -> bool {
+    downloads
+        .line(Instant::now())
+        .is_some_and(|line| line.starts_with("saved "))
+}
+
+/// The acceptance test for #10: a url that is a file is saved, under its own
+/// name, with what the server sent, and the page it was asked for from stays
+/// where it was — typed, typed again, and clicked.
+#[test]
+fn an_attachment_is_saved_under_its_own_name_with_its_contents() {
+    use std::os::unix::fs::PermissionsExt;
+    let (base, dir) = download_dir("attachment");
+    let Some((mut engine, mut browser, mut tabs, mut downloads)) = downloading(&dir) else {
+        return;
+    };
+    let server = serve_files();
+    let page = format!("{server}/page");
+    {
+        let tab = tabs.active_mut().expect("the tab");
+        navigate_tab(tab, &page);
+        follow(tab, Duration::from_secs(10));
+        assert_eq!(tab.url, page);
+    }
+
+    for (round, wanted) in ["report.pdf", "report (1).pdf"].into_iter().enumerate() {
+        let tab = tabs.active_mut().expect("the tab");
+        let reply = navigate_tab(tab, &format!("{server}/report.pdf"));
+        assert!(download::became_download(&reply), "{reply:?}");
+        // What `app::navigated` did with that reply: the page stayed, so the
+        // loading note is off and the url is the page's again.
+        assert_eq!(tab.note, None);
+        assert!(!tab.loading);
+        assert_eq!(tab.url, page);
+        assert_eq!(tab.problem, None);
+
+        assert!(
+            pump_downloads(
+                &mut browser,
+                &mut tabs,
+                &mut downloads,
+                Duration::from_secs(10),
+                |_| {},
+                saved
+            ),
+            "round {round}: never saved: {:?}",
+            downloads.line(Instant::now())
+        );
+        assert_eq!(
+            std::fs::read(dir.join(wanted)).expect(wanted),
+            REPORT,
+            "{wanted}"
+        );
+        // So that the next round's `saved` is its own.
+        downloads.expire(Instant::now() + download::NOTICE_FOR);
+    }
+    let mode = std::fs::metadata(&dir)
+        .expect("the directory")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+
+    // A click on the link: the way most files are asked for.
+    {
+        let tab = tabs.active_mut().expect("the tab");
+        let _ = tab.connection.events();
+        for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+            tab.connection
+                .call(
+                    "Input.dispatchMouseEvent",
+                    Json::object(vec![
+                        ("type", Json::string(kind)),
+                        ("x", Json::number(40)),
+                        ("y", Json::number(20)),
+                        ("button", Json::string("left")),
+                        ("buttons", Json::number(buttons)),
+                        ("clickCount", Json::number(1)),
+                        ("modifiers", Json::number(0)),
+                    ]),
+                )
+                .expect("the click is dispatched");
+        }
+    }
+    assert!(
+        pump_downloads(
+            &mut browser,
+            &mut tabs,
+            &mut downloads,
+            Duration::from_secs(10),
+            |_| {},
+            saved
+        ),
+        "the click saved nothing: {:?}",
+        downloads.line(Instant::now())
+    );
+    assert_eq!(
+        std::fs::read(dir.join("report (2).pdf")).expect("the third"),
+        REPORT
+    );
+    let tab = tabs.active_mut().expect("the tab");
+    let navigated: Vec<_> = tab
+        .connection
+        .events()
+        .into_iter()
+        .filter(|event| event.method == "Page.frameNavigated")
+        .collect();
+    assert!(
+        navigated.is_empty(),
+        "the page went somewhere: {navigated:?}"
+    );
+    assert_eq!(tab.url, page);
+
+    // Only the three, under their names: no guid left over, no partial.
+    assert_eq!(
+        names_in(&dir),
+        ["report (1).pdf", "report (2).pdf", "report.pdf"]
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A download that takes a while says so while it does, and the row is only
+/// redrawn when what it says has changed.
+#[test]
+fn a_download_says_how_far_it_has_come_and_then_where_it_went() {
+    let (base, dir) = download_dir("progress");
+    let Some((mut engine, mut browser, mut tabs, mut downloads)) = downloading(&dir) else {
+        return;
+    };
+    let server = serve_files();
+    let tab = tabs.active_mut().expect("the tab");
+    let reply = navigate_tab(tab, &format!("{server}/big"));
+    assert!(download::became_download(&reply), "{reply:?}");
+
+    let mut lines: Vec<Option<String>> = Vec::new();
+    assert!(
+        pump_downloads(
+            &mut browser,
+            &mut tabs,
+            &mut downloads,
+            Duration::from_secs(15),
+            |line| lines.push(line),
+            saved
+        ),
+        "never saved: {lines:?}"
+    );
+    let percents: Vec<u64> = lines
+        .iter()
+        .flatten()
+        .filter_map(|line| {
+            line.strip_prefix("downloading big.bin ")?
+                .strip_suffix('%')?
+                .parse()
+                .ok()
+        })
+        .collect();
+    assert!(
+        percents.iter().any(|&n| n > 0 && n < 100),
+        "nothing between the start and the end: {lines:?}"
+    );
+    assert!(
+        percents.windows(2).all(|pair| pair[0] <= pair[1]),
+        "went backwards: {lines:?}"
+    );
+    assert!(
+        lines.windows(2).all(|pair| pair[0] != pair[1]),
+        "redrawn with nothing new to say: {lines:?}"
+    );
+    let last = lines.last().cloned().flatten().expect("a last word");
+    assert!(
+        last.starts_with("saved ") && last.ends_with("/big.bin"),
+        "{last}"
+    );
+    assert_eq!(
+        std::fs::metadata(dir.join("big.bin"))
+            .expect("the file")
+            .len(),
+        BIG as u64
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A server that stops sending halfway: the engine tries again, gives up,
+/// and says `canceled`; the row says the file did not arrive and nothing of
+/// it is left.
+#[test]
+fn a_download_that_breaks_off_is_reported_and_leaves_nothing() {
+    let (base, dir) = download_dir("broken");
+    let Some((mut engine, mut browser, mut tabs, mut downloads)) = downloading(&dir) else {
+        return;
+    };
+    let server = serve_files();
+    let tab = tabs.active_mut().expect("the tab");
+    navigate_tab(tab, &format!("{server}/broken"));
+    assert!(
+        pump_downloads(
+            &mut browser,
+            &mut tabs,
+            &mut downloads,
+            Duration::from_secs(10),
+            |_| {},
+            |downloads| !downloads.all().is_empty() && downloads.in_flight().next().is_none()
+        ),
+        "never ended: {:?}",
+        downloads.line(Instant::now())
+    );
+    assert_eq!(
+        downloads.line(Instant::now()).as_deref(),
+        Some("couldn't save broken.bin")
+    );
+    assert_eq!(
+        emptied(&dir, Duration::from_secs(2)),
+        Vec::<String>::new(),
+        "the engine left its partial file"
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// What the way out does: cancelled, the engine removes its own partial and
+/// the row does not call that a failure; killed without a cancel — the
+/// temporary profile's way out, or an engine that stopped answering — the
+/// partials this run saw begin are removed by name afterwards.
+#[test]
+fn quitting_with_a_download_coming_leaves_no_partial_file() {
+    let (base, dir) = download_dir("quit");
+    let Some((mut engine, mut browser, mut tabs, mut downloads)) = downloading(&dir) else {
+        return;
+    };
+    let server = serve_files();
+    let start = |tabs: &mut Tabs<Client>, browser: &mut Client, downloads: &mut Downloads| {
+        let tab = tabs.active_mut().expect("the tab");
+        navigate_tab(tab, &format!("{server}/big"));
+        assert!(
+            pump_downloads(
+                browser,
+                tabs,
+                downloads,
+                Duration::from_secs(10),
+                |_| {},
+                |downloads| downloads.in_flight().any(|download| download.received > 0)
+            ),
+            "the download never started"
+        );
+    };
+
+    start(&mut tabs, &mut browser, &mut downloads);
+    downloads.cancel_all(&mut browser);
+    pump_downloads(
+        &mut browser,
+        &mut tabs,
+        &mut downloads,
+        Duration::from_secs(2),
+        |_| {},
+        |downloads| downloads.in_flight().next().is_none(),
+    );
+    assert_eq!(downloads.line(Instant::now()), None, "not a failure");
+    assert_eq!(
+        emptied(&dir, Duration::from_secs(2)),
+        Vec::<String>::new(),
+        "the engine left its partial file"
+    );
+    assert_eq!(
+        downloads.partials().len(),
+        1,
+        "still named, for an engine killed before it got round to it"
+    );
+    browser.close();
+    drop(tabs);
+    engine.kill();
+
+    let Some((mut engine, mut browser, mut tabs, mut downloads)) = downloading(&dir) else {
+        return;
+    };
+    start(&mut tabs, &mut browser, &mut downloads);
+    let partials = downloads.partials();
+    assert_eq!(partials.len(), 1, "{partials:?}");
+    browser.close();
+    drop(tabs);
+    engine.kill();
+    for partial in partials {
+        let _ = std::fs::remove_file(partial);
+    }
+    assert_eq!(names_in(&dir), Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -120,6 +120,7 @@ pub mod app;
 pub mod base64;
 pub mod cdp;
 pub mod dialog;
+pub mod download;
 pub mod engine;
 pub mod graphics;
 pub mod input;

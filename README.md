@@ -121,6 +121,31 @@ A full `chromium` rather than the headless shell still writes
 `~/.config/chromium/Crash Reports` whatever profile it is given; that
 directory is Chromium's, not `blinkterm`'s.
 
+## Downloads
+
+A file a page offers — a link to a PDF, anything served as
+`Content-Disposition: attachment`, an `<a download>` — is saved, under the
+name the page suggested, and the status row says so:
+
+    downloading report.pdf 42%        →        saved ~/Downloads/report.pdf
+
+The page stays where it was: a link to a file is not a place to go. A name
+that is already taken becomes `report (1).pdf`, the way a browser's shelf
+does it, rather than overwriting. What the row says when a download did not
+finish is `couldn't save report.pdf`; the engine gives no reason, and this
+program adds one when it has it.
+
+Files go to `$XDG_DOWNLOAD_DIR` when that is set, else to the
+`XDG_DOWNLOAD_DIR` in `~/.config/user-dirs.dirs` — the file every desktop
+reads — else to `~/Downloads`; `--download-dir <dir>` for somewhere else.
+The directory is made, 0700, the first time something is saved into it.
+The name a page suggests is checked here: one path component, no control
+characters, no leading dot, at most 255 bytes.
+
+Quitting cancels anything still coming and leaves no partial file. A
+`blinkterm` that is killed outright can leave `<guid>.crdownload` in the
+directory, which is the engine's partial file and is safe to delete.
+
 ## Keys
 
 | | |

@@ -272,17 +272,30 @@ pub fn dialog_line(cols: u32, caption: &str, hint: &str, typed: Option<&str>) ->
         };
         return prompt_line(cols, &prompt, typed);
     }
+    split_line(cols, caption, hint)
+}
+
+/// The top row in two halves: `left` from the start, `right` at the end.
+///
+/// What a dialog's question and its keys are drawn as, and what a download's
+/// progress beside the tab's own line is. The right-hand half is the one that
+/// survives a narrow pane, because in both cases it is the news: the keys
+/// that answer a question nobody could otherwise see how to answer, the file
+/// that is arriving while the page it came from stays where it was. So `left`
+/// is clipped to what `right` leaves, less two cells of gap so that the two
+/// do not read as one sentence, and `right` is clipped only by the pane.
+pub fn split_line(cols: u32, left: &str, right: &str) -> Vec<u8> {
     let cols = cols.max(1) as usize;
     let mut out = b"\x1b[1;1H\x1b[K\x1b[7m".to_vec();
-    let hint = clip_to(hint, cols);
-    let room = cols.saturating_sub(width(&hint) + 2);
-    let shown = clip_to(caption, room);
+    let right = clip_to(right, cols);
+    let room = cols.saturating_sub(width(&right) + 2);
+    let shown = clip_to(left, room);
     out.extend_from_slice(shown.as_bytes());
     out.extend(std::iter::repeat_n(
         b' ',
-        cols.saturating_sub(width(&shown) + width(&hint)),
+        cols.saturating_sub(width(&shown) + width(&right)),
     ));
-    out.extend_from_slice(hint.as_bytes());
+    out.extend_from_slice(right.as_bytes());
     out.extend_from_slice(b"\x1b[0m\x1b[?25l");
     out
 }
@@ -791,6 +804,35 @@ mod tests {
         // and still no more than the pane.
         let tiny = text(&dialog_line(4, "anything", "any key", None));
         assert_eq!(width(row_body(&tiny)), 4, "{tiny:?}");
+    }
+
+    #[test]
+    fn a_download_beside_the_tab_line_keeps_the_download_when_the_row_is_narrow() {
+        let tab = "Quarterly figures  —  https://example.com/reports";
+        let download = "downloading report.pdf 42%";
+        let wide = text(&split_line(100, tab, download));
+        let body = row_body(&wide);
+        assert_eq!(width(body), 100);
+        assert!(body.starts_with(tab), "{body:?}");
+        assert!(body.ends_with(download), "{body:?}");
+
+        let narrow = text(&split_line(40, tab, download));
+        let body = row_body(&narrow);
+        assert_eq!(width(body), 40, "{body:?}");
+        assert_eq!(body, "Quarterly f…  downloading report.pdf 42%");
+        assert!(narrow.ends_with("\x1b[0m\x1b[?25l"), "{narrow:?}");
+
+        // Narrower than the download's words: those, as far as they go, and
+        // the tab's line gone rather than run into them.
+        let tiny = text(&split_line(10, tab, download));
+        assert_eq!(row_body(&tiny), "downloadi…");
+
+        // Byte for byte what a dialog without typing was before it was
+        // factored out.
+        assert_eq!(
+            dialog_line(40, "Delete 3 files?", "y/n", None),
+            split_line(40, "Delete 3 files?", "y/n")
+        );
     }
 
     #[test]

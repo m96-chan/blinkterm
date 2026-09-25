@@ -33,6 +33,12 @@ carry, and the list is kept as things land rather than written at the end.
 - A page that did not come says why — "can't reach example.cmo: name not
   resolved" — rather than showing `chrome-error://`, and a 404 or 500 is shown
   beside the title.
+- Downloads: a file a page offers is saved under its own name in
+  `$XDG_DOWNLOAD_DIR`, the `XDG_DOWNLOAD_DIR` of `~/.config/user-dirs.dirs`,
+  or `~/Downloads` — `--download-dir <dir>` for elsewhere — with `report
+  (1).pdf` rather than an overwrite when the name is taken, progress and
+  where it went on the status row, and the page left where it was
+  ([#10](https://github.com/m96-chan/blinkterm/issues/10)).
 
 ### Changed
 

@@ -35,6 +35,7 @@ use tos_preview::fit::{Cells, Metrics};
 
 use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::dialog::{Answer, Kind};
+use crate::download::{self, Downloads};
 use crate::engine::Engine;
 use crate::graphics::{Painter, Raw};
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
@@ -176,6 +177,8 @@ pub struct Options {
     pub url: String,
     /// Where cookies, logins and site data are kept; see [`crate::profile`].
     pub profile: Choice,
+    /// Where a file a page offers is saved; see [`crate::download`].
+    pub download: download::Choice,
 }
 
 /// Everything the loop owns that is not the terminal, the tabs or the engine.
@@ -204,6 +207,11 @@ struct Chrome {
     editing_whole: bool,
     /// The `Page.navigate` that has been sent and not yet answered.
     navigation: Option<Navigation>,
+    /// Every file a page has handed over this run, and what the row says
+    /// about them. The program's rather than a tab's: a download outlives
+    /// the tab it started in, and its events come on the browser's
+    /// connection. See [`crate::download`].
+    downloads: Downloads,
 }
 
 /// A `Page.navigate` that is out with the engine.
@@ -279,6 +287,12 @@ pub fn run(options: Options) -> Result<(), String> {
         "Target.setDiscoverTargets",
         Json::object(vec![("discover", Json::Bool(true))]),
     )?;
+    // Before any page can be asked for anything, because a download that
+    // begins before the engine is told where is one it refuses without a
+    // word; and before the pane is taken, so that a directory which is a
+    // file is a sentence in the shell.
+    let downloads_dir = download::prepare(options.download.clone())?;
+    download::enable(&mut browser, &downloads_dir)?;
     let first = crate::engine::first_page_target(&mut browser, TARGET_TIMEOUT).map_err(|why| {
         let tail = engine.tail();
         if tail.is_empty() {
@@ -291,11 +305,50 @@ pub fn run(options: Options) -> Result<(), String> {
     let mut tabs = Tabs::new(Tab::new(first, client, "about:blank"));
 
     let mut pane = Pane::enter(0, 1).map_err(|e| format!("cannot take the terminal: {e}"))?;
-    let outcome = drive(&mut pane, &mut tabs, &mut browser, &mut engine, options);
+    // Built here rather than in `drive`, so that what it knows about the
+    // downloads is still here when `drive` is over and the engine is being
+    // stopped. The rest of it goes at the end of this block, before the pane
+    // is given back, as it always did.
+    let (outcome, downloads) = match pane.metrics() {
+        Ok(metrics) => {
+            let mut chrome = Chrome {
+                painter: Painter::new(),
+                parser: Parser::new(),
+                clicks: Clicks::default(),
+                buttons: 0,
+                metrics,
+                motion: Motion::new(Instant::now()),
+                still: None,
+                wheel: scroll::Wheel::start(),
+                editing: None,
+                editing_whole: false,
+                navigation: None,
+                downloads: Downloads::new(downloads_dir),
+            };
+            let outcome = drive(
+                &mut pane,
+                &mut tabs,
+                &mut browser,
+                &mut engine,
+                &mut chrome,
+                options,
+            );
+            (outcome, Some(chrome.downloads))
+        }
+        Err(e) => (Err(format!("cannot measure the pane: {e}")), None),
+    };
     pane.leave();
     // Dropping the tabs closes every page's session, which is all a tab is
     // once the engine is about to be killed anyway.
     drop(tabs);
+    let mut downloads = downloads;
+    if let Some(downloads) = downloads.as_mut() {
+        // Whatever is still coming is cancelled, whichever way the engine is
+        // about to stop: `Browser.close` would cancel it too, but the
+        // temporary profile's way out is a kill, and a kill leaves the
+        // engine's partial file behind. Cancelled, the engine removes it.
+        downloads.cancel_all(&mut browser);
+    }
     if !engine.profile().is_temporary() {
         // `Browser.close` is the only stop that writes the cookie jar — a
         // `SIGTERM` loses it; `crate::profile` has the measurements — and the
@@ -311,6 +364,13 @@ pub fn run(options: Options) -> Result<(), String> {
     }
     browser.close();
     engine.kill();
+    // And the partial files of every download this run saw begin and not
+    // save, now that nothing can be writing them: the engine removes the
+    // ones it cancelled, but after it has said so, and a kill can come in
+    // between. Those files and nothing else — the directory is the person's.
+    for partial in downloads.iter().flat_map(Downloads::partials) {
+        let _ = std::fs::remove_file(partial);
+    }
     outcome
 }
 
@@ -320,26 +380,10 @@ fn drive(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     engine: &mut Engine,
+    chrome: &mut Chrome,
     options: Options,
 ) -> Result<(), String> {
-    let metrics = pane
-        .metrics()
-        .map_err(|e| format!("cannot measure the pane: {e}"))?;
-    let mut chrome = Chrome {
-        painter: Painter::new(),
-        parser: Parser::new(),
-        clicks: Clicks::default(),
-        buttons: 0,
-        metrics,
-        motion: Motion::new(Instant::now()),
-        still: None,
-        wheel: scroll::Wheel::start(),
-        editing: None,
-        editing_whole: false,
-        navigation: None,
-    };
-
-    activate(tabs, browser, &mut chrome)?;
+    activate(tabs, browser, chrome)?;
 
     let url = normalise(&options.url);
     if let Some(tab) = tabs.active_mut() {
@@ -347,15 +391,15 @@ fn drive(
         tab.note = Some(format!("loading {url}"));
         tab.loading = true;
     }
-    redraw_row(pane, tabs, &chrome)?;
-    if let Some(why) = navigate(tabs, &mut chrome, &url) {
+    redraw_row(pane, tabs, chrome)?;
+    if let Some(why) = navigate(tabs, chrome, &url) {
         if let Some(tab) = tabs.active_mut() {
             tab.note = Some(why);
         }
     }
     // Whether or not it was an error on the wire: a reply that says the page
     // did not come has replaced the loading note with why.
-    redraw_row(pane, tabs, &chrome)?;
+    redraw_row(pane, tabs, chrome)?;
 
     let mut last_check = Instant::now();
     let mut buf = [0u8; 8192];
@@ -365,6 +409,10 @@ fn drive(
             // The last tab closed itself, which is the page saying the browser
             // is over — the same thing `ctrl+w` on the last tab means.
             return Ok(());
+        }
+        // A download's last word has been on the row long enough.
+        if chrome.downloads.expire(Instant::now()) {
+            redraw_row(pane, tabs, chrome)?;
         }
         if RESIZED.swap(false, Ordering::SeqCst) {
             chrome.metrics = pane
@@ -389,7 +437,7 @@ fn drive(
             // notches carry on. See `docs/design/browser.md`.
             let (width, height) = page_pixels(chrome.metrics);
             chrome.wheel.resized((width as i32, height as i32));
-            redraw_row(pane, tabs, &chrome)?;
+            redraw_row(pane, tabs, chrome)?;
         }
 
         // The engine is a child process and can die at any point; without this
@@ -402,7 +450,7 @@ fn drive(
         if let Some(ended) = browser.ended() {
             return Err(format!("the engine stopped talking: {ended}"));
         }
-        reap_dead_tabs(pane, tabs, browser, &mut chrome)?;
+        reap_dead_tabs(pane, tabs, browser, chrome)?;
 
         let wake = tabs.active().map(|tab| tab.connection.wake_fd());
         let mut watching = vec![pane.input_fd(), browser.wake_fd()];
@@ -415,7 +463,7 @@ fn drive(
                 Ok(ReadOutcome::Data(n)) => {
                     let inputs = chrome.parser.feed(&buf[..n]);
                     for input in inputs {
-                        if !handle_input(pane, tabs, browser, &mut chrome, input)? {
+                        if !handle_input(pane, tabs, browser, chrome, input)? {
                             return Ok(());
                         }
                     }
@@ -426,7 +474,7 @@ fn drive(
             }
         } else if let Some(input) = chrome.parser.flush() {
             // Nothing arrived, so a held escape was the Escape key after all.
-            if !handle_input(pane, tabs, browser, &mut chrome, input)? {
+            if !handle_input(pane, tabs, browser, chrome, input)? {
                 return Ok(());
             }
         }
@@ -455,21 +503,21 @@ fn drive(
         // Which pages exist first, then what the page in front is doing: a
         // frame is read from whichever tab is active once the list has settled,
         // and never from one that has just been left behind.
-        handle_target_events(pane, tabs, browser, &mut chrome)?;
-        handle_page_events(pane, tabs, &mut chrome)?;
+        handle_target_events(pane, tabs, browser, chrome)?;
+        handle_page_events(pane, tabs, chrome)?;
         // The answer to a navigation, which may have been held for as long as
         // a page's "leave this page?" was on the row. After the page's events,
         // so that a dialog which arrived on the same pass is already drawn.
         if chrome.navigation.is_some() {
             let before = tabs.active().map(Tab::line);
-            collect_navigation(tabs, &mut chrome);
+            collect_navigation(tabs, chrome);
             if tabs.active().map(Tab::line) != before {
-                redraw_row(pane, tabs, &chrome)?;
+                redraw_row(pane, tabs, chrome)?;
             }
         }
         // And last, because it is the thing to do when nothing else happened:
         // a page that has stopped moving gets its lossless picture.
-        rest_shot(pane, tabs, &mut chrome)?;
+        rest_shot(pane, tabs, chrome)?;
     }
     Ok(())
 }
@@ -631,7 +679,18 @@ fn navigate(tabs: &mut Tabs<Client>, chrome: &mut Chrome, url: &str) -> Option<S
 /// against the url that was asked for, and the error page's landing, which is
 /// ten to sixty milliseconds behind, keeps it. A reply without an
 /// `errorText` says nothing the page's own events will not say better.
+///
+/// Or when the url turned out to be a file: `net::ERR_ABORTED` with
+/// `isDownload`, and after it no landing, no rename and no history entry —
+/// the page stays exactly where it was, measured, and nothing else would ever
+/// take the "loading" note off. So it comes off here, the way it does after a
+/// "leave this page?" answered no. The file itself is
+/// [`crate::download`]'s, on the browser's connection.
 pub fn navigated(tab: &mut Tab<Client>, url: &str, reply: &Json) {
+    if download::became_download(reply) {
+        stayed(tab);
+        return;
+    }
     if let Some(code) = load::failed(reply) {
         tab.failed_to_reach(url, &code);
     }
@@ -671,6 +730,8 @@ fn collect_navigation(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
         // page?" was answered no — the page stayed, the note was already
         // cleared by `stayed`, and measured against `headless_shell` 141 that is
         // exactly what this reply carries then; `load::failed` passes over it.
+        // The same code with `isDownload` is a url that was a file, and
+        // `navigated` puts the tab back for that one.
         Ok(reply) => navigated(tab, &url, &reply),
     }
 }
@@ -952,7 +1013,7 @@ fn page_cells(metrics: Metrics) -> Cells {
 
 /// Draw the top row.
 ///
-/// Four things share it, and which one is showing is a decision rather than a
+/// Five things share it, and which one is showing is a decision rather than a
 /// layout. A url being typed takes the whole row however many tabs are open:
 /// it is the one moment the person is writing rather than reading, and half a
 /// url beside a strip would be neither. A dialog on the page in front comes
@@ -964,18 +1025,28 @@ fn page_cells(metrics: Metrics) -> Cells {
 /// byte — a browser showing one page should not look like a browser with a
 /// tab bar in it. More than one is the strip, where a tab behind with a dialog
 /// of its own is marked.
+///
+/// And a download, which is the fifth and never takes the row: its words sit
+/// beside the tab's line — at the right-hand end with one tab, in the url's
+/// place after the strip with more — and never instead of it, because the
+/// tab's line is what a person navigates by and a download is news, not a
+/// place. Behind the url bar and a dialog, like the tab's line itself.
 fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(), String> {
     let cols = chrome.metrics.cols;
     let Some(active) = tabs.active() else {
         return Ok(());
     };
+    let downloading = chrome.downloads.line(Instant::now());
     let bytes = if chrome.editing.is_some() {
         screen::status_line(cols, &active.line(), chrome.editing.as_deref())
     } else if let Some(dialog) = &active.dialog {
         let typed = dialog.typing().then_some(dialog.line.text.as_str());
         screen::dialog_line(cols, &dialog.caption(), dialog.hint(), typed)
     } else if tabs.len() < 2 {
-        screen::status_line(cols, &active.line(), None)
+        match &downloading {
+            Some(words) => screen::split_line(cols, &active.line(), words),
+            None => screen::status_line(cols, &active.line(), None),
+        }
     } else {
         // Held here first, because a label can be a sentence made on the spot
         // — a tab whose page did not come — and the strip only borrows.
@@ -990,7 +1061,8 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
                 dialog: tab.dialog.is_some(),
             })
             .collect();
-        screen::tab_line(cols, &labels, &active.url)
+        let right = downloading.as_deref().unwrap_or(&active.url);
+        screen::tab_line(cols, &labels, right)
     };
     pane.write(&bytes).map_err(|e| e.to_string())
 }
@@ -1011,6 +1083,11 @@ fn handle_target_events(
     let mut note: Option<String> = None;
 
     for event in &events {
+        // A download's news comes on this connection and is nobody's tab's.
+        // `tabs.take` ignores these, so they are read first and only here.
+        if chrome.downloads.take(event, Instant::now()) {
+            redraw = true;
+        }
         let outcome = tabs.take(event, |target| connect_tab(browser, target));
         match outcome {
             Outcome::Ignored => {}
@@ -1670,6 +1747,9 @@ fn answer_dialog(
 /// loading, and the url is asked of the engine's own history — which answers
 /// at once, dialog or none, because it is the browser's rather than the
 /// page's.
+///
+/// A url that turned out to be a download is the other way a page ends up not
+/// having gone anywhere, and [`navigated`] sends it here too.
 fn stayed(tab: &mut Tab<Client>) {
     tab.note = None;
     tab.loading = false;
