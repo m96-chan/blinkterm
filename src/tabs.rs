@@ -1,28 +1,32 @@
 //! The list of pages, and what the engine's `Target.*` events do to it.
 //!
 //! A tab here is a CDP *page target*: the engine's own unit of "a page", with
-//! its own history, its own renderer and its own WebSocket. That last one is
-//! the decision worth naming. CDP can multiplex every target over the browser
-//! endpoint with `Target.attachToTarget` and a session id on every message,
-//! and a browser with a hundred tabs open would want exactly that; a pane with
-//! three does not. One socket per tab costs a thread and a pipe each and keeps
-//! [`crate::cdp::Client`] the thing it already is — a connection that answers
-//! `call`, queues events and knocks on a pipe — instead of a router that has
-//! to sort a session id it would otherwise never see.
+//! its own history and its own renderer, reached as a flattened session on the
+//! one pipe the engine was started with — `Target.attachToTarget` with
+//! `flatten: true`, and the session's id on every message to and from it.
 //!
-//! What follows from one socket per tab is that a tab *is* its connection:
-//! closing the tab drops it, which closes the socket, which is all the tidying
-//! there is. Nothing here holds a client of its own, so this module is generic
-//! over what a tab is connected by and its tests use numbers.
+//! This used to say the opposite: that multiplexing was for a browser with a
+//! hundred tabs, and that one WebSocket per tab — a thread and a pipe each —
+//! kept [`crate::cdp::Client`] from having to become a router. What changed is
+//! that the WebSocket went, and it went because it was a port every process on
+//! the machine could drive the browser through. A pipe is one connection, so
+//! the router was no longer optional; it is one reader thread for every tab
+//! instead of one each, and [`crate::cdp::Client`] still shows the loop what it
+//! always did — `call`, a queue of events, a pipe to `poll`.
+//!
+//! What follows from a session per tab is that a tab *is* its connection:
+//! closing the tab drops it, which detaches the session, which is all the
+//! tidying there is. Nothing here holds a client of its own, so this module is
+//! generic over what a tab is connected by and its tests use numbers.
 //!
 //! # Only the active tab costs anything
 //!
 //! A screencast is a frame every sixteen milliseconds, and a background tab
 //! that sent them would be a pane's worth of PNG encoded for nobody. So the
 //! screencast is started on activation and stopped on deactivation, and a
-//! background tab is a socket sitting idle. What it still does is *exist*: the
-//! page goes on running, and its `Page` events go on arriving on its own
-//! socket, which is what keeps the strip's titles true without anything being
+//! background tab is a session sitting idle. What it still does is *exist*:
+//! the page goes on running, and its `Page` events go on arriving in its own
+//! mailbox, which is what keeps the strip's titles true without anything being
 //! polled.
 //!
 //! # Where a title comes from, which is not where it looks like it should
@@ -348,8 +352,8 @@ impl<C> Tabs<C> {
     /// What one event from the browser connection does to the list.
     ///
     /// `open` is asked for a connection only for a target that is becoming a
-    /// tab, and may fail: an engine that will not take another socket is a
-    /// sentence on the row, not a reason to stop.
+    /// tab, and may fail: an engine that will not attach is a sentence on the
+    /// row, not a reason to stop.
     pub fn take(
         &mut self,
         event: &Event,

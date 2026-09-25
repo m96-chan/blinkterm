@@ -71,16 +71,10 @@ const WIDTH: u32 = 640;
 const HEIGHT: u32 = 360;
 const CELL: (u32, u32) = (8, 16);
 
-/// The same, with the target id the page connection belongs to, for the tests
-/// that are about which targets exist.
+/// The same, with the target id the page's session is attached to, for the
+/// tests that are about which targets exist.
 fn connect_with_target() -> Option<(Engine, Client, String)> {
-    let (engine, client) = connect()?;
-    // `connect` found the page in `/json/list`; the id is the tail of the url
-    // it found, which is exactly how the program itself gets it.
-    let address = engine.address().expect("an address");
-    let url = engine::page_target(&address, Duration::from_secs(20)).expect("a page");
-    let target = engine::target_of(&url).expect("an id").to_string();
-    Some((engine, client, target))
+    connect_in_with_target(Profile::temporary().expect("a temporary profile"))
 }
 
 /// Connect to a fresh engine, or say why the test is not running.
@@ -93,6 +87,12 @@ fn connect() -> Option<(Engine, Client)> {
 
 /// The same, on the profile given.
 fn connect_in(profile: Profile) -> Option<(Engine, Client)> {
+    let (engine, client, _) = connect_in_with_target(profile)?;
+    Some((engine, client))
+}
+
+/// The one all three are: on the profile given, with the page's target id.
+fn connect_in_with_target(profile: Profile) -> Option<(Engine, Client, String)> {
     if std::env::var_os(engine::ENGINE_ENV).is_none() {
         eprintln!(
             "skipped: {} is not set; name a Chromium to run this against",
@@ -108,13 +108,19 @@ fn connect_in(profile: Profile) -> Option<(Engine, Client)> {
         }
     }
     let engine = Engine::launch(profile, Duration::from_secs(30)).expect("the engine starts");
-    let address = engine.address().expect("an address");
-    let target = match engine::page_target(&address, Duration::from_secs(20)) {
+    // What `app::run` does: the browser's client finds the page and attaches
+    // to it, and the page's session is the client the test drives. The
+    // browser's client goes when this returns, which leaves the page's
+    // session where it was and lets `tabbed` make another.
+    let mut browser = engine.browser().expect("the browser's client");
+    let target = match engine::first_page_target(&mut browser, Duration::from_secs(20)) {
         Ok(target) => target,
         Err(why) => panic!("{why}; the engine said: {}", engine.tail().join(" / ")),
     };
-    let client = Client::connect(&target, Duration::from_secs(10)).expect("a connection");
-    Some((engine, client))
+    let client = browser
+        .attach(&target, Duration::from_secs(10))
+        .expect("a session on the page");
+    Some((engine, client, target))
 }
 
 /// Get the page ready: sized, loaded, and painting.
@@ -578,8 +584,7 @@ fn viewport(client: &mut Client) {
 /// The browser-level connection, with target discovery on, and the tab list
 /// the program would be holding.
 fn tabbed(engine: &Engine, page: Client, target: String) -> (Client, Tabs<Client>) {
-    let mut browser =
-        Client::connect(engine.browser_url(), Duration::from_secs(10)).expect("the browser socket");
+    let mut browser = engine.browser().expect("the browser's client");
     browser
         .call(
             "Target.setDiscoverTargets",
@@ -595,7 +600,6 @@ fn tabbed(engine: &Engine, page: Client, target: String) -> (Client, Tabs<Client
 fn pump(
     browser: &mut Client,
     tabs: &mut Tabs<Client>,
-    browser_url: &str,
     timeout: Duration,
     done: impl Fn(&Tabs<Client>) -> bool,
 ) -> bool {
@@ -603,8 +607,7 @@ fn pump(
     loop {
         for event in browser.events() {
             let outcome = tabs.take(&event, |target| {
-                let socket = engine::target_url(browser_url, target)?;
-                Client::connect(&socket, Duration::from_secs(5))
+                browser.attach(target, Duration::from_secs(5))
             });
             match outcome {
                 Outcome::Failed(why) => panic!("a tab that would not open: {why}"),
@@ -629,9 +632,8 @@ fn pump(
 
 /// An engine with two tabs in it: the second opened by a click on a
 /// `target=_blank` link in the first, which is how a person opens one.
-fn two_tabs() -> Option<(Engine, Client, Tabs<Client>, String)> {
+fn two_tabs() -> Option<(Engine, Client, Tabs<Client>)> {
     let (engine, page, target) = connect_with_target()?;
-    let browser_url = engine.browser_url().to_string();
     let base = serve();
     let (mut browser, mut tabs) = tabbed(&engine, page, target);
 
@@ -679,20 +681,19 @@ fn two_tabs() -> Option<(Engine, Client, Tabs<Client>, String)> {
         pump(
             &mut browser,
             &mut tabs,
-            &browser_url,
             Duration::from_secs(15),
-            |tabs| tabs.len() == 2,
+            |tabs| tabs.len() == 2
         ),
         "the link with target=_blank opened no tab"
     );
-    Some((engine, browser, tabs, browser_url))
+    Some((engine, browser, tabs))
 }
 
 /// The whole reason tabs exist: a link that wants a window gets a tab, that
 /// tab is the one in front, and it is the one painting.
 #[test]
 fn a_link_that_wants_a_window_becomes_the_tab_in_front() {
-    let Some((mut engine, mut browser, mut tabs, browser_url)) = two_tabs() else {
+    let Some((mut engine, mut browser, mut tabs)) = two_tabs() else {
         return;
     };
     assert_eq!(tabs.len(), 2);
@@ -705,16 +706,11 @@ fn a_link_that_wants_a_window_becomes_the_tab_in_front() {
     // The urls come from the browser connection, with nothing asked of either
     // page — and the second tab's is the one the link pointed at.
     assert!(
-        pump(
-            &mut browser,
-            &mut tabs,
-            &browser_url,
-            Duration::from_secs(10),
-            |tabs| tabs
-                .iter()
+        pump(&mut browser, &mut tabs, Duration::from_secs(10), |tabs| {
+            tabs.iter()
                 .nth(1)
-                .is_some_and(|tab| tab.url.ends_with("/second")),
-        ),
+                .is_some_and(|tab| tab.url.ends_with("/second"))
+        }),
         "the second tab's url never arrived: {:?}",
         tabs.iter().map(|tab| tab.url.clone()).collect::<Vec<_>>()
     );
@@ -765,14 +761,13 @@ fn a_link_that_wants_a_window_becomes_the_tab_in_front() {
     engine.kill();
 }
 
-/// `ctrl+t`: a target this program asked for, reached on a url it worked out
-/// rather than looked up, and not announced twice as a tab.
+/// `ctrl+t`: a target this program asked for, attached to by the id the
+/// engine gave back, and not announced twice as a tab.
 #[test]
 fn a_tab_this_program_opens_is_reachable_and_counted_once() {
     let Some((mut engine, page, target)) = connect_with_target() else {
         return;
     };
-    let browser_url = engine.browser_url().to_string();
     let base = serve();
     let (mut browser, mut tabs) = tabbed(&engine, page, target);
 
@@ -787,9 +782,9 @@ fn a_tab_this_program_opens_is_reachable_and_counted_once() {
         .and_then(Json::as_str)
         .expect("the engine says which")
         .to_string();
-    let socket = engine::target_url(&browser_url, &opened).expect("a socket url");
-    let connection = Client::connect(&socket, Duration::from_secs(10))
-        .expect("the url worked out from the browser's own");
+    let connection = browser
+        .attach(&opened, Duration::from_secs(10))
+        .expect("a session on the page the engine opened");
     tabs.open(Tab::new(opened, connection, "about:blank"));
     assert_eq!(tabs.len(), 2);
     assert_eq!(tabs.active_index(), 1);
@@ -799,7 +794,6 @@ fn a_tab_this_program_opens_is_reachable_and_counted_once() {
     assert!(!pump(
         &mut browser,
         &mut tabs,
-        &browser_url,
         Duration::from_secs(3),
         |tabs| tabs.len() > 2,
     ));
@@ -836,12 +830,13 @@ fn a_tab_this_program_opens_is_reachable_and_counted_once() {
 /// left is the tab it was opened from.
 #[test]
 fn closing_a_tab_leaves_the_one_it_was_opened_from() {
-    let Some((mut engine, mut browser, mut tabs, browser_url)) = two_tabs() else {
+    let Some((mut engine, mut browser, mut tabs)) = two_tabs() else {
         return;
     };
     let closing = tabs.active_target().expect("a target").to_string();
 
-    // What `Command::CloseTab` does: the target in the engine, then the socket.
+    // What `Command::CloseTab` does: the target in the engine, then the
+    // session.
     let index = tabs.active_index();
     let mut tab = tabs.close(index).expect("the tab");
     browser
@@ -860,7 +855,6 @@ fn closing_a_tab_leaves_the_one_it_was_opened_from() {
         pump(
             &mut browser,
             &mut tabs,
-            &browser_url,
             Duration::from_secs(10),
             |tabs| tabs.len() == 1,
         ),
@@ -881,7 +875,7 @@ fn closing_a_tab_leaves_the_one_it_was_opened_from() {
 /// A page that closes itself takes its tab with it, with no key pressed.
 #[test]
 fn a_page_that_calls_window_close_removes_its_own_tab() {
-    let Some((mut engine, mut browser, mut tabs, browser_url)) = two_tabs() else {
+    let Some((mut engine, mut browser, mut tabs)) = two_tabs() else {
         return;
     };
     let closing = tabs.active_target().expect("a target").to_string();
@@ -900,7 +894,6 @@ fn a_page_that_calls_window_close_removes_its_own_tab() {
         pump(
             &mut browser,
             &mut tabs,
-            &browser_url,
             Duration::from_secs(10),
             |tabs| tabs.len() == 1,
         ),
@@ -944,8 +937,8 @@ fn wait_for_frame(client: &mut Client, timeout: Duration) -> Option<Vec<u8>> {
 /// On Debian — a tOS rootfs is Debian — `/usr/bin/chromium-shell` is a shell
 /// script that runs `/usr/lib/chromium/chromium-shell` as its child, so the
 /// pid `spawn` returns is `/bin/sh` and a signal to that pid alone leaves a
-/// browser behind with the page still painting and the debugging port still
-/// open. That is what was found on an installed machine: seven sessions, seven
+/// browser behind with the page still painting — and, when this program still
+/// drove it over a port, the debugging port still open. That is what was found on an installed machine: seven sessions, seven
 /// engines, none of them being looked at. This test is the shape of that bug —
 /// the group is read before the engine is dropped, and has to be empty after.
 #[test]
@@ -954,7 +947,6 @@ fn killing_the_engine_leaves_nothing_of_its_process_group() {
         return;
     };
     prepare(&mut client);
-    let address = engine.address().expect("an address");
     let group = engine
         .group()
         .expect("the engine is started in a group of its own");
@@ -985,10 +977,94 @@ fn killing_the_engine_leaves_nothing_of_its_process_group() {
         "the engine was killed and these are still running: {}",
         describe(&left)
     );
+}
+
+/// Issue #5: the engine's debugging endpoint was a port on loopback, and any
+/// process on the machine could drive the browser through it. With
+/// `--remote-debugging-pipe` there must be nothing listening at all — not the
+/// browser, and not any of the helpers it forks.
+///
+/// Asked of the kernel rather than of a connect: every socket descriptor every
+/// process in the engine's group holds, against every TCP socket in the
+/// `LISTEN` state (`0A` in `/proc/net/tcp`). A machine with no IPv6 has no
+/// `/proc/net/tcp6`, and that is read as no listeners rather than an error.
+#[test]
+fn the_engine_listens_on_no_port() {
+    let Some((engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    let group = engine
+        .group()
+        .expect("the engine is started in a group of its own");
+    let members = group_members(group);
     assert!(
-        std::net::TcpStream::connect(&address).is_err(),
-        "something is still listening on {address}"
+        members.len() >= 2,
+        "an engine is a wrapper and a browser at least, and this group has {}",
+        describe(&members)
     );
+
+    let listening: std::collections::HashSet<u64> = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .flat_map(|table| listening_inodes(table))
+        .collect();
+    let mut sockets = 0;
+    let mut found = Vec::new();
+    for (pid, command) in &members {
+        for inode in socket_inodes(*pid) {
+            sockets += 1;
+            if listening.contains(&inode) {
+                found.push(format!("{pid} ({command}) listens on socket:[{inode}]"));
+            }
+        }
+    }
+    eprintln!(
+        "group {group}: {} processes, {sockets} sockets between them, {} listening sockets \
+         on the machine, {} of them the engine's",
+        members.len(),
+        listening.len(),
+        found.len()
+    );
+    assert!(found.is_empty(), "the engine is listening: {found:?}");
+
+    drop(client);
+    drop(engine);
+}
+
+/// The inodes of the sockets in `LISTEN` in one of `/proc/net/tcp{,6}`.
+fn listening_inodes(table: &str) -> Vec<u64> {
+    let Ok(text) = std::fs::read_to_string(table) else {
+        return Vec::new();
+    };
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // sl, local, remote, st, queues, tr, retrnsmt, uid, timeout, inode
+            (fields.get(3) == Some(&"0A"))
+                .then(|| fields.get(9)?.parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// The inodes of every socket `pid` holds a descriptor to.
+fn socket_inodes(pid: i32) -> Vec<u64> {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let target = std::fs::read_link(entry.path()).ok()?;
+            let target = target.to_string_lossy();
+            target
+                .strip_prefix("socket:[")?
+                .strip_suffix(']')?
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 /// Every process in `group` that is still running, as pid and command line.
@@ -2345,8 +2421,7 @@ fn a_cookie_set_in_one_session_is_there_in_the_next() {
     assert_eq!(set.get("success").and_then(Json::as_bool), Some(true));
     assert_eq!(the_cookie(&mut client).as_deref(), Some("kept"));
 
-    let mut browser =
-        Client::connect(engine.browser_url(), Duration::from_secs(10)).expect("the browser socket");
+    let mut browser = engine.browser().expect("the browser's client");
     let asked = Instant::now();
     // The reply and the end of the connection race, and either is an answer.
     let _ = browser.call_within("Browser.close", Json::empty(), Duration::from_secs(5));

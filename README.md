@@ -10,7 +10,8 @@ blinkterm https://example.com
 ```
 
 `blinkterm` starts a Chromium as a child process, drives it over the Chrome
-DevTools Protocol on a WebSocket it speaks itself, takes the page's screencast,
+DevTools Protocol on a pipe only the two of them hold — no port, so nothing
+else on the machine can drive the browser — takes the page's screencast,
 decodes each frame, and hands the terminal raw pixels — turning the terminal's
 own reports of keys and mouse back into CDP input events. The engine renders;
 the terminal displays; this program is the wire between them and nothing else.
@@ -167,8 +168,9 @@ cargo test --locked
 The lint set is a `[lints]` table in `Cargo.toml` rather than a list of flags
 in the workflow, so a laptop and a runner disagree about `-D warnings` and
 nothing else. The one worth knowing about is
-`clippy::undocumented_unsafe_blocks`: there are twenty-six `unsafe` blocks in
-`src/`, all of them one-line `libc` calls, and each says what makes it sound.
+`clippy::undocumented_unsafe_blocks`: there are thirty-four `unsafe` blocks in
+`src/`, nearly all of them one-line `libc` calls, and each says what makes it
+sound.
 
 `--locked` throughout, because every dependency but `libc` is a git revision
 and `Cargo.lock` is the only record of which tree of tOS was built.

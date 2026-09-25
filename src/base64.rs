@@ -1,16 +1,15 @@
 //! Base64, strictly.
 //!
-//! Two callers with opposite needs. The WebSocket handshake needs an encoder
-//! for its sixteen random bytes and for the SHA-1 the server is checked
-//! against; the screencast needs a decoder for a PNG that arrived inside a
-//! JSON string.
+//! Two callers with opposite needs. The screencast needs a decoder for a
+//! picture that arrived inside a JSON string; the graphics protocol needs an
+//! encoder for the pixels and the shared-memory names it sends the terminal.
 //!
 //! [`tos_term::graphics::decode_base64`] already decodes, and this is
 //! deliberately not it. That one is a terminal reading what an application
 //! sent: it skips whitespace and stops at the first byte outside the
 //! alphabet, because a terminal that rejected a payload would have to answer
 //! with a protocol error and the kinder failure is a short image. Here the
-//! payload is a video frame arriving sixty times a second down a socket this
+//! payload is a video frame arriving sixty times a second down a pipe this
 //! program owns both ends of, and a decode that silently returns half a PNG
 //! would show a torn picture and give no hint why. So anything that is not
 //! four-character-aligned, in-alphabet and padded exactly once is an error

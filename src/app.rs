@@ -46,7 +46,7 @@ use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::tabs::{Outcome, Tab, Tabs};
 
-/// How long the engine gets to print its port.
+/// How long the engine gets to answer on its pipe.
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long it then gets to offer a page to drive.
@@ -106,7 +106,7 @@ const PAGE_ROW: u32 = 2;
 /// not make the tab somebody asked for wait fifteen seconds to appear.
 const SWITCH_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long a new tab's socket has to be accepted.
+/// How long an attach to a new tab's page has to be answered.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the engine gets to draw the lossless picture of a page that has
@@ -162,8 +162,9 @@ fn install_signals() {
             libc::sigemptyset(&mut action.sa_mask);
             libc::sigaction(signal, &action, std::ptr::null_mut());
         }
-        // A page that closes its connection must not kill this program before
-        // it has put the terminal back.
+        // An engine that closes its end of the pipe must not kill this
+        // program before it has put the terminal back: with this, a write to
+        // it is `EPIPE`, which `cdp` turns into a sentence.
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 }
@@ -235,9 +236,16 @@ pub fn run(options: Options) -> Result<(), String> {
     // is using is refused before anything has written to it.
     let profile = Profile::take(options.profile.clone())?;
     let mut engine = Engine::launch(profile, ENGINE_TIMEOUT)?;
-    let address = engine.address()?;
-    let browser_url = engine.browser_url().to_string();
-    let target = crate::engine::page_target(&address, TARGET_TIMEOUT).map_err(|why| {
+    // The browser's own client, rather than a page's. It is the only one that
+    // can hear about a target this program did not open — a `target=_blank`,
+    // a `window.open` — and the only one that can open, close, raise or
+    // attach to one, which is how every page's client is made.
+    let mut browser = engine.browser()?;
+    browser.call(
+        "Target.setDiscoverTargets",
+        Json::object(vec![("discover", Json::Bool(true))]),
+    )?;
+    let first = crate::engine::first_page_target(&mut browser, TARGET_TIMEOUT).map_err(|why| {
         let tail = engine.tail();
         if tail.is_empty() {
             why
@@ -245,34 +253,14 @@ pub fn run(options: Options) -> Result<(), String> {
             format!("{why}; the engine said: {}", tail.join(" / "))
         }
     })?;
-    let client = Client::connect(&target, Duration::from_secs(10))?;
-    let first = crate::engine::target_of(&target)
-        .ok_or_else(|| format!("the engine's page has no target id: {target}"))?
-        .to_string();
-
-    // A second connection, to the browser rather than to a page. It is the
-    // only one that can hear about a target this program did not open — a
-    // `target=_blank`, a `window.open` — and the only one that can open, close
-    // or raise one.
-    let mut browser = Client::connect(&browser_url, Duration::from_secs(10))?;
-    browser.call(
-        "Target.setDiscoverTargets",
-        Json::object(vec![("discover", Json::Bool(true))]),
-    )?;
+    let client = browser.attach(&first, CONNECT_TIMEOUT)?;
     let mut tabs = Tabs::new(Tab::new(first, client, "about:blank"));
 
     let mut pane = Pane::enter(0, 1).map_err(|e| format!("cannot take the terminal: {e}"))?;
-    let outcome = drive(
-        &mut pane,
-        &mut tabs,
-        &mut browser,
-        &mut engine,
-        &browser_url,
-        options,
-    );
+    let outcome = drive(&mut pane, &mut tabs, &mut browser, &mut engine, options);
     pane.leave();
-    // Dropping the tabs closes every page socket, which is all a tab is once
-    // the engine is about to be stopped anyway.
+    // Dropping the tabs closes every page's session, which is all a tab is
+    // once the engine is about to be killed anyway.
     drop(tabs);
     if !engine.profile().is_temporary() {
         // `Browser.close` is the only stop that writes the cookie jar — a
@@ -298,7 +286,6 @@ fn drive(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     engine: &mut Engine,
-    browser_url: &str,
     options: Options,
 ) -> Result<(), String> {
     let metrics = pane
@@ -392,7 +379,7 @@ fn drive(
                 Ok(ReadOutcome::Data(n)) => {
                     let inputs = chrome.parser.feed(&buf[..n]);
                     for input in inputs {
-                        if !handle_input(pane, tabs, browser, &mut chrome, browser_url, input)? {
+                        if !handle_input(pane, tabs, browser, &mut chrome, input)? {
                             return Ok(());
                         }
                     }
@@ -403,15 +390,15 @@ fn drive(
             }
         } else if let Some(input) = chrome.parser.flush() {
             // Nothing arrived, so a held escape was the Escape key after all.
-            if !handle_input(pane, tabs, browser, &mut chrome, browser_url, input)? {
+            if !handle_input(pane, tabs, browser, &mut chrome, input)? {
                 return Ok(());
             }
         }
 
         // What the animator thread has been doing while this loop was busy.
-        // Nothing here drives it — it has its own clock and its own socket —
-        // but every tick it sent is a page that moved, and a page that moved
-        // is not a page to photograph. See [`motion::INPUT_QUIET`].
+        // Nothing here drives it — it has its own clock and its own way onto
+        // the pipe — but every tick it sent is a page that moved, and a page
+        // that moved is not a page to photograph. See [`motion::INPUT_QUIET`].
         if let Some(at) = chrome.wheel.activity() {
             chrome.motion.input(at);
         }
@@ -432,7 +419,7 @@ fn drive(
         // Which pages exist first, then what the page in front is doing: a
         // frame is read from whichever tab is active once the list has settled,
         // and never from one that has just been left behind.
-        handle_target_events(pane, tabs, browser, &mut chrome, browser_url)?;
+        handle_target_events(pane, tabs, browser, &mut chrome)?;
         handle_page_events(pane, tabs, &mut chrome)?;
         // And last, because it is the thing to do when nothing else happened:
         // a page that has stopped moving gets its lossless picture.
@@ -643,7 +630,7 @@ fn switched(
     // What the last tab was owed is not owed to this one, and there is
     // nothing in flight to disown: the animation is this program's, so
     // forgetting it is the whole of stopping it. It also lets go of that
-    // tab's socket, which a tab that is closing needs.
+    // tab's session, which a tab that is closing needs.
     chrome.wheel.forget();
     if let Some(was) = &was {
         deactivate(tabs, was);
@@ -667,12 +654,7 @@ fn switched(
 }
 
 /// Open a page in a new tab and switch to it.
-fn open_tab(
-    tabs: &mut Tabs<Client>,
-    browser: &mut Client,
-    browser_url: &str,
-    url: &str,
-) -> Result<(), String> {
+fn open_tab(tabs: &mut Tabs<Client>, browser: &mut Client, url: &str) -> Result<(), String> {
     let created = browser.call(
         "Target.createTarget",
         Json::object(vec![("url", Json::string(url))]),
@@ -682,31 +664,30 @@ fn open_tab(
         .and_then(Json::as_str)
         .ok_or_else(|| "the engine opened a page and did not say which".to_string())?
         .to_string();
-    let connection = connect_tab(browser_url, &target)?;
+    let connection = connect_tab(browser, &target)?;
     tabs.open(Tab::new(target, connection, url));
     Ok(())
 }
 
-/// Connect to a target and start listening to its page, whether or not it is
+/// Attach to a target and start listening to its page, whether or not it is
 /// the tab in front.
 ///
 /// `Page.enable` from the moment the tab exists rather than from the moment it
 /// is looked at: a tab that is loading in the background still has to tell the
 /// strip when it has a name, and the events it sends before anybody asks are
 /// the only notice there is.
-fn connect_tab(browser_url: &str, target: &str) -> Result<Client, String> {
-    let socket = crate::engine::target_url(browser_url, target)?;
-    let mut connection = Client::connect(&socket, CONNECT_TIMEOUT)?;
+fn connect_tab(browser: &mut Client, target: &str) -> Result<Client, String> {
+    let mut connection = browser.attach(target, CONNECT_TIMEOUT)?;
     connection.call_within("Page.enable", Json::empty(), SWITCH_TIMEOUT)?;
     Ok(connection)
 }
 
-/// Close one tab: the page in the engine, and the socket to it.
+/// Close one tab: the page in the engine, and the session on it.
 ///
-/// In that order, and both. A target closed while its connection is still open
-/// is a page the engine keeps alive for the debugger that is still attached;
-/// a connection closed without the target is a page that goes on rendering for
-/// nobody.
+/// In that order, and both. A target closed while its session is still
+/// attached is a page the engine keeps alive for the debugger that is still
+/// there; a session closed without the target is a page that goes on rendering
+/// for nobody.
 ///
 /// Dropping the connection is also what makes a frame that was in flight
 /// harmless: it is in that client's mailbox, and the mailbox goes with the
@@ -724,15 +705,17 @@ fn close_tab(tabs: &mut Tabs<Client>, browser: &mut Client, index: usize) {
     tab.connection.close();
 }
 
-/// Drop any tab whose socket has gone.
+/// Drop any tab whose session has gone.
 ///
-/// A target that is closed takes its socket with it, so this and
-/// `Target.targetDestroyed` are two ways of hearing the same news and either
-/// may arrive first. Which is why neither a sentence nor an error comes out of
-/// here: a tab that went because the page called `window.close` must not be
-/// reported as a failure just because the socket noticed before the browser
-/// connection did, and whether a person sees a message for that would
-/// otherwise depend on which of two sockets was read first. A tab that died
+/// A target that is closed takes its session with it — the engine says
+/// `Target.detachedFromTarget`, and [`crate::cdp`] ends that tab's client when
+/// it reads it — so this and `Target.targetDestroyed` are two ways of hearing
+/// the same news and either may be looked at first. Which is why neither a
+/// sentence nor an error comes out of here: a tab that went because the page
+/// called `window.close` must not be reported as a failure just because its
+/// client noticed before the browser's did, and whether a person sees a
+/// message for that would otherwise depend on which of two mailboxes was
+/// read first. A tab that died
 /// for a reason worth a sentence gets one from `Target.targetCrashed`, which
 /// arrives on the browser connection either way; an engine that died is caught
 /// by [`Engine::check`] and by the browser connection ending, neither of which
@@ -816,7 +799,6 @@ fn handle_target_events(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
-    browser_url: &str,
 ) -> Result<(), String> {
     let events = browser.events();
     if events.is_empty() {
@@ -827,7 +809,7 @@ fn handle_target_events(
     let mut note: Option<String> = None;
 
     for event in &events {
-        let outcome = tabs.take(event, |target| connect_tab(browser_url, target));
+        let outcome = tabs.take(event, |target| connect_tab(browser, target));
         match outcome {
             Outcome::Ignored => {}
             Outcome::Opened | Outcome::Renamed => redraw = true,
@@ -1093,7 +1075,7 @@ fn collect_still(
 /// Ask for a still, if the page has earned one.
 ///
 /// A failure to send is a failure of the still and not of the program: the
-/// socket going is heard on the next pass by everything that cares.
+/// session going is heard on the next pass by everything that cares.
 fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     if !chrome.motion.wants_still(Instant::now()) {
         return;
@@ -1202,7 +1184,6 @@ fn handle_input(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
-    browser_url: &str,
     input: Input,
 ) -> Result<bool, String> {
     match input {
@@ -1262,7 +1243,7 @@ fn handle_input(
                 Some(Command::Back) => go(tabs, -1),
                 Some(Command::Forward) => go(tabs, 1),
                 Some(Command::NewTab) => {
-                    match open_tab(tabs, browser, browser_url, "about:blank") {
+                    match open_tab(tabs, browser, "about:blank") {
                         Ok(()) => {
                             switched(pane, tabs, browser, chrome, was)?;
                             // A new tab is a tab somebody is about to type an
