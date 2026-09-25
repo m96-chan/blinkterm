@@ -56,6 +56,35 @@ carry, and the list is kept as things land rather than written at the end.
   disk.
 - `--search-url <url with %s>`: words typed in the url bar go to that search.
   Off by default; without it nothing typed is sent anywhere it does not name.
+- A page's `<input type=file>` asks for a path on the status row, with tab
+  completion; several files for a `multiple` input, one per `enter` and an
+  empty `enter` to send them; `esc` sends nothing
+  ([#11](https://github.com/m96-chan/blinkterm/issues/11)).
+- Find in page: `ctrl+f` opens a `find:` prompt on the status row, matches
+  are highlighted as you type with the current one scrolled into view and
+  counted (`3/17`), `enter`/`ctrl+g` next and `shift+enter` previous, `esc`
+  clears. Case-insensitive, CJK included, same-origin frames included,
+  hidden text excluded; nothing in the page is modified
+  ([#12](https://github.com/m96-chan/blinkterm/issues/12)).
+- The status row: a link under the pointer shows where it goes (`link:
+  https://…`), a plain-http page on a named host is marked `not secure`, a
+  loading page says `esc stops` and counts the seconds, and `esc` stops it.
+  The terminal is asked for all mouse motion (mode 1003) and, where it
+  understands OSC 22, told the pointer's shape
+  ([#15](https://github.com/m96-chan/blinkterm/issues/15)).
+- Zoom: `alt+=`/`alt+-` (and `ctrl+=`/`ctrl+-` where the terminal passes
+  them) through Chrome's steps from 25% to 300%, `alt+0`/`ctrl+0` back to
+  100%; remembered per host in the profile's `zoom` file (0600), shown on
+  the row as `150%` ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
+- `--scale <n|auto>` for HiDPI terminals: auto says 2 when a cell is 28 px
+  or taller ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
+- `--color-scheme auto|light|dark`: a dark terminal gets dark pages, by
+  asking the terminal its background (`OSC 11`); `--force-dark` paints even
+  pages with no dark style dark
+  ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
+- Over ssh, or in a terminal whose `winsize` has no pixels, the cell size is
+  asked with `CSI 16 t`, so the picture is the pane's size there too
+  ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
 
 ### Changed
 
@@ -69,6 +98,7 @@ carry, and the list is kept as things land rather than written at the end.
   `http://`, not `https://`.
 - `ctrl+u` in the url bar deletes to the start of the line rather than the
   whole line — the same thing until the cursor could move.
+- Pages now see the pointer move, not only click and drag.
 
 - The minimum Rust is **1.87**. It was documented as 1.75, which had never been
   true: the dependency closure has not built below 1.87. It is checked by CI

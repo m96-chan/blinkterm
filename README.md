@@ -131,6 +131,15 @@ A full `chromium` rather than the headless shell still writes
 `~/.config/chromium/Crash Reports` whatever profile it is given; that
 directory is Chromium's, not `blinkterm`'s.
 
+### Zoom levels
+
+A page you zoom is remembered by its host, in a file called `zoom` beside
+the history: one line per change, the host and the level, and nothing for a
+site at 100%. It is a list of sites you have visited, so it is readable by
+you alone (0600) too, and keeps the last 500. `--temp-profile` keeps the
+levels in memory for the run and writes none; deleting the file forgets
+every level.
+
 ## Downloads
 
 A file a page offers — a link to a PDF, anything served as
@@ -156,22 +165,53 @@ Quitting cancels anything still coming and leaves no partial file. A
 `blinkterm` that is killed outright can leave `<guid>.crdownload` in the
 directory, which is the engine's partial file and is safe to delete.
 
+## Uploading a file
+
+A click on a page's file input — an "attach", a "choose file" — takes the
+status row for a path:
+
+    upload: ~/work/report/rep▌ort.pdf
+
+It starts in the directory the last file was uploaded from, or the one
+`blinkterm` was started in. `tab` completes a name (a second `tab` lists what
+it could be), `~` is your home, and the line is edited with the url bar's
+keys; `enter` sends the file. A page that takes several files asks once per
+file — `upload (2 added, enter to send):` — and an `enter` with nothing typed
+sends them. `esc` sends nothing, and the page is told the picker was
+dismissed, as a browser would tell it.
+
+What `enter` sends is checked here, because the engine checks nothing: the
+path is made absolute, and it must be a file that exists and can be read.
+Directories are refused. The page then gets what any browser gives it — the
+file's name, size and contents — and nothing is sent before `enter`: what
+`tab` reads of your disk to complete a name stays on this side.
+
+Two things a browser has that this does not: a page that uses the newer
+file-picker API (`showOpenFilePicker()`) is told no, and the row says "this
+page's file picker isn't supported"; and there is no drag and drop, which is
+not a thing a terminal has.
+
 ## Keys
 
 | | |
 | --- | --- |
 | `ctrl+l` | type a url. In the url bar, `←`/`→`, `home`/`end`, `ctrl+a`/`ctrl+e` and `alt+b`/`alt+f` (or `ctrl+←`/`ctrl+→`) move; `ctrl+w`/`alt+backspace` and `alt+d` delete a word; `ctrl+u`/`ctrl+k` delete to either end; `↑`/`↓` walk the pages visited; a dim suggestion after what you typed is taken with `tab` or `→` |
+| `ctrl+f` | find in the page. Type and the matches are highlighted as you go, the current one in orange and scrolled into view; the row says `3/17`. `enter`/`ctrl+g`/`↓` next, `shift+enter`/`ctrl+shift+g`/`↑` previous; the same editing keys as the url bar; `esc` closes and clears. The next `ctrl+f` offers the last needle again |
 | `ctrl+r` | reload |
 | `alt+left` / `alt+right` | back and forward |
 | `ctrl+t` | a new tab, with the cursor in the url bar |
 | `ctrl+w` | close this tab; closing the last one quits |
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
 | `alt+1` … `alt+9` | the nth tab |
-| your terminal's paste key | pastes into the page, the url bar, or a `prompt()` — whichever has the cursor |
-| `alt+c` | copy the page's selection to your clipboard; with the url bar or a `prompt()` open, copy that line |
+| `alt+=` / `alt+-` | zoom in and out (`ctrl+=` / `ctrl+-` where your terminal lets them through) |
+| `alt+0` / `ctrl+0` | back to 100% |
+| your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
+| `alt+c` | copy the page's selection to your clipboard; with the url bar, the find prompt, a `prompt()` or a file input's path open, copy that line |
 | `alt+u` | copy the page's url to your clipboard |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
+| a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
+| `esc` | while a page is loading and nothing else has the row, stop it |
 
 Everything else goes to the page, including the mouse. A link that asks for a
 new window gets a new tab, and the tab is switched to.
@@ -185,7 +225,17 @@ OSC 52, which your terminal may need to be told to allow.
 
 The url bar is asked about every key first while it is open, so `alt+←`/`→`
 are back and forward only when it is closed — in the bar they move by a word —
-and `ctrl+w`, `ctrl+t` and the rest do nothing there; `esc` closes it.
+and `ctrl+w`, `ctrl+t` and the rest do nothing there; `esc` closes it. The
+find prompt is the same.
+
+Find is case-insensitive, matches text as the page shows it — spaces
+collapsed, a word split across `<b>` still one word, never across a
+paragraph — and looks in same-origin frames but not cross-origin ones, nor in
+hidden text, a closed `<details>`, or the value of an `<input>`. Every match
+is counted; the first ten thousand are highlighted. Nothing is changed in the
+page: the highlights are the CSS Custom Highlight API from a world of their
+own, and the page's selection is left alone. A page that navigates closes the
+prompt.
 
 ### Searching
 
@@ -209,6 +259,68 @@ work, and the page gets no keys or mouse until it has its answer. A tab behind
 that opens one is marked `!` in the strip — `2! Title` — and keeps its question
 until you go to it. `ctrl+w` closes a tab without asking the page, so a tab
 with something unsaved in it is closed without a "leave this page?".
+
+A file input's path keeps the same keys — the tab keys and `ctrl+q` work,
+`ctrl+l`, reload, back and forward wait for `enter` or `esc` — but it does not
+stop the page, and the mouse still reaches it. A tab behind with a path
+waiting is marked `!` as one with a dialog is. A dialog the page opens while a
+path is half typed takes the row first; the path is there again once it is
+answered.
+
+### Zoom, scale and dark pages
+
+`alt+=` and `alt+-` zoom the page in and out through Chrome's own steps
+(25% to 300%), `alt+0` puts it back; `ctrl+=`, `ctrl+-` and `ctrl+0` do the
+same where your terminal lets them through — Kitty and tOS do, WezTerm and
+Ghostty keep them for their own font size. The level is remembered per
+site, in the profile's `zoom` file (0600, a list of hosts; `--temp-profile`
+keeps none), and shows on the row as `150%` while it is not 100%. Zooming
+reflows the page as a browser's zoom does — `devicePixelRatio` and
+`innerWidth` change, and the page lays itself out for the narrower width —
+rather than magnifying a picture of it. While the page is moving the frames
+are at the page's own resolution and the terminal scales them; the lossless
+still that follows is at the pane's.
+
+On a HiDPI terminal a page at one CSS pixel per terminal pixel is tiny.
+`--scale 2` makes it two, and the default, `auto`, says 2 when a cell is 28
+px or taller — a 2x display's cells are, a 1x display's are not — and
+follows the terminal's font size as it changes.
+
+A page is told whether you prefer dark: `--color-scheme dark|light|auto`.
+`auto` (the default) asks the terminal its background colour (`OSC 11`) and
+calls it dark below mid-grey; a terminal that does not answer gets light. A
+page with no dark style stays white; `--force-dark` has the engine paint
+every page dark regardless, which is Chromium's auto dark mode and is off
+unless you ask.
+
+## The status row
+
+The top row is the page's title and url, and five other things when they
+apply. A link under the pointer shows where it goes — `link: https://…` —
+which is the one defence against a link whose text says one place and whose
+href says another; the url shown is the one the engine resolved, with
+control characters and invisible characters removed. A plain `http://` page
+on a host that is not this machine is marked `not secure` before its title;
+`https://`, `file:` and `localhost` get nothing, as in a desktop browser. A
+page that is loading says `esc stops` at the right, and after a second how
+many seconds it has been going — no percentage, because without the
+engine's network domain there is nothing honest to compute one from, and
+that domain costs more than the row is worth (`src/load.rs` has the
+numbers). `esc` stops the load and leaves the page where it was: the
+previous page if nothing had arrived, the half-loaded page if something had.
+A terminal that understands OSC 22 (Kitty, Ghostty) also gets a hand over a
+link and an I-beam over a text field; the rest ignore it. A zoom that is not
+100% is a word at the right too, `150%`, after the loading hint.
+
+The url bar, the find prompt, a page's dialog and a file input's path take
+the whole row while they are open, and `esc` goes to whichever of them has it
+before it stops a load; no link is shown while one of them is there.
+
+To know what is under the pointer the terminal is asked to report every
+mouse movement, not only presses (`?1003h`), so the page now sees the
+pointer move — hover styling and tooltips work — at the cost of one small
+command to the engine per screen refresh while it moves and nothing while
+it rests.
 
 ## Tests
 

@@ -46,12 +46,16 @@
 //! loads anything costs nothing at all.
 
 use std::borrow::Cow;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::cdp::Event;
 use crate::dialog::Dialog;
 use crate::json::Json;
-use crate::load::{self, Landing, Loaded, Problem};
+use crate::load::{self, Landing, Loaded, Problem, Trust};
 use crate::text;
+use crate::upload::{Chooser, Upload};
+use crate::zoom::Zoom;
 
 /// One page target, and what the row says about it.
 pub struct Tab<C> {
@@ -95,6 +99,44 @@ pub struct Tab<C> {
     /// because a tab that is not in front can open one too, and it has to be
     /// there — marked in the strip — when the person goes to look.
     pub dialog: Option<Dialog>,
+    /// The file input this page asked about and nobody has answered: a path
+    /// being typed on the row. See [`crate::upload`].
+    ///
+    /// Beside [`Tab::dialog`] rather than in the same slot, because the two
+    /// are not exclusive. A chooser does not stop the page, so a script can
+    /// open an `alert()` while the path is half typed; the alert has the row
+    /// then, since the page is stopped behind it, and the path is still here
+    /// when it has been answered. Per tab, like a dialog, because a tab that
+    /// is not in front gets the event too (measured), and the answer goes to
+    /// that page's input.
+    pub upload: Option<Upload>,
+    /// The main frame's id, from `Page.getFrameTree` at attach and from every
+    /// landing since: what tells this tab's own `Page.frameStartedLoading`
+    /// and `Page.frameStoppedLoading` from an iframe's, which the engine
+    /// sends in the same shape under the child's id. `None` until known, and
+    /// then every frame's news is taken as the page's — see
+    /// [`crate::load::is_main`].
+    pub frame: Option<String>,
+    /// When the load in progress was asked for, typed or clicked; the seconds
+    /// on the row count from here. `None` when nothing is loading.
+    pub since: Option<Instant>,
+    /// Whether what is on the page is the document the last navigation asked
+    /// for: `false` from the moment one leaves until its `Page.frameNavigated`.
+    /// Until then the page's renderer answers nothing — the engine holds every
+    /// command meant for it while a navigation that will swap it is pending,
+    /// measured in [`crate::hover`] — so nothing is asked of it.
+    pub committed: bool,
+    /// Whether the document came over a transport the row should warn about.
+    /// Set at each landing, from the landing; see [`crate::load::trust`].
+    pub trust: Trust,
+    /// The level the page is zoomed to; see [`crate::zoom`].
+    ///
+    /// On the tab rather than looked up by host each time it is wanted,
+    /// because a page with no host — `about:blank`, a `data:` url — can be
+    /// zoomed too, and its level has to live somewhere that is not the file.
+    /// A page with a host takes its host's level when it lands and when its
+    /// tab comes to the front, so two tabs on one site zoom together.
+    pub zoom: Zoom,
 }
 
 impl<C> Tab<C> {
@@ -108,7 +150,74 @@ impl<C> Tab<C> {
             note: None,
             problem: None,
             dialog: None,
+            upload: None,
+            frame: None,
+            since: None,
+            committed: true,
+            trust: Trust::Plain,
+            zoom: Zoom::DEFAULT,
         }
+    }
+
+    /// `Page.frameStartedNavigating` for the main frame: the page is leaving
+    /// for `url`, typed or clicked, and nothing has come back yet.
+    ///
+    /// This is what makes a link clicked into a slow host say so at once
+    /// rather than when its document commits — for a host that never answers,
+    /// never — and what tells `esc` there is something to stop. The page on
+    /// the screen is still the last one, so its url and title stay; the note
+    /// stands in front of them. A typed url has already put up the same note
+    /// and started the clock, and the clock is kept: the seconds count from
+    /// the Enter, not from the engine's echo of it three milliseconds later.
+    pub fn started(&mut self, url: String, now: Instant) {
+        let note = format!("loading {url}");
+        if self.loading && self.note.as_deref() == Some(note.as_str()) {
+            self.since.get_or_insert(now);
+        } else {
+            self.since = Some(now);
+            self.note = Some(note);
+        }
+        self.loading = true;
+        self.committed = false;
+        self.problem = None;
+    }
+
+    /// `Page.frameStoppedLoading` for the main frame: the load is over,
+    /// however it ended.
+    ///
+    /// It fires in the same millisecond as the load event for a load that
+    /// finished, after `Page.stopLoading` for one that was stopped — when no
+    /// load event is ever coming — and for a navigation that was abandoned
+    /// before anything came back: a clicked link that turned out to be a
+    /// download, one the page overtook with another. In that last case the
+    /// page on the screen never left, and the note that said it was leaving
+    /// comes down with the load; the url was never changed for a click. The
+    /// title is still asked for on the load event, which is where it is
+    /// known; this only clears.
+    pub fn stopped_loading(&mut self) {
+        self.loading = false;
+        self.since = None;
+        if !self.committed {
+            if self
+                .note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("loading "))
+            {
+                self.note = None;
+            }
+            self.committed = true;
+        }
+    }
+
+    /// How long the load in progress has been going, in whole seconds, once
+    /// it has been going for one. Below a second a number would flicker past
+    /// on every page that is merely quick.
+    pub fn loading_for(&self, now: Instant) -> Option<u64> {
+        if !self.loading {
+            return None;
+        }
+        let going = now.saturating_duration_since(self.since?);
+        (going >= Duration::from_secs(1)).then_some(going.as_secs())
     }
 
     /// The main frame committed: a document, or the error page for one.
@@ -140,6 +249,16 @@ impl<C> Tab<C> {
         self.title.clear();
         self.note = None;
         self.loading = true;
+        // The input a path was being typed for has gone with its document. An
+        // answer sent to it now would be taken and do nothing (measured), but
+        // a question about an input that is not there is a lie on the row.
+        self.upload = None;
+        // The document is here, so the renderer answers again; and the clock
+        // goes on from the departure when there was one, which a load the
+        // engine began by itself — a redirect's second landing, a history
+        // step whose departure was missed — did not have.
+        self.committed = true;
+        self.since.get_or_insert_with(Instant::now);
         match landing {
             Landing::Document(url) => {
                 self.url = url;
@@ -225,6 +344,44 @@ impl<C> Tab<C> {
         }
     }
 
+    /// What a `Page.fileChooserOpened` does to this tab: a prompt for a path,
+    /// starting in `base`. True when the row is now out of date.
+    ///
+    /// A second click on the input a prompt is already up for comes with the
+    /// same `backendNodeId` (measured), and it is the person clicking again,
+    /// not a new question: the half-typed path is kept. A different input
+    /// replaces it, since that is the one the person clicked last. An event
+    /// with no input to give files to — `showOpenFilePicker()` — is said once
+    /// on the note, so that the click did not silently do nothing.
+    pub fn chooser_event(&mut self, event: &Event, base: &Path, home: Option<&Path>) -> bool {
+        if event.method != "Page.fileChooserOpened" {
+            return false;
+        }
+        let Some(chooser) = Chooser::opening(&event.params) else {
+            self.note = Some("this page's file picker isn't supported".to_string());
+            return true;
+        };
+        let same = self
+            .upload
+            .as_ref()
+            .is_some_and(|upload| upload.chooser.backend_node_id == chooser.backend_node_id);
+        if same {
+            return false;
+        }
+        self.upload = Some(Upload::new(
+            chooser,
+            base.to_path_buf(),
+            home.map(Path::to_path_buf),
+        ));
+        true
+    }
+
+    /// Whether the page is waiting on the person — a dialog, or a file
+    /// input's path — which is what the strip marks with a `!`.
+    pub fn asks(&self) -> bool {
+        self.dialog.is_some() || self.upload.is_some()
+    }
+
     /// The whole row, when this is the only tab there is.
     ///
     /// Unchanged from the browser that had no tabs, deliberately: one page in
@@ -241,11 +398,19 @@ impl<C> Tab<C> {
             Some(Problem::Status(status)) => Some(load::status_phrase(*status)),
             None => None,
         };
-        let parts: Vec<&str> = [status.as_deref(), Some(&self.title), Some(&self.url)]
-            .into_iter()
-            .flatten()
-            .filter(|part| !part.is_empty())
-            .collect();
+        // And `not secure` before the title, where it is read before the
+        // page's own words for itself — which, on a page anybody on the way
+        // could have rewritten, are exactly what it qualifies.
+        let parts: Vec<&str> = [
+            status.as_deref(),
+            self.trust.words(),
+            Some(&self.title),
+            Some(&self.url),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect();
         if parts.is_empty() {
             return "blinkterm".to_string();
         }
@@ -905,6 +1070,58 @@ mod tests {
     }
 
     #[test]
+    fn a_file_input_waits_on_its_tab_and_goes_with_its_page() {
+        let mut tabs = three();
+        let base = Path::new("/work");
+        let opened = |node: u32| {
+            event(
+                "Page.fileChooserOpened",
+                &format!(r#"{{"frameId":"F","mode":"selectSingle","backendNodeId":{node}}}"#),
+            )
+        };
+        // The third tab asks while the first is in front.
+        let tab = tabs.get_mut(2).expect("c");
+        assert!(tab.chooser_event(&opened(3), base, None));
+        assert!(tab.asks(), "marked in the strip");
+        assert_eq!(tab.upload.as_ref().expect("a prompt").line.text(), "/work/");
+        assert!(tabs.active().expect("a").upload.is_none());
+
+        // The same input clicked again keeps what was typed.
+        let tab = tabs.get_mut(2).expect("c");
+        tab.upload
+            .as_mut()
+            .expect("a prompt")
+            .line
+            .insert_str("rep");
+        assert!(!tab.chooser_event(&opened(3), base, None));
+        assert_eq!(tab.upload.as_ref().expect("kept").line.text(), "/work/rep");
+        // Another input is another question.
+        assert!(tab.chooser_event(&opened(7), base, None));
+        assert_eq!(tab.upload.as_ref().expect("new").chooser.backend_node_id, 7);
+        // Something else about the page is not about the input.
+        let loaded = event("Page.loadEventFired", r#"{"timestamp":1}"#);
+        assert!(!tab.chooser_event(&loaded, base, None));
+        assert!(tab.upload.is_some());
+
+        // The page going somewhere takes the input, and the prompt, with it.
+        tab.landed(Landing::Document("https://c.example/next".to_string()));
+        assert!(tab.upload.is_none());
+        assert!(!tab.asks());
+
+        // A picker with no input to fill is said, not asked.
+        let picker = event(
+            "Page.fileChooserOpened",
+            r#"{"frameId":"F","mode":"selectSingle"}"#,
+        );
+        assert!(tab.chooser_event(&picker, base, None));
+        assert!(tab.upload.is_none());
+        assert_eq!(
+            tab.note.as_deref(),
+            Some("this page's file picker isn't supported")
+        );
+    }
+
+    #[test]
     fn an_event_about_something_else_entirely() {
         let frame = event("Page.screencastFrame", r#"{"data":"x","sessionId":1}"#);
         assert_eq!(change(&frame), None);
@@ -1026,6 +1243,109 @@ mod tests {
 
         tab.landed(Landing::Unreachable("http://127.0.0.1:9/".to_string()));
         assert_eq!(tab.line(), "can't reach 127.0.0.1:9: connection refused");
+    }
+
+    #[test]
+    fn a_link_clicked_into_a_slow_host_says_loading_before_it_lands() {
+        let mut tab = tab("a", "A");
+        let url_before = tab.url.clone();
+        let now = Instant::now();
+        tab.started("http://127.0.0.1:1/hang".to_string(), now);
+        assert!(tab.loading);
+        assert!(!tab.committed, "nothing has come back yet");
+        assert_eq!(tab.note.as_deref(), Some("loading http://127.0.0.1:1/hang"));
+        assert_eq!(tab.line(), "loading http://127.0.0.1:1/hang");
+        assert_eq!(tab.url, url_before, "the page on screen is still the last");
+
+        tab.landed(Landing::Document("http://127.0.0.1:1/hang".to_string()));
+        assert!(tab.committed);
+        assert_eq!(tab.note, None);
+        assert_eq!(tab.since, Some(now), "the clock runs from the click");
+
+        tab.stopped_loading();
+        assert!(!tab.loading);
+        assert_eq!(tab.since, None);
+        assert_eq!(tab.loading_for(now + Duration::from_secs(9)), None);
+    }
+
+    #[test]
+    fn a_click_abandoned_before_it_lands_leaves_the_page_saying_what_it_was() {
+        // A link that turned out to be a download, or was overtaken: the
+        // departure, and then the stop with no landing in between.
+        let mut tab = tab("a", "A");
+        tab.started("https://a.example/file.pdf".to_string(), Instant::now());
+        tab.stopped_loading();
+        assert!(tab.committed);
+        assert_eq!(tab.note, None);
+        assert_eq!(tab.line(), "A  —  https://a.example");
+
+        // A note that is not about loading is not the stop's to take down.
+        tab.started("https://a.example/x".to_string(), Instant::now());
+        tab.note = Some("copied url".to_string());
+        tab.stopped_loading();
+        assert_eq!(tab.note.as_deref(), Some("copied url"));
+    }
+
+    #[test]
+    fn a_started_load_over_a_typed_one_keeps_the_clock() {
+        let mut tab: Tab<u32> = Tab::new("a", 0, "about:blank");
+        let typed = Instant::now();
+        // What `edit_url` and `navigate` do.
+        tab.url = "http://127.0.0.1:1/".to_string();
+        tab.note = Some("loading http://127.0.0.1:1/".to_string());
+        tab.loading = true;
+        tab.since = Some(typed);
+        tab.started(
+            "http://127.0.0.1:1/".to_string(),
+            typed + Duration::from_millis(3),
+        );
+        assert_eq!(tab.since, Some(typed));
+        assert_eq!(tab.note.as_deref(), Some("loading http://127.0.0.1:1/"));
+
+        // The engine's spelling of it is a different note and a new clock,
+        // three milliseconds on, which nobody can see.
+        let later = typed + Duration::from_millis(5);
+        tab.started("http://127.0.0.1:1/x".to_string(), later);
+        assert_eq!(tab.since, Some(later));
+    }
+
+    #[test]
+    fn loading_for_counts_whole_seconds_from_the_start_and_only_after_one() {
+        let mut tab = tab("a", "A");
+        let start = Instant::now();
+        assert_eq!(tab.loading_for(start), None, "not loading");
+        tab.started("https://a.example/".to_string(), start);
+        assert_eq!(tab.loading_for(start), None);
+        assert_eq!(tab.loading_for(start + Duration::from_millis(999)), None);
+        assert_eq!(
+            tab.loading_for(start + Duration::from_millis(1000)),
+            Some(1)
+        );
+        assert_eq!(
+            tab.loading_for(start + Duration::from_millis(4700)),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn a_plain_http_page_says_not_secure_beside_the_title_and_localhost_does_not() {
+        let mut tab: Tab<u32> = Tab::new("a", 0, "about:blank");
+        tab.landed(Landing::Document("http://wiki.corp/".to_string()));
+        tab.trust = Trust::Insecure;
+        load_finished(&mut tab, "Wiki", None);
+        assert_eq!(tab.line(), "not secure  —  Wiki  —  http://wiki.corp/");
+        assert_eq!(tab.label(), "Wiki", "the strip keeps the page's name");
+
+        load_finished(&mut tab, "nope", Some(404));
+        assert_eq!(
+            tab.line(),
+            "404 not found  —  not secure  —  nope  —  http://wiki.corp/"
+        );
+
+        tab.landed(Landing::Document("http://127.0.0.1:1/".to_string()));
+        tab.trust = Trust::Plain;
+        load_finished(&mut tab, "fine", None);
+        assert_eq!(tab.line(), "fine  —  http://127.0.0.1:1/");
     }
 
     #[test]

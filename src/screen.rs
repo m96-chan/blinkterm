@@ -43,12 +43,25 @@ pub const KEYBOARD_FLAGS: u8 = 1 | 2 | 4 | 16;
 /// `CSI 200 ~` and `CSI 201 ~`, [`crate::input`] hands over what is between
 /// them as one piece of text, and the page is given it as text — one
 /// `Input.insertText`, which fires no key at all.
+///
+/// Every motion is asked for (`?1003h`), not only motion with a button held
+/// (`?1002h`, which it includes): a link under a pointer at rest is what the
+/// row names ([`crate::hover`]), and a page that sees the pointer move is a
+/// page whose hover styling and tooltips work. What it costs is on the pty.
+/// tOS's compositor forwards every pointer event evdev gives it to the pane
+/// under the pointer, with no "same cell" check, so a 1000 Hz mouse moving is
+/// a thousand sixteen-byte reports a second — 16 kB/s into an 8 KiB read, a
+/// few hundred reports a pass — and none while it rests. Parsing them is
+/// microseconds; what matters is what is sent on for each, which is why the
+/// page is told and asked at most once a pass and not once a report. Kitty,
+/// WezTerm and Ghostty in cell mode report a motion only when the cell
+/// changes.
 pub fn enter_sequence() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[?1049h"); // the alternate screen
     out.extend_from_slice(b"\x1b[?25l"); // no cursor
     out.extend_from_slice(b"\x1b[?1000h"); // report buttons
-    out.extend_from_slice(b"\x1b[?1002h"); // and motion while one is held
+    out.extend_from_slice(b"\x1b[?1003h"); // and every motion, held or not
     out.extend_from_slice(b"\x1b[?1006h"); // in SGR, which has no 223 limit
     out.extend_from_slice(b"\x1b[?1016h"); // in pixels, if the terminal can
     out.extend_from_slice(b"\x1b[?2004h"); // a paste as a paste, not as keys
@@ -65,17 +78,64 @@ pub fn enter_sequence() -> Vec<u8> {
 /// to treat coordinates as pixels.
 pub const ASK_PIXEL_MOUSE: &[u8] = b"\x1b[?1016$p";
 
+/// The question that decides whether a page is told it is being shown on a
+/// dark background: what colour is the pane's?
+///
+/// Asked once, beside [`ASK_PIXEL_MOUSE`], and never waited for. tOS, Kitty,
+/// WezTerm, Ghostty, foot and xterm answer `OSC 11 ; rgb:… ST`, which
+/// [`crate::input`] reads as a colour rather than as alt+`]` and typing, and
+/// [`crate::appearance`] as light or dark; a terminal that does not know the
+/// question says nothing, and its pages are told nothing. `ST` rather than
+/// `BEL` to end it, as the clipboard's command is ended: xterm answers the
+/// way it was asked, and `ST` cannot ring.
+pub const ASK_BACKGROUND: &[u8] = b"\x1b]11;?\x1b\\";
+
+/// The question for a terminal whose kernel window size has no pixels in
+/// it: how big is a cell?
+///
+/// Over ssh `TIOCGWINSZ` carries rows and columns and zeroes for the
+/// pixels, because that is all the protocol forwards, and some terminals
+/// never fill the pixels in at all. Without them the cell is guessed at 8x16,
+/// the page is sized for that guess, and every frame is a picture the
+/// terminal resamples into cells of a different size — and the HiDPI scale,
+/// which is read off the cell, is guessed wrong with it. `CSI 16 t` is
+/// xterm's window operation for the cell size, answered `CSI 6 ; height ;
+/// width t` by tOS, Kitty, WezTerm, Ghostty, foot and xterm, over any number
+/// of hops, since it is only bytes. See [`Pane::metrics`] for when the answer
+/// is used.
+pub const ASK_CELL_SIZE: &[u8] = b"\x1b[16t";
+
 /// Everything turned off at the end, in the reverse order.
+///
+/// With the pointer's shape put back to the arrow as well: it is not set at
+/// the start, but a hand left over from a link the pointer was on when the
+/// program ended — or panicked, since [`emergency`] writes this too — would
+/// be the shell's pointer from then on, in a terminal that understands it.
 pub fn leave_sequence() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[<u"); // pop the keyboard flags
     out.extend_from_slice(b"\x1b[?2004l");
     out.extend_from_slice(b"\x1b[?1016l");
     out.extend_from_slice(b"\x1b[?1006l");
-    out.extend_from_slice(b"\x1b[?1002l");
+    out.extend_from_slice(b"\x1b[?1003l");
     out.extend_from_slice(b"\x1b[?1000l");
+    out.extend_from_slice(&pointer_shape("default"));
     out.extend_from_slice(b"\x1b[?25h"); // the cursor comes back
     out.extend_from_slice(b"\x1b[?1049l"); // and so does the screen
+    out
+}
+
+/// Tell the terminal what the pointer should look like: `OSC 22 ; name ST`.
+///
+/// Kitty's pointer-shape protocol, which Ghostty speaks too; every terminal
+/// that does not know OSC 22 drops it, tOS's included, so it is sent without
+/// asking. The name is a `&'static str` on purpose: it is always one of
+/// [`crate::hover::Shape::name`]'s, a table this program owns, and never the
+/// page's `cursor` string, which only chooses among them.
+pub fn pointer_shape(name: &'static str) -> Vec<u8> {
+    let mut out = b"\x1b]22;".to_vec();
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(b"\x1b\\");
     out
 }
 
@@ -153,6 +213,8 @@ impl Pane {
         };
         pane.write(&enter_sequence())?;
         pane.write(ASK_PIXEL_MOUSE)?;
+        pane.write(ASK_BACKGROUND)?;
+        pane.write(ASK_CELL_SIZE)?;
         Ok(pane)
     }
 
@@ -172,8 +234,19 @@ impl Pane {
     }
 
     /// Measure the pane again, which is what a `SIGWINCH` means.
-    pub fn metrics(&self) -> io::Result<Metrics> {
-        Metrics::probe(self.output)
+    ///
+    /// `cell_hint` is the terminal's own answer to [`ASK_CELL_SIZE`], once it
+    /// has given one. It is used only when the kernel's window size has no
+    /// pixels in it — which is when the cell would otherwise be a guess —
+    /// and never over a size the kernel does know, which is the one that
+    /// follows a font being changed.
+    pub fn metrics(&self, cell_hint: Option<(u32, u32)>) -> io::Result<Metrics> {
+        let metrics = Metrics::probe(self.output)?;
+        let size = tos_platform::tty::terminal_size(self.output)?;
+        Ok(match cell_hint {
+            Some(cell) if size.width_px == 0 || size.height_px == 0 => metrics.with_cell(cell),
+            _ => metrics,
+        })
     }
 
     /// Put everything back, now.
@@ -234,8 +307,27 @@ pub fn status_line(cols: u32, text: &str) -> Vec<u8> {
 /// The cells left for typing after `prompt`, clipped the way [`prompt_line`]
 /// will clip it: the room a [`crate::line::Line::view`] is asked to fill.
 pub fn prompt_room(cols: u32, prompt: &str) -> usize {
-    let cols = cols.max(1) as usize;
-    cols.saturating_sub(width(&clip_to(prompt, cols)))
+    prompt_room_beside(cols, prompt, "")
+}
+
+/// [`prompt_room`] less what `right` will take at the end of the row: its
+/// width and two cells of gap, or nothing when `right` is empty. The room
+/// [`prompt_line_beside`] leaves for the typing.
+pub fn prompt_room_beside(cols: u32, prompt: &str, right: &str) -> usize {
+    let left = left_of(cols.max(1) as usize, right);
+    left.saturating_sub(width(&clip_to(prompt, left)))
+}
+
+/// The cells a row leaves before `right` at its end: all of them for nothing
+/// there, or what is left of the pane after `right` — clipped by the pane
+/// alone — and two cells of gap, so that the typing and the words beside it
+/// do not read as one.
+fn left_of(cols: usize, right: &str) -> usize {
+    let right = clip_to(right, cols);
+    if right.is_empty() {
+        return cols;
+    }
+    cols.saturating_sub(width(&right) + 2)
 }
 
 /// The top row as a line being typed into: a prompt, what has been typed
@@ -261,10 +353,34 @@ pub fn prompt_room(cols: u32, prompt: &str) -> usize {
 /// be. [`dialog_prompt`] clips it long before that; this is the floor under
 /// it.
 pub fn prompt_line(cols: u32, prompt: &str, text: &str, hint: &str, cursor: usize) -> Vec<u8> {
+    prompt_line_beside(cols, prompt, text, hint, cursor, "")
+}
+
+/// [`prompt_line`] with `right` at the right-hand end of the row: what the
+/// find prompt's count (`3/17`) is drawn as.
+///
+/// `right` is clipped by the pane alone and the typing by what it leaves, the
+/// way [`split_line`] keeps a dialog's keys: the count is the answer to what
+/// is being typed, and a needle whose count had been pushed off the row would
+/// be a question with nowhere to read the answer. The view the caller passes
+/// is the one [`prompt_room_beside`] asked for, so the cursor is in sight of
+/// the count rather than under it. With `right` empty this is
+/// [`prompt_line`], byte for byte — which is what [`prompt_line`] is — so the
+/// url bar and a `prompt()` did not change by a byte when this came.
+pub fn prompt_line_beside(
+    cols: u32,
+    prompt: &str,
+    text: &str,
+    hint: &str,
+    cursor: usize,
+    right: &str,
+) -> Vec<u8> {
     let cols = cols.max(1) as usize;
     let mut out = b"\x1b[1;1H\x1b[K\x1b[7m".to_vec();
-    let prompt = clip_to(prompt, cols);
-    let room = cols.saturating_sub(width(&prompt));
+    let right = clip_to(right, cols);
+    let left = left_of(cols, &right);
+    let prompt = clip_to(prompt, left);
+    let room = left.saturating_sub(width(&prompt));
     let shown = tail_to(text, room);
     let hint = head_to(hint, room.saturating_sub(width(&shown)));
     out.extend_from_slice(prompt.as_bytes());
@@ -275,7 +391,11 @@ pub fn prompt_line(cols: u32, prompt: &str, text: &str, hint: &str, cursor: usiz
         out.extend_from_slice(b"\x1b[22m");
     }
     let used = width(&prompt) + width(&shown) + width(&hint);
-    out.extend(std::iter::repeat_n(b' ', cols.saturating_sub(used)));
+    out.extend(std::iter::repeat_n(
+        b' ',
+        cols.saturating_sub(used + width(&right)),
+    ));
+    out.extend_from_slice(right.as_bytes());
     out.extend_from_slice(b"\x1b[0m");
     // The cursor is put back where the typing is, and shown, because this is
     // the one moment the person is editing rather than watching.
@@ -761,7 +881,7 @@ mod tests {
             ("?1049h", "?1049l"),
             ("?25l", "?25h"),
             ("?1000h", "?1000l"),
-            ("?1002h", "?1002l"),
+            ("?1003h", "?1003l"),
             ("?1006h", "?1006l"),
             ("?1016h", "?1016l"),
             ("?2004h", "?2004l"),
@@ -790,6 +910,14 @@ mod tests {
         assert!(!terminal.modes.cursor_visible);
         assert_eq!(terminal.keyboard_flags().0, KEYBOARD_FLAGS);
         assert!(terminal.modes.bracketed_paste, "a paste comes bracketed");
+        assert_eq!(
+            terminal.mouse().tracking,
+            tos_term::MouseTracking::AnyEvent,
+            "every motion is reported, held or not"
+        );
+        terminal.advance(b"\x1b[?1003$p");
+        let answer = String::from_utf8(terminal.take_output()).expect("ascii");
+        assert_eq!(answer, "\x1b[?1003;1$y");
 
         terminal.advance(ASK_PIXEL_MOUSE);
         let answer = String::from_utf8(terminal.take_output()).expect("ascii");
@@ -805,6 +933,57 @@ mod tests {
         assert!(terminal.modes.cursor_visible);
         assert!(!terminal.modes.bracketed_paste);
         assert_eq!(terminal.keyboard_flags().0, 0);
+        assert_eq!(terminal.mouse().tracking, tos_term::MouseTracking::None);
+    }
+
+    #[test]
+    fn a_pointer_shape_is_an_osc_22_of_one_of_the_tables_names() {
+        assert_eq!(pointer_shape("pointer"), b"\x1b]22;pointer\x1b\\");
+        // A terminal that does not know it says nothing back and draws
+        // nothing: tOS's parser drops an OSC it has no arm for.
+        let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+        terminal.advance(&pointer_shape(crate::hover::Shape::Pointer.name()));
+        assert!(terminal.take_output().is_empty());
+        assert_eq!(terminal.title(), "");
+        assert!(terminal.grid().row(0).to_text().trim().is_empty());
+    }
+
+    /// The question about the background, asked of the compositor's own
+    /// terminal and its answer read back by this program's parser: the colour
+    /// the terminal was configured with, and nothing typed.
+    #[test]
+    fn a_terminal_answers_what_its_background_is_and_the_answer_is_a_colour() {
+        let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+        terminal.advance(&enter_sequence());
+        let _ = terminal.take_output();
+        terminal.advance(ASK_BACKGROUND);
+        let answer = terminal.take_output();
+        let inputs = crate::input::Parser::new().feed(&answer);
+        match inputs.as_slice() {
+            [crate::input::Input::Colour { slot: 11, .. }] => {}
+            other => panic!("{:?} read as {other:?}", text(&answer)),
+        }
+    }
+
+    /// The same for the cell's size: the one the terminal draws with.
+    #[test]
+    fn a_terminal_answers_how_big_a_cell_is_and_the_answer_is_a_cell_size() {
+        let config = tos_term::TerminalConfig::default();
+        let wanted = crate::input::Input::CellSize {
+            width: config.cell_width,
+            height: config.cell_height,
+        };
+        let mut terminal = tos_term::Terminal::new(80, 24, config);
+        terminal.advance(&enter_sequence());
+        let _ = terminal.take_output();
+        terminal.advance(ASK_CELL_SIZE);
+        let answer = terminal.take_output();
+        assert_eq!(
+            crate::input::Parser::new().feed(&answer),
+            vec![wanted],
+            "{:?}",
+            text(&answer)
+        );
     }
 
     #[test]
@@ -922,6 +1101,94 @@ mod tests {
         assert!(past.ends_with("\x1b[1;9H\x1b[?25h"), "{past:?}");
         assert_eq!(prompt_room(10, "url: "), 5);
         assert_eq!(prompt_room(3, "url: "), 0);
+    }
+
+    #[test]
+    fn a_prompt_with_nothing_beside_it_is_the_prompt_line_byte_for_byte() {
+        for cols in [1u32, 3, 8, 20, 80] {
+            for (prompt, typed, hint, cursor) in [
+                ("url: ", "example.com", "", 11),
+                ("url: ", "exa", "mple.com/", 3),
+                ("find: ", "\u{6771}\u{4eac}", "", 1),
+                ("Delete these files? ", "", "", 0),
+            ] {
+                assert_eq!(
+                    prompt_line_beside(cols, prompt, typed, hint, cursor, ""),
+                    prompt_line(cols, prompt, typed, hint, cursor),
+                    "{cols} cols, {prompt:?}"
+                );
+                assert_eq!(
+                    prompt_room_beside(cols, prompt, ""),
+                    prompt_room(cols, prompt)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_count_sits_at_the_right_and_the_typing_gives_way_to_it() {
+        let needle = "a needle forty cells wide, or near it...";
+        assert_eq!(width(needle), 40);
+        let mut line = crate::line::Line::empty();
+        line.set_text(needle);
+        let room = prompt_room_beside(30, "find: ", "3/17");
+        assert_eq!(room, prompt_room(30, "find: ") - 6, "the count and a gap");
+        let view = line.view(room);
+        let row = text(&prompt_line_beside(
+            30,
+            "find: ",
+            &view.text,
+            &view.hint,
+            view.cursor,
+            "3/17",
+        ));
+        let body = row
+            .trim_start_matches("\x1b[1;1H\x1b[K\x1b[7m")
+            .split("\x1b[0m")
+            .next()
+            .unwrap_or_default();
+        assert_eq!(width(body), 30, "{body:?}");
+        assert!(body.starts_with("find: "), "{body:?}");
+        assert!(body.ends_with("  3/17"), "two cells of gap: {body:?}");
+        // The typing is the tail that fits, with the cursor in sight of it
+        // and never on the count.
+        let typing = &body["find: ".len()..body.len() - "3/17".len()];
+        assert!(needle.ends_with(typing.trim_end()), "{typing:?}");
+        let column: usize = row
+            .rsplit("\x1b[1;")
+            .next()
+            .and_then(|tail| tail.strip_suffix("H\x1b[?25h"))
+            .and_then(|digits| digits.parse().ok())
+            .expect("the cursor is put back");
+        assert!(column <= 30 - 6, "column {column}: {row:?}");
+        assert!(only_the_rows_own_escapes(row.as_bytes()), "{row:?}");
+
+        // No matches is words, and they keep their room too.
+        let none = text(&prompt_line_beside(
+            24,
+            "find: ",
+            "zzz",
+            "",
+            3,
+            "no matches",
+        ));
+        assert!(none.contains("find: zzz"), "{none:?}");
+        assert!(none.contains("  no matches\x1b[0m"), "{none:?}");
+        assert_eq!(cells(none.as_bytes()), 24);
+
+        // At eight columns the count is still whole, and the prompt gives
+        // way to it; narrower than the count, the count as far as it goes.
+        let narrow = text(&prompt_line_beside(8, "find: ", "fox", "", 3, "3/17"));
+        assert_eq!(cells(narrow.as_bytes()), 8, "{narrow:?}");
+        assert!(narrow.contains("3/17\x1b[0m"), "{narrow:?}");
+        assert_eq!(prompt_room_beside(8, "find: ", "3/17"), 0);
+        let tiny = text(&prompt_line_beside(3, "find: ", "fox", "", 3, "3/17"));
+        assert_eq!(cells(tiny.as_bytes()), 3, "{tiny:?}");
+
+        // What is beside the typing is made plain like everything else on
+        // the row, whoever wrote it.
+        let hostile = prompt_line_beside(40, "find: ", "x", "", 1, "1/2\x1b]0;t\x07");
+        assert!(only_the_rows_own_escapes(&hostile), "{:?}", text(&hostile));
     }
 
     fn labels<'a>(titles: &[&'a str], active: usize) -> Vec<TabLabel<'a>> {
@@ -1274,6 +1541,13 @@ mod tests {
                     );
                 }
             }
+        }
+        // A page's `cursor` value chooses a pointer shape and is never the
+        // name written: every hostile string is the arrow.
+        for hostile in HOSTILE {
+            let shape = crate::hover::shape(hostile);
+            assert_eq!(shape, crate::hover::Shape::Default, "{hostile:?}");
+            assert_eq!(pointer_shape(shape.name()), b"\x1b]22;default\x1b\\");
         }
         // And what is left is the letters, which is what the person reads.
         assert!(row_body(&text(&status_line(80, "\x1b]0;x\x07"))).starts_with("]0;x "));

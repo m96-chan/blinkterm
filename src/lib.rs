@@ -117,14 +117,17 @@
 //! that made the port indefensible, and [`cdp`] the framing that replaced it.
 
 pub mod app;
+pub mod appearance;
 pub mod base64;
 pub mod cdp;
 pub mod clipboard;
 pub mod dialog;
 pub mod download;
 pub mod engine;
+pub mod find;
 pub mod graphics;
 pub mod history;
+pub mod hover;
 pub mod input;
 pub mod json;
 pub mod keys;
@@ -136,6 +139,8 @@ pub mod screen;
 pub mod scroll;
 pub mod tabs;
 pub mod text;
+pub mod upload;
+pub mod zoom;
 
 pub use app::Options;
 pub use json::Json;

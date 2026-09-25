@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use blinkterm::cdp::{Client, Pending};
 use blinkterm::engine::{self, Engine};
+use blinkterm::find::{self, Matches};
 use blinkterm::graphics::{Painter, Raw, IMAGE_ID};
 use blinkterm::input::{Key, KeyAction, KeyInput, Mods};
 use blinkterm::json::Json;
@@ -2666,6 +2667,7 @@ fn a_temporary_profile_leaves_nothing_on_disk() {
 // Failed loads
 // ---------------------------------------------------------------------------
 
+use blinkterm::hover;
 use blinkterm::load::{self, Landing, Loaded, Problem};
 
 /// A server with the troubles a page can have, and a port that has none of
@@ -2678,6 +2680,12 @@ use blinkterm::load::{self, Landing, Loaded, Problem};
 /// is one the kernel handed out and this test gave back, so nothing is on it
 /// and nothing will be while the test runs. The base comes back without a
 /// trailing slash, so that `base + "/404"` is the url.
+///
+/// And the slow ones: `/hang` accepts and never answers, `/slowbody` sends
+/// its headers and half a body and then nothing, and `/leave` is a page
+/// whose top-left corner is a link into `/hang`. `/links` is the hover's
+/// page: links of several kinds at known places. Each connection is served
+/// on a thread of its own, so a hang holds its own socket and nobody else's.
 fn serve_troubles() -> (String, u16) {
     use std::io::{Read, Write};
     let closed = {
@@ -2688,44 +2696,69 @@ fn serve_troubles() -> (String, u16) {
     let address = listener.local_addr().expect("an address");
     std::thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            let mut head = [0u8; 2048];
-            let read = stream.read(&mut head).unwrap_or(0);
-            let request = String::from_utf8_lossy(&head[..read]).to_string();
-            let path = request.split(' ').nth(1).unwrap_or("/").to_string();
-            let dead = format!("http://127.0.0.1:{closed}/");
-            let (status, extra, body) = match path.as_str() {
-                "/404" => (
-                    "404 Not Found",
-                    String::new(),
-                    "<!doctype html><title>nope</title><p>not here".to_string(),
-                ),
-                "/500" => (
-                    "500 Internal Server Error",
-                    String::new(),
-                    "<!doctype html><title>broken</title><p>broken".to_string(),
-                ),
-                "/redir" => ("302 Found", format!("Location: {dead}\r\n"), String::new()),
-                "/link" => (
-                    "200 OK",
-                    String::new(),
-                    format!(
-                        "<!doctype html><title>link</title><body style='margin:0'>\
+            std::thread::spawn(move || {
+                let mut head = [0u8; 2048];
+                let read = stream.read(&mut head).unwrap_or(0);
+                let request = String::from_utf8_lossy(&head[..read]).to_string();
+                let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+                let dead = format!("http://127.0.0.1:{closed}/");
+                if path == "/hang" {
+                    std::thread::sleep(Duration::from_secs(60));
+                    return;
+                }
+                if path == "/slowbody" {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 100000\r\n\
+                      Connection: close\r\n\r\n<!doctype html><title>slowbody</title>\
+                      <p>the first half of a page that never finishes ",
+                    );
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_secs(60));
+                    return;
+                }
+                let (status, extra, body) = match path.as_str() {
+                    "/404" => (
+                        "404 Not Found",
+                        String::new(),
+                        "<!doctype html><title>nope</title><p>not here".to_string(),
+                    ),
+                    "/500" => (
+                        "500 Internal Server Error",
+                        String::new(),
+                        "<!doctype html><title>broken</title><p>broken".to_string(),
+                    ),
+                    "/redir" => ("302 Found", format!("Location: {dead}\r\n"), String::new()),
+                    "/link" => (
+                        "200 OK",
+                        String::new(),
+                        format!(
+                            "<!doctype html><title>link</title><body style='margin:0'>\
                          <a href='{dead}' style='display:block;position:absolute;\
                          left:0;top:0;width:240px;height:80px;background:#cc3'>dead</a>"
+                        ),
                     ),
-                ),
-                _ => (
-                    "200 OK",
-                    String::new(),
-                    "<!doctype html><title>fine</title><p>fine".to_string(),
-                ),
-            };
-            let answer = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{extra}\
+                    "/leave" => (
+                        "200 OK",
+                        String::new(),
+                        "<!doctype html><title>leave</title><body style='margin:0'>\
+                     <a href='/hang' style='display:block;position:absolute;\
+                     left:0;top:0;width:240px;height:80px;background:#cc3'>hang</a>"
+                            .to_string(),
+                    ),
+                    "/links" => ("200 OK", String::new(), LINKS.to_string()),
+                    _ => (
+                        "200 OK",
+                        String::new(),
+                        "<!doctype html><title>fine</title><p>fine".to_string(),
+                    ),
+                };
+                let answer = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{extra}\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(answer.as_bytes());
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes());
+            });
         }
     });
     (format!("http://{address}"), closed)
@@ -3032,6 +3065,405 @@ fn the_status_of_the_document_comes_with_its_title() {
         }),
         "an error page has no title and no status"
     );
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// The hover's page: a link with markup inside it at the top left, a
+/// `javascript:` link under it, a `<div>` that only looks like one, a text
+/// field, and a link whose href tries to speak to the terminal.
+const LINKS: &str = "<!doctype html><title>links</title><body style='margin:0'>\
+<a id=a href='/target?x=1' style='position:absolute;left:0;top:0;width:100px;height:40px;\
+background:#cc3'><span><b>nested</b> text</span></a>\
+<a id=b href='javascript:void(0)' style='position:absolute;left:0;top:50px;width:100px;\
+height:40px;background:#3cc'>js</a>\
+<div id=d style='position:absolute;left:0;top:150px;width:100px;height:40px;\
+background:#999;cursor:pointer'>div pointer</div>\
+<input id=e style='position:absolute;left:0;top:200px;width:100px;height:30px'>\
+<a id=g href='http://\u{202e}evil.example/\u{1b}]0;x\u{7}' style='position:absolute;\
+left:200px;top:50px;width:100px;height:40px;background:#cc3'>hostile</a>";
+
+/// Tell the page the pointer is at `(x, y)` as `tick_hover` does, ask it
+/// what is there as `tick_hover` does — sent, and collected rather than
+/// waited on — and read the answer. With how long the answer took.
+fn hover_at(client: &mut Client, x: i32, y: i32) -> (hover::Hover, Duration) {
+    client
+        .notify(
+            "Input.dispatchMouseEvent",
+            Json::object(vec![
+                ("type", Json::string("mouseMoved")),
+                ("x", Json::number(x)),
+                ("y", Json::number(y)),
+                ("modifiers", Json::number(0)),
+                ("button", Json::string("none")),
+                ("buttons", Json::number(0)),
+            ]),
+        )
+        .expect("the move is sent");
+    let asked = Instant::now();
+    let pending = client
+        .send("Runtime.evaluate", hover::ask(x, y))
+        .expect("the ask is sent");
+    let deadline = asked + Duration::from_secs(2);
+    loop {
+        if let Some(reply) = client.take_reply(&pending) {
+            let took = asked.elapsed();
+            let reply = reply.expect("the page answers");
+            let answer = hover::answer(&reply)
+                .unwrap_or_else(|| panic!("not an answer at ({x}, {y}): {reply}"));
+            return (answer, took);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no answer about ({x}, {y}) in 2 s"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// What the row says for a link is the engine's resolved href, and the shape
+/// the terminal is told is one of the table's. A nested element inside an
+/// anchor is the anchor; a pointer cursor on something that is not a link is
+/// a hand and no href; empty page is nothing at all.
+#[test]
+fn hovering_a_link_reports_its_href_and_a_hand_and_a_plain_spot_reports_neither() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, _) = serve_troubles();
+    navigate_tab(&mut tab, &format!("{base}/links"));
+    follow(&mut tab, Duration::from_secs(10));
+    assert_eq!(tab.title, "links");
+
+    let (link, _) = hover_at(&mut tab.connection, 50, 20);
+    assert_eq!(
+        link,
+        hover::Hover {
+            href: format!("{base}/target?x=1"),
+            shape: hover::Shape::Pointer
+        }
+    );
+    assert_eq!(hover::words(&link.href), format!("link: {base}/target?x=1"));
+
+    let (script, _) = hover_at(&mut tab.connection, 50, 70);
+    assert_eq!(script.href, "javascript:void(0)", "shown as written");
+
+    let (div, _) = hover_at(&mut tab.connection, 50, 170);
+    assert_eq!(
+        div,
+        hover::Hover {
+            href: String::new(),
+            shape: hover::Shape::Pointer
+        },
+        "a hand, and no link"
+    );
+    let (field, _) = hover_at(&mut tab.connection, 50, 215);
+    assert_eq!(field.shape, hover::Shape::Text);
+    let (nothing, _) = hover_at(&mut tab.connection, 500, 340);
+    assert_eq!(nothing, hover::Hover::default());
+
+    let (hostile, _) = hover_at(&mut tab.connection, 250, 70);
+    eprintln!("the hostile href came back as {:?}", hostile.href);
+    // The engine IDNA-encodes the host with the override in it and
+    // percent-encodes the escape; either way it is a link, and plain.
+    assert!(hostile.href.contains(".example/"), "{hostile:?}");
+    assert_eq!(hostile.shape, hover::Shape::Pointer);
+    assert_eq!(
+        blinkterm::text::sanitize(&hostile.href),
+        hostile.href.as_str(),
+        "plain text already"
+    );
+    assert!(!hostile.href.chars().any(char::is_control));
+
+    // Timing, printed to be read against the table in `hover.rs`.
+    let mut took: Vec<Duration> = (0..30)
+        .map(|n| hover_at(&mut tab.connection, 10 + n, 20).1)
+        .collect();
+    took.sort();
+    eprintln!("median of thirty asks: {:?}", took[took.len() / 2]);
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// Where the tab's main frame is, as `connect_tab` reads it.
+fn learn_frame(tab: &mut Tab<Client>) {
+    let tree = tab
+        .connection
+        .call("Page.getFrameTree", Json::empty())
+        .expect("the frame tree");
+    tab.frame = load::main_frame(&tree);
+    assert!(tab.frame.is_some(), "no main frame in {tree}");
+}
+
+/// What `app::navigate` does after `edit_url` has set the tab up: sent, not
+/// waited for, with the clock started.
+fn send_navigation(tab: &mut Tab<Client>, url: &str) -> Pending {
+    let _ = tab.connection.events();
+    tab.url = url.to_string();
+    tab.note = Some(format!("loading {url}"));
+    tab.loading = true;
+    tab.problem = None;
+    tab.since = Some(Instant::now());
+    tab.committed = false;
+    tab.connection
+        .send(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the navigation is sent")
+}
+
+/// What `handle_page_events` does with the loading events, for `within`:
+/// the methods seen, in order.
+fn watch_loading(tab: &mut Tab<Client>, within: Duration) -> Vec<String> {
+    let deadline = Instant::now() + within;
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        for event in tab.connection.events() {
+            let main = load::is_main(&event.params, tab.frame.as_deref());
+            match event.method.as_str() {
+                "Page.frameStartedNavigating" => {
+                    if let Some(url) = load::started(&event.params, tab.frame.as_deref()) {
+                        tab.started(url, Instant::now());
+                    }
+                }
+                "Page.frameNavigated" => {
+                    if let Some(landing) = load::landing(&event.params) {
+                        tab.trust = load::trust(&event.params);
+                        tab.landed(landing);
+                    }
+                }
+                "Page.frameStoppedLoading" if main => tab.stopped_loading(),
+                _ => {}
+            }
+            // The load event names no frame; it is only ever the page's.
+            if main
+                || matches!(
+                    event.method.as_str(),
+                    "Page.frameNavigated" | "Page.loadEventFired"
+                )
+            {
+                seen.push(event.method);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    seen
+}
+
+/// `esc` on a page whose next page never comes: the load stops, and the tab
+/// is the page it was — its url, its title, its history — rather than a url
+/// that was typed and a note that it is loading. And past the commit, where
+/// no load event is ever coming: the half page, with its title.
+#[test]
+fn escape_while_a_page_hangs_stops_the_load_and_leaves_the_page_where_it_was() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, _) = serve_troubles();
+    navigate_tab(&mut tab, &format!("{base}/"));
+    follow(&mut tab, Duration::from_secs(10));
+    learn_frame(&mut tab);
+    assert_eq!(tab.title, "fine");
+    let entries = history_length(&mut tab.connection);
+
+    let hang = format!("{base}/hang");
+    let pending = send_navigation(&mut tab, &hang);
+    let before = watch_loading(&mut tab, Duration::from_millis(500));
+    eprintln!("before the stop: {before:?}");
+    assert!(
+        before
+            .iter()
+            .any(|method| method == "Page.frameStartedNavigating"
+                || method == "Page.frameStartedLoading"),
+        "the departure is announced: {before:?}"
+    );
+    assert!(
+        !before.iter().any(|method| method == "Page.frameNavigated"),
+        "nothing landed: {before:?}"
+    );
+    assert!(tab.loading);
+    assert!(!tab.committed);
+    assert_eq!(tab.line(), format!("loading {hang}"));
+    assert!(
+        tab.connection.take_reply(&pending).is_none(),
+        "the navigation is held"
+    );
+
+    let stopped = Instant::now();
+    blinkterm::app::stop(&mut tab);
+    let after = watch_loading(&mut tab, Duration::from_secs(1));
+    eprintln!("after the stop, {:?}: {after:?}", stopped.elapsed());
+    assert!(
+        after
+            .iter()
+            .any(|method| method == "Page.frameStoppedLoading"),
+        "the main frame stopped: {after:?}"
+    );
+    let reply = tab
+        .connection
+        .take_reply(&pending)
+        .expect("the navigation answered once stopped")
+        .expect("with a reply, not an error");
+    assert_eq!(
+        reply.get("errorText").and_then(Json::as_str),
+        Some("net::ERR_ABORTED")
+    );
+    assert_eq!(load::failed(&reply), None, "which is not a failure to say");
+    assert!(!tab.loading);
+    assert_eq!(tab.note, None);
+    assert_eq!(tab.url, format!("{base}/"));
+    assert_eq!(tab.title, "fine");
+    assert_eq!(tab.line(), format!("fine  —  {base}/"));
+    assert_eq!(history_length(&mut tab.connection), entries);
+
+    // Past the commit: headers and half a body, and then nothing.
+    let slow = format!("{base}/slowbody");
+    let _pending = send_navigation(&mut tab, &slow);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !tab.committed && Instant::now() < deadline {
+        watch_loading(&mut tab, Duration::from_millis(50));
+    }
+    assert!(tab.committed, "the half page committed");
+    assert!(tab.loading);
+    blinkterm::app::stop(&mut tab);
+    let after = watch_loading(&mut tab, Duration::from_secs(1));
+    eprintln!("after stopping the half page: {after:?}");
+    assert!(
+        after
+            .iter()
+            .any(|method| method == "Page.frameStoppedLoading"),
+        "{after:?}"
+    );
+    assert!(
+        !after.iter().any(|method| method == "Page.loadEventFired"),
+        "no load event is coming: {after:?}"
+    );
+    assert!(!tab.loading);
+    assert_eq!(tab.url, slow);
+    assert_eq!(tab.title, "slowbody");
+
+    // And a stop on a page that is not loading is nothing at all.
+    tab.connection
+        .call("Page.stopLoading", Json::empty())
+        .expect("a stop with nothing to stop is answered");
+    let idle = watch_loading(&mut tab, Duration::from_millis(300));
+    assert!(
+        !idle
+            .iter()
+            .any(|method| method == "Page.frameStoppedLoading"),
+        "{idle:?}"
+    );
+    engine.check().expect("the engine is still there");
+    assert!(blinkterm::app::page_loaded(&mut tab.connection).is_some());
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// A link clicked into a host that says nothing is announced, with its url,
+/// before any byte comes back — which is what puts `loading …` on the row at
+/// once rather than never — and `esc` takes it back off.
+#[test]
+fn a_click_that_leaves_is_announced_before_anything_comes_back() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, _) = serve_troubles();
+    navigate_tab(&mut tab, &format!("{base}/leave"));
+    follow(&mut tab, Duration::from_secs(10));
+    learn_frame(&mut tab);
+    assert_eq!(tab.title, "leave");
+    let _ = tab.connection.events();
+
+    for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+        tab.connection
+            .notify(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(20)),
+                    ("y", Json::number(20)),
+                    ("button", Json::string("left")),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(0)),
+                ]),
+            )
+            .expect("the click is dispatched");
+    }
+    let seen = watch_loading(&mut tab, Duration::from_millis(500));
+    eprintln!("after the click: {seen:?}");
+    if seen
+        .iter()
+        .any(|method| method == "Page.frameStartedNavigating")
+    {
+        assert_eq!(tab.line(), format!("loading {base}/hang"));
+        assert!(!tab.committed);
+    } else {
+        eprintln!(
+            "skipped the url: this engine sent no Page.frameStartedNavigating \
+             (older than Chromium 132)"
+        );
+    }
+    assert!(tab.loading, "either way the tab is loading: {seen:?}");
+
+    blinkterm::app::stop(&mut tab);
+    let after = watch_loading(&mut tab, Duration::from_secs(1));
+    assert!(
+        after
+            .iter()
+            .any(|method| method == "Page.frameStoppedLoading"),
+        "{after:?}"
+    );
+    assert!(!tab.loading);
+    assert_eq!(tab.line(), format!("leave  —  {base}/leave"));
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// A page on this machine over plain http is left unmarked, as a desktop
+/// browser leaves it, and the reason is the engine's: it calls loopback a
+/// secure context. The named-host case needs DNS or a resolver flag this
+/// program does not pass, so the `Insecure` branch is the unit test on the
+/// measured JSON; what this checks is that the event still has the shape
+/// that JSON has, so that a Chromium that renamed the field fails here
+/// rather than quietly un-marking every page.
+#[test]
+fn an_http_page_on_this_machine_is_not_marked_and_the_engine_says_why() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, _) = serve_troubles();
+    let _ = send_navigation(&mut tab, &format!("{base}/"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut landed = None;
+    while landed.is_none() && Instant::now() < deadline {
+        for event in tab.connection.events() {
+            if event.method == "Page.frameNavigated" && load::landing(&event.params).is_some() {
+                landed = Some(event.params);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let params = landed.expect("the page landed");
+    let context = params
+        .path(&["frame", "secureContextType"])
+        .and_then(Json::as_str);
+    assert_eq!(context, Some("SecureLocalhost"), "{params}");
+    assert_eq!(load::trust(&params), load::Trust::Plain);
+    tab.trust = load::trust(&params);
+    if let Some(landing) = load::landing(&params) {
+        tab.landed(landing);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    if let Some(loaded) = blinkterm::app::page_loaded(&mut tab.connection) {
+        tab.loaded(loaded);
+    }
+    assert!(!tab.line().contains("not secure"), "{}", tab.line());
 
     tab.connection.close();
     engine.kill();
@@ -3515,6 +3947,187 @@ fn a_dialog_on_a_tab_that_is_not_in_front_is_still_heard() {
     engine.kill();
 }
 
+// ---------------------------------------------------------------------------
+// File inputs
+// ---------------------------------------------------------------------------
+
+use blinkterm::upload::{Chooser, Disk, Outcome as Typed, Upload};
+
+/// A page whose file input sits in the first pixels of the page, and which
+/// writes into its title what it was given — each file's name and size, as a
+/// page reads them — or that it heard `cancel`.
+fn upload_page(multiple: bool) -> String {
+    format!(
+        "data:text/html,<title>ready</title><body style='margin:0'>\
+<input id=f type=file {} style='position:absolute;left:0;top:0;width:200px;height:32px'>\
+<script>f.addEventListener('change',function(){{var a=[];\
+for(var x of f.files)a.push(x.name+' '+x.size);document.title='files '+a.join(', ')}});\
+f.addEventListener('cancel',function(){{document.title='cancelled'}});</script></body>",
+        if multiple { "multiple" } else { "" }
+    )
+}
+
+/// What `/report.pdf` holds for these tests, and so what size the page says.
+const UPLOADED: &[u8] = b"%PDF-1.4 a small report";
+
+/// A page with its file inputs asked about, as `app::connect_tab` sets one
+/// up, and a directory with two files in it to choose from.
+fn an_upload_page(client: &mut Client, multiple: bool) -> std::path::PathBuf {
+    a_page_that_asks(client, &upload_page(multiple), "ready");
+    client
+        .call(
+            "Page.setInterceptFileChooserDialog",
+            Json::object(vec![("enabled", Json::Bool(true))]),
+        )
+        .expect("interception");
+    let dir = temp_dir(if multiple { "uploads" } else { "upload" });
+    std::fs::write(dir.join("report.pdf"), UPLOADED).expect("a file");
+    std::fs::write(dir.join("notes.txt"), b"one line\n").expect("a file");
+    dir
+}
+
+/// A left click at a point of the page, pressed and let go, as `send_mouse`
+/// sends one. The click is what gives the page the activation a chooser
+/// needs: from a script with none, the engine refuses to open one.
+fn click_at(client: &mut Client, x: u32, y: u32) {
+    for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+        client
+            .call(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(x)),
+                    ("y", Json::number(y)),
+                    ("button", Json::string("left")),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(0)),
+                ]),
+            )
+            .expect("the click is dispatched");
+    }
+}
+
+/// The next file input the page asks about, read the way the program reads
+/// it.
+fn wait_for_chooser(client: &Client, timeout: Duration) -> Chooser {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for event in client.events() {
+            if event.method == "Page.fileChooserOpened" {
+                return Chooser::opening(&event.params)
+                    .unwrap_or_else(|| panic!("a chooser with no input: {}", event.params));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("no file chooser opened in {timeout:?}");
+}
+
+/// Keys at an upload prompt, until one of them ends it.
+fn type_path(upload: &mut Upload, keys: &[KeyInput]) -> Typed {
+    let mut outcome = Typed::Waiting;
+    for key in keys {
+        outcome = upload.step(key, &Disk);
+        if outcome != Typed::Waiting {
+            break;
+        }
+    }
+    outcome
+}
+
+fn letters(text: &str) -> Vec<KeyInput> {
+    text.chars().map(letter).collect()
+}
+
+/// A `<input type=file>` used to be a click that did nothing — headless has
+/// no picker, and the engine told the page `cancel` at once. Now the click
+/// is a path on the row, and what is typed and confirmed reaches the page as
+/// the file: its name and its size, read the way the page reads them. And
+/// Escape sends nothing, and the page hears `cancel` as it would from a real
+/// chooser.
+#[test]
+fn a_file_typed_on_the_row_reaches_the_pages_file_input() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let dir = an_upload_page(&mut client, false);
+
+    click_at(&mut client, 8, 8);
+    let chooser = wait_for_chooser(&client, Duration::from_secs(5));
+    assert!(!chooser.multiple);
+
+    // `rep`, Tab completes to `report.pdf`, Enter sends.
+    let mut upload = Upload::new(chooser, dir.clone(), None);
+    let mut keys = letters("rep");
+    keys.extend([press(Key::Tab), press(Key::Enter)]);
+    assert_eq!(type_path(&mut upload, &keys), Typed::Send);
+    assert_eq!(upload.line.text(), format!("{}/report.pdf", dir.display()));
+    client
+        .call("DOM.setFileInputFiles", upload.reply())
+        .expect("the engine takes the file");
+    let wanted = format!("files report.pdf {}", UPLOADED.len());
+    assert_eq!(
+        wait_for_title(&mut client, &wanted, Duration::from_secs(5)),
+        wanted
+    );
+
+    // Escape: nothing sent, and the page hears cancel.
+    click_at(&mut client, 8, 8);
+    let chooser = wait_for_chooser(&client, Duration::from_secs(5));
+    let mut upload = Upload::new(chooser, dir.clone(), None);
+    let keys = [letter('n'), press(Key::Escape)];
+    assert_eq!(type_path(&mut upload, &keys), Typed::Cancel);
+    blinkterm::app::cancel_chooser(&mut client, upload.chooser.backend_node_id);
+    assert_eq!(
+        wait_for_title(&mut client, "cancelled", Duration::from_secs(5)),
+        "cancelled"
+    );
+    assert_eq!(
+        evaluate(&mut client, "f.files.length"),
+        Json::number(1),
+        "the file sent before is untouched"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
+/// A `multiple` input is asked once per file, and an Enter with nothing
+/// typed sends what was entered, in the order it was.
+#[test]
+fn a_multiple_input_takes_every_path_entered_until_an_empty_enter() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let dir = an_upload_page(&mut client, true);
+
+    click_at(&mut client, 8, 8);
+    let chooser = wait_for_chooser(&client, Duration::from_secs(5));
+    assert!(chooser.multiple);
+
+    let mut upload = Upload::new(chooser, dir.clone(), None);
+    let mut keys = letters("report.pdf");
+    keys.push(press(Key::Enter));
+    keys.extend(letters("notes.txt"));
+    keys.extend([press(Key::Enter), press(Key::Enter)]);
+    assert_eq!(type_path(&mut upload, &keys), Typed::Send);
+    assert_eq!(upload.taken.len(), 2);
+    client
+        .call("DOM.setFileInputFiles", upload.reply())
+        .expect("the engine takes the files");
+    let wanted = format!("files report.pdf {}, notes.txt 9", UPLOADED.len());
+    assert_eq!(
+        wait_for_title(&mut client, &wanted, Duration::from_secs(5)),
+        wanted
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
 use blinkterm::download::{self, Downloads};
 
 /// What `/report.pdf` sends, which is what the saved file must hold.
@@ -3783,16 +4396,33 @@ fn an_attachment_is_saved_under_its_own_name_with_its_contents() {
         REPORT
     );
     let tab = tabs.active_mut().expect("the tab");
-    let navigated: Vec<_> = tab
-        .connection
-        .events()
-        .into_iter()
+    let events = tab.connection.events();
+    let navigated: Vec<_> = events
+        .iter()
         .filter(|event| event.method == "Page.frameNavigated")
         .collect();
     assert!(
         navigated.is_empty(),
         "the page went somewhere: {navigated:?}"
     );
+    // The click was announced as a departure, and the departure that turned
+    // into a file ends like any load: nothing on the row says it is still
+    // going (#15).
+    for event in &events {
+        match event.method.as_str() {
+            "Page.frameStartedNavigating" => {
+                if let Some(url) = load::started(&event.params, None) {
+                    tab.started(url, Instant::now());
+                }
+            }
+            "Page.frameStoppedLoading" => tab.stopped_loading(),
+            _ => {}
+        }
+    }
+    let methods: Vec<&str> = events.iter().map(|event| event.method.as_str()).collect();
+    eprintln!("the click that became a file: {methods:?}");
+    assert!(!tab.loading, "{methods:?}");
+    assert_eq!(tab.note, None, "{methods:?}");
     assert_eq!(tab.url, page);
 
     // Only the three, under their names: no guid left over, no partial.
@@ -4058,6 +4688,1007 @@ fn enter_submits_a_form_and_breaks_a_line_in_a_textarea() {
         Some("a\n"),
         "Enter in a textarea starts a new line"
     );
+
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Find in page (#12): the script in `blinkterm::find`, run the way the
+// program runs it — in an isolated world, through `Runtime.callFunctionOn` —
+// against pages served over HTTP, with what the page and a screenshot say
+// afterwards as the evidence.
+
+/// Serve the pages `build` makes, given the port they will be served on, for
+/// as long as the test binary runs; the port comes back.
+///
+/// A thread per connection, unlike [`serve`]: Chromium opens a speculative
+/// second connection that sends nothing, and with one thread its read held up
+/// every request after it — which is what the first measurement of find ran
+/// into. A path nobody made is a 404.
+fn serve_pages(build: impl FnOnce(u16) -> Vec<(String, String)>) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
+    let port = listener.local_addr().expect("an address").port();
+    let pages = Arc::new(build(port));
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let pages = Arc::clone(&pages);
+            std::thread::spawn(move || {
+                let mut head = [0u8; 2048];
+                let read = stream.read(&mut head).unwrap_or(0);
+                let request = String::from_utf8_lossy(&head[..read]).to_string();
+                let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+                let page = pages.iter().find(|(served, _)| *served == path);
+                let (status, body) = match page {
+                    Some((_, body)) => ("200 OK", body.as_str()),
+                    None => ("404 Not Found", "<title>not found</title>"),
+                };
+                let answer = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+/// A page with `fox` where a person can see it six times — three spellings in
+/// one paragraph, one split across `<b>`, two far down — and where nobody can
+/// in four more: a closed `<details>`, `display:none`, `visibility:hidden`
+/// and a `<textarea>`. The page `find`'s module doc was measured on.
+fn fox_page() -> String {
+    let filler: String = (0..200)
+        .map(|i| format!("<p>filler line {i}</p>"))
+        .collect();
+    format!(
+        "<!doctype html><meta charset=utf-8><title>foxes</title>\
+         <body style='margin:0;font:16px monospace;background:#fff;color:#000'>\
+         <h1>Top of the page</h1>\
+         <p>The quick brown fox jumps over the lazy dog. A Fox is here too, and a FOX.</p>\
+         <details><summary>closed</summary><p>hidden fox inside details</p></details>\
+         <p style='display:none'>display none fox</p>\
+         <p style='visibility:hidden'>visibility hidden fox</p>\
+         <textarea>fox in a textarea</textarea>\
+         <p>Split <b>fo</b>x across nodes.</p>\
+         {filler}\
+         <p id=deep>A deep fox near the bottom.</p>\
+         <p>and the last fox.</p></body>"
+    )
+}
+
+/// An engine on a page this test serves, sized as the pane would be, with the
+/// find script's world made in it.
+fn finding(url: &str, title: &str) -> Option<(Engine, Client, i64)> {
+    let (engine, mut client) = connect()?;
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    open(&mut client, url, title);
+    let context = find_world(&mut client);
+    Some((engine, client, context))
+}
+
+/// Go to `url` and wait for it to call itself `title`.
+fn open(client: &mut Client, url: &str, title: &str) {
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(client, title, Duration::from_secs(15)),
+        title,
+        "{url}"
+    );
+}
+
+/// The world the program makes on `ctrl+f`: the main frame, then a world of
+/// [`find::WORLD`]'s name in it.
+fn find_world(client: &mut Client) -> i64 {
+    let tree = client
+        .call("Page.getFrameTree", Json::empty())
+        .expect("the frame tree");
+    let frame = find::main_frame(&tree).expect("a main frame");
+    let world = client
+        .call("Page.createIsolatedWorld", find::world_params(&frame))
+        .expect("an isolated world");
+    find::context(&world).expect("the world's id")
+}
+
+/// One search or step, waited for, as the program sends it.
+fn search(client: &mut Client, context: i64, needle: &str, step: i32) -> Matches {
+    let ask = find::Ask {
+        needle: needle.to_string(),
+        step,
+    };
+    let reply = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            find::call_params(context, &ask),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers the search");
+    find::matches(&reply).unwrap_or_else(|| panic!("an answer of the script's shape: {reply}"))
+}
+
+/// How many yellow (`#ff0`, every match) and orange (`#f80`, the current
+/// one) pixels a PNG has, within 8 of each channel, inside `area` — `(x, y,
+/// width, height)` — or everywhere.
+fn highlight_pixels(png: &[u8], area: Option<(u32, u32, u32, u32)>) -> (usize, usize) {
+    let image = tos_term::png::decode(png, 64 * 1024 * 1024).expect("the PNG decodes");
+    let (x0, y0, w, h) = area.unwrap_or((0, 0, image.width, image.height));
+    let near = |pixel: &[u8], rgb: [u8; 3]| {
+        pixel
+            .iter()
+            .zip(rgb)
+            .all(|(&have, want)| have.abs_diff(want) <= 8)
+    };
+    let (mut yellow, mut orange) = (0, 0);
+    for y in y0..(y0 + h).min(image.height) {
+        for x in x0..(x0 + w).min(image.width) {
+            let at = ((y * image.width + x) * 4) as usize;
+            let pixel = &image.rgba[at..at + 3];
+            if near(pixel, [0xff, 0xff, 0x00]) {
+                yellow += 1;
+            } else if near(pixel, [0xff, 0x88, 0x00]) {
+                orange += 1;
+            }
+        }
+    }
+    (yellow, orange)
+}
+
+/// A number the page works out.
+fn page_number(client: &mut Client, expression: &str) -> f64 {
+    evaluate(client, expression)
+        .as_f64()
+        .unwrap_or_else(|| panic!("{expression} is a number"))
+}
+
+/// The acceptance criterion of #12: a needle is counted, and a match below the
+/// fold is brought into view — checked by where the page is, not by trusting
+/// the script's own word for it.
+#[test]
+fn a_needle_is_counted_and_the_current_match_is_scrolled_into_view() {
+    let port = serve_pages(|_| {
+        let paragraphs: String = (0..300)
+            .map(|i| {
+                format!(
+                    "<p id=p{i}>{i} The quick brown fox jumps over the lazy dog; \
+                     Lorem ipsum dolor sit amet, <b>consectetur</b> adipiscing elit.</p>"
+                )
+            })
+            .collect();
+        vec![(
+            "/".to_string(),
+            format!(
+                "<!doctype html><meta charset=utf-8><title>paragraphs</title>\
+                 <body style='font:14px sans-serif;background:#fff'>{paragraphs}</body>"
+            ),
+        )]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "paragraphs") else {
+        return;
+    };
+
+    let fox = search(&mut client, context, "fox", 0);
+    assert_eq!((fox.count, fox.current), (300, 1));
+    assert!(fox.highlighted, "the Custom Highlight API is there");
+    assert_eq!(scroll_y(&mut client), 0.0, "the first is already in view");
+
+    let far = search(&mut client, context, "250 The", 0);
+    assert_eq!((far.count, far.current), (1, 1));
+    assert!(scroll_y(&mut client) > 0.0, "the page moved to it");
+    let top = page_number(
+        &mut client,
+        "document.getElementById('p250').getBoundingClientRect().top",
+    );
+    assert!(
+        (0.0..HEIGHT as f64).contains(&top),
+        "paragraph 250 is on the screen: its top is at {top}"
+    );
+    let (_, orange) = highlight_pixels(&screenshot(&mut client, "png", None), None);
+    assert!(orange > 0, "the current match is painted");
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn next_and_previous_walk_the_matches_and_wrap() {
+    let port = serve_pages(|_| vec![("/".to_string(), fox_page())]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "foxes") else {
+        return;
+    };
+
+    let first = search(&mut client, context, "fox", 0);
+    assert_eq!((first.count, first.current), (6, 1));
+    assert_eq!(scroll_y(&mut client), 0.0);
+    let mut went = Vec::new();
+    for _ in 2..=6 {
+        let step = search(&mut client, context, "fox", 1);
+        went.push((step.current, scroll_y(&mut client)));
+    }
+    let currents: Vec<u32> = went.iter().map(|(current, _)| *current).collect();
+    assert_eq!(currents, [2, 3, 4, 5, 6]);
+    // The first four are on the first screen; the fifth is two hundred lines
+    // down, and the page goes to it.
+    assert_eq!(went[2].1, 0.0, "{went:?}");
+    assert!(went[3].1 > 0.0, "the fifth scrolled the page: {went:?}");
+    let wrapped = search(&mut client, context, "fox", 1);
+    assert_eq!(wrapped.current, 1, "past the last is the first");
+    assert_eq!(scroll_y(&mut client), 0.0, "and the page went back up");
+    let back = search(&mut client, context, "fox", -1);
+    assert_eq!(back.current, 6, "before the first is the last");
+    assert!(scroll_y(&mut client) > 0.0);
+    // A step of any size wraps, either way.
+    assert_eq!(search(&mut client, context, "fox", 13).current, 1);
+    assert_eq!(search(&mut client, context, "fox", -7).current, 6);
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn hidden_text_is_not_a_match_and_the_page_is_left_as_it_was() {
+    let port = serve_pages(|_| vec![("/".to_string(), fox_page())]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "foxes") else {
+        return;
+    };
+    let before = evaluate(&mut client, "document.body.innerHTML");
+    let selected = evaluate(
+        &mut client,
+        "var r=document.createRange();r.selectNodeContents(document.querySelector('h1'));\
+         getSelection().removeAllRanges();getSelection().addRange(r);String(getSelection())",
+    );
+    assert_eq!(selected.as_str(), Some("Top of the page"));
+
+    let fox = search(&mut client, context, "fox", 0);
+    assert_eq!(
+        fox.count, 6,
+        "details, display:none, visibility:hidden and the textarea are not matches; \
+         the split fo|x is"
+    );
+    let (yellow, orange) = highlight_pixels(&screenshot(&mut client, "png", None), None);
+    assert!(yellow > 0 && orange > 0, "{yellow} yellow, {orange} orange");
+
+    // Nothing in the page changed, and nothing of the script is in its world.
+    assert_eq!(evaluate(&mut client, "document.body.innerHTML"), before);
+    assert_eq!(
+        evaluate(&mut client, "typeof __blinktermFind").as_str(),
+        Some("undefined")
+    );
+    assert_eq!(
+        evaluate(&mut client, "String(getSelection())").as_str(),
+        Some("Top of the page"),
+        "the person's selection is theirs"
+    );
+    // Whitespace as the page shows it, and never across a block.
+    assert_eq!(search(&mut client, context, "lazy  dog", 0).count, 0);
+    assert_eq!(search(&mut client, context, "lazy dog", 0).count, 1);
+    assert_eq!(search(&mut client, context, "page the", 0).count, 0);
+
+    let cleared = search(&mut client, context, "", 0);
+    assert_eq!((cleared.count, cleared.current), (0, 0));
+    assert_eq!(
+        evaluate(&mut client, "CSS.highlights.size").as_f64(),
+        Some(0.0)
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(0.0)
+    );
+    let (yellow, orange) = highlight_pixels(&screenshot(&mut client, "png", None), None);
+    assert_eq!((yellow, orange), (0, 0), "nothing left painted");
+    assert_eq!(evaluate(&mut client, "document.body.innerHTML"), before);
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn cjk_text_is_found_counted_and_highlighted() {
+    let port = serve_pages(|_| {
+        vec![(
+            "/".to_string(),
+            "<!doctype html><meta charset=utf-8><title>nihongo</title>\
+             <body style='margin:0;font:20px sans-serif;background:#fff'>\
+             <p>東京は日本の首都です。</p>\
+             <p>日本語のテキストです。東京タワー。</p>\
+             <p>京都と東京と大阪。日本。</p>\
+             <p>TOKYO in capitals.</p></body>"
+                .to_string(),
+        )]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "nihongo") else {
+        return;
+    };
+
+    assert_eq!(search(&mut client, context, "東京", 0).count, 3);
+    assert_eq!(search(&mut client, context, "日本", 0).count, 3);
+    assert_eq!(search(&mut client, context, "日本の首都", 0).count, 1);
+    // A glyph box paints its background whether or not a font drew the glyph.
+    let (yellow, orange) = highlight_pixels(&screenshot(&mut client, "png", None), None);
+    assert!(yellow + orange > 0, "the match is painted");
+    assert_eq!(
+        search(&mut client, context, "tokyo", 0).count,
+        1,
+        "any case"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// Why a search is sent rather than called, and what the program does when
+/// the document it was searching has gone.
+#[test]
+fn a_search_is_collected_on_a_later_pass_and_a_stale_world_is_told_apart() {
+    let port = serve_pages(|_| {
+        let paragraphs: String = (0..2000)
+            .map(|i| {
+                format!(
+                    "<p>{i} The quick brown fox jumps over the lazy dog; Lorem ipsum \
+                     dolor sit amet, <b>consectetur</b> adipiscing elit.</p>"
+                )
+            })
+            .collect();
+        vec![
+            (
+                "/".to_string(),
+                format!("<!doctype html><title>long</title><body>{paragraphs}</body>"),
+            ),
+            (
+                "/other".to_string(),
+                "<!doctype html><title>other</title><body><p>a fox elsewhere</p></body>"
+                    .to_string(),
+            ),
+        ]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "long") else {
+        return;
+    };
+
+    let ask = find::Ask {
+        needle: "fox".to_string(),
+        step: 0,
+    };
+    let pending: Pending = client
+        .send("Runtime.callFunctionOn", find::call_params(context, &ask))
+        .expect("the search goes out");
+    assert!(
+        client.take_reply(&pending).is_none(),
+        "a walk of 2000 paragraphs is not back the moment it was sent"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let answer = loop {
+        if let Some(answer) = client.take_reply(&pending) {
+            break answer;
+        }
+        assert!(Instant::now() < deadline, "the search answered within 5 s");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let fox = find::matches(&answer.expect("a reply")).expect("the script's answer");
+    assert_eq!(fox.count, 2000);
+
+    open(&mut client, &format!("{url}other"), "other");
+    let gone = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            find::call_params(context, &ask),
+            Duration::from_secs(5),
+        )
+        .expect_err("the world went with its document");
+    assert!(find::stale_world(&gone), "{gone}");
+    let context = find_world(&mut client);
+    assert_eq!(search(&mut client, context, "fox", 0).count, 1);
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn a_match_in_a_same_origin_frame_is_reached_and_a_cross_origin_one_is_not() {
+    let port = serve_pages(|port| {
+        let inner: String = (0..30)
+            .map(|i| format!("<p>inner line {i}</p>"))
+            .collect::<String>()
+            + "<p>an inner fox</p>";
+        let outer: String = (0..40).map(|i| format!("<p>outer line {i}</p>")).collect();
+        vec![
+            (
+                "/inner".to_string(),
+                format!(
+                    "<!doctype html><meta charset=utf-8>\
+                     <body style='font:16px monospace;margin:0;background:#fff'>{inner}</body>"
+                ),
+            ),
+            (
+                "/".to_string(),
+                format!(
+                    "<!doctype html><meta charset=utf-8><title>loading</title>\
+                     <body style='font:16px monospace;margin:0;background:#fff'>\
+                     <p>outer fox</p>\
+                     <iframe id=same src='http://127.0.0.1:{port}/inner' \
+                     style='width:300px;height:120px'></iframe>\
+                     <iframe id=cross src='http://localhost:{port}/inner' \
+                     style='width:300px;height:120px'></iframe>\
+                     <iframe id=doc srcdoc='<p>srcdoc fox</p>'></iframe>\
+                     {outer}<p>last outer fox</p>\
+                     <script>onload=function(){{document.title='frames'}}</script></body>"
+                ),
+            ),
+        ]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "frames") else {
+        return;
+    };
+    assert_eq!(
+        evaluate(
+            &mut client,
+            "document.getElementById('cross').contentDocument === null"
+        )
+        .as_bool(),
+        Some(true),
+        "the second frame really is another origin"
+    );
+
+    let fox = search(&mut client, context, "fox", 0);
+    assert_eq!(
+        (fox.count, fox.current),
+        (4, 1),
+        "outer, the same-origin frame, srcdoc, outer again; not the other origin"
+    );
+    let into = search(&mut client, context, "fox", 1);
+    assert_eq!(into.current, 2);
+    assert!(
+        page_number(
+            &mut client,
+            "document.getElementById('same').contentWindow.scrollY"
+        ) > 0.0,
+        "the frame scrolled to its match"
+    );
+    assert_eq!(scroll_y(&mut client), 0.0, "and the page stayed");
+    let area = |client: &mut Client, what: &str| {
+        page_number(
+            client,
+            &format!("document.getElementById('same').getBoundingClientRect().{what}"),
+        ) as u32
+    };
+    let frame = (
+        area(&mut client, "left"),
+        area(&mut client, "top"),
+        area(&mut client, "width"),
+        area(&mut client, "height"),
+    );
+    let (_, orange) = highlight_pixels(&screenshot(&mut client, "png", None), Some(frame));
+    assert!(orange > 0, "the current match is painted inside the frame");
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn a_search_that_asks_nothing_of_the_page_still_answers_on_about_blank_and_the_error_page() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("about:blank");
+    let context = find_world(&mut client);
+    let blank = search(&mut client, context, "fox", 0);
+    assert_eq!((blank.count, blank.current), (0, 0));
+    assert_eq!(search(&mut client, context, "fox", 1).current, 0);
+
+    // Port 1 is one the engine refuses to connect to, and says so with its
+    // own error page, at once.
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string("http://127.0.0.1:1/"))]),
+        )
+        .expect("the navigation is answered");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        // The error page's document arrives after the reply; until it has,
+        // the world asked for may be the one that is about to go.
+        let context = find_world(&mut client);
+        let ask = find::Ask {
+            needle: "fox".to_string(),
+            step: 0,
+        };
+        match client.call_within(
+            "Runtime.callFunctionOn",
+            find::call_params(context, &ask),
+            Duration::from_secs(5),
+        ) {
+            Ok(reply) => break find::matches(&reply),
+            Err(why) if find::stale_world(&why) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(why) => panic!("{why}"),
+        }
+    };
+    let error_page = answer.expect("the script's answer");
+    assert_eq!(error_page.count, 0);
+
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Zoom, the HiDPI scale, and light and dark
+// ---------------------------------------------------------------------------
+
+/// A box at CSS (100..150, 50..100) that says when it is pressed, on a page
+/// tall enough to scroll. Every press puts where the page saw it, and whether
+/// it was on the box, into the title.
+const BOXES: &str = "data:text/html,<body style='margin:0;height:3000px;background:%23fff'>\
+<div id=b style='position:absolute;left:100px;top:50px;width:50px;height:50px;background:%23c33'></div>\
+<script>document.title='ready';\
+addEventListener('mousedown',function(e){document.title=(e.target.id==='b'?'box ':'miss ')+e.clientX+' '+e.clientY});\
+</script></body>";
+
+/// A page that is white, or black when it is told dark is preferred.
+const SCHEME: &str = "data:text/html,<style>body{margin:0;background:white}\
+@media (prefers-color-scheme: dark){body{background:black}}</style>\
+<body><script>document.title='ready'</script></body>";
+
+/// A page with no dark style at all: white, whatever it is told.
+const WHITE: &str = "data:text/html,<body style='margin:0'><p>Some text on a white page.</p>\
+<script>document.title='ready'</script></body>";
+
+/// The override the program sends for `factor` on the test's pane.
+fn zoom_to(client: &mut Client, factor: f64) -> blinkterm::zoom::Viewport {
+    let viewport = blinkterm::zoom::Viewport::fit((WIDTH, HEIGHT), factor);
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            viewport.metrics_params(),
+        )
+        .expect("the zoom");
+    viewport
+}
+
+/// [`prepare`], and then the page zoomed to `factor`.
+fn prepare_at(client: &mut Client, factor: f64) -> blinkterm::zoom::Viewport {
+    prepare(client);
+    zoom_to(client, factor)
+}
+
+/// Go to `url` and wait for it to say it is ready — having said something
+/// else first, so that the page being left is not taken for it.
+fn go_to(client: &mut Client, url: &str) {
+    evaluate(client, "document.title='leaving'");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+}
+
+/// `innerWidth`, `innerHeight` and `devicePixelRatio`, as the page sees them.
+fn page_metrics(client: &mut Client) -> (f64, f64, f64) {
+    let answer = evaluate(client, "[innerWidth, innerHeight, devicePixelRatio]");
+    let numbers: Vec<f64> = answer
+        .as_array()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(Json::as_f64)
+        .collect();
+    match numbers.as_slice() {
+        [w, h, ratio] => (*w, *h, *ratio),
+        _ => panic!("the page said {answer}"),
+    }
+}
+
+/// A still, decoded.
+fn still(client: &mut Client) -> (Vec<u8>, u32, u32) {
+    let png = screenshot(client, "png", None);
+    let image = tos_term::png::decode(&png, 64 * 1024 * 1024).expect("a still decodes");
+    (image.rgba, image.width, image.height)
+}
+
+/// A press and a release at a CSS point, as `send_mouse` sends them.
+fn click_css(client: &mut Client, (x, y): (f64, f64)) {
+    for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+        client
+            .call(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(x)),
+                    ("y", Json::number(y)),
+                    ("button", Json::string("left")),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(0)),
+                ]),
+            )
+            .expect("the click is dispatched");
+    }
+}
+
+/// Whether the page is being told dark is preferred.
+fn prefers_dark(client: &mut Client) -> bool {
+    evaluate(client, "matchMedia('(prefers-color-scheme: dark)').matches").as_bool() == Some(true)
+}
+
+/// Wait for `wanted` to be what `ask` says, and say what it said last.
+fn wait_until<T: PartialEq + Copy>(
+    client: &mut Client,
+    wanted: T,
+    ask: impl Fn(&mut Client) -> T,
+) -> T {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = ask(client);
+        if now == wanted || Instant::now() >= deadline {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The still's pixel at (5, 5), as a luminance.
+fn corner_luminance(client: &mut Client) -> f64 {
+    let (rgba, width, _) = still(client);
+    let at = (5 * width as usize + 5) * 4;
+    blinkterm::appearance::luminance((rgba[at], rgba[at + 1], rgba[at + 2]))
+}
+
+/// 200%: the page is laid out for half the pane and draws itself at the
+/// whole of it. The still is the pane's size and goes into the same cells as
+/// ever; a moving frame is the CSS viewport's size, and goes into the same
+/// cells too.
+#[test]
+fn zoom_changes_what_the_page_sees_and_the_still_stays_the_panes_size() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare_at(&mut client, 2.0);
+    assert_eq!(page_metrics(&mut client), (320.0, 180.0, 2.0));
+
+    let dir = temp_dir("zoom");
+    let mut painter = Painter::at(&dir);
+    let mut terminal = a_terminal(&dir);
+    let cells = Cells {
+        cols: WIDTH / CELL.0,
+        rows: HEIGHT / CELL.1,
+    };
+    let (rgba, width, height) = still(&mut client);
+    assert_eq!((width, height), (WIDTH, HEIGHT), "the still is the pane's");
+    terminal.advance(&painter.frame(Raw::rgba(&rgba, width, height), cells, 2, 1));
+    let store = terminal.graphics();
+    let image = store.image(IMAGE_ID).expect("the still is in the store");
+    assert_eq!((image.width, image.height), (WIDTH, HEIGHT));
+    let placement = store.placements().next().expect("one placement");
+    assert_eq!(
+        (placement.cols as u32, placement.rows as u32),
+        (cells.cols, cells.rows)
+    );
+
+    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDTH, HEIGHT);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut frame = None;
+    while frame.is_none() && Instant::now() < deadline {
+        frame = take_frames(&mut client).pop();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (jpeg, _) = frame.expect("a frame");
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    let image = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+    assert_eq!(
+        (image.width, image.height),
+        (WIDTH / 2, HEIGHT / 2),
+        "a moving frame is the CSS viewport's size"
+    );
+    terminal.advance(&painter.frame(Raw::rgb(&image.rgb, image.width, image.height), cells, 2, 1));
+    let store = terminal.graphics();
+    assert_eq!(store.placements().count(), 1);
+    let placement = store.placements().next().expect("one placement");
+    assert_eq!(
+        (placement.cols as u32, placement.rows as u32),
+        (cells.cols, cells.rows),
+        "and goes into the same cells, for the terminal to scale"
+    );
+
+    // A fractional level: the ratio is the level, and the still fits the
+    // pane exactly once it has been fitted.
+    zoom_to(&mut client, 1.5);
+    let (_, _, ratio) = wait_until(&mut client, (427.0, 240.0, 1.5), page_metrics);
+    assert_eq!(ratio, 1.5);
+    let (rgba, width, height) = still(&mut client);
+    eprintln!("a still at 150% on {WIDTH}x{HEIGHT} came {width}x{height}");
+    let fitted = blinkterm::zoom::fit(&rgba, width, height, 4, (WIDTH, HEIGHT)).unwrap_or(rgba);
+    assert_eq!(fitted.len(), (WIDTH * HEIGHT * 4) as usize);
+
+    painter.clean_up();
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
+/// A point on the screen is the same element at every level: the terminal's
+/// pixels divided by the factor, and nothing else.
+#[test]
+fn a_click_lands_on_the_same_element_at_every_zoom() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let viewport = prepare_at(&mut client, 2.0);
+    // The cell `a_click_lands_where_the_cell_was` clicks, at 200%.
+    let report = blinkterm::input::MouseInput {
+        kind: blinkterm::input::MouseKind::Press,
+        button: Some(0),
+        mods: Mods::default(),
+        x: 11,
+        y: 4,
+        wheel: (0, 0),
+    };
+    let (x, y) = blinkterm::input::page_point(&report, false, CELL, 1);
+    assert_eq!((x, y), (84, 40));
+    assert_eq!(viewport.css_point(x, y), (42.0, 20.0));
+    click_css(&mut client, viewport.css_point(x, y));
+    assert_eq!(
+        wait_for_title(&mut client, "click ", Duration::from_secs(5)),
+        "click 0 42 20"
+    );
+
+    go_to(&mut client, BOXES);
+    for (factor, point, hit) in [
+        (2.0, (250, 150), true),
+        (0.5, (60, 30), true),
+        (1.0, (250, 150), false),
+    ] {
+        let viewport = zoom_to(&mut client, factor);
+        wait_until(&mut client, factor, |client| page_metrics(client).2);
+        evaluate(&mut client, "document.title='waiting'");
+        click_css(&mut client, viewport.css_point(point.0, point.1));
+        let seen = wait_for_title(
+            &mut client,
+            if hit { "box " } else { "miss " },
+            Duration::from_secs(5),
+        );
+        assert!(
+            seen.starts_with(if hit { "box " } else { "miss " }),
+            "{point:?} at {factor}: {seen}"
+        );
+    }
+
+    client.close();
+    engine.kill();
+}
+
+/// A notch is 120 pixels of the screen at every level, which at 200% is 60
+/// of the page's.
+#[test]
+fn a_wheel_notch_moves_the_page_the_same_distance_on_screen_at_any_zoom() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    go_to(&mut client, BOXES);
+    let wire = blinkterm::app::Wire::new(client.notifier());
+    for (factor, css) in [(2.0, 60.0), (1.0, 120.0), (0.5, 240.0)] {
+        let viewport = zoom_to(&mut client, factor);
+        wait_until(&mut client, factor, |client| page_metrics(client).2);
+        evaluate(&mut client, "scrollTo(0,0)");
+        let at = viewport.css_point(320, 180);
+        wire.send(Step {
+            at: (at.0.round() as i32, at.1.round() as i32),
+            delta: viewport.notch((0, 1), blinkterm::app::WHEEL_PIXELS),
+        })
+        .expect("the wheel event goes out");
+        let moved = wait_until(&mut client, css, scroll_y);
+        assert_eq!(moved, css, "at {factor}");
+        assert_eq!(moved * factor, 120.0, "on the screen, at {factor}");
+    }
+
+    client.close();
+    engine.kill();
+}
+
+/// The override is the session's: a navigation keeps it, and a session made
+/// afterwards starts without it — which is why the program sends it every
+/// time a tab comes to the front.
+#[test]
+fn the_zoom_survives_a_navigation_and_a_new_tab_starts_at_its_hosts_level() {
+    let Some((mut engine, mut page, target)) = connect_with_target() else {
+        return;
+    };
+    prepare_at(&mut page, 2.0);
+    for url in [BOXES, PAGE] {
+        go_to(&mut page, url);
+        assert_eq!(page_metrics(&mut page).0, 320.0, "after going to {url}");
+    }
+
+    let (mut browser, tabs) = tabbed(&engine, page, target);
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("a new target");
+    let opened = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("the engine says which")
+        .to_string();
+    let mut second = browser
+        .attach(&opened, Duration::from_secs(10))
+        .expect("a session on it");
+    second
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    blinkterm::app::prepare_session(
+        &mut second,
+        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+    );
+    let (width, _, ratio) = page_metrics(&mut second);
+    eprintln!("a new session, told nothing about its size, is {width} wide");
+    assert_ne!(width, 320.0, "a new session starts at the engine's size");
+    assert_eq!(ratio, 1.0);
+    // Which `activate` then tells it.
+    zoom_to(&mut second, 2.0);
+    assert_eq!(page_metrics(&mut second), (320.0, 180.0, 2.0));
+
+    second.close();
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// A dark terminal's answer makes a loaded page dark where it stands, the
+/// next page dark, and a tab opened afterwards dark; a light answer after it
+/// makes the page light again, and none of it is a reload.
+#[test]
+fn a_dark_terminal_gets_dark_pages_and_so_does_a_tab_opened_later() {
+    let Some((mut engine, mut page, target)) = connect_with_target() else {
+        return;
+    };
+    page.call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut page);
+    go_to(&mut page, SCHEME);
+    assert!(!prefers_dark(&mut page), "the engine's own answer is light");
+    assert!(corner_luminance(&mut page) > 0.9);
+
+    let mut appearance =
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+    assert!(appearance.learned((0x1c, 0x1c, 0x1c)));
+    blinkterm::app::prepare_session(&mut page, &appearance);
+    assert!(
+        wait_until(&mut page, true, prefers_dark),
+        "told on the loaded page"
+    );
+    evaluate(&mut page, "window.kept=1");
+    assert!(corner_luminance(&mut page) < 0.05);
+
+    // Which survives the page being left.
+    go_to(&mut page, SCHEME);
+    assert!(prefers_dark(&mut page), "after a navigation");
+    evaluate(&mut page, "window.kept=1");
+
+    // A tab made afterwards is told when it is made.
+    let (mut browser, tabs) = tabbed(&engine, page, target);
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("a new target");
+    let opened = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("the engine says which")
+        .to_string();
+    let mut second = browser
+        .attach(&opened, Duration::from_secs(10))
+        .expect("a session on it");
+    second
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    blinkterm::app::prepare_session(&mut second, &appearance);
+    viewport(&mut second);
+    go_to(&mut second, SCHEME);
+    assert!(prefers_dark(&mut second), "a tab opened later");
+
+    // And the terminal turning light turns the first page light, live.
+    assert!(appearance.learned((0xfd, 0xf6, 0xe3)));
+    let mut tabs = tabs;
+    let first = &mut tabs.active_mut().expect("the first tab").connection;
+    blinkterm::app::prepare_session(first, &appearance);
+    assert!(!wait_until(first, false, prefers_dark), "told light");
+    assert_eq!(
+        evaluate(first, "window.kept").as_f64(),
+        Some(1.0),
+        "and not by a reload"
+    );
+
+    second.close();
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// `--force-dark`: a page with no dark style of its own is painted dark, and
+/// stays dark on the next page.
+#[test]
+fn forced_dark_paints_a_white_page_dark() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    go_to(&mut client, WHITE);
+    assert!(corner_luminance(&mut client) > 0.9, "white to begin with");
+
+    let forced = blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, true);
+    blinkterm::app::prepare_session(&mut client, &forced);
+    let dark = |client: &mut Client| corner_luminance(client) < 0.1;
+    assert!(wait_until(&mut client, true, dark), "painted dark");
+    go_to(&mut client, WHITE);
+    assert!(
+        wait_until(&mut client, true, dark),
+        "and after a navigation"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// At every fractional level in the table that the engine rounds, the still
+/// is made exactly the pane's size, which is what keeps the terminal from
+/// resampling it.
+#[test]
+fn the_still_at_a_fractional_level_is_cut_to_the_pane() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    for factor in [1.1, 1.5, 1.75, 3.0] {
+        let viewport = zoom_to(&mut client, factor);
+        wait_until(&mut client, factor, |client| page_metrics(client).2);
+        let (rgba, width, height) = still(&mut client);
+        eprintln!(
+            "at {factor}: css {:?}, the still came {width}x{height}",
+            viewport.css
+        );
+        assert!(
+            width.abs_diff(WIDTH) <= blinkterm::zoom::SLACK
+                && height.abs_diff(HEIGHT) <= blinkterm::zoom::SLACK,
+            "{width}x{height} at {factor}"
+        );
+        let fitted = blinkterm::zoom::fit(&rgba, width, height, 4, (WIDTH, HEIGHT)).unwrap_or(rgba);
+        assert_eq!(fitted.len(), (WIDTH * HEIGHT * 4) as usize, "at {factor}");
+    }
 
     client.close();
     engine.kill();

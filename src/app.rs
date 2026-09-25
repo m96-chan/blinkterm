@@ -26,6 +26,7 @@
 //! side is a notch handed over as it is read and a timestamp read back once a
 //! pass.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,13 +34,16 @@ use std::time::{Duration, Instant};
 use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::{Cells, Metrics};
 
+use crate::appearance::{self, Appearance};
 use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::clipboard;
 use crate::dialog::{Answer, Dialog, Kind};
 use crate::download::{self, Downloads};
 use crate::engine::Engine;
+use crate::find;
 use crate::graphics::{Painter, Raw};
 use crate::history::{self, History};
+use crate::hover::{self, Shape};
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
 use crate::json::Json;
 use crate::keys;
@@ -50,6 +54,8 @@ use crate::profile::{Choice, Profile};
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::tabs::{Outcome, Tab, Tabs};
+use crate::upload::{self, Upload};
+use crate::zoom::{self, Scale, Viewport, Zoom, Zooms};
 
 /// How long the engine gets to answer on its pipe.
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -144,6 +150,24 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// something else wrong with it, and the last motion frame stays up.
 const STILL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a search gets before the row gives up on it.
+///
+/// Sent and collected like the still, never waited for: see [`find`] for
+/// the measurements, which are 31 to 61 ms of renderer on a long article and
+/// up to a second on 2.4 million characters of text, more than anybody reads.
+/// Five, so that the largest page measured has room to spare and a page that
+/// takes longer has something else wrong with it. The clock does not run
+/// while the page is stopped behind a dialog: the search is queued behind the
+/// question like every other command, and lands when it has been answered.
+const FIND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long each of the two calls that make the find script's world gets.
+///
+/// Waited for, as [`SELECTION_TIMEOUT`] is and for the same reason: the
+/// person has just pressed `ctrl+f` and the first letter they type needs the
+/// world. Measured at 0.4 to 2.2 ms each.
+const WORLD_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The largest frame either decoder may produce, in bytes of pixels.
 ///
 /// A frame is a pane, so this is never reached; it is the ceiling that stops
@@ -203,6 +227,14 @@ pub struct Options {
     /// where they go; or none, in which case what is typed is always a url.
     /// See [`destination`].
     pub search_url: Option<String>,
+    /// `--scale`: terminal pixels per CSS pixel before any zoom, or `Auto`
+    /// to guess it from the cell. See [`crate::zoom::Scale`].
+    pub scale: Scale,
+    /// `--color-scheme`: what a page is told it prefers, or `Auto` for what
+    /// the terminal's background says. See [`crate::appearance`].
+    pub scheme: appearance::Choice,
+    /// `--force-dark`: every page painted dark, dark style or none.
+    pub force_dark: bool,
 }
 
 /// Everything the loop owns that is not the terminal, the tabs or the engine.
@@ -221,6 +253,12 @@ struct Chrome {
     wheel: scroll::Wheel,
     /// `Some` while the url is being typed.
     bar: Option<UrlBar>,
+    /// `Some` while a needle is being typed into the find prompt. Asked about
+    /// every key after the url bar, drawn on the row when the bar is closed.
+    find: Option<Find>,
+    /// The needle the find prompt last closed with, offered whole by the
+    /// next `ctrl+f` as `ctrl+l` offers the url.
+    last_needle: String,
     /// The pages visited, which the url bar offers back; kept in the profile,
     /// or only in memory for a temporary one. See [`crate::history`].
     history: History,
@@ -233,6 +271,47 @@ struct Chrome {
     /// the tab it started in, and its events come on the browser's
     /// connection. See [`crate::download`].
     downloads: Downloads,
+    /// The directory the last file was uploaded from, this run: where the
+    /// next file input's prompt starts. See [`upload::start_dir`].
+    upload_dir: Option<PathBuf>,
+    /// Where the pointer is and what is under it, for the tab in front only.
+    /// See [`crate::hover`].
+    hover: hover::Tracker,
+    /// The hover ask that is out with the engine.
+    asking: Option<Ask>,
+    /// The pointer shape the terminal was last told, so that it is told only
+    /// on a change.
+    shape: Shape,
+    /// The right-hand hint last drawn for a load in progress, so that the row
+    /// is redrawn when its seconds change and not otherwise.
+    hint: Option<String>,
+    /// `--scale` as it was given, which `Auto` makes a question asked again
+    /// of every new cell size.
+    scale_choice: Scale,
+    /// The answer to it for the pane as it is now: terminal pixels per CSS
+    /// pixel before the tab's zoom. See [`viewport`].
+    scale: f64,
+    /// The zoom levels remembered per host; kept in the profile, or only in
+    /// memory for a temporary one. See [`crate::zoom`].
+    zooms: Zooms,
+    /// What every page is told about light and dark, once the terminal has
+    /// said. See [`crate::appearance`] and [`prepare_session`].
+    appearance: Appearance,
+    /// The terminal's answer to `CSI 16 t`, for a pane whose kernel window
+    /// size has no pixels in it. See [`crate::screen::ASK_CELL_SIZE`].
+    cell_hint: Option<(u32, u32)>,
+}
+
+impl Chrome {
+    /// Where a file input's prompt starts, read now: see
+    /// [`upload::start_dir`].
+    fn upload_base(&self) -> PathBuf {
+        upload::start_dir(
+            self.upload_dir.as_deref(),
+            std::env::current_dir().ok(),
+            upload::home().as_deref(),
+        )
+    }
 }
 
 /// The url bar while it is open.
@@ -254,6 +333,45 @@ struct UrlBar {
 impl UrlBar {
     fn new(line: Line) -> UrlBar {
         UrlBar { line, walk: None }
+    }
+}
+
+/// The find prompt while it is open, and the page it is searching.
+///
+/// The program's rather than a tab's, like [`Navigation`] and [`Still`], with
+/// the target beside it for the same reason: there is one row and one person
+/// typing on it, and an answer collected against a tab that is no longer in
+/// front would put one page's count under another's needle. A tab cannot be
+/// switched from the keyboard while the prompt is open, because the prompt
+/// takes every key; a page that opens a window, or closes itself, can put
+/// another tab in front all the same, and [`switched`] closes the prompt then.
+/// Per-tab prompts remembered behind every tab, which is Chrome's model, were
+/// left out: state nobody can see in a strip, and one more thing to keep in
+/// step with the engine.
+struct Find {
+    target: String,
+    finder: find::Finder,
+    /// The world the script runs in, once made for this document; `None` for
+    /// a page that did not answer when it was asked for one.
+    context: Option<i64>,
+    /// The search out with the engine, what it asked, and when it went.
+    pending: Option<(Pending, find::Ask, Instant)>,
+    /// What to ask next, once the answer is in: keys typed while a search is
+    /// out fold in here ([`find::Ask::merge`]), so at most one is ever out.
+    wanted: Option<find::Ask>,
+    /// Whether a world that went with its document has already been made
+    /// again for this ask, so that a page which keeps navigating under the
+    /// prompt is reported rather than chased.
+    remade: bool,
+}
+
+impl Find {
+    /// Fold `ask` into whatever is waiting to be sent.
+    fn want(&mut self, ask: find::Ask) {
+        self.wanted = Some(match self.wanted.take() {
+            Some(older) => older.merge(ask),
+            None => ask,
+        });
     }
 }
 
@@ -297,6 +415,23 @@ struct Still {
     target: String,
     pending: Pending,
     /// When it went out, against [`STILL_TIMEOUT`].
+    sent: Instant,
+}
+
+/// A `Runtime.evaluate` of [`hover::ASK`] that is out with the engine.
+///
+/// Beside its target, as [`Still`] is, so that an answer about one page is
+/// never shown over another; and never a `call`, because a page whose
+/// navigation is pending holds every such question until it commits — for a
+/// host that never answers, forever. See [`crate::hover`].
+struct Ask {
+    target: String,
+    /// The point it is about, as the [`hover::Tracker`] keeps it: in the
+    /// terminal's pixels, which is what its answer is matched against. The
+    /// page was asked about the same point in its own.
+    at: (i32, i32),
+    pending: Pending,
+    /// When it went out, against [`hover::ASK_TIMEOUT`].
     sent: Instant,
 }
 
@@ -344,15 +479,26 @@ pub fn run(options: Options) -> Result<(), String> {
             format!("{why}; the engine said: {}", tail.join(" / "))
         }
     })?;
-    let client = browser.attach(&first, CONNECT_TIMEOUT)?;
-    let mut tabs = Tabs::new(Tab::new(first, client, "about:blank"));
+    // What pages are told about light and dark, before there is a page to
+    // tell: the flags now, the terminal's answer when it comes.
+    let appearance = Appearance::new(options.scheme, options.force_dark);
+    // Set up as every other tab is: so that the page most uploads happen in
+    // is one whose file inputs are asked on the row, so that nothing a
+    // session is told when it is made can be forgotten on this one, and so
+    // that the first page is not a tab with less known about it than the
+    // rest — its main frame's id above all, which is what its loading is
+    // told apart from an iframe's by. See [`connect_tab`].
+    let (client, frame) = connect_tab(&mut browser, &first, &appearance)?;
+    let mut first = Tab::new(first, client, "about:blank");
+    first.frame = frame;
+    let mut tabs = Tabs::new(first);
 
     let mut pane = Pane::enter(0, 1).map_err(|e| format!("cannot take the terminal: {e}"))?;
     // Built here rather than in `drive`, so that what it knows about the
     // downloads is still here when `drive` is over and the engine is being
     // stopped. The rest of it goes at the end of this block, before the pane
     // is given back, as it always did.
-    let (outcome, downloads) = match pane.metrics() {
+    let (outcome, downloads) = match pane.metrics(None) {
         Ok(metrics) => {
             let mut chrome = Chrome {
                 painter: Painter::new(),
@@ -364,6 +510,8 @@ pub fn run(options: Options) -> Result<(), String> {
                 still: None,
                 wheel: scroll::Wheel::start(),
                 bar: None,
+                find: None,
+                last_needle: String::new(),
                 history: if engine.profile().is_temporary() {
                     History::in_memory()
                 } else {
@@ -372,6 +520,20 @@ pub fn run(options: Options) -> Result<(), String> {
                 search_url: options.search_url.clone(),
                 navigation: None,
                 downloads: Downloads::new(downloads_dir),
+                upload_dir: None,
+                hover: hover::Tracker::default(),
+                asking: None,
+                shape: Shape::Default,
+                hint: None,
+                scale_choice: options.scale,
+                scale: options.scale.resolve(metrics.cell),
+                zooms: if engine.profile().is_temporary() {
+                    Zooms::in_memory()
+                } else {
+                    Zooms::load(engine.profile().dir())
+                },
+                appearance,
+                cell_hint: None,
             };
             let outcome = drive(
                 &mut pane,
@@ -465,15 +627,32 @@ fn drive(
         if chrome.downloads.expire(Instant::now()) {
             redraw_row(pane, tabs, chrome)?;
         }
+        // A load's seconds, counted up: a redraw when the number changes,
+        // which is once a second while something is loading and never
+        // otherwise, at most a pass late.
+        let hint = tabs
+            .active()
+            .filter(|tab| tab.loading)
+            .map(|tab| load::loading_hint(tab.loading_for(Instant::now())));
+        if hint != chrome.hint {
+            chrome.hint = hint;
+            redraw_row(pane, tabs, chrome)?;
+        }
         if RESIZED.swap(false, Ordering::SeqCst) {
             chrome.metrics = pane
-                .metrics()
+                .metrics(chrome.cell_hint)
                 .map_err(|e| format!("cannot measure the pane: {e}"))?;
+            // A font made bigger in the terminal is a resize too, and a cell
+            // that has grown past 28 pixels is a HiDPI answer that follows it.
+            chrome.scale = chrome.scale_choice.resolve(chrome.metrics.cell);
             pane.write(b"\x1b[2J").map_err(|e| e.to_string())?;
             let metrics = chrome.metrics;
+            let mut css = page_pixels(metrics);
             if let Some(tab) = tabs.active_mut() {
                 let stopped = tab.dialog.is_some();
-                emulate(&mut tab.connection, metrics, stopped)?;
+                let viewport = viewport(chrome, tab);
+                css = viewport.css;
+                emulate(&mut tab.connection, viewport, stopped)?;
                 restart_screencast(&mut tab.connection, metrics, stopped)?;
             }
             // The screen was cleared and the page is a different size, so
@@ -485,9 +664,12 @@ fn drive(
             // page to stop dead halfway through a flick; what a resize really
             // invalidates is the *point* the events are sent at, which may now
             // be off the page, so that is brought back inside it and the
-            // notches carry on. See `docs/design/browser.md`.
-            let (width, height) = page_pixels(chrome.metrics);
-            chrome.wheel.resized((width as i32, height as i32));
+            // notches carry on. See `docs/design/browser.md`. Inside it in
+            // the page's own pixels, which is what the point is sent in.
+            chrome.wheel.resized((css.0 as i32, css.1 as i32));
+            // The page is a different size under the same pointer, so what
+            // was under it is not known any more.
+            forget_hover(pane, chrome)?;
             redraw_row(pane, tabs, chrome)?;
         }
 
@@ -538,6 +720,9 @@ fn drive(
                 return Ok(());
             }
         }
+        // Whatever the pointer did in all the reports just read, told to the
+        // page and asked about once: see [`crate::hover`].
+        tick_hover(pane, tabs, chrome)?;
 
         // What the animator thread has been doing while this loop was busy.
         // Nothing here drives it — it has its own clock and its own way onto
@@ -574,6 +759,12 @@ fn drive(
             if tabs.active().map(Tab::line) != before {
                 redraw_row(pane, tabs, chrome)?;
             }
+        }
+        // The answer to a search, and the next one if keys were typed while it
+        // was out. After the page's events, so that a navigation which took
+        // the document away has already closed the prompt.
+        if pump_find(tabs, chrome) {
+            redraw_row(pane, tabs, chrome)?;
         }
         // And last, because it is the thing to do when nothing else happened:
         // a page that has stopped moving gets its lossless picture.
@@ -613,24 +804,48 @@ fn tell(
     }
 }
 
-/// Tell the engine how big the page is.
-fn emulate(client: &mut Client, metrics: Metrics, stopped: bool) -> Result<(), String> {
-    let (width, height) = page_pixels(metrics);
+/// The page as the tab in front is told it: the pane, less the row, divided
+/// by the terminal's scale and the tab's zoom.
+///
+/// Everything that sends the engine a size or a point asks this: the
+/// override itself, a click, the wheel, and anything that hit-tests the page.
+/// See [`crate::zoom::Viewport::css_point`] for the one mapping from the
+/// terminal's pixels to the page's.
+fn viewport(chrome: &Chrome, tab: &Tab<Client>) -> Viewport {
+    Viewport::fit(
+        page_pixels(chrome.metrics),
+        chrome.scale * tab.zoom.factor(),
+    )
+}
+
+/// Tell the engine how big the page is, and how many of the pane's pixels
+/// are one of the page's.
+///
+/// One `Emulation.setDeviceMetricsOverride`, with the CSS size and the factor
+/// as the device's pixel ratio, which is what a browser's zoom and a HiDPI
+/// display both are to a page: it lays itself out again for the size, live,
+/// and draws its stills at the pane's resolution. It outlives navigations and
+/// reloads on its session, and a session made afterwards starts without it,
+/// so it is sent where the size always was — when a tab comes to the front
+/// and when the pane is resized — and when the level changes. The measurements
+/// are in [`crate::zoom`].
+fn emulate(client: &mut Client, viewport: Viewport, stopped: bool) -> Result<(), String> {
     tell(
         client,
         stopped,
         "Emulation.setDeviceMetricsOverride",
-        Json::object(vec![
-            ("width", Json::number(width)),
-            ("height", Json::number(height)),
-            ("deviceScaleFactor", Json::number(1)),
-            ("mobile", Json::Bool(false)),
-        ]),
+        viewport.metrics_params(),
         crate::cdp::CALL_TIMEOUT,
     )
 }
 
 /// Start the frames coming, in the format [`crate::motion`] argues for.
+///
+/// At the pane's size whatever the zoom: the engine casts no more pixels than
+/// the page's CSS viewport has, so a page zoomed in sends frames smaller than
+/// the pane — at 200%, half of it each way — and the terminal scales them
+/// into the same cells, until the still at the pane's own resolution replaces
+/// them. See [`crate::zoom`] for why nothing sharper was taken.
 fn start_screencast(client: &mut Client, metrics: Metrics, stopped: bool) -> Result<(), String> {
     let (width, height) = page_pixels(metrics);
     tell(
@@ -713,9 +928,16 @@ pub fn page_title(client: &mut Client) -> Option<String> {
 /// The problem the tab had is cleared before anything is sent, so that a
 /// reason from an earlier navigation — one whose reply was dropped and whose
 /// failure landed afterwards — cannot be pinned on this one.
+///
+/// The load's clock starts here, at the Enter, and the page is taken as no
+/// longer committed from here too: its renderer will hold anything asked of
+/// it from the moment the engine has the navigation (see [`crate::hover`]),
+/// and the engine's own word that it is leaving is three milliseconds behind.
 fn navigate(tabs: &mut Tabs<Client>, chrome: &mut Chrome, url: &str) -> Option<String> {
     let tab = tabs.active_mut()?;
     tab.problem = None;
+    tab.since = Some(Instant::now());
+    tab.committed = false;
     let sent = tab.connection.send(
         "Page.navigate",
         Json::object(vec![("url", Json::string(url))]),
@@ -820,12 +1042,13 @@ fn activate(
         SWITCH_TIMEOUT,
     );
     let metrics = chrome.metrics;
+    let base = chrome.upload_base();
     let Some(tab) = tabs.active_mut() else {
         return Ok(());
     };
     // First, whether the page is stopped behind a dialog, because that
     // decides whether anything below can be waited for. See [`tell`].
-    bin_events(tab);
+    bin_events(tab, &base);
     let mut stopped = tab.dialog.is_some();
     if let Err(why) = tell(
         &mut tab.connection,
@@ -838,13 +1061,20 @@ fn activate(
         // is the one way to get here with a page that is fine. The command is
         // queued behind the dialog like everything else, so the rest is told
         // rather than asked; anything else is a page that is not answering.
-        bin_events(tab);
+        bin_events(tab, &base);
         if tab.dialog.is_none() {
             return Err(why);
         }
         stopped = true;
     }
-    emulate(&mut tab.connection, metrics, stopped)?;
+    // The level its host was left at, which another tab on the same site may
+    // have changed while this one was behind. A page with no host keeps the
+    // tab's own.
+    if let Some(host) = zoom::host_key(&tab.url) {
+        tab.zoom = chrome.zooms.get(Some(&host));
+    }
+    let viewport = viewport(chrome, tab);
+    emulate(&mut tab.connection, viewport, stopped)?;
     // Whatever this tab queued and nobody has read goes in the bin, frames
     // above all: the newest of them is older than the tab was, and painting it
     // would put the page as it looked before it was left behind on screen
@@ -863,7 +1093,7 @@ fn activate(
     // Except while a dialog is up, when the page cannot say what it is called
     // and a question would cost the two seconds of [`page_loaded`] for
     // nothing. The page is asked when the dialog closes instead.
-    bin_events(tab);
+    bin_events(tab, &base);
     if tab.dialog.is_none() {
         if let Some(loaded) = page_loaded(&mut tab.connection) {
             tab.loaded(loaded);
@@ -878,16 +1108,23 @@ fn activate(
     Ok(())
 }
 
-/// Throw away what a tab has queued, except what it says about a dialog.
+/// Throw away what a tab has queued, except what it says about a dialog or a
+/// file input.
 ///
 /// A queue that is binned is binned for its frames, which are older than the
 /// moment they would be painted in. A dialog is not like that: the page opened
 /// it and is stopped until it is answered, however long ago that was, and a
 /// `Page.javascriptDialogOpening` that went in the bin would be a tab that
-/// had stopped with nothing on the row to say why and nothing to answer.
-fn bin_events(tab: &mut Tab<Client>) {
+/// had stopped with nothing on the row to say why and nothing to answer. A
+/// `Page.fileChooserOpened` is the same question without the stopping: the
+/// person clicked an input, and a prompt that went in the bin would be a
+/// click that did nothing — which is what issue #11 was. `base` is where a
+/// prompt opened here starts.
+fn bin_events(tab: &mut Tab<Client>, base: &Path) {
+    let home = upload::home();
     for event in tab.connection.events() {
         tab.dialog_event(&event);
+        tab.chooser_event(&event, base, home.as_deref());
     }
 }
 
@@ -934,6 +1171,13 @@ fn switched(
     // forgetting it is the whole of stopping it. It also lets go of that
     // tab's session, which a tab that is closing needs.
     chrome.wheel.forget();
+    // The find prompt was searching the page being left. Closed before that
+    // page stops painting, so that the clear goes to it while it is still
+    // the one on the screen.
+    close_find(tabs, chrome);
+    // The same for the pointer: it is over a different page now, and an ask
+    // in flight is the old page's, dropped the way the still is.
+    forget_hover(pane, chrome)?;
     if let Some(was) = &was {
         deactivate(tabs, was);
     }
@@ -956,7 +1200,12 @@ fn switched(
 }
 
 /// Open a page in a new tab and switch to it.
-fn open_tab(tabs: &mut Tabs<Client>, browser: &mut Client, url: &str) -> Result<(), String> {
+fn open_tab(
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    appearance: &Appearance,
+    url: &str,
+) -> Result<(), String> {
     let created = browser.call(
         "Target.createTarget",
         Json::object(vec![("url", Json::string(url))]),
@@ -966,22 +1215,84 @@ fn open_tab(tabs: &mut Tabs<Client>, browser: &mut Client, url: &str) -> Result<
         .and_then(Json::as_str)
         .ok_or_else(|| "the engine opened a page and did not say which".to_string())?
         .to_string();
-    let connection = connect_tab(browser, &target)?;
-    tabs.open(Tab::new(target, connection, url));
+    let (connection, frame) = connect_tab(browser, &target, appearance)?;
+    let mut tab = Tab::new(target, connection, url);
+    tab.frame = frame;
+    tabs.open(tab);
     Ok(())
 }
 
 /// Attach to a target and start listening to its page, whether or not it is
-/// the tab in front.
+/// the tab in front; and its main frame's id, if the engine says.
 ///
 /// `Page.enable` from the moment the tab exists rather than from the moment it
 /// is looked at: a tab that is loading in the background still has to tell the
 /// strip when it has a name, and the events it sends before anybody asks are
 /// the only notice there is.
-fn connect_tab(browser: &mut Client, target: &str) -> Result<Client, String> {
+///
+/// And a page's file inputs are asked about on the row from then on:
+/// `Page.setInterceptFileChooserDialog`, which turns a click on one into a
+/// `Page.fileChooserOpened` rather than the engine's own at-once `cancel`.
+/// Here and not in [`activate`], because it is per session and a tab behind
+/// gets the event too; and after `Page.enable`, because before it the command
+/// is accepted and does nothing — both measured against
+/// `chrome-headless-shell` 153. It survives the page navigating. See
+/// [`crate::upload`].
+///
+/// Then [`prepare_session`], which is everything else a session is told once
+/// for its whole life: sent and not waited for, so it costs the new tab
+/// nothing, and ahead of the frame tree only because it is the one of these
+/// the page will be looked at through.
+///
+/// `Page.getFrameTree` last, because a page's loading and an iframe's
+/// arrive as the same events under different frame ids, and the main frame's
+/// is what tells them apart ([`crate::load::is_main`]). It is browser-side
+/// and answers at once; a tab whose tree does not come still works, taking
+/// every frame's news as its own until its first landing names the frame.
+/// The interception is not optional in the same way: a tab without it would
+/// be one whose file inputs cancel themselves, so a refusal there is the
+/// tab's failure, as `Page.enable`'s is.
+///
+/// Every tab is made here, the first one included: a session made any other
+/// way would be a page that was never told what the rest were.
+fn connect_tab(
+    browser: &mut Client,
+    target: &str,
+    appearance: &Appearance,
+) -> Result<(Client, Option<String>), String> {
     let mut connection = browser.attach(target, CONNECT_TIMEOUT)?;
     connection.call_within("Page.enable", Json::empty(), SWITCH_TIMEOUT)?;
-    Ok(connection)
+    connection.call_within(
+        "Page.setInterceptFileChooserDialog",
+        Json::object(vec![("enabled", Json::Bool(true))]),
+        SWITCH_TIMEOUT,
+    )?;
+    prepare_session(&mut connection, appearance);
+    let frame = connection
+        .call_within("Page.getFrameTree", Json::empty(), SWITCH_TIMEOUT)
+        .ok()
+        .and_then(|tree| load::main_frame(&tree));
+    Ok((connection, frame))
+}
+
+/// Tell a new session what every session is told and nothing resets: the
+/// colour scheme a page is to see, and whether it is to be painted dark.
+///
+/// This is where every per-session `Emulation` command that is not about the
+/// size belongs. The size is not here because it changes with the pane and
+/// the zoom, and is sent by `activate` to the tab in front; what is here is
+/// per session and survives every navigation on it, and a target attached
+/// later starts without it — measured, in [`crate::appearance`] — so a
+/// session that missed this would be the one page in the browser that was
+/// light in a dark terminal.
+///
+/// Told rather than asked: a page that has just been made may already be
+/// stopped behind a dialog, and a scheme that did not take is a page that is
+/// light, which is no reason not to open it.
+pub fn prepare_session(client: &mut Client, appearance: &Appearance) {
+    for (method, params) in appearance.commands() {
+        let _ = client.notify(method, params);
+    }
 }
 
 /// Close one tab: the page in the engine, and the session on it.
@@ -1091,28 +1402,55 @@ fn page_cells(metrics: Metrics) -> Cells {
 /// place after the strip with more — and never instead of it, because the
 /// tab's line is what a person navigates by and a download is news, not a
 /// place. Behind the url bar and a dialog, like the tab's line itself.
+///
+/// The find prompt is a line being typed like the url bar, with its count at
+/// the right-hand end where a dialog's keys go; a file input's path, being
+/// typed, is another. Which of them has the row is [`row_owner`]'s to say.
+///
+/// Once none of them has it the row is shared, and two more things share
+/// it. On the left, a link under the pointer — `link: https://…` — in place
+/// of the tab's line, because the pointer resting on a link is the person
+/// asking where it goes. On the right, after a download's words, a load in
+/// progress: `esc stops`, and after a second the seconds. [`screen::split_line`]
+/// keeps the right when the pane is narrow, which is the dialog's rule for
+/// the same reason — the key that does something is what has to survive.
+/// With the strip, the right-hand choice goes in the url's place, the hover
+/// words and the hint before a url that is already the first thing to go; a
+/// plain-http page's url is marked `not secure` there, the strip's labels
+/// being too narrow to carry it. Markers are ASCII words, not glyphs: a
+/// padlock or a spinner is ambiguous-width in East Asian terminals, and a row
+/// one cell out wraps.
+///
+/// The zoom level is one more word of the same kind: `150%` while the tab in
+/// front is not at 100%. With one tab it goes after whatever else is at the
+/// right-hand end — the download's words or the loading hint — because the
+/// right is clipped from its end when the pane is narrow, and `esc stops` is
+/// a key that does something while the level is only news. With the strip it
+/// goes after the download, the link or the hint that stands in the url's
+/// place, for the same reason, and before the url when the url is there, so
+/// that it is the url that runs out of room first. Beside the title, never
+/// instead of it, and nothing of it under a line that owns the row.
 fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(), String> {
     let cols = chrome.metrics.cols;
     let Some(active) = tabs.active() else {
         return Ok(());
     };
-    let downloading = chrome.downloads.line(Instant::now());
-    let bytes = if let Some(bar) = &chrome.bar {
-        typing_row(cols, "url: ", &bar.line)
-    } else if let Some(dialog) = &active.dialog {
-        if dialog.typing() {
-            typing_row(
-                cols,
-                &screen::dialog_prompt(cols, &dialog.caption()),
-                &dialog.line,
-            )
-        } else {
-            screen::dialog_line(cols, &dialog.caption(), dialog.hint())
-        }
+    let now = Instant::now();
+    let downloading = chrome.downloads.line(now);
+    let hovered = &chrome.hover.shown().href;
+    let pointing = (!hovered.is_empty()).then(|| hover::words(hovered));
+    let loading = active
+        .loading
+        .then(|| load::loading_hint(active.loading_for(now)));
+    let marker = active.zoom.marker();
+    let bytes = if let Some(owner) = row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref()) {
+        owned_row(cols, owner)
     } else if tabs.len() < 2 {
-        match &downloading {
-            Some(words) => screen::split_line(cols, &active.line(), words),
-            None => screen::status_line(cols, &active.line()),
+        let left = pointing.unwrap_or_else(|| active.line());
+        // The download's words or the loading hint, then the level.
+        match words(&[downloading.or(loading).as_deref(), marker.as_deref()]) {
+            Some(right) => screen::split_line(cols, &left, &right),
+            None => screen::status_line(cols, &left),
         }
     } else {
         // Held here first, because a label can be a sentence made on the spot
@@ -1125,20 +1463,114 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
             .map(|(index, (name, tab))| screen::TabLabel {
                 title: name,
                 active: index == tabs.active_index(),
-                dialog: tab.dialog.is_some(),
+                // A dialog or a file input's path: the page is waiting on
+                // the person either way.
+                dialog: tab.asks(),
             })
             .collect();
-        let right = downloading.as_deref().unwrap_or(&active.url);
-        screen::tab_line(cols, &labels, right)
+        // After the strip, the download, the link or the hint in the url's
+        // place and the level after it; or the level, the transport's warning
+        // and the url, which is the one to run out of room.
+        let right = match downloading.or(pointing).or(loading) {
+            Some(news) => words(&[Some(&news), marker.as_deref()]),
+            None => words(&[marker.as_deref(), active.trust.words(), Some(&active.url)]),
+        };
+        screen::tab_line(cols, &labels, right.as_deref().unwrap_or_default())
     };
     pane.write(&bytes).map_err(|e| e.to_string())
+}
+
+/// The row as whichever of them owns it draws it.
+fn owned_row(cols: u32, owner: RowOwner<'_>) -> Vec<u8> {
+    match owner {
+        RowOwner::Bar(bar) => typing_row(cols, "url: ", &bar.line),
+        RowOwner::Find(find) => {
+            typing_row_beside(cols, "find: ", &find.finder.line, &find.finder.count_text())
+        }
+        RowOwner::Dialog(dialog) if dialog.typing() => typing_row(
+            cols,
+            &screen::dialog_prompt(cols, &dialog.caption()),
+            &dialog.line,
+        ),
+        RowOwner::Dialog(dialog) => screen::dialog_line(cols, &dialog.caption(), dialog.hint()),
+        RowOwner::Upload(upload) => typing_row(
+            cols,
+            &screen::dialog_prompt(cols, &upload.prompt()),
+            &upload.line,
+        ),
+    }
+}
+
+/// What has the whole row, when something does: something being typed, or
+/// a question the page is stopped on.
+///
+/// Each of these is kept where it belongs — the url bar on [`Chrome`],
+/// because it is the person's and `ctrl+l` opens the same bar on any tab; the
+/// rest on the tab in front, because each is that page's — and what is
+/// shared is the one rule for which of them has the row and the cursor.
+enum RowOwner<'a> {
+    Bar(&'a UrlBar),
+    /// `ctrl+f`'s prompt: the person's, like the bar, and not any page's.
+    Find(&'a Find),
+    /// Any dialog: a `prompt()` is a line with the cursor, the others are a
+    /// question answered by a key.
+    Dialog(&'a Dialog),
+    Upload(&'a Upload),
+}
+
+/// Which line owns the row: the url bar, then the find prompt, then a dialog,
+/// then a file input's path — or nothing, and the row is the page's own.
+///
+/// The url bar first, because it was opened by the person, and a question
+/// that arrived while they were typing is there when they finish. The find
+/// prompt next, for the same reason; the keyboard cannot have both open. A dialog
+/// next, because the page is stopped behind it — even behind an upload
+/// prompt, since a chooser does not stop the page and a script can
+/// `alert()` while a path is half typed; the path waits underneath and comes
+/// back when the alert is answered. The upload prompt last, because it is
+/// the page's question and the page is not waiting on it.
+///
+/// A line that joins them goes in here, in its place in that order, as one
+/// more arm of [`RowOwner`]; [`redraw_row`] and
+/// [`row_owns_cursor`] follow from it. What does not follow from it is which
+/// keys reach each one, which is [`handle_input`]'s, in the same order but
+/// with a rule of its own for each about which of the program's keys survive
+/// it; and [`paste`], which goes to the same place by the same order.
+fn row_owner<'a, C>(
+    tabs: &'a Tabs<C>,
+    bar: Option<&'a UrlBar>,
+    find: Option<&'a Find>,
+) -> Option<RowOwner<'a>> {
+    if let Some(bar) = bar {
+        return Some(RowOwner::Bar(bar));
+    }
+    if let Some(find) = find {
+        return Some(RowOwner::Find(find));
+    }
+    let tab = tabs.active()?;
+    if let Some(dialog) = &tab.dialog {
+        return Some(RowOwner::Dialog(dialog));
+    }
+    tab.upload.as_ref().map(RowOwner::Upload)
+}
+
+/// The words that are there, two spaces apart, or `None` for none.
+fn words(parts: &[Option<&str>]) -> Option<String> {
+    let there: Vec<&str> = parts.iter().flatten().copied().collect();
+    (!there.is_empty()).then(|| there.join("  "))
 }
 
 /// The row as `line` being typed after `prompt`: as much of it as fits, with
 /// the cursor in sight.
 fn typing_row(cols: u32, prompt: &str, line: &Line) -> Vec<u8> {
-    let view = line.view(screen::prompt_room(cols, prompt));
-    screen::prompt_line(cols, prompt, &view.text, &view.hint, view.cursor)
+    typing_row_beside(cols, prompt, line, "")
+}
+
+/// The same, with `right` at the right-hand end of the row: the find
+/// prompt's count. With `right` empty it is [`typing_row`].
+fn typing_row_beside(cols: u32, prompt: &str, line: &Line, right: &str) -> Vec<u8> {
+    let view = line.view(screen::prompt_room_beside(cols, prompt, right));
+    screen::prompt_line_beside(cols, prompt, &view.text, &view.hint, view.cursor, right)
 }
 
 /// Everything the browser connection said: which pages there are.
@@ -1162,10 +1594,25 @@ fn handle_target_events(
         if chrome.downloads.take(event, Instant::now()) {
             redraw = true;
         }
-        let outcome = tabs.take(event, |target| connect_tab(browser, target));
+        let appearance = chrome.appearance;
+        let mut frame = None;
+        let outcome = tabs.take(event, |target| {
+            connect_tab(browser, target, &appearance).map(|(connection, main)| {
+                frame = main;
+                connection
+            })
+        });
         match outcome {
             Outcome::Ignored => {}
-            Outcome::Opened | Outcome::Renamed => redraw = true,
+            Outcome::Opened => {
+                // An opened tab is the one in front; one that was already
+                // ours and was only switched to keeps the frame it had.
+                if let (Some(frame), Some(tab)) = (frame, tabs.active_mut()) {
+                    tab.frame = Some(frame);
+                }
+                redraw = true;
+            }
+            Outcome::Renamed => redraw = true,
             Outcome::Gone { mut tab, why } => {
                 tab.connection.close();
                 redraw = true;
@@ -1219,6 +1666,11 @@ fn handle_page_events(
     // The newest frame worth painting, still encoded.
     let mut newest_frame: Option<Vec<u8>> = None;
     let mut redraw = false;
+    // Whether the page the find prompt is searching has gone to another.
+    let mut find_left = false;
+    // Whether the page in front left or arrived, which takes away whatever
+    // link was under the pointer.
+    let mut left_page = false;
 
     for index in 0..tabs.len() {
         let Some(tab) = tabs.get_mut(index) else {
@@ -1279,12 +1731,85 @@ fn handle_page_events(
                     // rather than `chrome-error://chromewebdata/` — see
                     // [`crate::load`].
                     if let Some(landing) = load::landing(&params) {
+                        // Read beside the landing, from the same frame: how
+                        // the document came, and the main frame's id, which a
+                        // landing is the surest word on.
+                        tab.trust = load::trust(&params);
+                        if let Some(frame) = load::landed_frame(&params) {
+                            tab.frame = Some(frame);
+                        }
                         tab.landed(landing);
+                        redraw = true;
+                        // The matches, their highlights and the world they
+                        // were found from went with the document. The prompt
+                        // closes rather than searching a page the person has
+                        // not seen yet; the needle is kept for the next
+                        // `ctrl+f`.
+                        find_left |= chrome
+                            .find
+                            .as_ref()
+                            .is_some_and(|find| find.target == tab.target);
+                        if index == active {
+                            left_page = true;
+                        }
+                        // A page lands at its host's level, as it would in a
+                        // browser: a link from a zoomed site to another lands
+                        // at that one's. The tab in front is told now — told,
+                        // not asked, because a page that has just landed may
+                        // already be asking something — and a tab behind is
+                        // told when it comes to the front.
+                        let wanted =
+                            zoom::host_key(&tab.url).map(|host| chrome.zooms.get(Some(&host)));
+                        if let Some(wanted) = wanted.filter(|&wanted| wanted != tab.zoom) {
+                            tab.zoom = wanted;
+                            if index == active {
+                                let viewport = viewport(chrome, tab);
+                                let _ = emulate(&mut tab.connection, viewport, true);
+                                chrome.motion.reset(Instant::now());
+                                chrome.still = None;
+                                chrome
+                                    .wheel
+                                    .resized((viewport.css.0 as i32, viewport.css.1 as i32));
+                            }
+                        }
+                    }
+                }
+                "Page.frameStartedNavigating" => {
+                    // The page is leaving, typed or clicked, before any byte
+                    // has come back: the note goes up now rather than at the
+                    // commit, which for a host that never answers is never.
+                    // See [`crate::load`].
+                    if let Some(url) = load::started(&params, tab.frame.as_deref()) {
+                        tab.started(url, Instant::now());
+                        redraw = true;
+                        if index == active {
+                            left_page = true;
+                        }
+                    }
+                }
+                "Page.frameStartedLoading" => {
+                    // The older engines' word for the same, with no url in
+                    // it; and a `pushState`'s, which the stop undoes a
+                    // millisecond later. No note, so the row shows the hint.
+                    if load::is_main(&params, tab.frame.as_deref()) && !tab.loading {
+                        tab.loading = true;
+                        tab.since = Some(Instant::now());
+                        redraw = true;
+                    }
+                }
+                "Page.frameStoppedLoading" => {
+                    // The end of every load, however it ended: finished,
+                    // stopped, abandoned. After a stop no load event is ever
+                    // coming, so this and not that is what says it is over.
+                    if load::is_main(&params, tab.frame.as_deref()) {
+                        tab.stopped_loading();
                         redraw = true;
                     }
                 }
                 "Page.loadEventFired" => {
-                    tab.loading = false;
+                    // Still the moment to ask the title. What says the load
+                    // is over is `Page.frameStoppedLoading`, in the same
+                    // millisecond.
                     ask_title = true;
                     redraw = true;
                 }
@@ -1318,6 +1843,16 @@ fn handle_page_events(
                         redraw = true;
                     }
                 }
+                "Page.fileChooserOpened" => {
+                    // A click on a file input, on this tab, in front or not:
+                    // a path to type on the row, answered by a key in
+                    // `answer_upload`. The page is not stopped.
+                    let base = chrome.upload_base();
+                    let event = Event { method, params };
+                    if tab.chooser_event(&event, &base, upload::home().as_deref()) {
+                        redraw = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1339,6 +1874,12 @@ fn handle_page_events(
         }
     }
 
+    if find_left {
+        close_find(tabs, chrome);
+    }
+    if left_page {
+        forget_hover(pane, chrome)?;
+    }
     if redraw {
         redraw_row(pane, tabs, chrome)?;
     }
@@ -1379,14 +1920,38 @@ fn paint(
     Ok(())
 }
 
-/// Whether the row is a line being typed into: the url bar, or the answer to
-/// a `prompt()` on the page in front.
+/// Whether the row is a line being typed into: the url bar, the find
+/// prompt, the answer to a `prompt()` on the page in front, or a path for its
+/// file input — whichever [`row_owner`] says has the row.
 fn row_owns_cursor(tabs: &Tabs<Client>, chrome: &Chrome) -> bool {
-    chrome.bar.is_some()
-        || tabs
-            .active()
-            .and_then(|tab| tab.dialog.as_ref())
-            .is_some_and(|dialog| dialog.typing())
+    typing_line(tabs, chrome).is_some()
+}
+
+/// Which line being typed has the row, when one has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Typing {
+    /// `ctrl+l`, or a new tab.
+    Url,
+    /// `ctrl+f`.
+    Find,
+    /// A page's `prompt()`.
+    Prompt,
+    /// A path for the page's file input.
+    Upload,
+}
+
+/// The line a key, a paste and the cursor go to: [`row_owner`]'s order, less
+/// a dialog that is answered by a key rather than typed into — an alert has
+/// the row and no line, and a path half typed under it waits. Derived rather
+/// than decided again, so that what the row shows and where the typing goes
+/// cannot disagree.
+fn typing_line(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<Typing> {
+    match row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref())? {
+        RowOwner::Bar(_) => Some(Typing::Url),
+        RowOwner::Find(_) => Some(Typing::Find),
+        RowOwner::Dialog(dialog) => dialog.typing().then_some(Typing::Prompt),
+        RowOwner::Upload(_) => Some(Typing::Upload),
+    }
 }
 
 /// Whether the page in front is stopped behind a dialog.
@@ -1468,7 +2033,15 @@ fn collect_still(
         chrome.motion.still_failed();
         return Ok(());
     };
-    let raw = Raw::rgba(&image.rgba, image.width, image.height);
+    // At a fractional level the engine's rounding leaves the still a pixel or
+    // two off the pane, and a picture that is not the pane's size is one the
+    // terminal resamples until the text goes soft. See [`zoom::fit`].
+    let pane_pixels = page_pixels(chrome.metrics);
+    let fitted = zoom::fit(&image.rgba, image.width, image.height, 4, pane_pixels);
+    let raw = match &fitted {
+        Some(pixels) => Raw::rgba(pixels, pane_pixels.0, pane_pixels.1),
+        None => Raw::rgba(&image.rgba, image.width, image.height),
+    };
     paint(pane, tabs, chrome, raw)
 }
 
@@ -1571,16 +2144,178 @@ fn scroll(tabs: &Tabs<Client>, chrome: &Chrome, report: &MouseInput) {
     let Some(tab) = tabs.active() else {
         return;
     };
-    let distance = (
-        report.wheel.0 as f64 * WHEEL_PIXELS,
-        report.wheel.1 as f64 * WHEEL_PIXELS,
-    );
+    // In the page's pixels, both of them: the point, and a notch that moves
+    // the page the same distance on the screen whatever it is zoomed to.
+    let viewport = viewport(chrome, tab);
+    let at = css_point(viewport, (x, y));
     chrome.wheel.notch(
         &tab.target,
         Arc::new(Wire::new(tab.connection.notifier())),
-        (x, y),
-        distance,
+        (at.0.round() as i32, at.1.round() as i32),
+        viewport.notch(report.wheel, WHEEL_PIXELS),
     );
+}
+
+/// Once a pass: what the pointer did, told to the page and asked about, for
+/// the tab in front.
+///
+/// Three steps, each cheap and each at most once. The answer to the last ask
+/// is collected first, so that the row and the pointer's shape change the
+/// pass it arrives. Then the page is told where the pointer is — one
+/// `mouseMoved` at the latest position however many reports there were,
+/// which is what makes its hover styling and tooltips work — and not counted
+/// as input to [`crate::motion`], for the reason the mouse arm of
+/// [`handle_input`] gives. Then, if nothing is out, the page is asked what is
+/// under it: not while anything [`row_owner`] names has the row — the url
+/// bar, the find prompt, a dialog that has stopped the page, a file input's
+/// path — and not while a navigation has not committed, when the engine
+/// would hold the question until it did ([`crate::hover`]).
+///
+/// Nothing at all while one of those has the row, the page's `mouseMoved`
+/// included, rather than only no ask. The words the ask is for would have
+/// nowhere to go, since whatever has the row takes all of it; a dialog's page
+/// is stopped and would queue the moves behind its question; and the person
+/// is answering or typing on the row, and should have an arrow to do it with
+/// rather than the hand of a link they are not about to follow. The pointer
+/// is asked about again when the row is the page's once more, the first time
+/// it moves.
+fn tick_hover(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> Result<(), String> {
+    collect_hover(pane, tabs, chrome)?;
+    let owned = row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref()).is_some();
+    if owned || tabs.active().is_none() {
+        return forget_hover(pane, chrome);
+    }
+    let now = Instant::now();
+    let buttons = chrome.buttons;
+    // The tracker keeps the pointer in the terminal's pixels; the page is
+    // told and asked in its own, at the level it is at now.
+    let Some(viewport) = tabs.active().map(|tab| viewport(chrome, tab)) else {
+        return Ok(());
+    };
+    let Some(tab) = tabs.active_mut() else {
+        return Ok(());
+    };
+    if let Some((at, modifiers)) = chrome.hover.tell(now) {
+        let (x, y) = css_point(viewport, at);
+        let _ = tab.connection.notify(
+            "Input.dispatchMouseEvent",
+            Json::object(vec![
+                ("type", Json::string("mouseMoved")),
+                ("x", Json::number(x)),
+                ("y", Json::number(y)),
+                ("modifiers", Json::number(modifiers)),
+                ("button", Json::string("none")),
+                ("buttons", Json::number(buttons)),
+            ]),
+        );
+    }
+    if tab.loading && !tab.committed {
+        return Ok(());
+    }
+    let Some(at) = chrome.hover.wants_ask(now, chrome.asking.is_some()) else {
+        return Ok(());
+    };
+    // Recorded as asked whether or not it could be sent: a session that
+    // cannot take a command is heard about elsewhere, and asking it again
+    // every pass would not help.
+    chrome.hover.asked(at, now);
+    let (x, y) = css_point(viewport, at);
+    if let Ok(pending) = tab.connection.send(
+        "Runtime.evaluate",
+        hover::ask(x.round() as i32, y.round() as i32),
+    ) {
+        chrome.asking = Some(Ask {
+            target: tab.target.clone(),
+            at,
+            pending,
+            sent: now,
+        });
+    }
+    Ok(())
+}
+
+/// Take the answer to the hover ask, if it has come back; drop it if the
+/// tab it was for is no longer in front or it has been out for
+/// [`hover::ASK_TIMEOUT`]. A dropped ask leaves its position marked asked, so
+/// the page is asked again when the pointer moves and not before.
+fn collect_hover(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+) -> Result<(), String> {
+    let Some(ask) = chrome.asking.as_ref() else {
+        return Ok(());
+    };
+    if tabs.active_target() != Some(ask.target.as_str()) {
+        chrome.asking = None;
+        return Ok(());
+    }
+    let Some(tab) = tabs.active() else {
+        return Ok(());
+    };
+    let Some(answer) = tab.connection.take_reply(&ask.pending) else {
+        if ask.sent.elapsed() >= hover::ASK_TIMEOUT {
+            chrome.asking = None;
+        }
+        return Ok(());
+    };
+    let at = ask.at;
+    chrome.asking = None;
+    let Some(hovered) = answer.ok().as_ref().and_then(hover::answer) else {
+        return Ok(());
+    };
+    if chrome.hover.answered(at, hovered) {
+        redraw_row(pane, tabs, chrome)?;
+    }
+    sync_shape(pane, chrome)
+}
+
+/// The pointer is not over the page in front any more, or the page is not
+/// the one it was over: forget what was under it, drop the ask about it, and
+/// give the terminal its arrow back. The caller redraws the row; nothing
+/// here does, so that a caller about to redraw anyway is not made to twice.
+fn forget_hover(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> {
+    chrome.asking = None;
+    chrome.hover.left();
+    sync_shape(pane, chrome)
+}
+
+/// Tell the terminal the pointer's shape, if it is not the one it was last
+/// told. The name is [`Shape::name`]'s, from this program's own table; the
+/// page's `cursor` string only chose which. See [`screen::pointer_shape`].
+fn sync_shape(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> {
+    let shape = chrome.hover.shown().shape;
+    if shape == chrome.shape {
+        return Ok(());
+    }
+    chrome.shape = shape;
+    pane.write(&screen::pointer_shape(shape.name()))
+        .map_err(|e| e.to_string())
+}
+
+/// Whether a mouse report is the pointer merely moving — no button held —
+/// which is the hover's and not sent on as it comes. A drag is a move with a
+/// button, a selection being made, and every report of it goes to the page.
+fn routes_to_hover(report: &MouseInput) -> bool {
+    report.kind == MouseKind::Move && report.button.is_none()
+}
+
+/// Where a point in the page's part of the pane is on the page, in CSS
+/// pixels: the one place a terminal's coordinates become the page's, for a
+/// click, a wheel notch and the hover alike.
+///
+/// The arithmetic is [`Viewport::css_point`]'s and nowhere else's; this is
+/// the loop's one door to it, so that a caller holding a terminal point asks
+/// here with the [`viewport`] of the tab it is about, and cannot do the
+/// division some other way. What comes in is [`crate::input::page_point`]'s
+/// — the report in terminal pixels, less the status row — and everything
+/// that is about the screen rather than the page is decided on that before
+/// it gets here: whether the point is on the row, whether two presses are a
+/// double click, and whether the pointer has moved far enough to ask the page
+/// again ([`hover::ASK_STEP`]), which at 300% would otherwise be twelve of
+/// the screen's pixels and at 25% one.
+fn css_point(viewport: Viewport, at: (i32, i32)) -> (f64, f64) {
+    viewport.css_point(at.0, at.1)
 }
 
 /// Handle one thing the terminal said. `false` means quit.
@@ -1593,6 +2328,34 @@ fn handle_input(
 ) -> Result<bool, String> {
     match input {
         Input::Mode { .. } => {}
+        // The terminal's background, which this program asked for: if it
+        // changes what pages are told, every tab is told again, in front or
+        // behind, and a page already loaded changes where it stands. Told,
+        // not asked, so that a tab stopped behind a dialog costs nothing.
+        Input::Colour { slot: 11, rgb } => {
+            if chrome.appearance.learned(rgb) {
+                for index in 0..tabs.len() {
+                    if let Some(tab) = tabs.get_mut(index) {
+                        prepare_session(&mut tab.connection, &chrome.appearance);
+                    }
+                }
+            }
+        }
+        // Another colour is nothing this program asked about.
+        Input::Colour { .. } => {}
+        // How big the terminal says a cell is. The pane is measured again
+        // on the next pass, as if it had been resized, which it has as far
+        // as the page is concerned when the kernel had no pixels to go on:
+        // the page, the placement and the HiDPI guess were all made from
+        // 8x16. A hint that changes nothing measured — a kernel that knew
+        // the pixels all along — is not a resize.
+        Input::CellSize { width, height } => {
+            chrome.cell_hint = Some((width, height));
+            let measured = pane.metrics(chrome.cell_hint);
+            if measured.is_ok_and(|metrics| metrics.cell != chrome.metrics.cell) {
+                RESIZED.store(true, Ordering::SeqCst);
+            }
+        }
         Input::PasteRefused { bytes } => {
             note(
                 tabs,
@@ -1617,8 +2380,14 @@ fn handle_input(
             if key.action != KeyAction::Release {
                 chrome.motion.input(Instant::now());
             }
-            if chrome.bar.is_some() {
-                return edit_url(pane, tabs, chrome, key);
+            // A line being typed on the row is asked about every key first;
+            // a `prompt()` is answered below, with the dialog it belongs to.
+            match typing_line(tabs, chrome) {
+                Some(Typing::Url) => return edit_url(pane, tabs, chrome, key),
+                Some(Typing::Find) => return edit_find(pane, tabs, chrome, key),
+                // A `prompt()` and a file input's path are answered below,
+                // after the program's own keys have had their say.
+                Some(Typing::Prompt | Typing::Upload) | None => {}
             }
             let was = tabs.active_target().map(str::to_string);
             let command = command(&key);
@@ -1648,12 +2417,38 @@ fn handle_input(
                     None => return answer_dialog(pane, tabs, chrome, key),
                 }
             }
+            if tabs.active().is_some_and(|tab| tab.upload.is_some()) {
+                // A file input's path is being typed. The page is not
+                // stopped, but the keys are the path's, by the same rule as a
+                // dialog's: the tab keys and quit work, and `ctrl+l`, reload,
+                // back and forward wait — a half-typed path is not something
+                // to navigate away from by reflex, and Escape is one key.
+                match command {
+                    Some(Command::CopySelection) => {
+                        let typed = tabs
+                            .active()
+                            .and_then(|tab| tab.upload.as_ref())
+                            .map(|upload| upload.line.text().to_string())
+                            .unwrap_or_default();
+                        copy_out(pane, tabs, &typed, Copied::Text)?;
+                        redraw_row(pane, tabs, chrome)?;
+                        return Ok(true);
+                    }
+                    Some(command) if survives_dialog(command) => {}
+                    Some(_) => return Ok(true),
+                    None => return answer_upload(pane, tabs, chrome, key),
+                }
+            }
             match command {
                 Some(Command::Quit) => return Ok(false),
                 Some(Command::EditUrl) => {
                     chrome.bar = tabs
                         .active()
                         .map(|tab| UrlBar::new(Line::selected(tab.url.clone())));
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(Command::Find) => {
+                    open_find(tabs, chrome);
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(Command::Reload) => {
@@ -1692,7 +2487,8 @@ fn handle_input(
                 Some(Command::Back) => go(tabs, -1),
                 Some(Command::Forward) => go(tabs, 1),
                 Some(Command::NewTab) => {
-                    match open_tab(tabs, browser, "about:blank") {
+                    let appearance = chrome.appearance;
+                    match open_tab(tabs, browser, &appearance, "about:blank") {
                         Ok(()) => {
                             switched(pane, tabs, browser, chrome, was)?;
                             // A new tab is a tab somebody is about to type an
@@ -1736,6 +2532,15 @@ fn handle_input(
                     copy_out(pane, tabs, &url, Copied::Url)?;
                     redraw_row(pane, tabs, chrome)?;
                 }
+                Some(what @ (Command::ZoomIn | Command::ZoomOut | Command::ZoomReset)) => {
+                    let now = tabs.active().map(|tab| tab.zoom).unwrap_or_default();
+                    let wanted = match what {
+                        Command::ZoomIn => now.step_in(),
+                        Command::ZoomOut => now.step_out(),
+                        _ => Zoom::DEFAULT,
+                    };
+                    rezoom(pane, tabs, chrome, wanted)?;
+                }
                 Some(Command::CopySelection) => {
                     let answer = tabs.active_mut().map(|tab| {
                         tab.connection.call_within(
@@ -1754,7 +2559,16 @@ fn handle_input(
                     redraw_row(pane, tabs, chrome)?;
                 }
                 None => {
-                    if let Some(tab) = tabs.active_mut() {
+                    let loading = tabs.active().is_some_and(|tab| tab.loading);
+                    let stops = key.key == Key::Escape
+                        && key.action != KeyAction::Release
+                        && escapes(
+                            row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref()).as_ref(),
+                            loading,
+                        ) == Escapes::StopLoading;
+                    if stops {
+                        stop_loading(pane, tabs, chrome)?;
+                    } else if let Some(tab) = tabs.active_mut() {
                         send_key(&mut tab.connection, &key);
                     }
                 }
@@ -1777,10 +2591,41 @@ fn handle_input(
                 // Not an event but a curve: what puts it on the wire is
                 // [`crate::scroll::Wheel`]'s thread, on its own clock.
                 scroll(tabs, chrome, &report);
+                // And the page moves under a pointer that did not, so what
+                // is under it is asked again.
+                chrome.hover.scrolled();
                 return Ok(true);
             }
-            let metrics = chrome.metrics;
+            let cell = chrome.metrics.cell;
             let pixels = chrome.parser.pixel_coordinates();
+            // In the terminal's pixels, inside the page: whether it is on the
+            // row, and how far the pointer has moved, are about the screen.
+            // The page's pixels come after, at the one place they are made.
+            let point = crate::input::page_point(&report, pixels, cell, 1);
+            // A bare motion is the hover's: remembered here and told to the
+            // page once a pass by `tick_hover`, since a terminal in any-event
+            // mode can send a thousand of them a second. Over the row it is
+            // the pointer leaving the page.
+            if routes_to_hover(&report) {
+                if point.1 >= 0 {
+                    chrome.hover.moved(point, report.mods.cdp());
+                    return Ok(true);
+                }
+                let shown = !chrome.hover.shown().href.is_empty();
+                forget_hover(pane, chrome)?;
+                if shown {
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                return Ok(true);
+            }
+            // A press is where the pointer is, too, so a click's position
+            // is the hover's.
+            if report.kind == MouseKind::Press && point.1 >= 0 {
+                chrome.hover.moved(point, report.mods.cdp());
+            }
+            let Some(viewport) = tabs.active().map(|tab| viewport(chrome, tab)) else {
+                return Ok(true);
+            };
             let clicks = &mut chrome.clicks;
             let buttons = &mut chrome.buttons;
             if let Some(tab) = tabs.active_mut() {
@@ -1789,7 +2634,8 @@ fn handle_input(
                     pixels,
                     clicks,
                     buttons,
-                    metrics,
+                    cell,
+                    viewport,
                     report,
                 );
             }
@@ -1813,10 +2659,19 @@ enum Command {
     /// The nth tab, counted from one.
     SelectTab(usize),
     /// `alt+c`: the page's selection to the host's clipboard — or, with the
-    /// url bar or a `prompt()`'s line open, that line.
+    /// url bar, the find prompt, a `prompt()`'s line or a file input's path
+    /// open, that line.
     CopySelection,
     /// `alt+u`: the current url to the host's clipboard.
     CopyUrl,
+    /// `ctrl+f`: find in the page. See [`crate::find`].
+    Find,
+    /// `alt+=` or `ctrl+=`: the next of [`crate::zoom::LEVELS`] up.
+    ZoomIn,
+    /// `alt+-` or `ctrl+-`: the next one down.
+    ZoomOut,
+    /// `alt+0` or `ctrl+0`: back to 100%.
+    ZoomReset,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -1835,7 +2690,19 @@ enum Command {
 /// touches the page not at all. Copying the selection does not, because it
 /// asks the page, and a page stopped behind a dialog answers nothing until the
 /// deadline — except on a `prompt()`, where it copies the line being typed,
-/// which [`handle_input`] does before it gets here.
+/// which [`handle_input`] does before it gets here. Find does not survive
+/// either, for the same reason: it asks the page.
+///
+/// A zoom waits too. The page is stopped, so it would not lay itself out
+/// again or be photographed at the new level until it was answered, and the
+/// level then arrives with whatever else was queued — which is the reload
+/// case again.
+///
+/// The same keys survive a file input's prompt, and the same wait, although
+/// that page is not stopped: what waits is still what would do something to
+/// the page the path is being typed for, and the copy is still of the line.
+/// A zoom there would lay the page out again under an input the person is
+/// answering for, and it is one key to finish the path first.
 fn survives_dialog(command: Command) -> bool {
     match command {
         Command::Quit
@@ -1849,7 +2716,11 @@ fn survives_dialog(command: Command) -> bool {
         | Command::Reload
         | Command::Back
         | Command::Forward
-        | Command::CopySelection => false,
+        | Command::CopySelection
+        | Command::Find
+        | Command::ZoomIn
+        | Command::ZoomOut
+        | Command::ZoomReset => false,
     }
 }
 
@@ -1892,6 +2763,94 @@ fn answer_dialog(
     Ok(true)
 }
 
+/// A key, as typing into the path for the file input on the page in front.
+///
+/// Sent, the prompt comes off the tab at once and the files go as
+/// `DOM.setFileInputFiles` — a notification, because the reply is `{}` and the
+/// engine reading the file is not this loop's business. The row says what
+/// went, on the tab's note, until the page says something else: there is no
+/// event for the page having read it, so there is no progress to show. The
+/// directory it came from is where the next prompt starts.
+///
+/// Escaped, nothing is sent, and the page is told `cancel` the way a real
+/// chooser would tell it: [`cancel_chooser`].
+fn answer_upload(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    key: KeyInput,
+) -> Result<bool, String> {
+    let Some(tab) = tabs.active_mut() else {
+        return Ok(true);
+    };
+    let Some(prompt) = tab.upload.as_mut() else {
+        return Ok(true);
+    };
+    match prompt.step(&key, &upload::Disk) {
+        upload::Outcome::Waiting => {}
+        upload::Outcome::Quit => return Ok(false),
+        upload::Outcome::Send => {
+            let params = prompt.reply();
+            tab.note = Some(prompt.sentence());
+            chrome.upload_dir = prompt.last_dir();
+            tab.upload = None;
+            let _ = tab.connection.notify("DOM.setFileInputFiles", params);
+        }
+        upload::Outcome::Cancel => {
+            let node = prompt.chooser.backend_node_id;
+            tab.upload = None;
+            cancel_chooser(&mut tab.connection, node);
+        }
+    }
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
+/// Tell a page its file input was dismissed: `cancel`, dispatched on the
+/// input itself, which is what Chromium's own chooser fires on a dismiss
+/// since 113.
+///
+/// There is no cancel in the protocol — `DOM.setFileInputFiles` with no
+/// files is answered and does nothing at all, measured — so the input is
+/// found by the node the event named (`DOM.resolveNode`, which answers at once
+/// on a live page, and needs no `DOM.enable`), the event is fired on it
+/// ([`Upload::CANCEL_FUNCTION`]), and the handle is let go. The first is a
+/// call, briefly, because the next two need what it answers; they are
+/// notifications. A page that does not answer in time does not hear its
+/// `cancel`, which is the one thing here this program can afford to lose.
+///
+/// Public so that the engine tests send what this program sends.
+pub fn cancel_chooser(client: &mut Client, backend_node_id: i64) {
+    let Ok(node) = client.call_within(
+        "DOM.resolveNode",
+        Json::object(vec![(
+            "backendNodeId",
+            Json::number(backend_node_id as f64),
+        )]),
+        SWITCH_TIMEOUT,
+    ) else {
+        return;
+    };
+    let Some(object) = node
+        .path(&["object", "objectId"])
+        .and_then(Json::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let _ = client.notify(
+        "Runtime.callFunctionOn",
+        Json::object(vec![
+            ("objectId", Json::string(&object)),
+            ("functionDeclaration", Json::string(Upload::CANCEL_FUNCTION)),
+        ]),
+    );
+    let _ = client.notify(
+        "Runtime.releaseObject",
+        Json::object(vec![("objectId", Json::string(object))]),
+    );
+}
+
 /// A page that asked before it was left and was told no.
 ///
 /// It is where it was, and nothing about the tab should say otherwise: not
@@ -1902,10 +2861,17 @@ fn answer_dialog(
 /// page's.
 ///
 /// A url that turned out to be a download is the other way a page ends up not
-/// having gone anywhere, and [`navigated`] sends it here too.
+/// having gone anywhere, and [`navigated`] sends it here too. And a load
+/// stopped with `esc` is the third: whatever is on the page — the last page,
+/// or as much of the new one as came — is where the tab is, and the history
+/// says which, because `Page.getNavigationHistory` is answered during a hang
+/// that holds everything asked of the page itself (measured).
 fn stayed(tab: &mut Tab<Client>) {
     tab.note = None;
     tab.loading = false;
+    tab.since = None;
+    // Whatever is on the page has committed, or it would not be there.
+    tab.committed = true;
     let Ok(history) =
         tab.connection
             .call_within("Page.getNavigationHistory", Json::empty(), SWITCH_TIMEOUT)
@@ -1914,6 +2880,109 @@ fn stayed(tab: &mut Tab<Client>) {
     };
     if let Some(url) = load::current_url(&history) {
         tab.url = url;
+    }
+}
+
+/// Who an Escape press is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escapes {
+    /// The url bar is open: it closes (`Edit::Cancel`).
+    UrlBar,
+    /// The find prompt is open: it closes, and the highlights go with it.
+    Find,
+    /// The page in front has a dialog up: it is dismissed.
+    Dialog,
+    /// The page in front is asking for a file input's path: nothing is sent,
+    /// and the input is told `cancel` ([`cancel_chooser`]).
+    Upload,
+    /// The page in front is loading: the load stops ([`stop_loading`]).
+    StopLoading,
+    /// Nothing of this program's wants it, so it is the page's key.
+    Page,
+}
+
+/// Who an Escape press is for: whatever has the row, by [`row_owner`]'s
+/// order; then a load; then the page.
+///
+/// Whatever has the row first, because Escape is how a line is abandoned and
+/// how a question is said no to, and the row is where the person can see
+/// which of them it will be. Its order is [`row_owner`]'s and not one of its
+/// own — the url bar, the find prompt, a dialog, a file input's path — so
+/// that what Escape closes is always the thing on the screen, never one
+/// underneath it. That is why a dialog comes before a path here, which the
+/// design for this key had the other way round: an `alert()` opened while a
+/// path is half typed has the row, the page is stopped behind it, and an
+/// Escape that cancelled the path instead would close something the person
+/// cannot see and leave the question they can.
+///
+/// Then a load, because a page that is loading and hung is the one thing on
+/// the screen the person cannot otherwise get out of, and Escape dispatched to
+/// the page does not stop a load (measured: the navigation stayed held). Only
+/// then the page, which is what Escape was before any of this. A page that is
+/// loading *and* has a modal of its own open gets the stop first; that is a
+/// desktop browser's order too. And a load under something that has the row
+/// goes on: the first Escape closes the find prompt or answers the question,
+/// the second stops the load, which is one press per thing the person can see.
+///
+/// The keys reach the first four by their own routes before this is asked —
+/// [`handle_input`] gives a line being typed every key, and a dialog's or a
+/// path's key to [`answer_dialog`] or [`answer_upload`] — and each of those
+/// treats Escape as this says. What is asked here, with the key nobody took,
+/// is whether it stops a load; the whole order is kept in one place all the
+/// same, so that the truth table in the tests is the order, not a guess at it.
+fn escapes(owner: Option<&RowOwner<'_>>, loading: bool) -> Escapes {
+    match owner {
+        Some(RowOwner::Bar(_)) => Escapes::UrlBar,
+        Some(RowOwner::Find(_)) => Escapes::Find,
+        Some(RowOwner::Dialog(_)) => Escapes::Dialog,
+        Some(RowOwner::Upload(_)) => Escapes::Upload,
+        None if loading => Escapes::StopLoading,
+        None => Escapes::Page,
+    }
+}
+
+/// Stop the load on the page in front, and put the row back where the page
+/// is.
+fn stop_loading(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+) -> Result<(), String> {
+    let Some(tab) = tabs.active_mut() else {
+        return Ok(());
+    };
+    // Its reply, `net::ERR_ABORTED`, is passed over by `load::failed` anyway;
+    // dropped, it is not even waited for.
+    chrome.navigation = None;
+    stop(tab);
+    forget_hover(pane, chrome)?;
+    redraw_row(pane, tabs, chrome)
+}
+
+/// What `esc` does to a loading tab: the engine told to stop, and the tab put
+/// back to say what the page now is.
+///
+/// `Page.stopLoading` is sent as a notification. It is answered by the
+/// browser in under a millisecond whatever the renderer is doing, and the
+/// reply says nothing; what says the load is over is the
+/// `Page.frameStoppedLoading` that follows within a millisecond or five, which
+/// `handle_page_events` reads like any other. What that event cannot do is
+/// put the url back: after a stop before anything committed the tab still
+/// carries the url that was typed and the note that says it is loading, and
+/// that is the state `stayed` exists for — a page asked to leave and told
+/// no. So it is called here too. And the title is asked as a load event would
+/// ask it, because after a stop past the commit — headers and half a body,
+/// or a page waiting on an image — the document is there with its title, and
+/// no load event is ever coming for it (measured against
+/// `chrome-headless-shell` 153, all three cases).
+///
+/// Public so that the engine tests can do exactly this to a tab and look.
+pub fn stop(tab: &mut Tab<Client>) {
+    let _ = tab.connection.notify("Page.stopLoading", Json::empty());
+    stayed(tab);
+    tab.stopped_loading();
+    if let Some(loaded) = page_loaded(&mut tab.connection) {
+        tab.loaded(loaded);
     }
 }
 
@@ -1956,6 +3025,24 @@ fn stayed(tab: &mut Tab<Client>) {
 /// `alt+letter` is left to the program by Kitty, WezTerm and Ghostty alike.
 /// What it shadows on a page is an `accesskey` on `c` or `u`, on the same
 /// terms `alt+1`..`alt+9` already shadow the digits.
+///
+/// Find is `ctrl+f` because that is the reflex, and the compositor binds
+/// nothing on it. What it shadows is a page's own `ctrl+f` handler, which in
+/// a headless engine opened nothing anyway. Inside a line being typed it is
+/// readline's forward-a-character, because the line is asked first.
+///
+/// Zoom is on both. `ctrl+=`, `ctrl+-` and `ctrl+0` are the browser's reflex
+/// and are bound, but only some terminals let them through: Kitty passes them
+/// (its own font size is `ctrl+shift+=`) and so does tOS, whose compositor
+/// binds `=` only under its `ctrl+a` leader; WezTerm and Ghostty keep them
+/// for their own font size by default, and a legacy terminal sends `ctrl+=`
+/// as a bare `=`. `alt+=`, `alt+-` and `alt+0` are the program's own, on the
+/// modifier it already uses for back, forward, tabs and copying, and pass
+/// through every one of them and over any ssh. `+` and `_` are the same keys
+/// shifted, and `ctrl+_` is what a legacy terminal sends for `ctrl+-`
+/// (`0x1f`). `ctrl+0` is the one ctrl-digit taken, because no page has ever
+/// been sent it by a browser; `ctrl+1`..`ctrl+9` stay the page's. What the
+/// alt forms shadow is an `accesskey` on `=`, `-` or `0`.
 fn command(key: &KeyInput) -> Option<Command> {
     if key.action == KeyAction::Release {
         return None;
@@ -1967,8 +3054,12 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('r') => Some(Command::Reload),
             Key::Char('t') => Some(Command::NewTab),
             Key::Char('w') => Some(Command::CloseTab),
+            Key::Char('f') => Some(Command::Find),
             Key::Tab if key.mods.shift() => Some(Command::PreviousTab),
             Key::Tab => Some(Command::NextTab),
+            Key::Char('=' | '+') => Some(Command::ZoomIn),
+            Key::Char('-' | '_') => Some(Command::ZoomOut),
+            Key::Char('0') => Some(Command::ZoomReset),
             _ => None,
         };
     }
@@ -1979,10 +3070,63 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char(digit @ '1'..='9') => Some(Command::SelectTab(digit as usize - '0' as usize)),
             Key::Char('c') => Some(Command::CopySelection),
             Key::Char('u') => Some(Command::CopyUrl),
+            Key::Char('=' | '+') => Some(Command::ZoomIn),
+            Key::Char('-' | '_') => Some(Command::ZoomOut),
+            Key::Char('0') => Some(Command::ZoomReset),
             _ => None,
         };
     }
     None
+}
+
+/// A new level for the tab in front: told to the engine, remembered for the
+/// host, and the row redrawn.
+///
+/// No screencast restart and no screen clear: a running cast follows the new
+/// size by itself (measured, 45 frames at the new size in the next 1.5 s and
+/// none at the old), and the picture that is up stays up until the first of
+/// them replaces it. The motion clock is reset, so that the page laid out
+/// again gets its lossless still, and a still already asked for is dropped,
+/// because it is of the page at the old level. A scroll in flight carries on
+/// at a point brought back inside the new CSS size, as after a resize, and
+/// what is under the pointer is asked again, as after a scroll.
+///
+/// A page with no host is zoomed all the same, on its tab alone; see
+/// [`crate::zoom::host_key`]. A level that cannot be written to the profile
+/// is still the level the page is at.
+fn rezoom(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    level: Zoom,
+) -> Result<(), String> {
+    let Some(tab) = tabs.active_mut() else {
+        return Ok(());
+    };
+    if tab.zoom == level {
+        return Ok(());
+    }
+    tab.zoom = level;
+    if let Some(host) = zoom::host_key(&tab.url) {
+        let _ = chrome.zooms.set(&host, level);
+    }
+    let viewport = viewport(chrome, tab);
+    let stopped = tab.dialog.is_some();
+    if let Err(why) = emulate(&mut tab.connection, viewport, stopped) {
+        tab.note = Some(why);
+    }
+    chrome.motion.reset(Instant::now());
+    chrome.still = None;
+    chrome
+        .wheel
+        .resized((viewport.css.0 as i32, viewport.css.1 as i32));
+    // The page is laid out again under a pointer that did not move, as a
+    // wheel moves it: an ask that is out is about the old layout and is
+    // dropped, and the same place is asked about once more. The link on the
+    // row stays until the answer says otherwise, as it does after a scroll.
+    chrome.asking = None;
+    chrome.hover.scrolled();
+    redraw_row(pane, tabs, chrome)
 }
 
 /// Type into the url bar. Returns `false` only if the person quit.
@@ -1995,25 +3139,13 @@ fn edit_url(
     if key.action == KeyAction::Release {
         return Ok(true);
     }
-    // The copy keys, before the editor sees them: they leave the line as it
-    // is, the selection included. What is on the row while the line is open
-    // is the line, so that is what `alt+c` copies.
-    match command(&key) {
-        Some(Command::CopySelection) => {
-            let typed = chrome
-                .bar
-                .as_ref()
-                .map(|bar| bar.line.text().to_string())
-                .unwrap_or_default();
-            copy_out(pane, tabs, &typed, Copied::Text)?;
-            return Ok(true);
-        }
-        Some(Command::CopyUrl) => {
-            let url = tabs.active().map(|tab| tab.url.clone()).unwrap_or_default();
-            copy_out(pane, tabs, &url, Copied::Url)?;
-            return Ok(true);
-        }
-        _ => {}
+    let typed = chrome
+        .bar
+        .as_ref()
+        .map(|bar| bar.line.text().to_string())
+        .unwrap_or_default();
+    if copy_from_row(pane, tabs, &key, &typed)? {
+        return Ok(true);
     }
     let Some(bar) = chrome.bar.as_mut() else {
         return Ok(true);
@@ -2041,13 +3173,219 @@ fn edit_url(
     Ok(true)
 }
 
+/// The copy keys, while a line is being typed on the row: `true` if `key`
+/// was one of them and has been done.
+///
+/// Before the editor sees the key: they leave the line as it is, the
+/// selection included. What is on the row while the line is open is the
+/// line, so that is what `alt+c` copies, as `typed`; `alt+u` is still the
+/// page's url.
+fn copy_from_row(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    key: &KeyInput,
+    typed: &str,
+) -> Result<bool, String> {
+    match command(key) {
+        Some(Command::CopySelection) => {
+            copy_out(pane, tabs, typed, Copied::Text)?;
+            Ok(true)
+        }
+        Some(Command::CopyUrl) => {
+            let url = tabs.active().map(|tab| tab.url.clone()).unwrap_or_default();
+            copy_out(pane, tabs, &url, Copied::Url)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Open the find prompt on the tab in front, offering the last needle.
+///
+/// The script's world is made now, in two calls ([`make_world`]), because
+/// the person has just pressed a key and the first letter they type is about
+/// to need it. A page that will not answer them in [`WORLD_TIMEOUT`] is a page
+/// that would not answer a search either: the prompt still opens, and the
+/// first search says so. With a needle remembered, the search for it goes at
+/// once, so that its highlights come straight back.
+fn open_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(tab) = tabs.active_mut() else {
+        return;
+    };
+    let finder = find::Finder::open(&chrome.last_needle);
+    let wanted = finder.initial();
+    chrome.find = Some(Find {
+        target: tab.target.clone(),
+        context: make_world(&mut tab.connection),
+        finder,
+        pending: None,
+        wanted,
+        remade: false,
+    });
+    pump_find(tabs, chrome);
+}
+
+/// The find script's world in the page's main frame: `Page.getFrameTree` for
+/// the frame, then `Page.createIsolatedWorld`, which answers with the same
+/// world for as long as the document lasts. `None` for a page that did not
+/// answer.
+fn make_world(client: &mut Client) -> Option<i64> {
+    let tree = client
+        .call_within("Page.getFrameTree", Json::empty(), WORLD_TIMEOUT)
+        .ok()?;
+    let frame = find::main_frame(&tree)?;
+    let world = client
+        .call_within(
+            "Page.createIsolatedWorld",
+            find::world_params(&frame),
+            WORLD_TIMEOUT,
+        )
+        .ok()?;
+    find::context(&world)
+}
+
+/// Type into the find prompt. Returns `false` only if the person quit.
+///
+/// Every key comes here first while the prompt is open, as it does to the url
+/// bar: the tab keys, `alt+←` and the rest do nothing until Escape, and
+/// `ctrl+f` moves the cursor. What the key asks of the page is folded into
+/// what is waiting and sent by [`pump_find`] when nothing is out.
+fn edit_find(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    key: KeyInput,
+) -> Result<bool, String> {
+    if key.action == KeyAction::Release {
+        return Ok(true);
+    }
+    let typed = chrome
+        .find
+        .as_ref()
+        .map(|find| find.finder.line.text().to_string())
+        .unwrap_or_default();
+    if copy_from_row(pane, tabs, &key, &typed)? {
+        return Ok(true);
+    }
+    let Some(find) = chrome.find.as_mut() else {
+        return Ok(true);
+    };
+    match find.finder.step(&key) {
+        find::Step::Typing(None) => {}
+        find::Step::Typing(Some(ask)) => find.want(ask),
+        find::Step::Close => close_find(tabs, chrome),
+        find::Step::Quit => return Ok(false),
+    }
+    pump_find(tabs, chrome);
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
+/// Collect the answer to a search if it has come, and send the next one if
+/// one is wanted and none is out. Never waits: a search is the still's shape,
+/// not a `call` (see [`crate::find`]). Returns whether the row should be drawn
+/// again.
+///
+/// One search out at a time, so that the answers arrive in the order the keys
+/// were typed and the count on the row is always for a needle that was on
+/// it. A world that went with its document — a navigation this program did
+/// not hear, because its event was binned with a tab's frames — is made again
+/// once and the search asked again; a second time is reported. Whatever goes
+/// wrong goes on the tab's note, which the row shows once the prompt closes.
+fn pump_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
+    let Some(find) = chrome.find.as_mut() else {
+        return false;
+    };
+    // A tab that is no longer in front is [`switched`]'s to close.
+    if tabs.active_target() != Some(find.target.as_str()) {
+        return false;
+    }
+    let Some(tab) = tabs.active_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some((pending, ask, sent)) = find.pending.take() {
+        match tab.connection.take_reply(&pending) {
+            // A page stopped behind a dialog answers when it has been
+            // answered; the wait for the person is not the page's.
+            None if tab.dialog.is_some() => find.pending = Some((pending, ask, Instant::now())),
+            None if sent.elapsed() < FIND_TIMEOUT => find.pending = Some((pending, ask, sent)),
+            None => {
+                tab.note = Some("the page did not answer the search".to_string());
+                changed = true;
+            }
+            Some(Ok(reply)) => {
+                find.finder.matches = find::matches(&reply);
+                find.remade = false;
+                changed = true;
+            }
+            Some(Err(why)) if find::stale_world(&why) && !find.remade => {
+                find.context = make_world(&mut tab.connection);
+                find.remade = true;
+                find.wanted = Some(match find.wanted.take() {
+                    Some(newer) => ask.merge(newer),
+                    None => ask,
+                });
+            }
+            Some(Err(why)) => {
+                tab.note = Some(why);
+                changed = true;
+            }
+        }
+    }
+    if find.pending.is_none() {
+        if let Some(ask) = find.wanted.take() {
+            let sent = match find.context {
+                Some(context) => tab
+                    .connection
+                    .send("Runtime.callFunctionOn", find::call_params(context, &ask)),
+                None => Err("the page did not answer the search".to_string()),
+            };
+            match sent {
+                Ok(pending) => find.pending = Some((pending, ask, Instant::now())),
+                Err(why) => {
+                    tab.note = Some(why);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Close the find prompt, from wherever it is closed: Escape, a tab switch,
+/// a navigation of the page it was searching. The needle is remembered for
+/// the next `ctrl+f`.
+///
+/// The page is told to clear as a notification: there is nothing to collect,
+/// and it is queued behind any search still out, so the page ends clear
+/// whichever of the two it reads first. Dropping the search still out
+/// withdraws the claim on its answer. Quitting does not come here: the
+/// engine is being stopped, and there is no page to leave clear.
+fn close_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(find) = chrome.find.take() else {
+        return;
+    };
+    chrome.last_needle = find.finder.line.text().to_string();
+    let (Some(context), Some(index)) = (find.context, tabs.index_of(&find.target)) else {
+        return;
+    };
+    if let Some(tab) = tabs.get_mut(index) {
+        let _ = tab
+            .connection
+            .notify("Runtime.callFunctionOn", find::clear_params(context));
+    }
+}
+
 /// A paste, put wherever the typing is.
 ///
 /// The url bar if it is open, because the person pressed `ctrl+l` and that
-/// is where they are typing; then a `prompt()`'s line on the page in front;
-/// then the page. A paste on an alert, a confirm or a "leave this page?" is
-/// dropped: a paste is not "any key", and answering "delete these files?"
-/// with the clipboard's contents would be worse than not pasting at all.
+/// is where they are typing; then the find prompt; then a `prompt()`'s line
+/// on the page in front; then the path for its file input; then the page —
+/// [`typing_line`]'s order. A paste on an alert, a confirm or a "leave this
+/// page?" is dropped: a paste is not "any key", and answering "delete these
+/// files?" with the clipboard's contents would be worse than not pasting at
+/// all.
 ///
 /// Into the page it is one `Input.insertText` carrying the whole paste, and
 /// never keystrokes. Measured against `chrome-headless-shell` 153, that is
@@ -2067,14 +3405,30 @@ fn paste(
     chrome: &mut Chrome,
     text: &str,
 ) -> Result<(), String> {
-    if let Some(bar) = chrome.bar.as_mut() {
-        if paste_into_line(&mut bar.line, text) {
-            // As a typed character does: the walk through history ends, and
-            // what was there to take is asked for again.
-            bar.walk = None;
-            bar.line.suggest(chrome.history.complete(bar.line.text()));
+    match typing_line(tabs, chrome) {
+        Some(Typing::Url) => {
+            if let Some(bar) = chrome.bar.as_mut() {
+                if paste_into_line(&mut bar.line, text) {
+                    // As a typed character does: the walk through history
+                    // ends, and what was there to take is asked for again.
+                    bar.walk = None;
+                    bar.line.suggest(chrome.history.complete(bar.line.text()));
+                }
+            }
+            return redraw_row(pane, tabs, chrome);
         }
-        return redraw_row(pane, tabs, chrome);
+        Some(Typing::Find) => {
+            if let Some(find) = chrome.find.as_mut() {
+                // As a typed character does: a search for what is there now.
+                if paste_into_line(&mut find.finder.line, text) {
+                    let needle = find.finder.line.text().to_string();
+                    find.want(find::Ask { needle, step: 0 });
+                }
+            }
+            pump_find(tabs, chrome);
+            return redraw_row(pane, tabs, chrome);
+        }
+        Some(Typing::Prompt | Typing::Upload) | None => {}
     }
     if asking(tabs) {
         let pasted = tabs
@@ -2086,6 +3440,13 @@ fn paste(
         }
         return Ok(());
     }
+    // A file input's path, which is where a long path most often comes from:
+    // the same order as [`row_owner`]'s, and the same one-line rule as the
+    // lines above.
+    if let Some(prompt) = tabs.active_mut().and_then(|tab| tab.upload.as_mut()) {
+        prompt.paste(&clipboard::one_line(text), &upload::Disk);
+        return redraw_row(pane, tabs, chrome);
+    }
     if let Some(tab) = tabs.active_mut() {
         let _ = tab
             .connection
@@ -2094,7 +3455,8 @@ fn paste(
     Ok(())
 }
 
-/// A paste into a line being typed: the url bar's, or a `prompt()`'s.
+/// A paste into a line being typed: the url bar's, the find prompt's, or a
+/// `prompt()`'s.
 ///
 /// What is kept of it is [`clipboard::one_line`], put in at the cursor by
 /// [`Line::insert_str`] — which replaces a line still offered whole, as the
@@ -2313,15 +3675,23 @@ fn button_bit(button: Option<u32>) -> u32 {
     }
 }
 
+/// One mouse report as the page's `Input.dispatchMouseEvent`.
+///
+/// Measured in the terminal's pixels until it goes on the wire — whether it
+/// is on the status row, and whether two presses are close enough to be a
+/// double click, are about the screen — and then in the page's, through
+/// [`Viewport::css_point`]. `cell` is the terminal's, which turns a report
+/// into a point, and `viewport` is the page as the engine was told it.
 fn send_mouse(
     client: &mut Client,
     pixel_coordinates: bool,
     clicks: &mut Clicks,
     buttons: &mut u32,
-    metrics: Metrics,
+    cell: (u32, u32),
+    viewport: Viewport,
     report: MouseInput,
 ) {
-    let (x, y) = crate::input::page_point(&report, pixel_coordinates, metrics.cell, 1);
+    let (x, y) = crate::input::page_point(&report, pixel_coordinates, cell, 1);
     if y < 0 {
         // The status row is this program's, and a click on it is not the
         // page's business. A release is still forwarded, so that a drag that
@@ -2350,6 +3720,7 @@ fn send_mouse(
         MouseKind::Wheel => return,
     };
 
+    let (x, y) = css_point(viewport, (x, y));
     let mut fields = vec![
         ("type", Json::string(kind)),
         ("x", Json::number(x)),
@@ -2584,8 +3955,12 @@ mod tests {
                 "alt+{n}"
             );
         }
-        // There is no tab zero, and a digit on its own is typing.
-        assert_eq!(command(&key(Key::Char('0'), Mods::ALT)), None);
+        // There is no tab zero — alt+0 is back to 100% — and a digit on its
+        // own is still typing.
+        assert_eq!(
+            command(&key(Key::Char('0'), Mods::ALT)),
+            Some(Command::ZoomReset)
+        );
         assert_eq!(command(&key(Key::Char('1'), 0)), None);
         // ctrl+digit stays the page's: a page may bind it, and the compositor
         // puts its own workspace digits on ctrl+shift and on super.
@@ -2622,6 +3997,134 @@ mod tests {
     }
 
     #[test]
+    fn the_tab_keys_and_quit_survive_an_upload_prompt_and_the_rest_wait() {
+        // The same set as a dialog's, and the same reasons: see
+        // `survives_dialog`. Checked here from the upload's side so that a
+        // change to one is a decision about both.
+        let survives = |k: Key, mods: u32| command(&key(k, mods)).map(survives_dialog);
+        for (k, mods) in [
+            (Key::Char('q'), Mods::CTRL),
+            (Key::Char('t'), Mods::CTRL),
+            (Key::Char('w'), Mods::CTRL),
+            (Key::Tab, Mods::CTRL),
+            (Key::Char('2'), Mods::ALT),
+            (Key::Char('u'), Mods::ALT),
+        ] {
+            assert_eq!(survives(k, mods), Some(true), "{k:?}");
+        }
+        for (k, mods) in [
+            (Key::Char('l'), Mods::CTRL),
+            (Key::Char('r'), Mods::CTRL),
+            (Key::Left, Mods::ALT),
+            (Key::Right, Mods::ALT),
+        ] {
+            assert_eq!(survives(k, mods), Some(false), "{k:?}");
+        }
+        // Tab, Enter and Escape are the path's.
+        assert_eq!(survives(Key::Tab, 0), None);
+        assert_eq!(survives(Key::Enter, 0), None);
+        assert_eq!(survives(Key::Escape, 0), None);
+    }
+
+    #[test]
+    fn the_row_goes_to_the_url_bar_then_a_dialog_then_a_file_input() {
+        let owner = |tabs: &Tabs<()>, bar: Option<&UrlBar>| match row_owner(tabs, bar, None) {
+            Some(RowOwner::Bar(_)) => "bar",
+            Some(RowOwner::Find(_)) => "find",
+            Some(RowOwner::Dialog(_)) => "dialog",
+            Some(RowOwner::Upload(_)) => "upload",
+            None => "page",
+        };
+        let mut tabs = Tabs::new(Tab::new("a", (), "https://a.example/"));
+        let bar = UrlBar::new(Line::empty());
+        assert_eq!(owner(&tabs, None), "page");
+
+        let chooser = upload::Chooser {
+            backend_node_id: 3,
+            multiple: false,
+            frame_id: "F".to_string(),
+        };
+        let tab = tabs.active_mut().expect("a tab");
+        tab.upload = Some(Upload::new(chooser, PathBuf::from("/work"), None));
+        assert_eq!(owner(&tabs, None), "upload");
+        assert_eq!(owner(&tabs, Some(&bar)), "bar", "the person's typing first");
+
+        // An alert while the path is half typed: the page is stopped, so the
+        // alert has the row, and the path is underneath it.
+        let alert = Json::parse(r#"{"type":"alert","message":"m","url":"u"}"#).expect("JSON");
+        let tab = tabs.active_mut().expect("a tab");
+        tab.dialog = Dialog::opening(&alert);
+        assert_eq!(owner(&tabs, None), "dialog");
+        assert_eq!(owner(&tabs, Some(&bar)), "bar");
+        let tab = tabs.active_mut().expect("a tab");
+        tab.dialog = None;
+        assert_eq!(owner(&tabs, None), "upload", "and back when it is answered");
+
+        // A tab behind with a prompt does not own the row in front.
+        tabs.open(Tab::new("b", (), "https://b.example/"));
+        assert_eq!(owner(&tabs, None), "page");
+    }
+
+    #[test]
+    fn the_zoom_keys_are_the_browsers_and_the_ones_every_terminal_lets_through() {
+        for mods in [Mods::CTRL, Mods::ALT, Mods::CTRL | Mods::SHIFT] {
+            for (c, wanted) in [
+                ('=', Command::ZoomIn),
+                ('+', Command::ZoomIn),
+                ('-', Command::ZoomOut),
+                ('_', Command::ZoomOut),
+                ('0', Command::ZoomReset),
+            ] {
+                assert_eq!(
+                    command(&key(Key::Char(c), mods)),
+                    Some(wanted),
+                    "{c} {mods:?}"
+                );
+            }
+        }
+        // `ctrl+-` in a legacy terminal is `0x1f`, which is ctrl+_.
+        match Parser::new().feed(&[0x1f]).as_slice() {
+            [Input::Key(legacy)] => assert_eq!(command(legacy), Some(Command::ZoomOut)),
+            other => panic!("{other:?}"),
+        }
+        // Unmodified they are typing, both at once is the page's, and the
+        // other ctrl-digits stay the page's.
+        assert_eq!(command(&key(Key::Char('='), 0)), None);
+        assert_eq!(command(&key(Key::Char('-'), Mods::SHIFT)), None);
+        assert_eq!(command(&key(Key::Char('0'), Mods::CTRL | Mods::ALT)), None);
+        for n in 1..=9u8 {
+            assert_eq!(
+                command(&key(Key::Char((b'0' + n) as char), Mods::CTRL)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn the_zoom_keys_wait_for_a_dialog_and_a_file_inputs_path() {
+        // One rule for both, `survives_dialog`, which `handle_input` asks for
+        // a dialog and for a path alike: a level changed under either would
+        // lay the page out again behind something the person is answering.
+        for command in [Command::ZoomIn, Command::ZoomOut, Command::ZoomReset] {
+            assert!(!survives_dialog(command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn the_words_at_the_end_of_the_row_are_what_there_is_two_spaces_apart() {
+        assert_eq!(words(&[None, None]), None);
+        assert_eq!(words(&[Some("150%"), None]).as_deref(), Some("150%"));
+        assert_eq!(
+            words(&[Some("downloading report.pdf 42%"), Some("150%")]).as_deref(),
+            Some("downloading report.pdf 42%  150%")
+        );
+        assert_eq!(
+            words(&[Some("150%"), Some("https://example.com")]).as_deref(),
+            Some("150%  https://example.com")
+        );
+    }
+
+    #[test]
     fn copying_is_alt_c_and_alt_u_and_ctrl_c_and_ctrl_v_stay_the_pages() {
         assert_eq!(
             command(&key(Key::Char('c'), Mods::ALT)),
@@ -2642,6 +4145,37 @@ mod tests {
         // selection has to be asked of a page that may be stopped.
         assert!(survives_dialog(Command::CopyUrl));
         assert!(!survives_dialog(Command::CopySelection));
+    }
+
+    #[test]
+    fn ctrl_f_is_find_and_does_not_survive_a_dialog() {
+        assert_eq!(
+            command(&key(Key::Char('f'), Mods::CTRL)),
+            Some(Command::Find)
+        );
+        // It asks the page, and a page behind a dialog answers nothing.
+        assert!(!survives_dialog(Command::Find));
+        // Only ctrl: `f` is typing, and the others are the page's.
+        assert_eq!(command(&key(Key::Char('f'), 0)), None);
+        assert_eq!(command(&key(Key::Char('f'), Mods::ALT)), None);
+        assert_eq!(command(&key(Key::Char('f'), Mods::CTRL | Mods::ALT)), None);
+        // The prompt's own next and previous are the prompt's, not commands
+        // a page loses when it is closed.
+        assert_eq!(command(&key(Key::Char('g'), Mods::CTRL)), None);
+    }
+
+    #[test]
+    fn the_find_prompt_draws_its_count_at_the_end_and_the_url_bar_is_unchanged() {
+        let line = Line::selected("fox");
+        assert_eq!(
+            typing_row_beside(40, "url: ", &line, ""),
+            screen::prompt_line(40, "url: ", "fox", "", 3)
+        );
+        let row = String::from_utf8(typing_row_beside(40, "find: ", &line, "3/17"))
+            .expect("a row is UTF-8");
+        assert!(row.contains("find: fox "), "{row:?}");
+        assert!(row.contains("  3/17\x1b[0m"), "{row:?}");
+        assert!(row.ends_with("\x1b[1;10H\x1b[?25h"), "{row:?}");
     }
 
     #[test]
@@ -2892,6 +4426,13 @@ mod tests {
             page_cells(metrics).rows * metrics.cell.1,
             page_pixels(metrics).1
         );
+        // At 200% — a HiDPI scale, a zoom, or one of each — the page is laid
+        // out in half that, and the middle of cell (11, 4) is half as far in.
+        let viewport = Viewport::fit(page_pixels(metrics), 2.0);
+        assert_eq!(viewport.css, (320, 184));
+        assert_eq!(viewport.css_point(84, 40), (42.0, 20.0));
+        // And the placement does not move: the cells are the pane's.
+        assert_eq!(page_cells(metrics), Cells { cols: 80, rows: 23 });
     }
 
     #[test]
@@ -2927,5 +4468,116 @@ mod tests {
         assert_eq!(tab.line(), "Example  —  https://example.com");
         tab.note = Some("loading".to_string());
         assert_eq!(tab.line(), "loading");
+        tab.note = None;
+        tab.url = "http://wiki.corp/".to_string();
+        tab.title = "Wiki".to_string();
+        tab.trust = load::Trust::Insecure;
+        assert_eq!(tab.line(), "not secure  —  Wiki  —  http://wiki.corp/");
+    }
+
+    #[test]
+    fn escape_goes_to_whatever_has_the_row_then_the_load_then_the_page() {
+        let alert = Json::parse(r#"{"type":"alert","message":"m","url":"u"}"#).expect("JSON");
+        let chooser = upload::Chooser {
+            backend_node_id: 3,
+            multiple: false,
+            frame_id: "F".to_string(),
+        };
+        let bar = UrlBar::new(Line::empty());
+        let find = Find {
+            target: "a".to_string(),
+            finder: find::Finder::open(""),
+            context: None,
+            pending: None,
+            wanted: None,
+            remade: false,
+        };
+        // Every combination of the four things that can have the row, and a
+        // load under them or not: the answer is the first of them in
+        // `row_owner`'s order, and the load only when none of them is there.
+        for mask in 0..32u32 {
+            let [open_bar, open_find, dialog, path, loading] =
+                [0, 1, 2, 3, 4].map(|bit| mask & (1 << bit) != 0);
+            let mut tab = Tab::new("a", (), "https://a.example/");
+            tab.loading = loading;
+            if dialog {
+                tab.dialog = Dialog::opening(&alert);
+            }
+            if path {
+                tab.upload = Some(Upload::new(chooser.clone(), PathBuf::from("/work"), None));
+            }
+            let tabs = Tabs::new(tab);
+            let wanted = if open_bar {
+                Escapes::UrlBar
+            } else if open_find {
+                Escapes::Find
+            } else if dialog {
+                Escapes::Dialog
+            } else if path {
+                Escapes::Upload
+            } else if loading {
+                Escapes::StopLoading
+            } else {
+                Escapes::Page
+            };
+            let owner = row_owner(&tabs, open_bar.then_some(&bar), open_find.then_some(&find));
+            assert_eq!(
+                escapes(owner.as_ref(), loading),
+                wanted,
+                "bar {open_bar}, find {open_find}, dialog {dialog}, path {path}, loading {loading}"
+            );
+        }
+        // Escape is not one of the program's commands: when nothing wants
+        // it, it is the page's key, as it always was.
+        assert_eq!(command(&key(Key::Escape, 0)), None);
+    }
+
+    #[test]
+    fn a_bare_motion_is_the_hovers_and_a_drag_is_still_the_pages() {
+        let report = |bytes: &[u8]| match Parser::new().feed(bytes).as_slice() {
+            [Input::Mouse(report)] => *report,
+            other => panic!("{bytes:?} is not one mouse report: {other:?}"),
+        };
+        // 35 is motion (32) with no button (3): the pointer moving.
+        assert!(routes_to_hover(&report(b"\x1b[<35;10;5M")));
+        assert!(routes_to_hover(&report(b"\x1b[<39;10;5M")), "with shift");
+        // 32 is motion with the left button held: a drag, a selection.
+        assert!(!routes_to_hover(&report(b"\x1b[<32;10;5M")));
+        assert!(!routes_to_hover(&report(b"\x1b[<34;10;5M")), "right drag");
+        // Presses, releases and the wheel go where they always went.
+        assert!(!routes_to_hover(&report(b"\x1b[<0;10;5M")));
+        assert!(!routes_to_hover(&report(b"\x1b[<0;10;5m")));
+        assert!(!routes_to_hover(&report(b"\x1b[<64;10;5M")));
+    }
+
+    #[test]
+    fn a_click_a_notch_and_the_hover_are_the_same_point() {
+        let metrics = Metrics {
+            cols: 80,
+            rows: 24,
+            cell: (8, 16),
+        };
+        let report = MouseInput {
+            kind: MouseKind::Move,
+            button: None,
+            mods: Mods::default(),
+            x: 3,
+            y: 2,
+            wheel: (0, 0),
+        };
+        // In cells: the middle of the third cell of the first page row.
+        let cells = crate::input::page_point(&report, false, metrics.cell, 1);
+        assert_eq!(cells, (20, 8));
+        // In pixels: the pixel itself, less the row.
+        assert_eq!(
+            crate::input::page_point(&report, true, metrics.cell, 1),
+            (2, -15)
+        );
+        // Then the page's pixels, at the level the page is at: the same
+        // point at 100%, half as far in at 200% — a HiDPI scale, a zoom, or
+        // one of each — whichever of the three is asking.
+        let at = |factor: f64| css_point(Viewport::fit(page_pixels(metrics), factor), cells);
+        assert_eq!(at(1.0), (20.0, 8.0));
+        assert_eq!(at(2.0), (10.0, 4.0));
     }
 }
