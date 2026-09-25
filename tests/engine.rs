@@ -36,6 +36,7 @@ use blinkterm::input::{Key, KeyAction, KeyInput, Mods};
 use blinkterm::json::Json;
 use blinkterm::keys;
 use blinkterm::motion::{self, Motion};
+use blinkterm::profile::{Choice, Profile};
 use blinkterm::scroll::{self, Animator, Dispatch, Step, Wheel};
 use blinkterm::tabs::{Outcome, Tab, Tabs};
 use tos_compositor::ImageFiles;
@@ -70,20 +71,28 @@ const WIDTH: u32 = 640;
 const HEIGHT: u32 = 360;
 const CELL: (u32, u32) = (8, 16);
 
-/// The same, with the target id the page connection belongs to, for the tests
-/// that are about which targets exist.
+/// The same, with the target id the page's session is attached to, for the
+/// tests that are about which targets exist.
 fn connect_with_target() -> Option<(Engine, Client, String)> {
-    let (engine, client) = connect()?;
-    // `connect` found the page in `/json/list`; the id is the tail of the url
-    // it found, which is exactly how the program itself gets it.
-    let address = engine.address().expect("an address");
-    let url = engine::page_target(&address, Duration::from_secs(20)).expect("a page");
-    let target = engine::target_of(&url).expect("an id").to_string();
-    Some((engine, client, target))
+    connect_in_with_target(Profile::temporary().expect("a temporary profile"))
 }
 
 /// Connect to a fresh engine, or say why the test is not running.
+///
+/// On a temporary profile, so that no test reads or writes the one a person
+/// browses with.
 fn connect() -> Option<(Engine, Client)> {
+    connect_in(Profile::temporary().expect("a temporary profile"))
+}
+
+/// The same, on the profile given.
+fn connect_in(profile: Profile) -> Option<(Engine, Client)> {
+    let (engine, client, _) = connect_in_with_target(profile)?;
+    Some((engine, client))
+}
+
+/// The one all three are: on the profile given, with the page's target id.
+fn connect_in_with_target(profile: Profile) -> Option<(Engine, Client, String)> {
     if std::env::var_os(engine::ENGINE_ENV).is_none() {
         eprintln!(
             "skipped: {} is not set; name a Chromium to run this against",
@@ -98,14 +107,20 @@ fn connect() -> Option<(Engine, Client)> {
             return None;
         }
     }
-    let engine = Engine::launch(Duration::from_secs(30)).expect("the engine starts");
-    let address = engine.address().expect("an address");
-    let target = match engine::page_target(&address, Duration::from_secs(20)) {
+    let engine = Engine::launch(profile, Duration::from_secs(30)).expect("the engine starts");
+    // What `app::run` does: the browser's client finds the page and attaches
+    // to it, and the page's session is the client the test drives. The
+    // browser's client goes when this returns, which leaves the page's
+    // session where it was and lets `tabbed` make another.
+    let mut browser = engine.browser().expect("the browser's client");
+    let target = match engine::first_page_target(&mut browser, Duration::from_secs(20)) {
         Ok(target) => target,
         Err(why) => panic!("{why}; the engine said: {}", engine.tail().join(" / ")),
     };
-    let client = Client::connect(&target, Duration::from_secs(10)).expect("a connection");
-    Some((engine, client))
+    let client = browser
+        .attach(&target, Duration::from_secs(10))
+        .expect("a session on the page");
+    Some((engine, client, target))
 }
 
 /// Get the page ready: sized, loaded, and painting.
@@ -569,8 +584,7 @@ fn viewport(client: &mut Client) {
 /// The browser-level connection, with target discovery on, and the tab list
 /// the program would be holding.
 fn tabbed(engine: &Engine, page: Client, target: String) -> (Client, Tabs<Client>) {
-    let mut browser =
-        Client::connect(engine.browser_url(), Duration::from_secs(10)).expect("the browser socket");
+    let mut browser = engine.browser().expect("the browser's client");
     browser
         .call(
             "Target.setDiscoverTargets",
@@ -586,7 +600,6 @@ fn tabbed(engine: &Engine, page: Client, target: String) -> (Client, Tabs<Client
 fn pump(
     browser: &mut Client,
     tabs: &mut Tabs<Client>,
-    browser_url: &str,
     timeout: Duration,
     done: impl Fn(&Tabs<Client>) -> bool,
 ) -> bool {
@@ -594,8 +607,7 @@ fn pump(
     loop {
         for event in browser.events() {
             let outcome = tabs.take(&event, |target| {
-                let socket = engine::target_url(browser_url, target)?;
-                Client::connect(&socket, Duration::from_secs(5))
+                browser.attach(target, Duration::from_secs(5))
             });
             match outcome {
                 Outcome::Failed(why) => panic!("a tab that would not open: {why}"),
@@ -620,9 +632,8 @@ fn pump(
 
 /// An engine with two tabs in it: the second opened by a click on a
 /// `target=_blank` link in the first, which is how a person opens one.
-fn two_tabs() -> Option<(Engine, Client, Tabs<Client>, String)> {
+fn two_tabs() -> Option<(Engine, Client, Tabs<Client>)> {
     let (engine, page, target) = connect_with_target()?;
-    let browser_url = engine.browser_url().to_string();
     let base = serve();
     let (mut browser, mut tabs) = tabbed(&engine, page, target);
 
@@ -670,20 +681,19 @@ fn two_tabs() -> Option<(Engine, Client, Tabs<Client>, String)> {
         pump(
             &mut browser,
             &mut tabs,
-            &browser_url,
             Duration::from_secs(15),
-            |tabs| tabs.len() == 2,
+            |tabs| tabs.len() == 2
         ),
         "the link with target=_blank opened no tab"
     );
-    Some((engine, browser, tabs, browser_url))
+    Some((engine, browser, tabs))
 }
 
 /// The whole reason tabs exist: a link that wants a window gets a tab, that
 /// tab is the one in front, and it is the one painting.
 #[test]
 fn a_link_that_wants_a_window_becomes_the_tab_in_front() {
-    let Some((mut engine, mut browser, mut tabs, browser_url)) = two_tabs() else {
+    let Some((mut engine, mut browser, mut tabs)) = two_tabs() else {
         return;
     };
     assert_eq!(tabs.len(), 2);
@@ -696,16 +706,11 @@ fn a_link_that_wants_a_window_becomes_the_tab_in_front() {
     // The urls come from the browser connection, with nothing asked of either
     // page — and the second tab's is the one the link pointed at.
     assert!(
-        pump(
-            &mut browser,
-            &mut tabs,
-            &browser_url,
-            Duration::from_secs(10),
-            |tabs| tabs
-                .iter()
+        pump(&mut browser, &mut tabs, Duration::from_secs(10), |tabs| {
+            tabs.iter()
                 .nth(1)
-                .is_some_and(|tab| tab.url.ends_with("/second")),
-        ),
+                .is_some_and(|tab| tab.url.ends_with("/second"))
+        }),
         "the second tab's url never arrived: {:?}",
         tabs.iter().map(|tab| tab.url.clone()).collect::<Vec<_>>()
     );
@@ -756,14 +761,13 @@ fn a_link_that_wants_a_window_becomes_the_tab_in_front() {
     engine.kill();
 }
 
-/// `ctrl+t`: a target this program asked for, reached on a url it worked out
-/// rather than looked up, and not announced twice as a tab.
+/// `ctrl+t`: a target this program asked for, attached to by the id the
+/// engine gave back, and not announced twice as a tab.
 #[test]
 fn a_tab_this_program_opens_is_reachable_and_counted_once() {
     let Some((mut engine, page, target)) = connect_with_target() else {
         return;
     };
-    let browser_url = engine.browser_url().to_string();
     let base = serve();
     let (mut browser, mut tabs) = tabbed(&engine, page, target);
 
@@ -778,9 +782,9 @@ fn a_tab_this_program_opens_is_reachable_and_counted_once() {
         .and_then(Json::as_str)
         .expect("the engine says which")
         .to_string();
-    let socket = engine::target_url(&browser_url, &opened).expect("a socket url");
-    let connection = Client::connect(&socket, Duration::from_secs(10))
-        .expect("the url worked out from the browser's own");
+    let connection = browser
+        .attach(&opened, Duration::from_secs(10))
+        .expect("a session on the page the engine opened");
     tabs.open(Tab::new(opened, connection, "about:blank"));
     assert_eq!(tabs.len(), 2);
     assert_eq!(tabs.active_index(), 1);
@@ -790,7 +794,6 @@ fn a_tab_this_program_opens_is_reachable_and_counted_once() {
     assert!(!pump(
         &mut browser,
         &mut tabs,
-        &browser_url,
         Duration::from_secs(3),
         |tabs| tabs.len() > 2,
     ));
@@ -827,12 +830,13 @@ fn a_tab_this_program_opens_is_reachable_and_counted_once() {
 /// left is the tab it was opened from.
 #[test]
 fn closing_a_tab_leaves_the_one_it_was_opened_from() {
-    let Some((mut engine, mut browser, mut tabs, browser_url)) = two_tabs() else {
+    let Some((mut engine, mut browser, mut tabs)) = two_tabs() else {
         return;
     };
     let closing = tabs.active_target().expect("a target").to_string();
 
-    // What `Command::CloseTab` does: the target in the engine, then the socket.
+    // What `Command::CloseTab` does: the target in the engine, then the
+    // session.
     let index = tabs.active_index();
     let mut tab = tabs.close(index).expect("the tab");
     browser
@@ -851,7 +855,6 @@ fn closing_a_tab_leaves_the_one_it_was_opened_from() {
         pump(
             &mut browser,
             &mut tabs,
-            &browser_url,
             Duration::from_secs(10),
             |tabs| tabs.len() == 1,
         ),
@@ -872,7 +875,7 @@ fn closing_a_tab_leaves_the_one_it_was_opened_from() {
 /// A page that closes itself takes its tab with it, with no key pressed.
 #[test]
 fn a_page_that_calls_window_close_removes_its_own_tab() {
-    let Some((mut engine, mut browser, mut tabs, browser_url)) = two_tabs() else {
+    let Some((mut engine, mut browser, mut tabs)) = two_tabs() else {
         return;
     };
     let closing = tabs.active_target().expect("a target").to_string();
@@ -891,7 +894,6 @@ fn a_page_that_calls_window_close_removes_its_own_tab() {
         pump(
             &mut browser,
             &mut tabs,
-            &browser_url,
             Duration::from_secs(10),
             |tabs| tabs.len() == 1,
         ),
@@ -935,8 +937,8 @@ fn wait_for_frame(client: &mut Client, timeout: Duration) -> Option<Vec<u8>> {
 /// On Debian — a tOS rootfs is Debian — `/usr/bin/chromium-shell` is a shell
 /// script that runs `/usr/lib/chromium/chromium-shell` as its child, so the
 /// pid `spawn` returns is `/bin/sh` and a signal to that pid alone leaves a
-/// browser behind with the page still painting and the debugging port still
-/// open. That is what was found on an installed machine: seven sessions, seven
+/// browser behind with the page still painting — and, when this program still
+/// drove it over a port, the debugging port still open. That is what was found on an installed machine: seven sessions, seven
 /// engines, none of them being looked at. This test is the shape of that bug —
 /// the group is read before the engine is dropped, and has to be empty after.
 #[test]
@@ -945,7 +947,6 @@ fn killing_the_engine_leaves_nothing_of_its_process_group() {
         return;
     };
     prepare(&mut client);
-    let address = engine.address().expect("an address");
     let group = engine
         .group()
         .expect("the engine is started in a group of its own");
@@ -976,10 +977,94 @@ fn killing_the_engine_leaves_nothing_of_its_process_group() {
         "the engine was killed and these are still running: {}",
         describe(&left)
     );
+}
+
+/// Issue #5: the engine's debugging endpoint was a port on loopback, and any
+/// process on the machine could drive the browser through it. With
+/// `--remote-debugging-pipe` there must be nothing listening at all — not the
+/// browser, and not any of the helpers it forks.
+///
+/// Asked of the kernel rather than of a connect: every socket descriptor every
+/// process in the engine's group holds, against every TCP socket in the
+/// `LISTEN` state (`0A` in `/proc/net/tcp`). A machine with no IPv6 has no
+/// `/proc/net/tcp6`, and that is read as no listeners rather than an error.
+#[test]
+fn the_engine_listens_on_no_port() {
+    let Some((engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    let group = engine
+        .group()
+        .expect("the engine is started in a group of its own");
+    let members = group_members(group);
     assert!(
-        std::net::TcpStream::connect(&address).is_err(),
-        "something is still listening on {address}"
+        members.len() >= 2,
+        "an engine is a wrapper and a browser at least, and this group has {}",
+        describe(&members)
     );
+
+    let listening: std::collections::HashSet<u64> = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .flat_map(|table| listening_inodes(table))
+        .collect();
+    let mut sockets = 0;
+    let mut found = Vec::new();
+    for (pid, command) in &members {
+        for inode in socket_inodes(*pid) {
+            sockets += 1;
+            if listening.contains(&inode) {
+                found.push(format!("{pid} ({command}) listens on socket:[{inode}]"));
+            }
+        }
+    }
+    eprintln!(
+        "group {group}: {} processes, {sockets} sockets between them, {} listening sockets \
+         on the machine, {} of them the engine's",
+        members.len(),
+        listening.len(),
+        found.len()
+    );
+    assert!(found.is_empty(), "the engine is listening: {found:?}");
+
+    drop(client);
+    drop(engine);
+}
+
+/// The inodes of the sockets in `LISTEN` in one of `/proc/net/tcp{,6}`.
+fn listening_inodes(table: &str) -> Vec<u64> {
+    let Ok(text) = std::fs::read_to_string(table) else {
+        return Vec::new();
+    };
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // sl, local, remote, st, queues, tr, retrnsmt, uid, timeout, inode
+            (fields.get(3) == Some(&"0A"))
+                .then(|| fields.get(9)?.parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// The inodes of every socket `pid` holds a descriptor to.
+fn socket_inodes(pid: i32) -> Vec<u64> {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let target = std::fs::read_link(entry.path()).ok()?;
+            let target = target.to_string_lossy();
+            target
+                .strip_prefix("socket:[")?
+                .strip_suffix(']')?
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 /// Every process in `group` that is still running, as pid and command line.
@@ -2263,5 +2348,875 @@ fn nothing_is_kept_for_the_acknowledgements_and_the_wheel() {
     );
 
     client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+//
+// What `--profile` is for, against the real engine: a cookie that survives a
+// quit. There is deliberately no test here that starts two engines on one
+// directory — the headless shell has no singleton and would run both happily,
+// so it would pass and prove nothing; the lock that prevents it is this
+// program's and is tested in `profile.rs` without an engine. Nor is there one
+// asserting that a `SIGTERM` loses the cookie: that is a fact about Chromium
+// 141 worth knowing (`profile.rs` has the table), not a behaviour of this
+// crate worth pinning.
+
+/// The cookie, from `Network.getCookies` on `client`, if the engine has it.
+fn the_cookie(client: &mut Client) -> Option<String> {
+    let reply = client
+        .call(
+            "Network.getCookies",
+            Json::object(vec![(
+                "urls",
+                Json::Array(vec![Json::string("https://example.com/")]),
+            )]),
+        )
+        .expect("the cookies");
+    reply
+        .get("cookies")
+        .and_then(Json::as_array)
+        .unwrap_or_default()
+        .iter()
+        .find(|cookie| cookie.get("name").and_then(Json::as_str) == Some("blinkterm"))
+        .and_then(|cookie| cookie.get("value"))
+        .and_then(Json::as_str)
+        .map(str::to_string)
+}
+
+/// The whole point of issue #6: a login is a cookie, and a cookie set in one
+/// run is there in the next — provided the engine is stopped the way
+/// `app::run` stops it, with `Browser.close` and a wait, rather than killed.
+#[test]
+fn a_cookie_set_in_one_session_is_there_in_the_next() {
+    let root = temp_dir("profile-kept");
+    let dir = root.join("profile");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let profile = Profile::take(Choice::At(dir.clone())).expect("the profile");
+    let Some((mut engine, mut client)) = connect_in(profile) else {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    // A day from now: a session cookie is not written to disk by design, so
+    // it would be lost however the engine stopped and prove nothing.
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs_f64()
+        + 86_400.0;
+    let set = client
+        .call(
+            "Network.setCookie",
+            Json::object(vec![
+                ("name", Json::string("blinkterm")),
+                ("value", Json::string("kept")),
+                ("url", Json::string("https://example.com/")),
+                ("expires", Json::number(expires)),
+            ]),
+        )
+        .expect("the cookie is set");
+    assert_eq!(set.get("success").and_then(Json::as_bool), Some(true));
+    assert_eq!(the_cookie(&mut client).as_deref(), Some("kept"));
+
+    let mut browser = engine.browser().expect("the browser's client");
+    let asked = Instant::now();
+    // The reply and the end of the connection race, and either is an answer.
+    let _ = browser.call_within("Browser.close", Json::empty(), Duration::from_secs(5));
+    assert!(
+        engine.wait_for_exit(Duration::from_secs(5)),
+        "the engine was asked to close and was still running five seconds later"
+    );
+    eprintln!("Browser.close to gone: {:?}", asked.elapsed());
+    drop(browser);
+    drop(client);
+    drop(engine);
+    assert!(
+        dir.join("Default").is_dir(),
+        "the engine wrote no profile into {}",
+        dir.display()
+    );
+
+    let profile = Profile::take(Choice::At(dir.clone()))
+        .expect("the profile is free once the engine that had it is gone");
+    let (engine, mut client) = connect_in(profile).expect("a second engine");
+    assert_eq!(
+        the_cookie(&mut client).as_deref(),
+        Some("kept"),
+        "the cookie did not survive a Browser.close"
+    );
+    drop(client);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `--temp-profile`, and every engine test: the directory is the program's to
+/// make and the program's to remove, whichever engine it is — full Chromium
+/// left to itself leaves a whole profile in `/tmp` after every run.
+#[test]
+fn a_temporary_profile_leaves_nothing_on_disk() {
+    let Some((engine, mut client)) = connect() else {
+        return;
+    };
+    let dir = engine.profile().dir().to_path_buf();
+    assert!(engine.profile().is_temporary());
+    assert!(dir.is_dir(), "{} was never made", dir.display());
+    prepare(&mut client);
+
+    drop(client);
+    drop(engine);
+    assert!(!dir.exists(), "{} is still there", dir.display());
+}
+
+// ---------------------------------------------------------------------------
+// Failed loads
+// ---------------------------------------------------------------------------
+
+use blinkterm::load::{self, Landing, Loaded, Problem};
+
+/// A server with the troubles a page can have, and a port that has none of
+/// anything.
+///
+/// `/404` and `/500` are error statuses with bodies of their own — a body is
+/// what makes the engine show the site's page rather than its own — `/redir`
+/// is a 302 into the closed port, `/link` is a page whose top-left corner is
+/// a link into it, and anything else is a page that is fine. The closed port
+/// is one the kernel handed out and this test gave back, so nothing is on it
+/// and nothing will be while the test runs. The base comes back without a
+/// trailing slash, so that `base + "/404"` is the url.
+fn serve_troubles() -> (String, u16) {
+    use std::io::{Read, Write};
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to close");
+        listener.local_addr().expect("an address").port()
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
+    let address = listener.local_addr().expect("an address");
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = [0u8; 2048];
+            let read = stream.read(&mut head).unwrap_or(0);
+            let request = String::from_utf8_lossy(&head[..read]).to_string();
+            let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+            let dead = format!("http://127.0.0.1:{closed}/");
+            let (status, extra, body) = match path.as_str() {
+                "/404" => (
+                    "404 Not Found",
+                    String::new(),
+                    "<!doctype html><title>nope</title><p>not here".to_string(),
+                ),
+                "/500" => (
+                    "500 Internal Server Error",
+                    String::new(),
+                    "<!doctype html><title>broken</title><p>broken".to_string(),
+                ),
+                "/redir" => ("302 Found", format!("Location: {dead}\r\n"), String::new()),
+                "/link" => (
+                    "200 OK",
+                    String::new(),
+                    format!(
+                        "<!doctype html><title>link</title><body style='margin:0'>\
+                         <a href='{dead}' style='display:block;position:absolute;\
+                         left:0;top:0;width:240px;height:80px;background:#cc3'>dead</a>"
+                    ),
+                ),
+                _ => (
+                    "200 OK",
+                    String::new(),
+                    "<!doctype html><title>fine</title><p>fine".to_string(),
+                ),
+            };
+            let answer = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{extra}\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(answer.as_bytes());
+        }
+    });
+    (format!("http://{address}"), closed)
+}
+
+/// A page connection with `Page.enable` and nothing else, which is all the
+/// program has on a tab either — no `Network`, no `Log` — held in a tab the
+/// way the program holds it.
+fn failing_tab() -> Option<(Engine, Tab<Client>)> {
+    let (engine, mut client) = connect()?;
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    Some((engine, Tab::new("t", client, "about:blank")))
+}
+
+/// Navigate as `app::navigate` does — the problem cleared, the call made, the
+/// reply handed to `app::navigated` — and hand the reply back to be looked at.
+fn navigate_tab(tab: &mut Tab<Client>, url: &str) -> Json {
+    let _ = tab.connection.events();
+    tab.url = url.to_string();
+    tab.note = Some(format!("loading {url}"));
+    tab.loading = true;
+    tab.problem = None;
+    let reply = tab
+        .connection
+        .call_within(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+            Duration::from_secs(20),
+        )
+        .expect("the engine answers the navigation");
+    blinkterm::app::navigated(tab, url, &reply);
+    reply
+}
+
+/// What `app::handle_page_events` does with a tab's events, until a main
+/// frame has landed and the load event after it has fired: the landings seen,
+/// in order.
+fn follow(tab: &mut Tab<Client>, timeout: Duration) -> Vec<Landing> {
+    let deadline = Instant::now() + timeout;
+    let mut landings = Vec::new();
+    let mut loaded = false;
+    // `loaded` is only ever set once something has landed, and a landing
+    // after it sets it back.
+    while !loaded && Instant::now() < deadline {
+        for event in tab.connection.events() {
+            match event.method.as_str() {
+                "Page.frameNavigated" => {
+                    if let Some(landing) = load::landing(&event.params) {
+                        landings.push(landing.clone());
+                        tab.landed(landing);
+                        loaded = false;
+                    }
+                }
+                "Page.loadEventFired" if !landings.is_empty() => {
+                    tab.loading = false;
+                    if let Some(answer) = blinkterm::app::page_loaded(&mut tab.connection) {
+                        tab.loaded(answer);
+                    }
+                    loaded = true;
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        loaded,
+        "no load event after the landing within {timeout:?}: {landings:?}"
+    );
+    landings
+}
+
+/// How many entries the tab's history has.
+fn history_length(client: &mut Client) -> usize {
+    client
+        .call("Page.getNavigationHistory", Json::empty())
+        .expect("the history")
+        .get("entries")
+        .and_then(Json::as_array)
+        .map_or(0, <[Json]>::len)
+}
+
+/// The quickest failure there is, and the one the resolver would otherwise
+/// be asked about: `.invalid` is reserved never to resolve, and the engine
+/// knows it without asking anyone. What matters is that the reason is in the
+/// reply to `Page.navigate`, which is the only place it is, and that the
+/// error page's landing afterwards keeps it.
+#[test]
+fn a_host_that_does_not_exist_is_explained_before_the_resolver_gives_up() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let url = "https://nonexistent.invalid/";
+    let started = Instant::now();
+    let reply = navigate_tab(&mut tab, url);
+    let elapsed = started.elapsed();
+    let code = load::failed(&reply).expect("a reply with an errorText in it");
+    eprintln!("{url}: {code} in {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "{elapsed:?} to say a reserved name does not exist"
+    );
+    assert_eq!(
+        tab.line(),
+        format!("can't reach nonexistent.invalid: {}", load::reason(&code))
+    );
+
+    let landings = follow(&mut tab, Duration::from_secs(5));
+    assert_eq!(landings, [Landing::Unreachable(url.to_string())]);
+    assert_eq!(tab.url, url, "the address, never chrome-error://");
+    // Behind a proxy the engine never asks a resolver and the code is the
+    // proxy's; the sentence still names the host, and the words are checked
+    // exactly only for the code this was measured with.
+    if code == "net::ERR_NAME_NOT_RESOLVED" {
+        assert_eq!(
+            tab.line(),
+            "can't reach nonexistent.invalid: name not resolved"
+        );
+    } else {
+        eprintln!(
+            "not the resolver's answer, so probably a proxy's: {}",
+            tab.line()
+        );
+        assert!(tab.line().starts_with("can't reach nonexistent.invalid: "));
+    }
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// A closed port is refused, and a redirect into one fails where it ended:
+/// the reply's reason is the last hop's, and the landing is at the last hop's
+/// url, which is what the row names. Going to the failed url again — which is
+/// what `ctrl+r` does on an error page — is checked here not to add a history
+/// entry.
+#[test]
+fn a_port_nobody_listens_on_is_refused_and_a_redirect_into_it_names_where_it_ended() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, closed) = serve_troubles();
+    let dead = format!("http://127.0.0.1:{closed}/");
+    let refused = format!("can't reach 127.0.0.1:{closed}: connection refused");
+
+    // Somewhere to have been, so that the history has a before.
+    navigate_tab(&mut tab, &format!("{base}/"));
+    follow(&mut tab, Duration::from_secs(10));
+
+    let reply = navigate_tab(&mut tab, &dead);
+    assert_eq!(
+        load::failed(&reply).as_deref(),
+        Some("net::ERR_CONNECTION_REFUSED")
+    );
+    assert_eq!(
+        follow(&mut tab, Duration::from_secs(5)),
+        [Landing::Unreachable(dead.clone())]
+    );
+    assert_eq!(tab.line(), refused);
+    let before = history_length(&mut tab.connection);
+
+    // `ctrl+r` on the error page: the same url again, through `Page.navigate`.
+    let again = navigate_tab(&mut tab, &dead);
+    assert_eq!(
+        load::failed(&again).as_deref(),
+        Some("net::ERR_CONNECTION_REFUSED")
+    );
+    follow(&mut tab, Duration::from_secs(5));
+    assert_eq!(tab.line(), refused);
+    let after = history_length(&mut tab.connection);
+    eprintln!("history: {before} entries before going again, {after} after");
+    assert_eq!(
+        after, before,
+        "going to the same failed url again is a reload"
+    );
+
+    // Through a redirect.
+    let reply = navigate_tab(&mut tab, &format!("{base}/redir"));
+    assert_eq!(
+        load::failed(&reply).as_deref(),
+        Some("net::ERR_CONNECTION_REFUSED"),
+        "the last hop's reason"
+    );
+    assert_eq!(
+        follow(&mut tab, Duration::from_secs(5)),
+        [Landing::Unreachable(dead.clone())],
+        "and the last hop's url"
+    );
+    assert_eq!(tab.url, dead);
+    assert_eq!(tab.line(), refused);
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// A link is not a `Page.navigate`, so there is no reply and no reason — and
+/// the landing still says the page did not come, which is the half that used
+/// to show `chrome-error://`. A reload of the error page lands again.
+#[test]
+fn a_link_into_a_dead_host_is_a_failure_the_page_reports_by_itself() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, closed) = serve_troubles();
+    let dead = format!("http://127.0.0.1:{closed}/");
+
+    navigate_tab(&mut tab, &format!("{base}/link"));
+    follow(&mut tab, Duration::from_secs(10));
+    assert_eq!(tab.title, "link");
+    assert_eq!(tab.problem, None);
+
+    let clicked = Instant::now();
+    for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+        tab.connection
+            .call(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(20)),
+                    ("y", Json::number(20)),
+                    ("button", Json::string("left")),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(0)),
+                ]),
+            )
+            .expect("the click is dispatched");
+    }
+    let landings = follow(&mut tab, Duration::from_secs(5));
+    eprintln!("the link's failure landed within {:?}", clicked.elapsed());
+    assert_eq!(landings, [Landing::Unreachable(dead.clone())]);
+    assert_eq!(tab.url, dead);
+    assert_eq!(tab.line(), format!("can't reach 127.0.0.1:{closed}"));
+
+    let _ = tab.connection.events();
+    tab.connection
+        .call("Page.reload", Json::empty())
+        .expect("the reload is taken");
+    assert_eq!(
+        follow(&mut tab, Duration::from_secs(5)),
+        [Landing::Unreachable(dead.clone())],
+        "a reload of an error page is a second landing"
+    );
+    assert_eq!(tab.line(), format!("can't reach 127.0.0.1:{closed}"));
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// The status comes out of the same evaluation as the title, from the
+/// navigation timing entry, with no `Network` domain enabled.
+#[test]
+fn the_status_of_the_document_comes_with_its_title() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, closed) = serve_troubles();
+
+    let reply = navigate_tab(&mut tab, &format!("{base}/404"));
+    assert_eq!(
+        load::failed(&reply),
+        None,
+        "a 404 is not a failure to the engine"
+    );
+    follow(&mut tab, Duration::from_secs(10));
+    assert_eq!(
+        blinkterm::app::page_loaded(&mut tab.connection),
+        Some(Loaded {
+            title: "nope".to_string(),
+            status: Some(404)
+        })
+    );
+    assert_eq!(tab.problem, Some(Problem::Status(404)));
+    assert_eq!(tab.line(), format!("404 not found  —  nope  —  {base}/404"));
+
+    navigate_tab(&mut tab, &format!("{base}/500"));
+    follow(&mut tab, Duration::from_secs(10));
+    assert_eq!(
+        blinkterm::app::page_loaded(&mut tab.connection).and_then(|loaded| loaded.status),
+        Some(500)
+    );
+    assert_eq!(tab.problem, Some(Problem::Status(500)));
+
+    navigate_tab(&mut tab, &format!("{base}/"));
+    follow(&mut tab, Duration::from_secs(10));
+    assert_eq!(
+        blinkterm::app::page_loaded(&mut tab.connection),
+        Some(Loaded {
+            title: "fine".to_string(),
+            status: None
+        })
+    );
+    assert_eq!(tab.problem, None);
+
+    navigate_tab(&mut tab, &format!("http://127.0.0.1:{closed}/"));
+    follow(&mut tab, Duration::from_secs(5));
+    assert_eq!(
+        blinkterm::app::page_loaded(&mut tab.connection),
+        Some(Loaded {
+            title: String::new(),
+            status: None
+        }),
+        "an error page has no title and no status"
+    );
+
+    tab.connection.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Dialogs
+// ---------------------------------------------------------------------------
+//
+// A page with a dialog open is a page whose renderer is stopped inside the
+// script that opened it, so nothing below asks it anything while one is up:
+// not its title, not a screenshot. Those would sit out their deadlines and
+// prove only that the page was stopped, which is the one thing already known.
+// What is asked is the engine — the dialog opening, the dialog closing, and
+// what the page did with the answer once it had one.
+
+/// A page with nothing on it but a title, which is where the scripts below
+/// write what their dialogs returned.
+const QUIET_PAGE: &str = "data:text/html,<title>ready</title><body>";
+
+/// Load a page that can be asked to open dialogs.
+fn a_page_that_asks(client: &mut Client, url: &str, title: &str) {
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(client, title, Duration::from_secs(10)),
+        title
+    );
+    let _ = client.events();
+}
+
+/// Run a script that opens a dialog.
+///
+/// `notify` rather than `call`: the evaluation does not answer until the
+/// script is over, and the script is not over until the dialog is answered —
+/// a `call` here would wait out its own deadline and then report the page as
+/// broken.
+fn raise(client: &mut Client, expression: &str) {
+    client
+        .notify(
+            "Runtime.evaluate",
+            Json::object(vec![("expression", Json::string(expression))]),
+        )
+        .expect("the script is sent");
+}
+
+/// The next dialog the page opens, read the way the program reads it.
+fn wait_for_dialog(client: &Client, timeout: Duration) -> blinkterm::dialog::Dialog {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for event in client.events() {
+            if event.method == "Page.javascriptDialogOpening" {
+                return blinkterm::dialog::Dialog::opening(&event.params)
+                    .unwrap_or_else(|| panic!("a dialog of no known kind: {}", event.params));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("no dialog opened in {timeout:?}");
+}
+
+/// Press `keys` at a dialog until one of them answers it, tell the engine
+/// what the program would tell it, and wait for the engine to say the dialog
+/// has closed with that answer.
+fn answer(
+    client: &mut Client,
+    mut dialog: blinkterm::dialog::Dialog,
+    keys: &[KeyInput],
+) -> blinkterm::dialog::Answer {
+    use blinkterm::dialog::Answer;
+    let mut answered = Answer::Waiting;
+    for key in keys {
+        answered = dialog.step(key);
+        if answered != Answer::Waiting {
+            break;
+        }
+    }
+    assert!(
+        matches!(answered, Answer::Accept | Answer::Dismiss),
+        "{keys:?} did not answer the {:?}",
+        dialog.kind
+    );
+    client
+        .call("Page.handleJavaScriptDialog", dialog.reply(answered))
+        .expect("the engine takes the answer");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        for event in client.events() {
+            if event.method == "Page.javascriptDialogClosed" {
+                assert_eq!(
+                    event.params.get("result").and_then(Json::as_bool),
+                    Some(answered == Answer::Accept),
+                    "the engine closed it with a different answer: {}",
+                    event.params
+                );
+                return answered;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("the dialog never said it had closed");
+}
+
+fn press(key: Key) -> KeyInput {
+    KeyInput::press(key)
+}
+
+fn letter(c: char) -> KeyInput {
+    KeyInput {
+        key: Key::Char(c),
+        mods: Mods::default(),
+        action: KeyAction::Press,
+        text: Some(c),
+    }
+}
+
+/// `alert()` used to be answered no on the page's behalf and never seen. Now
+/// it is seen, it says what it said, and the key that dismisses it is what
+/// lets the rest of the script run.
+#[test]
+fn an_alert_is_seen_and_any_key_lets_the_page_carry_on() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    a_page_that_asks(&mut client, QUIET_PAGE, "ready");
+
+    raise(
+        &mut client,
+        "alert('saved\\nthree files'); document.title = 'after the alert'",
+    );
+    let dialog = wait_for_dialog(&client, Duration::from_secs(5));
+    assert_eq!(dialog.kind, blinkterm::dialog::Kind::Alert);
+    assert_eq!(dialog.message, "saved\nthree files");
+    assert_eq!(dialog.caption(), "alert: saved three files");
+    assert!(dialog.url.starts_with("data:text/html"), "{}", dialog.url);
+
+    // Shift on its own is not an answer; the x after it is.
+    let shift = KeyInput {
+        key: Key::Other(57441),
+        mods: Mods(Mods::SHIFT),
+        action: KeyAction::Press,
+        text: None,
+    };
+    answer(&mut client, dialog, &[shift, letter('x')]);
+    assert_eq!(
+        wait_for_title(&mut client, "after the alert", Duration::from_secs(5)),
+        "after the alert",
+        "the script that opened the alert never finished"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// `confirm()` returns what the person said, which is the thing that was
+/// broken: a "delete this?" was a silent no.
+#[test]
+fn a_confirm_answered_both_ways_reaches_the_page() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    a_page_that_asks(&mut client, QUIET_PAGE, "ready");
+
+    for (keys, returned) in [
+        (vec![letter('x'), letter('y')], "true"),
+        (vec![letter('n')], "false"),
+        (vec![press(Key::Escape)], "false"),
+        (vec![press(Key::Enter)], "true"),
+    ] {
+        raise(
+            &mut client,
+            "document.title = 'confirm ' + confirm('Delete three files?')",
+        );
+        let dialog = wait_for_dialog(&client, Duration::from_secs(5));
+        assert_eq!(dialog.kind, blinkterm::dialog::Kind::Confirm);
+        assert_eq!(dialog.caption(), "Delete three files?");
+        answer(&mut client, dialog, &keys);
+        let wanted = format!("confirm {returned}");
+        assert_eq!(
+            wait_for_title(&mut client, &wanted, Duration::from_secs(5)),
+            wanted,
+            "{keys:?}"
+        );
+    }
+
+    client.close();
+    engine.kill();
+}
+
+/// `prompt()` returns what was typed, the default when nothing was, and
+/// `null` when it was dismissed — the three answers a page can tell apart.
+#[test]
+fn a_prompt_sends_back_what_was_typed_or_nothing() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    a_page_that_asks(&mut client, QUIET_PAGE, "ready");
+
+    for (keys, returned) in [
+        (
+            vec![letter('x'), letter('y'), press(Key::Enter)],
+            "prompt xy",
+        ),
+        (vec![press(Key::Enter)], "prompt default"),
+        (vec![letter('z'), press(Key::Escape)], "prompt null"),
+    ] {
+        raise(
+            &mut client,
+            "document.title = 'prompt ' + prompt('Your name?', 'default')",
+        );
+        let dialog = wait_for_dialog(&client, Duration::from_secs(5));
+        assert_eq!(dialog.kind, blinkterm::dialog::Kind::Prompt);
+        assert_eq!(dialog.line.text, "default", "the page's default is offered");
+        assert!(dialog.line.whole, "and selected");
+        answer(&mut client, dialog, &keys);
+        assert_eq!(
+            wait_for_title(&mut client, returned, Duration::from_secs(5)),
+            returned,
+            "{keys:?}"
+        );
+    }
+
+    client.close();
+    engine.kill();
+}
+
+/// A page with something unsaved asks before it is left, and the answer
+/// decides whether it is.
+///
+/// The navigation goes out with `send`, as `app::navigate` sends it, because
+/// this is the case that made it stop being a `call`: the engine holds the
+/// reply to `Page.navigate` until the question has been answered, and a
+/// program that waited for the reply would never draw the question.
+#[test]
+fn a_page_that_asks_before_unloading_is_asked_and_answered() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    const DIRTY: &str = "data:text/html,<title>stay</title>\
+        <body style='height:100vh'>a form with something typed in it<script>\
+        addEventListener('beforeunload', function (e) { e.preventDefault(); e.returnValue = ''; })\
+        </script>";
+    const AWAY: &str = "data:text/html,<title>left</title><body>";
+    a_page_that_asks(&mut client, DIRTY, "stay");
+
+    // Chromium asks only on behalf of a page somebody has touched, so it is
+    // touched: a click, dispatched as the program would dispatch one.
+    let touch = |client: &mut Client| {
+        for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+            client
+                .call(
+                    "Input.dispatchMouseEvent",
+                    Json::object(vec![
+                        ("type", Json::string(kind)),
+                        ("x", Json::number(40)),
+                        ("y", Json::number(20)),
+                        ("button", Json::string("left")),
+                        ("buttons", Json::number(buttons)),
+                        ("clickCount", Json::number(1)),
+                        ("modifiers", Json::number(0)),
+                    ]),
+                )
+                .expect("the click is dispatched");
+        }
+    };
+    let reply_to = |client: &Client, pending: &Pending| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(reply) = client.take_reply(pending) {
+                return reply;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("Page.navigate was never answered after its dialog was");
+    };
+
+    for (key, stays) in [(letter('n'), true), (letter('y'), false)] {
+        touch(&mut client);
+        let _ = client.events();
+        let pending = client
+            .send(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(AWAY))]),
+            )
+            .expect("the navigation is sent");
+        let dialog = wait_for_dialog(&client, Duration::from_secs(5));
+        assert_eq!(dialog.kind, blinkterm::dialog::Kind::BeforeUnload);
+        // Whatever the page put in `returnValue`, the engine does not pass it
+        // on, which is why the row asks its own question.
+        assert_eq!(dialog.message, "");
+        assert_eq!(dialog.caption(), "leave this page?");
+        assert!(
+            client.take_reply(&pending).is_none(),
+            "the engine answered the navigation before the question, so it \
+             would not have held a program that waited for it"
+        );
+
+        answer(&mut client, dialog, &[key]);
+        let reply = reply_to(&client, &pending);
+        let wanted = if stays { "stay" } else { "left" };
+        assert_eq!(
+            wait_for_title(&mut client, wanted, Duration::from_secs(5)),
+            wanted,
+            "the navigation's reply was {reply:?}"
+        );
+    }
+
+    client.close();
+    engine.kill();
+}
+
+/// A tab that is not in front can open a dialog too. It is heard — its queue
+/// is drained every pass, and the dialog kept on the tab — and it is still
+/// there to be answered when the person goes to it.
+#[test]
+fn a_dialog_on_a_tab_that_is_not_in_front_is_still_heard() {
+    let Some((mut engine, mut browser, mut tabs)) = two_tabs() else {
+        return;
+    };
+    assert_eq!(tabs.active_index(), 1, "the second tab is in front");
+    {
+        let first = tabs.get_mut(0).expect("the first tab");
+        let _ = first.connection.events();
+        raise(
+            &mut first.connection,
+            "document.title = 'confirm ' + confirm('Leave the others?')",
+        );
+    }
+
+    // What `app::handle_page_events` does with every tab's queue, with the
+    // drawing left out.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tabs.iter().all(|tab| tab.dialog.is_none()) {
+        assert!(
+            Instant::now() < deadline,
+            "the tab behind never said it had a question"
+        );
+        for index in 0..tabs.len() {
+            let tab = tabs.get_mut(index).expect("a tab");
+            for event in tab.connection.events() {
+                tab.dialog_event(&event);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let asking: Vec<bool> = tabs.iter().map(|tab| tab.dialog.is_some()).collect();
+    assert_eq!(
+        asking,
+        [true, false],
+        "the question is on the tab that asked"
+    );
+    assert_eq!(
+        tabs.active_index(),
+        1,
+        "and asking did not bring it forward"
+    );
+
+    // The person goes to it, and answers.
+    assert!(tabs.select(1));
+    let tab = tabs.active_mut().expect("the first tab");
+    let dialog = tab.dialog.take().expect("still waiting");
+    assert_eq!(dialog.caption(), "Leave the others?");
+    answer(&mut tab.connection, dialog, &[letter('y')]);
+    assert_eq!(
+        wait_for_title(&mut tab.connection, "confirm", Duration::from_secs(5)),
+        "confirm true"
+    );
+
+    browser.close();
+    drop(tabs);
     engine.kill();
 }

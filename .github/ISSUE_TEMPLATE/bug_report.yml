@@ -46,8 +46,8 @@ body:
     id: engine
     attributes:
       label: The engine
-      description: "Which binary and which version — `chromium-shell --version`, or whatever `$BLINKTERM_ENGINE` points at."
-      placeholder: /usr/bin/chromium-shell — Chromium 120.0.6099.224
+      description: "Which binary and which version — `chrome-headless-shell --version`, or whatever `$BLINKTERM_ENGINE` points at."
+      placeholder: /opt/chrome-headless-shell-linux64/chrome-headless-shell — Google Chrome for Testing 153.0.8010.52
     validations:
       required: true
 

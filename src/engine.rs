@@ -10,7 +10,7 @@
 //! `--headless --disable-gpu --ozone-platform=headless` is the combination
 //! that was measured to work. The third is the one that looks redundant and is
 //! not: a Chromium started headless *without* an ozone platform opens its
-//! debugging port, accepts a connection, and then never answers on it — no
+//! debugging endpoint, accepts a connection, and then never answers on it — no
 //! error, no output, no exit. That failure is why every wait in this program
 //! has a deadline, and why the flags are written here as a constant rather
 //! than assembled from options.
@@ -23,7 +23,7 @@
 //! wait for it, and `/usr/bin/google-chrome` is a wrapper too. So the pid this
 //! program gets back from `spawn` is `/bin/sh`, and a `kill(2)` on it takes
 //! the shell and leaves the browser: reparented to init, still holding its
-//! debugging port, still painting the page it had. Seven sessions of that on
+//! debugging endpoint, still painting the page it had. Seven sessions of that on
 //! an installed machine left seven engines nobody was looking at, between them
 //! keeping two processors busy.
 //!
@@ -32,19 +32,43 @@
 //! and renderer processes the browser forked, all of which inherit the group
 //! and none of which this program otherwise knows the pid of.
 //!
-//! `--remote-debugging-port=0` asks the kernel for a free port and Chromium
-//! prints the one it got; taking a port from the child is the only way to run
-//! two of these at once without them colliding.
 //! `--disable-dev-shm-usage` keeps the engine off the same `/dev/shm` the
-//! frames go through. `--remote-allow-origins=*` is needed because a
-//! WebSocket handshake without an `Origin` is checked against a list that is
-//! empty by default. `--no-sandbox` only when this program is root, because
+//! frames go through. `--no-sandbox` only when this program is root, because
 //! Chromium refuses to start as root without it and adding it as anyone else
 //! would be turning off a protection that was working. Root also gets a
 //! sentence on stderr about it: it is the one flag here that takes a defence
 //! away, and it should not be added on the person's behalf in silence.
+//!
+//! # A pipe, because a port is everybody's
+//!
+//! `--remote-debugging-pipe` rather than `--remote-debugging-port`, and the
+//! difference is who else can drive the browser. A port on 127.0.0.1 is open
+//! to every process on the machine, whoever runs it, and a browser driven from
+//! it can be made to read any page this one has open and type into any form.
+//! This used to ask for `--remote-debugging-port=0` and
+//! `--remote-allow-origins=*`, and said here that the second was needed
+//! because a WebSocket handshake without an `Origin` is checked against a list
+//! that is empty by default. That was never true. Measured against
+//! `headless_shell` 141.0.7390.37 without the flag, a handshake with no
+//! `Origin` at all — which is what this program sent — is answered `101`, and
+//! only one naming an origin such as `http://evil.example` gets `403`. So the
+//! flag was letting any web page in the browser that could guess the port
+//! talk to it, and removing it would have closed that and left every local
+//! process exactly as able to attach as before.
+//!
+//! With the pipe there is nothing to attach to. The engine reads commands on
+//! its descriptor 3 and writes replies and events on its descriptor 4, which
+//! it inherits from this program and nobody else has; the whole group — six
+//! processes, measured — holds no listening socket at all, and there is no
+//! `DevTools listening on` line to wait for. The engine is ready when it
+//! answers `Browser.getVersion` on the pipe, which is asked the moment it has
+//! been started and is the first thing [`Engine::launch`] waits for.
+//!
+//! `wire` is how the two descriptors get to be 3 and 4, and every step of it
+//! is there because the obvious version was wrong.
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -52,17 +76,30 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::cdp::{Client, Exchange};
 use crate::json::Json;
+use crate::profile::Profile;
 
 /// The engines that are looked for, in the order they are looked for.
 ///
-/// `chromium-shell` first: it is Debian's `headless_shell`, the one this was
-/// measured against, and the one with no window system code in it at all.
-pub const CANDIDATES: [&str; 4] = [
-    "chromium-shell",
+/// `chrome-headless-shell` first: Chrome for Testing's `headless_shell`, the
+/// one the engine tests run against, and the one with no window system code
+/// in it at all.
+///
+/// `chromium-shell` last. It was first, on the belief that it was Debian's
+/// `headless_shell`, and it is not: it is Chromium's `content_shell`, and it
+/// differs where this program cares most. It opens its DevTools port whether
+/// or not it is asked to, so the pipe stops being the only way in; it answers
+/// a page's `alert`, `confirm` and `prompt` itself, before the person can; and
+/// it does not exit on `Browser.close`, so a kept profile is never flushed.
+/// Measured against a `content_shell` build and against Debian's 153 in CI.
+/// It still renders a page, so it stays on the list, behind anything better.
+pub const CANDIDATES: [&str; 5] = [
+    "chrome-headless-shell",
     "chromium",
     "chromium-browser",
     "google-chrome",
+    "chromium-shell",
 ];
 
 /// The environment variable that overrides the search.
@@ -98,8 +135,11 @@ static TARGET: AtomicI32 = AtomicI32::new(0);
 ///
 /// Signal-safe enough for what it is used for: one `kill(2)` on an integer
 /// read out of an atomic. The panic hook and the signal path do not go through
-/// [`Engine::kill`] and have no connection to ask the browser to close on, so
-/// they take the group with `SIGKILL` and leave the lock file behind.
+/// [`Engine::kill`] and do not close the pipe the browser would take as its
+/// cue to close, nor ask it to close, so they take the group with `SIGKILL`.
+/// Whatever the engine had not flushed of the profile is lost with it — see
+/// [`crate::profile`] for how much — and a temporary profile's directory is
+/// [`crate::profile::remove_temp_profile`]'s to take away, not this.
 pub fn kill_engine() {
     signal_all(TARGET.swap(0, Ordering::SeqCst), libc::SIGKILL);
 }
@@ -157,6 +197,67 @@ fn spawn_in_own_group(command: &mut Command) -> std::io::Result<(Child, i32)> {
     Ok((child, group_target(pid)))
 }
 
+/// A descriptor with the same pipe behind it, numbered 5 or higher, and
+/// close-on-exec. The one it was made from is closed as it drops.
+///
+/// The engine's ends of its two pipes go through this before [`wire`] puts
+/// them on 3 and 4, for two reasons that both come from the numbers a fresh
+/// process hands out. In a program that has opened nothing yet, the first pipe
+/// *is* 3 and 4, and `dup2(3, 3)` is defined to do nothing at all — including
+/// not clearing close-on-exec — so the engine would start with no descriptor 3
+/// and say "remote debugging pipe file descriptors are not open". And with two
+/// pipes the ends can be crossed: were the engine's writing end 3, the
+/// `dup2(read, 3)` that comes first would close it before it had been copied
+/// to 4. Above 4, neither can happen.
+fn above(fd: OwnedFd) -> std::io::Result<OwnedFd> {
+    // SAFETY: `fcntl(2)` with `F_DUPFD_CLOEXEC` takes a descriptor and an
+    // integer and reads no memory; `fd` is open for the whole call because it
+    // is an `OwnedFd` that is not dropped until this returns.
+    let moved = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+    if moved < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `moved` is a descriptor `fcntl` has just made, so it is open and
+    // nothing else in this program owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(moved) })
+}
+
+/// Give the engine `engine_read` as its descriptor 3 and `engine_write` as 4.
+///
+/// Both pipes are made close-on-exec (`std::io::pipe` is `pipe2(2)` with
+/// `O_CLOEXEC`), so that nothing of them leaks into the engine except the two
+/// copies made here: `dup2(2)` clears close-on-exec on the descriptor it
+/// makes, which is the whole mechanism — the originals, at 5 and above, close
+/// at `exec`, and 3 and 4 survive it. The parent has to close its own copies
+/// of the engine's two ends once the engine is started, or it holds the
+/// writing end of its own reading pipe and never sees end of file.
+///
+/// Both have to be above 4 before this runs; see [`above`].
+///
+/// Rust runs `pre_exec` closures after it has put stdin, stdout and stderr in
+/// place, and in the order they were registered, so this is registered before
+/// [`spawn_in_own_group`] registers its own. One consequence is worth
+/// knowing: the pipe the standard library uses to hear that `exec` failed may
+/// itself be numbered 3 or 4 in the child, and a `dup2` onto it closes it —
+/// so an `exec` that fails reads here as an engine that started and then did
+/// not answer, which [`Engine::launch`] reports all the same. [`locate`]
+/// checks that the file is executable first, so that is a rare way to fail.
+fn wire(command: &mut Command, engine_read: RawFd, engine_write: RawFd) {
+    // SAFETY: the closure runs in the child between `fork` and `exec`, where
+    // only async-signal-safe calls are allowed; it makes two `dup2(2)` calls
+    // and reads `errno`, all of which are. The two descriptors are integers
+    // copied into the closure, and the parent keeps them open until `spawn`
+    // has returned, so they are open in the child when it runs.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(engine_read, 3) < 0 || libc::dup2(engine_write, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// `kill(2)`'s argument for everything `pid` leads: `-pid` once `pid` is a
 /// group of its own, and `pid` alone if it somehow is not.
 ///
@@ -185,6 +286,16 @@ fn group_target(pid: i32) -> i32 {
 /// `ESRCH` is the answer that the group is empty. A process nobody has waited
 /// for is still a member of it, which is why the wrapper is reaped before this
 /// is believed.
+///
+/// And why a yes from `kill(2)` is checked against `/proc`. The browser's
+/// renderers and zygotes are not this program's children; once the browser
+/// has gone they belong to whatever is pid 1, and are only removed when it
+/// waits for them. A real init does at once. The pid 1 of a container often
+/// does not — CI's is one — and there the group keeps its zombies for as long
+/// as the container lives, `kill(2)` goes on saying yes, and an engine that
+/// closed in two seconds looked to [`Engine::wait_for_exit`] like one that was
+/// still running at five. A zombie runs nothing and holds nothing open, so a
+/// group whose members are all zombies is a group that has gone.
 fn group_alive(target: i32) -> bool {
     if target >= 0 {
         // No group of its own; the child's own exit status is the whole
@@ -194,9 +305,37 @@ fn group_alive(target: i32) -> bool {
     // SAFETY: signal 0 sends nothing and only asks whether it could, and
     // `kill(2)` reads no memory. `target` is negative here, checked above.
     if unsafe { libc::kill(target, 0) } == 0 {
-        return true;
+        return group_has_living_member(-target);
     }
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Whether any process in `group` is something other than a zombie, read out
+/// of `/proc`. A `/proc` that cannot be read is taken to say yes, which leaves
+/// `kill(2)`'s answer standing.
+fn group_has_living_member(group: i32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    entries.flatten().any(|entry| {
+        std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .and_then(|stat| state_and_group(&stat))
+            .is_some_and(|(state, pgrp)| pgrp == group && state != 'Z')
+    })
+}
+
+/// The state and the process group out of a `/proc/<pid>/stat` line.
+///
+/// The command name is the second field, in parentheses, and may itself hold
+/// spaces and parentheses, so the fields are counted from the last `)`.
+fn state_and_group(stat: &str) -> Option<(char, i32)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _parent = fields.next()?;
+    let group = fields.next()?.parse().ok()?;
+    Some((state, group))
 }
 
 /// Where the engine is, or a sentence about why there is none.
@@ -250,8 +389,7 @@ pub fn flags(as_root: bool) -> Vec<&'static str> {
         "--disable-gpu",
         "--disable-dev-shm-usage",
         "--ozone-platform=headless",
-        "--remote-debugging-port=0",
-        "--remote-allow-origins=*",
+        "--remote-debugging-pipe",
     ];
     if as_root {
         flags.push("--no-sandbox");
@@ -260,25 +398,29 @@ pub fn flags(as_root: bool) -> Vec<&'static str> {
     flags
 }
 
-/// The url out of `DevTools listening on ws://127.0.0.1:PORT/...`.
-pub fn devtools_url(line: &str) -> Option<String> {
-    let at = line.find("ws://")?;
-    Some(line[at..].trim().to_string())
-}
-
 /// A running engine, killed when this is dropped and when the program dies.
 pub struct Engine {
     child: Child,
     /// What to kill, in `kill(2)`'s notation; see [`TARGET`].
     target: i32,
-    browser_url: String,
+    /// The pipe, from this side. Every [`Client`] holds it too, and this is
+    /// the holder that shuts it.
+    exchange: Arc<Exchange>,
     tail: Arc<Mutex<Vec<String>>>,
+    /// The `--user-data-dir` it was given. Declared last so that it is dropped
+    /// last: [`Engine`]'s own `Drop` kills the engine first, and only then is a
+    /// kept profile's lock let go or a temporary one's directory removed.
+    profile: Profile,
 }
 
 impl Engine {
-    /// Start one and wait, for no longer than `timeout`, for it to say where
-    /// its debugging port is.
-    pub fn launch(timeout: Duration) -> Result<Engine, String> {
+    /// Start one and wait, for no longer than `timeout`, for it to answer on
+    /// its pipe.
+    ///
+    /// `profile` is where it keeps what it keeps, and is held for as long as
+    /// the engine is: see [`crate::profile`] for why the directory is always
+    /// named, and why the lock on it is this program's.
+    pub fn launch(profile: Profile, timeout: Duration) -> Result<Engine, String> {
         let path = locate()?;
         // SAFETY: `geteuid(2)` takes nothing, reads no memory and cannot fail.
         let as_root = unsafe { libc::geteuid() } == 0;
@@ -298,28 +440,44 @@ impl Engine {
                  untrusted pages. Run as an ordinary user if you can."
             );
         }
+
+        let piped = |e: std::io::Error| format!("cannot make the engine's pipe: {e}");
+        // Commands go down the first; replies and events come up the second.
+        let (engine_read, ours_write) = std::io::pipe().map_err(piped)?;
+        let (ours_read, engine_write) = std::io::pipe().map_err(piped)?;
+        let engine_read = above(engine_read.into()).map_err(piped)?;
+        let engine_write = above(engine_write.into()).map_err(piped)?;
+
         let mut command = Command::new(&path);
         command
+            .arg(format!("--user-data-dir={}", profile.dir().display()))
             .args(flags(as_root))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        wire(
+            &mut command,
+            engine_read.as_raw_fd(),
+            engine_write.as_raw_fd(),
+        );
         let (mut child, target) = spawn_in_own_group(&mut command)
             .map_err(|e| format!("cannot start {}: {e}", path.display()))?;
         TARGET.store(target, Ordering::SeqCst);
+        // The engine has its own copies now. Keeping these would be holding the
+        // writing end of the pipe this program reads, which is the difference
+        // between an engine that dies being heard as end of file and not.
+        drop(engine_read);
+        drop(engine_write);
 
         let stderr = child.stderr.take().ok_or("the engine has no stderr")?;
         let tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let (found, url) = std::sync::mpsc::channel();
         let keep = Arc::clone(&tail);
-        // A thread rather than a poll, because the line has to be read as it
-        // arrives: a pipe nobody reads fills, and an engine whose stderr is
-        // full stops.
+        // A thread rather than a poll, because the lines have to be read as
+        // they arrive: a pipe nobody reads fills, and an engine whose stderr is
+        // full stops. Nothing in them is waited for any more — the pipe says
+        // when the engine is ready — but they are what explains a death.
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Some(url) = devtools_url(&line) {
-                    let _ = found.send(url);
-                }
                 if let Ok(mut tail) = keep.lock() {
                     tail.push(line);
                     if tail.len() > HEAD + TAIL {
@@ -330,31 +488,43 @@ impl Engine {
             }
         });
 
-        let browser_url = match url.recv_timeout(timeout) {
-            Ok(url) => url,
-            Err(_) => {
-                let why = describe_tail(&tail);
-                let mut engine = Engine {
-                    child,
-                    target,
-                    browser_url: String::new(),
-                    tail,
-                };
-                engine.kill();
-                return Err(format!(
-                    "{} did not say where its debugging port is within {} seconds{why}",
-                    path.display(),
-                    timeout.as_secs()
-                ));
-            }
-        };
-
-        Ok(Engine {
+        let exchange = Exchange::over(ours_read.into_raw_fd(), ours_write.into_raw_fd());
+        let mut engine = Engine {
             child,
             target,
-            browser_url,
+            exchange,
             tail,
-        })
+            profile,
+        };
+        // The first thing asked, and the readiness signal: an engine that is
+        // up answers it, and one that died on the way up closes the pipe,
+        // which fails the call at once rather than at the deadline.
+        let ready = Client::browser(&engine.exchange).and_then(|mut browser| {
+            browser.call_within("Browser.getVersion", Json::empty(), timeout)
+        });
+        if let Err(err) = ready {
+            engine.kill();
+            // After the kill, so that whatever the engine said on its way out
+            // has been read by the time it is quoted.
+            let why = describe_tail(&engine.tail);
+            return Err(format!(
+                "{} did not answer on its debugging pipe within {} seconds ({err}){why}",
+                path.display(),
+                timeout.as_secs()
+            ));
+        }
+        Ok(engine)
+    }
+
+    /// A client for the browser's own messages: the one that opens, closes,
+    /// raises and attaches to pages. One at a time; see [`Client::browser`].
+    pub fn browser(&self) -> Result<Client, String> {
+        Client::browser(&self.exchange)
+    }
+
+    /// The profile it was started with.
+    pub fn profile(&self) -> &Profile {
+        &self.profile
     }
 
     /// The engine's process group, once it has one of its own.
@@ -363,17 +533,6 @@ impl Engine {
     /// there is to kill, which is the case this module exists to avoid.
     pub fn group(&self) -> Option<i32> {
         (self.target < 0).then_some(-self.target)
-    }
-
-    /// The browser-level WebSocket url the engine printed.
-    pub fn browser_url(&self) -> &str {
-        &self.browser_url
-    }
-
-    /// `host:port` of the engine's HTTP endpoints.
-    pub fn address(&self) -> Result<String, String> {
-        let (host, port, _) = crate::ws::split_url(&self.browser_url)?;
-        Ok(format!("{host}:{port}"))
     }
 
     /// The last lines the engine wrote, for an error message.
@@ -394,34 +553,77 @@ impl Engine {
         }
     }
 
+    /// Wait, for no longer than `timeout`, for the engine to finish on its
+    /// own — after `Browser.close`, which is the only stop that writes the
+    /// profile — and say whether it did.
+    ///
+    /// Nothing is signalled. `false` means it is still running, and
+    /// [`Engine::kill`] is what comes next.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+        self.gone_by(Instant::now() + timeout)
+    }
+
     /// Stop it, politely and then not — and the group, not the pid.
+    ///
+    /// This is not how the profile gets written, and it used to say it was:
+    /// that Chromium flushes its profile and takes its `SingletonLock` with it
+    /// when it is asked to stop. Measured against 141, `SIGTERM` ends the
+    /// group in about two seconds and in that time neither writes the cookie
+    /// jar nor removes the lock — full Chromium exits 0 while losing the
+    /// cookie. The stop that keeps a login is `Browser.close`, and that is
+    /// [`crate::app::run`]'s, before this is called; [`crate::profile`] has
+    /// the table. On that path the engine has gone by the time this runs and
+    /// there is nothing left here to signal.
+    ///
+    /// So the `SIGTERM` stays for what it is still worth — half a second to
+    /// close its files is fewer half-written ones — and the `SIGKILL` after it
+    /// is the part that is relied on, because an engine that is only ever
+    /// asked can take as long as it likes. Then a temporary profile is
+    /// removed, since nothing is left that could write into it.
+    ///
+    /// Before any signal, the pipe is closed: a browser whose descriptor 3
+    /// reaches end of file exits on its own, measured at 14 ms with status 0.
+    /// It does not take the whole group with it — two of the six were still
+    /// running at that point — so the signals to the group stay, and they are
+    /// what this is sure of.
     pub fn kill(&mut self) {
         TARGET.store(0, Ordering::SeqCst);
-        let target = self.target;
-        signal_all(target, libc::SIGTERM);
-        // Half a second to close its files, then the signal that is not a
-        // request. Chromium flushes its profile and takes its SingletonLock
-        // with it when it is asked to stop, leaves the lock behind if it is
-        // only ever SIGKILLed, and waits forever if it is only ever asked.
-        let deadline = Instant::now() + Duration::from_millis(500);
+        self.exchange.shutdown();
+        signal_all(self.target, libc::SIGTERM);
+        if !self.gone_by(Instant::now() + Duration::from_millis(500)) {
+            signal_all(self.target, libc::SIGKILL);
+            // The wrapper is this program's child and has to be waited for.
+            // The rest of the group are init's children by the time the
+            // signal lands, and die on it with nothing here left to reap.
+            let _ = self.child.wait();
+            self.target = 0;
+        }
+        self.profile.remove();
+    }
+
+    /// Whether the engine and everything it started are gone, waiting until
+    /// `deadline` for it.
+    ///
+    /// The wrapper first — a process nobody has waited for is still a member
+    /// of its own group — and then the group it led, which is where the
+    /// browser and its renderers are. Once both are gone the target is
+    /// forgotten, here and in [`TARGET`], so that a kill after
+    /// [`Engine::wait_for_exit`] — or the one in `Drop` after an explicit one
+    /// — does not signal a group id the kernel may since have given to
+    /// somebody else. [`Engine::group`] reads `None` from then on.
+    fn gone_by(&mut self, deadline: Instant) -> bool {
         loop {
-            // The wrapper first — a process nobody has waited for is still a
-            // member of its own group — and then the group it led, which is
-            // where the browser and its renderers are.
             let waited = !matches!(self.child.try_wait(), Ok(None));
-            if waited && !group_alive(target) {
-                return;
+            if waited && !group_alive(self.target) {
+                let _ = TARGET.compare_exchange(self.target, 0, Ordering::SeqCst, Ordering::SeqCst);
+                self.target = 0;
+                return true;
             }
             if Instant::now() >= deadline {
-                break;
+                return false;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        signal_all(target, libc::SIGKILL);
-        // The wrapper is this program's child and has to be waited for. The
-        // rest of the group are init's children by the time the signal lands,
-        // and die on it with nothing here left to reap.
-        let _ = self.child.wait();
     }
 }
 
@@ -439,21 +641,22 @@ fn describe_tail(tail: &Arc<Mutex<Vec<String>>>) -> String {
     format!("; it said: {}", lines.join(" / "))
 }
 
-/// The WebSocket url of a page target, once the engine has one.
+/// The first page target's id, once the engine has one.
 ///
-/// The engine prints its *browser* endpoint, which drives the browser and not
-/// a page. The page endpoint is in `/json/list`, which is also the first thing
-/// this program asks the engine for — so a Chromium that opened its port and
-/// then stopped answering is caught here, by the deadline, rather than by a
-/// CDP command that never returns.
-pub fn page_target(address: &str, timeout: Duration) -> Result<String, String> {
+/// The engine starts with the `about:blank` it was given on its command line,
+/// but a browser that has only just answered `Browser.getVersion` may not
+/// have made its page yet, so the list is asked for again every 50 ms until
+/// there is a page in it or the time is up. It is also the first command that
+/// needs the engine to have done anything, so an engine that answers the pipe
+/// and then does nothing is caught here, by the deadline.
+pub fn first_page_target(browser: &mut Client, timeout: Duration) -> Result<String, String> {
     let deadline = Instant::now() + timeout;
     let mut last = String::new();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(format!(
-                "the engine at {address} has no page to drive{}",
+                "the engine has no page to drive{}",
                 if last.is_empty() {
                     String::new()
                 } else {
@@ -461,9 +664,13 @@ pub fn page_target(address: &str, timeout: Duration) -> Result<String, String> {
                 }
             ));
         }
-        match crate::http::get(address, "/json/list", left.min(Duration::from_secs(2))) {
-            Ok(body) => match first_page(&body) {
-                Ok(url) => return Ok(url),
+        match browser.call_within(
+            "Target.getTargets",
+            Json::empty(),
+            left.min(Duration::from_secs(2)),
+        ) {
+            Ok(reply) => match first_page(&reply) {
+                Ok(target) => return Ok(target),
                 Err(why) => last = why,
             },
             Err(why) => last = why,
@@ -472,37 +679,18 @@ pub fn page_target(address: &str, timeout: Duration) -> Result<String, String> {
     }
 }
 
-/// The WebSocket url of any page target, from the browser's own url.
-///
-/// A second tab has no entry in `/json/list` until the engine has got round to
-/// listing it, and asking over HTTP for something the browser connection just
-/// told us about would be a round trip and a race. Every endpoint the engine
-/// serves is `/devtools/<kind>/<id>` on the one port, so the page endpoint is
-/// the browser endpoint with the last two path elements replaced — which is
-/// exactly what [`page_target`] finds by asking, and this finds by knowing.
-pub fn target_url(browser_url: &str, target: &str) -> Result<String, String> {
-    let (host, port, _) = crate::ws::split_url(browser_url)?;
-    Ok(format!("ws://{host}:{port}/devtools/page/{target}"))
-}
-
-/// The target id at the end of a target's WebSocket url.
-pub fn target_of(url: &str) -> Option<&str> {
-    let id = url.rsplit('/').next()?;
-    (!id.is_empty()).then_some(id)
-}
-
-/// The first page target's WebSocket url in a `/json/list` answer.
-pub fn first_page(body: &str) -> Result<String, String> {
-    let value = Json::parse(body).map_err(|e| format!("the target list is not JSON: {e}"))?;
-    let targets = value
-        .as_array()
+/// The first page target's id in a `Target.getTargets` answer.
+pub fn first_page(reply: &Json) -> Result<String, String> {
+    let targets = reply
+        .get("targetInfos")
+        .and_then(Json::as_array)
         .ok_or_else(|| "the target list is not a list".to_string())?;
     targets
         .iter()
         .find(|target| target.get("type").and_then(Json::as_str) == Some("page"))
-        .and_then(|target| target.get("webSocketDebuggerUrl"))
+        .and_then(|target| target.get("targetId"))
         .and_then(Json::as_str)
-        .map(|url| url.to_string())
+        .map(|id| id.to_string())
         .ok_or_else(|| format!("no page among {} targets", targets.len()))
 }
 
@@ -520,11 +708,24 @@ mod tests {
                 "--disable-gpu",
                 "--disable-dev-shm-usage",
                 "--ozone-platform=headless",
-                "--remote-debugging-port=0",
-                "--remote-allow-origins=*",
+                "--remote-debugging-pipe",
                 "about:blank",
             ]
         );
+        for flags in [flags(false), flags(true)] {
+            assert!(
+                !flags
+                    .iter()
+                    .any(|f| f.starts_with("--remote-debugging-port")),
+                "a port is open to every process on the machine"
+            );
+            assert!(
+                !flags
+                    .iter()
+                    .any(|f| f.starts_with("--remote-allow-origins")),
+                "and origins are a question only a port asks"
+            );
+        }
         assert!(!plain.contains(&"--no-sandbox"), "not unless we are root");
         assert!(flags(true).contains(&"--no-sandbox"));
         assert_eq!(
@@ -535,48 +736,69 @@ mod tests {
     }
 
     #[test]
-    fn the_port_comes_out_of_the_line_chromium_prints() {
-        let line = "DevTools listening on ws://127.0.0.1:37021/devtools/browser/8f-4a";
-        assert_eq!(
-            devtools_url(line).as_deref(),
-            Some("ws://127.0.0.1:37021/devtools/browser/8f-4a")
-        );
-        // Chromium prefixes its stderr with a timestamp and a level.
-        let noisy = "[0918/120000.1:INFO:main.cc(50)] DevTools listening on ws://127.0.0.1:1/x\n";
-        assert_eq!(devtools_url(noisy).as_deref(), Some("ws://127.0.0.1:1/x"));
-        assert_eq!(devtools_url("[0918] some other warning"), None);
-    }
-
-    #[test]
     fn a_page_is_picked_out_of_the_target_list() {
-        let body = r#"[
-          {"type":"browser","webSocketDebuggerUrl":"ws://127.0.0.1:1/b"},
-          {"type":"page","title":"about:blank",
-           "webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/AB"}
-        ]"#;
-        assert_eq!(
-            first_page(body),
-            Ok("ws://127.0.0.1:1/devtools/page/AB".into())
-        );
-        assert!(first_page("[]").is_err());
-        assert!(first_page(r#"[{"type":"browser"}]"#).is_err());
-        assert!(first_page("not json").is_err());
+        let reply = Json::parse(
+            r#"{"targetInfos":[
+              {"targetId":"B","type":"browser","title":"","url":""},
+              {"targetId":"AB","type":"page","title":"about:blank","url":"about:blank"}
+            ]}"#,
+        )
+        .expect("the test's own JSON");
+        assert_eq!(first_page(&reply), Ok("AB".into()));
+        let none = Json::parse(r#"{"targetInfos":[]}"#).expect("JSON");
+        assert!(first_page(&none).is_err());
+        let browser = Json::parse(r#"{"targetInfos":[{"type":"browser"}]}"#).expect("JSON");
+        assert!(first_page(&browser).is_err());
+        assert!(first_page(&Json::Null).is_err());
     }
 
     #[test]
-    fn a_second_tab_is_reached_on_the_port_the_browser_answered_on() {
-        let browser = "ws://127.0.0.1:37021/devtools/browser/8f-4a";
-        assert_eq!(
-            target_url(browser, "AB12"),
-            Ok("ws://127.0.0.1:37021/devtools/page/AB12".into())
+    fn a_descriptor_moved_above_four_is_above_four_and_closes_on_exec() {
+        let (read, write) = std::io::pipe().expect("a pipe");
+        let moved = above(read.into()).expect("a move");
+        assert!(moved.as_raw_fd() >= 5, "moved to {}", moved.as_raw_fd());
+        // SAFETY: `F_GETFD` reads a descriptor's flags and no memory; `moved`
+        // is open, owned by this test, for the whole call.
+        let flags = unsafe { libc::fcntl(moved.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+            "close-on-exec is off"
         );
-        // And the id comes back out of a url the list gave us.
-        assert_eq!(
-            target_of("ws://127.0.0.1:1/devtools/page/AB12"),
-            Some("AB12")
+        drop(write);
+    }
+
+    #[test]
+    fn a_shell_on_fds_3_and_4_is_reached_through_them() {
+        use std::io::{Read, Write};
+        // What the engine is to this program, with `cat` standing in for it:
+        // commands in on 3, answers out on 4, nothing else inherited.
+        let (engine_read, mut ours_write) = std::io::pipe().expect("a pipe");
+        let (mut ours_read, engine_write) = std::io::pipe().expect("a pipe");
+        let engine_read = above(engine_read.into()).expect("a move");
+        let engine_write = above(engine_write.into()).expect("a move");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("exec cat <&3 >&4")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        wire(
+            &mut command,
+            engine_read.as_raw_fd(),
+            engine_write.as_raw_fd(),
         );
-        assert_eq!(target_of("ws://127.0.0.1:1/devtools/page/"), None);
-        assert!(target_url("not a url", "AB12").is_err());
+        let (mut child, _) = spawn_in_own_group(&mut command).expect("a shell starts");
+        drop(engine_read);
+        drop(engine_write);
+
+        ours_write.write_all(b"hello\0").expect("the write");
+        drop(ours_write);
+        let mut echoed = Vec::new();
+        ours_read.read_to_end(&mut echoed).expect("the read");
+        assert_eq!(echoed, b"hello\0");
+        let status = child.wait().expect("the shell is reaped");
+        assert!(status.success(), "{status}");
     }
 
     #[test]
@@ -624,6 +846,49 @@ mod tests {
             !group_alive(0),
             "a pid with no group of its own is not a group"
         );
+    }
+
+    #[test]
+    fn a_stat_line_gives_its_state_and_group_whatever_the_command_is_called() {
+        assert_eq!(
+            state_and_group("4082 (chrome-headless) S 4079 4079 4079 0 -1"),
+            Some(('S', 4079))
+        );
+        // A command name may hold spaces and parentheses of its own.
+        assert_eq!(
+            state_and_group("17 (a (b) c) Z 1 4079 4079 0 -1"),
+            Some(('Z', 4079))
+        );
+        assert_eq!(state_and_group("17 (cut off"), None);
+    }
+
+    #[test]
+    fn a_group_of_zombies_is_a_group_that_has_gone() {
+        // A child in a group of its own that exits and is not waited for: a
+        // zombie, which is what a container's pid 1 leaves of the engine's
+        // renderers. `kill(2)` still finds the group; this must not.
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("exit 0");
+        let (mut child, target) = spawn_in_own_group(&mut command).expect("a shell starts");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let zombie = loop {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.id()))
+                .expect("an unreaped child keeps its /proc entry");
+            if state_and_group(&stat).map(|(state, _)| state) == Some('Z') {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(zombie, "the shell never finished");
+        // SAFETY: signal 0 sends nothing and `kill(2)` reads no memory;
+        // `target` is the child's own group.
+        let found = unsafe { libc::kill(target, 0) };
+        assert_eq!(found, 0, "the kernel still has it");
+        assert!(!group_alive(target), "and the group is gone all the same");
+        child.wait().expect("the shell is reaped");
     }
 
     #[test]

@@ -174,9 +174,11 @@ impl fmt::Display for Json {
 
 /// Write a JSON string, escaping what has to be escaped and nothing else.
 ///
-/// Non-ASCII goes out as UTF-8 rather than `\u` escapes: the transport is a
-/// WebSocket text frame, which is UTF-8 by definition, so escaping would
-/// double the size of every Japanese page title for no reader's benefit.
+/// Non-ASCII goes out as UTF-8 rather than `\u` escapes: the transport is the
+/// engine's debugging pipe, which reads each message as UTF-8 JSON up to a
+/// NUL, so escaping would double the size of every Japanese page title for no
+/// reader's benefit. (A NUL inside a string is escaped as `\u0000` below,
+/// which is what keeps it from ending the message early.)
 fn write_string(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
     f.write_str("\"")?;
     for c in value.chars() {

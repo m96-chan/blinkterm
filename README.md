@@ -10,7 +10,8 @@ blinkterm https://example.com
 ```
 
 `blinkterm` starts a Chromium as a child process, drives it over the Chrome
-DevTools Protocol on a WebSocket it speaks itself, takes the page's screencast,
+DevTools Protocol on a pipe only the two of them hold — no port, so nothing
+else on the machine can drive the browser — takes the page's screencast,
 decodes each frame, and hands the terminal raw pixels — turning the terminal's
 own reports of keys and mouse back into CDP input events. The engine renders;
 the terminal displays; this program is the wire between them and nothing else.
@@ -63,24 +64,62 @@ cargo install --git https://github.com/m96-chan/blinkterm
 ```
 
 Then a browser engine, which `blinkterm` does not ship — a Chromium is 482 MB
-installed, twice a tOS ISO, and a choice about which browser somebody runs. On
-Debian or Ubuntu:
+installed, twice a tOS ISO, and a choice about which browser somebody runs.
+The one it is tested against is `chrome-headless-shell` from
+[Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/):
+the same Chromium with no desktop browser UI compiled in. On x86-64 Linux:
 
 ```sh
-apt-get install -y --no-install-recommends chromium-shell fonts-noto-cjk
+curl -fsSLO https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.52/linux64/chrome-headless-shell-linux64.zip
+unzip chrome-headless-shell-linux64.zip -d /opt
+BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell blinkterm
 ```
 
-`chromium-shell` is Debian's `headless_shell`: the same Chromium with no
-desktop browser UI compiled in, 76 packages against 112. The CJK fonts are not
-optional if you read any; without them every Japanese glyph is a box.
+It wants the usual Chromium libraries (its `deb.deps` lists them) and, if you
+read any CJK, `fonts-noto-cjk`: without it every Japanese glyph is a box.
 
-Anything Chromium-shaped will do. `blinkterm` looks at `$BLINKTERM_ENGINE`
-first, then on `PATH` for `chromium-shell`, `chromium`, `chromium-browser` and
-`google-chrome`, in that order.
+Anything Chromium-shaped will do, with one caution. `blinkterm` looks at
+`$BLINKTERM_ENGINE` first, then on `PATH` for `chrome-headless-shell`,
+`chromium`, `chromium-browser`, `google-chrome` and `chromium-shell`, in that
+order. Debian's `chromium-shell` is last because it is Chromium's
+`content_shell`, not a headless shell: it keeps a DevTools port open beside
+the pipe whatever it is told, answers a page's dialogs itself, and does not
+close when asked, so a kept profile is not flushed. It renders pages; it does
+not keep the promises below.
+
+## Profiles
+
+Cookies, logins, local storage and the rest of what a site keeps are kept
+between runs, in `$XDG_DATA_HOME/blinkterm/profile` — or
+`~/.local/share/blinkterm/profile` when `XDG_DATA_HOME` is not set. The
+directory is made readable by you alone (0700), since a cookie is a login.
 
 ```sh
-BLINKTERM_ENGINE=/opt/chrome/chrome-headless-shell blinkterm
+blinkterm --profile ~/work-profile https://example.com   # somewhere else
+blinkterm --temp-profile https://example.com             # nothing kept
 ```
+
+`--temp-profile` makes a fresh profile under the system's temporary directory
+and removes it when `blinkterm` exits, including when it panics; one left by a
+`blinkterm` that was killed outright is removed by the next one.
+
+One `blinkterm` uses a profile at a time. A second one started on a profile
+that is in use is refused, and told which pid has it; it does not quietly fall
+back to a throwaway profile, because a login you thought was being kept and was
+not is worse than an error. The lock is `blinkterm`'s own — an `flock` on
+`blinkterm.lock` in the profile — because the headless shell has no lock of its
+own and will happily run two engines on one cookie database.
+
+A login survives a quit because the engine is asked to close
+(`Browser.close`) and waited for, which is when Chromium writes its cookie
+jar: measured against Chromium 141, that takes about two seconds, and every
+other way of stopping it — `SIGTERM` included — loses what was not yet
+written. So a `blinkterm` that is itself `SIGKILL`ed can lose the last thirty
+seconds or so of cookies, which is Chromium's own flush interval.
+
+A full `chromium` rather than the headless shell still writes
+`~/.config/chromium/Crash Reports` whatever profile it is given; that
+directory is Chromium's, not `blinkterm`'s.
 
 ## Keys
 
@@ -94,9 +133,16 @@ BLINKTERM_ENGINE=/opt/chrome/chrome-headless-shell blinkterm
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
 | `alt+1` … `alt+9` | the nth tab |
 | `ctrl+q` | quit |
+| a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 
 Everything else goes to the page, including the mouse. A link that asks for a
 new window gets a new tab, and the tab is switched to.
+
+While a page is waiting on its dialog, only the tab keys and `ctrl+q` still
+work, and the page gets no keys or mouse until it has its answer. A tab behind
+that opens one is marked `!` in the strip — `2! Title` — and keeps its question
+until you go to it. `ctrl+w` closes a tab without asking the page, so a tab
+with something unsaved in it is closed without a "leave this page?".
 
 ## Tests
 
@@ -109,7 +155,8 @@ when they skip — naming the engine is the consent, because a machine with a
 Chromium on it did not thereby agree to have it started.
 
 ```sh
-BLINKTERM_ENGINE=chromium-shell cargo test --release -- --test-threads=1
+BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
+  cargo test --release -- --test-threads=1
 ```
 
 `--release` because several of them assert on timings, and one at a time
@@ -133,8 +180,9 @@ cargo test --locked
 The lint set is a `[lints]` table in `Cargo.toml` rather than a list of flags
 in the workflow, so a laptop and a runner disagree about `-D warnings` and
 nothing else. The one worth knowing about is
-`clippy::undocumented_unsafe_blocks`: there are twenty-three `unsafe` blocks in
-`src/`, all of them one-line `libc` calls, and each says what makes it sound.
+`clippy::undocumented_unsafe_blocks`: there are thirty-five `unsafe` blocks in
+`src/`, nearly all of them one-line `libc` calls, and each says what makes it
+sound.
 
 `--locked` throughout, because every dependency but `libc` is a git revision
 and `Cargo.lock` is the only record of which tree of tOS was built.

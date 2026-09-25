@@ -1,7 +1,7 @@
 //! Browse the web in a terminal pane.
 //!
 //! `blinkterm` runs a headless Chromium as a child process, drives it over the
-//! Chrome DevTools Protocol on a hand-rolled WebSocket, takes its screencast,
+//! Chrome DevTools Protocol on a pipe nobody else holds, takes its screencast,
 //! decodes each frame here, and hands the terminal raw pixels as Kitty
 //! graphics commands, turning the terminal's own reports of keys and mouse
 //! back into CDP input events. The engine renders; the terminal displays; this
@@ -33,8 +33,8 @@
 //! # Tabs, and why they are not panes
 //!
 //! A tab here is one CDP page target: a page with its own history, its own
-//! renderer and its own WebSocket, listed on the one row this program already
-//! owns. Tabs exist because the first thing anybody meets on a real site is a
+//! renderer and its own session on the engine's pipe, listed on the one row
+//! this program already owns. Tabs exist because the first thing anybody meets on a real site is a
 //! link with `target=_blank` — the engine makes a target for it whatever this
 //! program does, and a target nothing attaches to is a click that did nothing
 //! at all.
@@ -51,7 +51,7 @@
 //! nothing about panes, so a pane per page would be a second list to keep in
 //! step with the engine's. So the tabs live in the browser, on the row that
 //! was already there, and the pane stays one pane. See [`tabs`] for what that
-//! costs per tab, which is one socket and no frames.
+//! costs per tab, which is one session and no frames.
 //!
 //! # JPEG while it moves, PNG when it stops
 //!
@@ -96,33 +96,42 @@
 //! Debian packages, one upstream binary, and everything else is the person's
 //! (`docs/design/applications.md`), and that is this program's rule too: it is
 //! one small binary, and the engine it drives is installed by the person who
-//! wants one — `$BLINKTERM_ENGINE`, or whichever of `chromium-shell`,
-//! `chromium`, `chromium-browser` or `google-chrome` is on the path.
+//! wants one — `$BLINKTERM_ENGINE`, or whichever of `chrome-headless-shell`,
+//! `chromium`, `chromium-browser`, `google-chrome` or `chromium-shell` is on
+//! the path. See [`engine::CANDIDATES`] for why in that order.
 //!
-//! **No dependencies to speak of.** The HTTP GET, the WebSocket client, the
-//! JSON, the base64 and the SHA-1 are all in this crate, each in its own
+//! **No dependencies to speak of.** The pipe's framing and its session
+//! router, the JSON and the base64 are all in this crate, each in its own
 //! module with its own tests, for the reason tOS hand-rolled PNG and inflate:
 //! a browser is a large enough thing to want a crate for every part of it, and
 //! that is exactly how a one-dependency program stops being one. What is
 //! depended on is `libc` and three tOS crates that were already written for
 //! this: `tos-term` for the PNG and JPEG decoders, `tos-platform` for the
 //! terminal, `tos-preview` for the cell arithmetic.
+//!
+//! **No port.** The engine is driven over `--remote-debugging-pipe`, on two
+//! descriptors it inherits from this program, rather than a DevTools port on
+//! loopback that every process on the machine could connect to and drive the
+//! browser from. There used to be an HTTP GET, a WebSocket client and a SHA-1
+//! here for that port, and they went with it; [`engine`] has the measurement
+//! that made the port indefensible, and [`cdp`] the framing that replaced it.
 
 pub mod app;
 pub mod base64;
 pub mod cdp;
+pub mod dialog;
 pub mod engine;
 pub mod graphics;
-pub mod http;
 pub mod input;
 pub mod json;
 pub mod keys;
+pub mod line;
+pub mod load;
 pub mod motion;
+pub mod profile;
 pub mod screen;
 pub mod scroll;
-pub mod sha1;
 pub mod tabs;
-pub mod ws;
 
 pub use app::Options;
 pub use json::Json;

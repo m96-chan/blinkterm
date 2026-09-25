@@ -1,28 +1,32 @@
 //! The list of pages, and what the engine's `Target.*` events do to it.
 //!
 //! A tab here is a CDP *page target*: the engine's own unit of "a page", with
-//! its own history, its own renderer and its own WebSocket. That last one is
-//! the decision worth naming. CDP can multiplex every target over the browser
-//! endpoint with `Target.attachToTarget` and a session id on every message,
-//! and a browser with a hundred tabs open would want exactly that; a pane with
-//! three does not. One socket per tab costs a thread and a pipe each and keeps
-//! [`crate::cdp::Client`] the thing it already is — a connection that answers
-//! `call`, queues events and knocks on a pipe — instead of a router that has
-//! to sort a session id it would otherwise never see.
+//! its own history and its own renderer, reached as a flattened session on the
+//! one pipe the engine was started with — `Target.attachToTarget` with
+//! `flatten: true`, and the session's id on every message to and from it.
 //!
-//! What follows from one socket per tab is that a tab *is* its connection:
-//! closing the tab drops it, which closes the socket, which is all the tidying
-//! there is. Nothing here holds a client of its own, so this module is generic
-//! over what a tab is connected by and its tests use numbers.
+//! This used to say the opposite: that multiplexing was for a browser with a
+//! hundred tabs, and that one WebSocket per tab — a thread and a pipe each —
+//! kept [`crate::cdp::Client`] from having to become a router. What changed is
+//! that the WebSocket went, and it went because it was a port every process on
+//! the machine could drive the browser through. A pipe is one connection, so
+//! the router was no longer optional; it is one reader thread for every tab
+//! instead of one each, and [`crate::cdp::Client`] still shows the loop what it
+//! always did — `call`, a queue of events, a pipe to `poll`.
+//!
+//! What follows from a session per tab is that a tab *is* its connection:
+//! closing the tab drops it, which detaches the session, which is all the
+//! tidying there is. Nothing here holds a client of its own, so this module is
+//! generic over what a tab is connected by and its tests use numbers.
 //!
 //! # Only the active tab costs anything
 //!
 //! A screencast is a frame every sixteen milliseconds, and a background tab
 //! that sent them would be a pane's worth of PNG encoded for nobody. So the
 //! screencast is started on activation and stopped on deactivation, and a
-//! background tab is a socket sitting idle. What it still does is *exist*: the
-//! page goes on running, and its `Page` events go on arriving on its own
-//! socket, which is what keeps the strip's titles true without anything being
+//! background tab is a session sitting idle. What it still does is *exist*:
+//! the page goes on running, and its `Page` events go on arriving in its own
+//! mailbox, which is what keeps the strip's titles true without anything being
 //! polled.
 //!
 //! # Where a title comes from, which is not where it looks like it should
@@ -41,8 +45,12 @@
 //! tab — event-driven rather than polled, and a background tab that never
 //! loads anything costs nothing at all.
 
+use std::borrow::Cow;
+
 use crate::cdp::Event;
+use crate::dialog::Dialog;
 use crate::json::Json;
+use crate::load::{self, Landing, Loaded, Problem};
 
 /// One page target, and what the row says about it.
 pub struct Tab<C> {
@@ -60,6 +68,26 @@ pub struct Tab<C> {
     /// else: what it is loading, why a navigation failed, what happened to the
     /// tab that is no longer here.
     pub note: Option<String>,
+    /// What is wrong with the page, when something is: it did not come, or it
+    /// came with an error status.
+    ///
+    /// Not a [`Tab::note`], for two reasons. A 404 page has a title and a url
+    /// that are both worth keeping on the row, and a note stands in for the
+    /// title rather than beside it. And a note is wiped by the browser
+    /// connection's rename of the tab, which arrives a millisecond after a
+    /// failed page lands and, for a url the engine spells differently from the
+    /// one that was typed — a trailing slash is enough — would clear the
+    /// failure the moment it was said. [`Tabs::take`] does not touch this;
+    /// only the tab's own `Page` events do. See [`crate::load`].
+    pub problem: Option<Problem>,
+    /// The dialog this page has open and nobody has answered.
+    ///
+    /// The page is stopped until somebody does: its renderer is inside the
+    /// `alert()` that opened it, so it paints nothing and answers no
+    /// `Runtime.evaluate`. It is kept on the tab rather than on the loop
+    /// because a tab that is not in front can open one too, and it has to be
+    /// there — marked in the strip — when the person goes to look.
+    pub dialog: Option<Dialog>,
 }
 
 impl<C> Tab<C> {
@@ -71,6 +99,122 @@ impl<C> Tab<C> {
             url: url.into(),
             loading: false,
             note: None,
+            problem: None,
+            dialog: None,
+        }
+    }
+
+    /// The main frame committed: a document, or the error page for one.
+    ///
+    /// This is `Page.frameNavigated`, and it is the one signal of a failure
+    /// that arrives however the navigation started — typed, clicked, reloaded
+    /// or walked to through history. What it does not carry is why, which
+    /// only a `Page.navigate` reply says, and that arrives first, through
+    /// [`Tab::failed_to_reach`]. So the question here is whether a reason
+    /// already on the tab belongs to this landing.
+    ///
+    /// The reason names the url that was asked for and the landing names where
+    /// the engine ended up — the same place in the engine's spelling, or the
+    /// end of a redirect — so the two cannot simply be compared. What can be
+    /// relied on instead is that between the reply and the landing nothing
+    /// else happens to this tab: a reason recorded while the tab is still
+    /// loading is this landing's. A reason for the very url that has landed
+    /// again is kept too, which is what reloading an error page looks like.
+    /// Anything else is dropped, because a wrong reason is worse than none.
+    /// [`crate::app`]'s `navigate` clears the problem before it sends, which
+    /// is what keeps "still loading" honest against a `Page.navigate` that
+    /// timed out here and failed in the engine afterwards.
+    pub fn landed(&mut self, landing: Landing) {
+        // Read before it is set below: it says whether a reason from
+        // `failed_to_reach` belongs to this landing.
+        let ours = self.loading;
+        // A page that has gone somewhere has not got there yet, and the title
+        // it had was the last page's.
+        self.title.clear();
+        self.note = None;
+        self.loading = true;
+        match landing {
+            Landing::Document(url) => {
+                self.url = url;
+                self.problem = None;
+            }
+            Landing::Unreachable(url) => {
+                let reason = match &self.problem {
+                    Some(Problem::Unreachable { url: was, reason }) if ours || *was == url => {
+                        reason.clone()
+                    }
+                    _ => None,
+                };
+                // The url that did not come, and never the error page's own
+                // `chrome-error://chromewebdata/`: that is where the engine
+                // put the page, not where anybody was going.
+                self.url = url.clone();
+                self.problem = Some(Problem::Unreachable { url, reason });
+            }
+        }
+    }
+
+    /// `Page.navigate` answered with an `errorText`: the landing is on its way,
+    /// ten to sixty milliseconds behind, and this is why.
+    ///
+    /// Or it has already come. The reply is collected a pass after it is sent
+    /// rather than waited for — a navigation away from a page with a "leave
+    /// this page?" is held by the engine until somebody answers, and a loop
+    /// that waited could not show the question — so the error page's own
+    /// events can be read first. Then the tab already says where it ended up
+    /// and has had its load event, and all this adds is the reason: the url
+    /// stays the landing's, which is the truer one after a redirect, and
+    /// `loading` is left alone, since the load event it would wait for has
+    /// been and gone. An unreachable problem on the tab can only be this
+    /// navigation's, because `navigate` cleared it before sending.
+    pub fn failed_to_reach(&mut self, url: &str, code: &str) {
+        self.note = None;
+        if let Some(Problem::Unreachable { reason, .. }) = &mut self.problem {
+            reason.get_or_insert_with(|| code.to_string());
+            return;
+        }
+        self.loading = true;
+        self.problem = Some(Problem::Unreachable {
+            url: url.to_string(),
+            reason: Some(code.to_string()),
+        });
+    }
+
+    /// The page said it has loaded, and this is what it answered.
+    ///
+    /// An error status replaces a status and nothing else: a page that did not
+    /// come keeps saying so, because the error page it is showing has a status
+    /// of 0 and no title, and that is not the news that the problem is over.
+    pub fn loaded(&mut self, loaded: Loaded) {
+        self.title = loaded.title;
+        match loaded.status {
+            Some(status) => self.problem = Some(Problem::Status(status)),
+            None => {
+                if matches!(self.problem, Some(Problem::Status(_))) {
+                    self.problem = None;
+                }
+            }
+        }
+    }
+
+    /// What a `Page.javascriptDialog*` event does to this tab. True when the
+    /// row is now out of date.
+    ///
+    /// Opening replaces whatever was there, because a page has one dialog at
+    /// a time: a second can only open once the first has been answered, and
+    /// if the close of the first was lost the second is the truth. Closing
+    /// clears it whoever answered — this program, or the engine itself when
+    /// the page navigated or its renderer went away — so a dialog that was
+    /// answered somewhere else is not left on the row as a question with
+    /// nobody to ask.
+    pub fn dialog_event(&mut self, event: &Event) -> bool {
+        match event.method.as_str() {
+            "Page.javascriptDialogOpening" => {
+                self.dialog = Dialog::opening(&event.params);
+                self.dialog.is_some()
+            }
+            "Page.javascriptDialogClosed" => self.dialog.take().is_some(),
+            _ => false,
         }
     }
 
@@ -82,28 +226,46 @@ impl<C> Tab<C> {
         if let Some(note) = &self.note {
             return note.clone();
         }
-        match (self.title.is_empty(), self.url.is_empty()) {
-            (true, true) => "blinkterm".to_string(),
-            (true, false) => self.url.clone(),
-            (false, true) => self.title.clone(),
-            (false, false) => format!("{}  —  {}", self.title, self.url),
+        // A status is said beside the title and the url rather than instead
+        // of them: a 404 page has both, and the site's own words for what went
+        // wrong are usually in the title.
+        let status = match &self.problem {
+            Some(problem @ Problem::Unreachable { .. }) => return load::sentence(problem),
+            Some(Problem::Status(status)) => Some(load::status_phrase(*status)),
+            None => None,
+        };
+        let parts: Vec<&str> = [status.as_deref(), Some(&self.title), Some(&self.url)]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return "blinkterm".to_string();
         }
+        parts.join("  —  ")
     }
 
     /// The name this tab goes by in the strip, before it is clipped.
-    pub fn label(&self) -> &str {
+    ///
+    /// A page that did not come is named for that, since the host and the
+    /// reason are all there is to know about it. A status is not: a strip is
+    /// narrow, and the title of a 404 page is usually the site saying so.
+    pub fn label(&self) -> Cow<'_, str> {
         if let Some(note) = &self.note {
-            return note;
+            return Cow::Borrowed(note);
+        }
+        if let Some(problem @ Problem::Unreachable { .. }) = &self.problem {
+            return Cow::Owned(load::sentence(problem));
         }
         if !self.title.is_empty() {
-            return &self.title;
+            return Cow::Borrowed(&self.title);
         }
         // A tab that was just opened has the url it was opened with and no
         // title yet, and "about:blank" is not a name for anything.
         if self.url.is_empty() || self.url == "about:blank" {
-            return "new tab";
+            return Cow::Borrowed("new tab");
         }
-        &self.url
+        Cow::Borrowed(&self.url)
     }
 }
 
@@ -236,8 +398,8 @@ impl<C> Tabs<C> {
     /// What one event from the browser connection does to the list.
     ///
     /// `open` is asked for a connection only for a target that is becoming a
-    /// tab, and may fail: an engine that will not take another socket is a
-    /// sentence on the row, not a reason to stop.
+    /// tab, and may fail: an engine that will not attach is a sentence on the
+    /// row, not a reason to stop.
     pub fn take(
         &mut self,
         event: &Event,
@@ -294,7 +456,10 @@ impl<C> Tabs<C> {
     fn gone(&mut self, target: &str, why: Option<String>) -> Outcome<C> {
         match self.index_of(target) {
             Some(index) => match self.close(index) {
-                Some(tab) => Outcome::Gone { tab, why },
+                Some(tab) => Outcome::Gone {
+                    tab: Box::new(tab),
+                    why,
+                },
                 None => Outcome::Ignored,
             },
             None => Outcome::Ignored,
@@ -313,7 +478,10 @@ pub enum Outcome<C> {
     /// A tab is no longer in the list. Its connection comes back with it, to
     /// be closed by the caller, and `why` is the sentence to put on the row
     /// when the page did not simply close itself.
-    Gone { tab: Tab<C>, why: Option<String> },
+    Gone {
+        tab: Box<Tab<C>>,
+        why: Option<String>,
+    },
     /// A target that should have become a tab could not be connected to.
     Failed(String),
 }
@@ -658,10 +826,195 @@ mod tests {
     }
 
     #[test]
+    fn a_dialog_stays_with_the_tab_it_opened_on() {
+        let mut tabs = three();
+        let opening = event(
+            "Page.javascriptDialogOpening",
+            r#"{"url":"https://c.example","message":"sure?","type":"confirm",
+                "hasBrowserHandler":false,"defaultPrompt":""}"#,
+        );
+        // The third tab asks while the first is in front.
+        assert!(tabs.get_mut(2).expect("c").dialog_event(&opening));
+        assert_eq!(tabs.active_target(), Some("a"), "a dialog does not switch");
+        assert!(tabs.active().expect("a").dialog.is_none());
+
+        // Going to it and away again leaves the question where it was asked.
+        tabs.select(3);
+        assert!(tabs.active().expect("c").dialog.is_some());
+        tabs.select(2);
+        assert!(tabs.active().expect("b").dialog.is_none());
+        let asking: Vec<bool> = tabs.iter().map(|tab| tab.dialog.is_some()).collect();
+        assert_eq!(asking, [false, false, true]);
+
+        // Something else about the page is not about the dialog.
+        let loaded = event("Page.loadEventFired", r#"{"timestamp":1}"#);
+        assert!(!tabs.get_mut(2).expect("c").dialog_event(&loaded));
+        assert!(tabs.iter().nth(2).expect("c").dialog.is_some());
+
+        // Closed, by whoever answered it; and closed again is nothing new.
+        let closed = event(
+            "Page.javascriptDialogClosed",
+            r#"{"result":true,"userInput":""}"#,
+        );
+        assert!(tabs.get_mut(2).expect("c").dialog_event(&closed));
+        assert!(tabs.iter().nth(2).expect("c").dialog.is_none());
+        assert!(!tabs.get_mut(2).expect("c").dialog_event(&closed));
+
+        // And closing the tab takes its dialog with it.
+        tabs.get_mut(1).expect("b").dialog_event(&opening);
+        let gone = tabs.close(1).expect("b");
+        assert!(gone.dialog.is_some());
+        assert!(tabs.iter().all(|tab| tab.dialog.is_none()));
+    }
+
+    #[test]
     fn an_event_about_something_else_entirely() {
         let frame = event("Page.screencastFrame", r#"{"data":"x","sessionId":1}"#);
         assert_eq!(change(&frame), None);
         let empty = event("Target.targetCreated", r#"{}"#);
         assert_eq!(change(&empty), None);
+    }
+
+    /// What `app::handle_page_events` does with a load event, which is not a
+    /// method of the tab's because the title is asked of the page in between.
+    fn load_finished(tab: &mut Tab<u32>, title: &str, status: Option<u16>) {
+        tab.loading = false;
+        tab.loaded(Loaded {
+            title: title.to_string(),
+            status,
+        });
+    }
+
+    #[test]
+    fn a_failed_navigation_is_a_sentence_until_the_page_goes_somewhere_else() {
+        let mut tab: Tab<u32> = Tab::new("a", 0, "about:blank");
+        // What `navigate` does: the url typed, a note while it goes, and then
+        // a reply with an `errorText` in it.
+        tab.url = "https://example.cmo".to_string();
+        tab.note = Some("loading https://example.cmo".to_string());
+        tab.loading = true;
+        tab.failed_to_reach("https://example.cmo", "net::ERR_NAME_NOT_RESOLVED");
+        assert_eq!(tab.line(), "can't reach example.cmo: name not resolved");
+
+        // The error page lands under the url in the engine's spelling, and
+        // the reason stays with it.
+        tab.landed(Landing::Unreachable("https://example.cmo/".to_string()));
+        assert_eq!(tab.url, "https://example.cmo/", "never chrome-error://");
+        assert_eq!(tab.line(), "can't reach example.cmo: name not resolved");
+        // The error page loads like any page, with no title and no status,
+        // and that is not the news that the problem is over.
+        load_finished(&mut tab, "", None);
+        assert_eq!(tab.line(), "can't reach example.cmo: name not resolved");
+        assert_eq!(tab.label(), "can't reach example.cmo: name not resolved");
+
+        // Going somewhere that works is.
+        tab.landed(Landing::Document("https://example.com/".to_string()));
+        load_finished(&mut tab, "Example", None);
+        assert_eq!(tab.problem, None);
+        assert_eq!(tab.line(), "Example  —  https://example.com/");
+    }
+
+    #[test]
+    fn a_reason_that_comes_after_its_landing_is_added_to_it() {
+        // The reply read a pass late: the error page has landed and loaded
+        // already, under the url the redirect ended at.
+        let mut tab: Tab<u32> = Tab::new("a", 0, "about:blank");
+        tab.loading = true;
+        tab.landed(Landing::Unreachable("http://127.0.0.1:1/".to_string()));
+        load_finished(&mut tab, "", None);
+        assert!(!tab.loading);
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:1");
+
+        tab.failed_to_reach("http://127.0.0.1:2/redir", "net::ERR_CONNECTION_REFUSED");
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:1: connection refused");
+        assert_eq!(tab.url, "http://127.0.0.1:1/", "the landing's url stays");
+        assert!(!tab.loading, "its load event has been and gone");
+    }
+
+    #[test]
+    fn a_failure_the_page_found_on_its_own_names_the_host() {
+        // A link clicked on a loaded page: no `Page.navigate`, so no reason,
+        // only the landing.
+        let mut tab = tab("a", "A");
+        tab.landed(Landing::Unreachable("http://127.0.0.1:9/x".to_string()));
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:9");
+        assert_eq!(tab.label(), "can't reach 127.0.0.1:9");
+        assert_eq!(tab.title, "", "the last page's title went with it");
+
+        // And reloading it lands at the same url again, still with nothing
+        // to say why.
+        load_finished(&mut tab, "", None);
+        tab.landed(Landing::Unreachable("http://127.0.0.1:9/x".to_string()));
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:9");
+    }
+
+    #[test]
+    fn a_reason_that_timed_out_is_not_pinned_on_the_next_failure() {
+        let mut tab: Tab<u32> = Tab::new("a", 0, "about:blank");
+        tab.failed_to_reach("https://first.invalid/", "net::ERR_NAME_NOT_RESOLVED");
+        tab.landed(Landing::Unreachable("https://first.invalid/".to_string()));
+        load_finished(&mut tab, "", None);
+
+        // Reloading the same failure keeps its reason: nothing else could
+        // have happened to the same url.
+        tab.landed(Landing::Unreachable("https://first.invalid/".to_string()));
+        assert_eq!(tab.line(), "can't reach first.invalid: name not resolved");
+        load_finished(&mut tab, "", None);
+
+        // A different url failing from a page at rest is not the first one's
+        // reason again: nothing has said why this one failed.
+        tab.landed(Landing::Unreachable("http://127.0.0.1:9/".to_string()));
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:9");
+    }
+
+    #[test]
+    fn a_rename_from_the_browser_leaves_the_failure_alone() {
+        let mut tabs = Tabs::new(Tab::new("a", 0u32, "about:blank"));
+        let tab = tabs.active_mut().expect("a tab");
+        tab.url = "http://127.0.0.1:9".to_string();
+        tab.loading = true;
+        tab.failed_to_reach("http://127.0.0.1:9", "net::ERR_CONNECTION_REFUSED");
+
+        // A millisecond later the browser connection renames the tab, in the
+        // engine's spelling — which is a different url, so the rename is
+        // taken, and a note would have gone with it.
+        let renamed = event(
+            "Target.targetInfoChanged",
+            r#"{"targetInfo":{"targetId":"a","type":"page","title":"127.0.0.1:9/",
+                "url":"http://127.0.0.1:9/"}}"#,
+        );
+        assert!(matches!(tabs.take(&renamed, |_| Ok(0)), Outcome::Renamed));
+        let tab = tabs.active_mut().expect("a tab");
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:9: connection refused");
+
+        tab.landed(Landing::Unreachable("http://127.0.0.1:9/".to_string()));
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:9: connection refused");
+    }
+
+    #[test]
+    fn an_error_status_is_said_beside_the_title_and_not_instead_of_it() {
+        let mut tab: Tab<u32> = Tab::new("a", 0, "about:blank");
+        tab.landed(Landing::Document("http://127.0.0.1:1/404".to_string()));
+        load_finished(&mut tab, "nope", Some(404));
+        assert_eq!(
+            tab.line(),
+            "404 not found  —  nope  —  http://127.0.0.1:1/404"
+        );
+        assert_eq!(tab.label(), "nope", "the strip keeps the page's own name");
+
+        // No title: the status and the url.
+        tab.title.clear();
+        assert_eq!(tab.line(), "404 not found  —  http://127.0.0.1:1/404");
+
+        // A note still stands in for the lot while something is loading.
+        tab.note = Some("loading".to_string());
+        assert_eq!(tab.line(), "loading");
+        tab.note = None;
+
+        // The next page is fine, and says nothing about a status.
+        tab.landed(Landing::Document("http://127.0.0.1:1/".to_string()));
+        load_finished(&mut tab, "fine", None);
+        assert_eq!(tab.problem, None);
+        assert_eq!(tab.line(), "fine  —  http://127.0.0.1:1/");
     }
 }

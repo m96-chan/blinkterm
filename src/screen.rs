@@ -196,43 +196,107 @@ impl Drop for Pane {
 /// too tall covers something that is already there rather than the first line
 /// of the page.
 pub fn status_line(cols: u32, text: &str, editing: Option<&str>) -> Vec<u8> {
+    if let Some(url) = editing {
+        return prompt_line(cols, "url: ", url);
+    }
     let cols = cols.max(1) as usize;
     let mut out = b"\x1b[1;1H\x1b[K\x1b[7m".to_vec();
-    match editing {
-        Some(url) => {
-            // The tail of what is being typed, because the end of a url is
-            // where the cursor is and what the person is looking at.
-            let prompt = "url: ";
-            let room = cols.saturating_sub(prompt.len());
-            let shown = tail_to(url, room);
-            out.extend_from_slice(prompt.as_bytes());
-            out.extend_from_slice(shown.as_bytes());
-            let used = prompt.len() + width(&shown);
-            out.extend(std::iter::repeat_n(b' ', cols.saturating_sub(used)));
-            out.extend_from_slice(b"\x1b[0m");
-            // The cursor is put back where the typing is, and shown, because
-            // this is the one moment the person is editing rather than
-            // watching.
-            out.extend_from_slice(format!("\x1b[1;{}H\x1b[?25h", used + 1).as_bytes());
-        }
-        None => {
-            let shown = clip_to(text, cols);
-            out.extend_from_slice(shown.as_bytes());
-            out.extend(std::iter::repeat_n(
-                b' ',
-                cols.saturating_sub(width(&shown)),
-            ));
-            out.extend_from_slice(b"\x1b[0m\x1b[?25l");
-        }
-    }
+    let shown = clip_to(text, cols);
+    out.extend_from_slice(shown.as_bytes());
+    out.extend(std::iter::repeat_n(
+        b' ',
+        cols.saturating_sub(width(&shown)),
+    ));
+    out.extend_from_slice(b"\x1b[0m\x1b[?25l");
     out
 }
 
-/// One tab, as the strip needs it: a name and whether it is the one in front.
+/// The top row as a line being typed into: a prompt, what has been typed
+/// after it, and the cursor at the end.
+///
+/// The url bar's row, taken out of [`status_line`] when a page's `prompt()`
+/// became the second thing that is typed on this row. It is the same row byte
+/// for byte when the prompt is `url: `, which is what the url bar's tests
+/// still check.
+///
+/// A prompt wider than the pane is clipped rather than left to push the
+/// cursor off the edge — which a `url: ` never is, and a page's question can
+/// be. [`dialog_line`] clips it long before that; this is the floor under it.
+pub fn prompt_line(cols: u32, prompt: &str, typed: &str) -> Vec<u8> {
+    let cols = cols.max(1) as usize;
+    let mut out = b"\x1b[1;1H\x1b[K\x1b[7m".to_vec();
+    let prompt = clip_to(prompt, cols);
+    // The tail of what is being typed, because the end of a url is where the
+    // cursor is and what the person is looking at.
+    let room = cols.saturating_sub(width(&prompt));
+    let shown = tail_to(typed, room);
+    out.extend_from_slice(prompt.as_bytes());
+    out.extend_from_slice(shown.as_bytes());
+    let used = width(&prompt) + width(&shown);
+    out.extend(std::iter::repeat_n(b' ', cols.saturating_sub(used)));
+    out.extend_from_slice(b"\x1b[0m");
+    // The cursor is put back where the typing is, and shown, because this is
+    // the one moment the person is editing rather than watching.
+    out.extend_from_slice(format!("\x1b[1;{}H\x1b[?25h", used + 1).as_bytes());
+    out
+}
+
+/// The top row while the page in front is waiting on a dialog: the question,
+/// and the keys that answer it at the right-hand end.
+///
+/// The hint is what survives a narrow pane, not the question. A question cut
+/// to `Delete all…` still says there is a question, and the row being taken
+/// over says the rest; a row with no hint is a page that has stopped for no
+/// reason anybody can see and no key anybody knows. So the caption is clipped
+/// to what the hint leaves, less two cells of gap so that the two do not read
+/// as one sentence.
+///
+/// `typed` is a `prompt()`'s answer, and turns the row into a line being
+/// typed into: the question as the prompt, cut to half the pane so that there
+/// is room to see what is being typed, and the cursor shown at the end of it.
+/// The hint goes then — Enter and Escape are what a line has always been
+/// finished with, and the half of the row it would take is the half the
+/// answer needs.
+pub fn dialog_line(cols: u32, caption: &str, hint: &str, typed: Option<&str>) -> Vec<u8> {
+    if let Some(typed) = typed {
+        let half = (cols.max(1) / 2) as usize;
+        let prompt = if caption.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", clip_to(caption, half))
+        };
+        return prompt_line(cols, &prompt, typed);
+    }
+    let cols = cols.max(1) as usize;
+    let mut out = b"\x1b[1;1H\x1b[K\x1b[7m".to_vec();
+    let hint = clip_to(hint, cols);
+    let room = cols.saturating_sub(width(&hint) + 2);
+    let shown = clip_to(caption, room);
+    out.extend_from_slice(shown.as_bytes());
+    out.extend(std::iter::repeat_n(
+        b' ',
+        cols.saturating_sub(width(&shown) + width(&hint)),
+    ));
+    out.extend_from_slice(hint.as_bytes());
+    out.extend_from_slice(b"\x1b[0m\x1b[?25l");
+    out
+}
+
+/// One tab, as the strip needs it: a name, whether it is the one in front,
+/// and whether it is waiting on an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TabLabel<'a> {
     pub title: &'a str,
     pub active: bool,
+    /// The page has a dialog open, and has stopped until it is answered.
+    ///
+    /// Drawn as a `!` after the tab's number — `2! Title` — because a tab
+    /// that is not in front cannot show its question, and a page stopped
+    /// behind one looks, from the strip, exactly like a page that is loading
+    /// slowly. ASCII on purpose: the warning signs a font would draw better
+    /// are ambiguous-width in East Asian terminals, and a strip that is one
+    /// cell out is a strip that wraps.
+    pub dialog: bool,
 }
 
 /// How much room a url has to be worth putting after the strip.
@@ -273,12 +337,15 @@ pub fn tab_line(cols: u32, tabs: &[TabLabel], url: &str) -> Vec<u8> {
 ///
 /// Separate from the escapes so that what fits can be tested as what fits.
 fn strip(cols: usize, tabs: &[TabLabel], url: &str) -> Vec<(String, bool)> {
-    // What every tab costs before its title: its number, a space, and the two
-    // spaces that separate it from the one before.
+    // What every tab costs before its title: its number, the mark of a
+    // dialog if it has one, a space, and the two spaces that separate it from
+    // the one before.
     let fixed: usize = tabs
         .iter()
         .enumerate()
-        .map(|(index, _)| number_width(index + 1) + 1 + if index == 0 { 0 } else { 2 })
+        .map(|(index, tab)| {
+            number_width(index + 1) + usize::from(tab.dialog) + 1 + if index == 0 { 0 } else { 2 }
+        })
         .sum();
     let budget = cols.saturating_sub(fixed);
     let wanted: Vec<usize> = tabs.iter().map(|tab| width(tab.title)).collect();
@@ -291,7 +358,8 @@ fn strip(cols: usize, tabs: &[TabLabel], url: &str) -> Vec<(String, bool)> {
             runs.push(("  ".to_string(), false));
             used += 2;
         }
-        let text = format!("{} {}", index + 1, clip_to(tab.title, given[index]));
+        let mark = if tab.dialog { "!" } else { "" };
+        let text = format!("{}{mark} {}", index + 1, clip_to(tab.title, given[index]));
         used += width(&text);
         runs.push((text, tab.active));
     }
@@ -533,6 +601,7 @@ mod tests {
             .map(|(index, title)| TabLabel {
                 title,
                 active: index == active,
+                dialog: false,
             })
             .collect()
     }
@@ -638,6 +707,126 @@ mod tests {
         assert_eq!(shares(10, &[100, 100, 100]), vec![4, 3, 3]);
         // Nothing to share.
         assert_eq!(shares(1, &[10, 10, 10]), vec![0, 0, 0]);
+    }
+
+    /// What a row reads as with its own escapes taken off.
+    fn row_body(line: &str) -> &str {
+        line.trim_start_matches("\x1b[1;1H\x1b[K\x1b[7m")
+            .trim_end_matches("\x1b[0m\x1b[?25l")
+    }
+
+    #[test]
+    fn a_dialog_fills_the_width_and_keeps_its_hint() {
+        let captions = [
+            "alert: saved",
+            "Delete these three files? This cannot be undone.",
+            // Wide characters, which are two cells and never cut in half.
+            "\u{3053}\u{306e}\u{30da}\u{30fc}\u{30b8}\u{3092}\u{96e2}\u{308c}\u{307e}\u{3059}\u{304b}\u{ff1f}",
+            "",
+        ];
+        for cols in 10u32..=80 {
+            for caption in captions {
+                for hint in ["any key", "y/n"] {
+                    let line = text(&dialog_line(cols, caption, hint, None));
+                    assert!(line.starts_with("\x1b[1;1H\x1b[K\x1b[7m"), "{line:?}");
+                    assert!(
+                        line.ends_with("\x1b[0m\x1b[?25l"),
+                        "no cursor: there is nothing to type: {line:?}"
+                    );
+                    let body = row_body(&line);
+                    assert_eq!(width(body), cols as usize, "{cols} cols: {body:?}");
+                    assert!(body.ends_with(hint), "{cols} cols: {body:?}");
+                    // And never run into the question.
+                    let before = &body[..body.len() - hint.len()];
+                    assert!(
+                        before.ends_with("  ") || before.trim().is_empty(),
+                        "{cols} cols: {body:?}"
+                    );
+                }
+            }
+        }
+        // With room, all of it; without, as much of the front as fits.
+        let wide = text(&dialog_line(40, "Delete 3 files?", "y/n", None));
+        assert!(row_body(&wide).starts_with("Delete 3 files?  "), "{wide:?}");
+        let narrow = text(&dialog_line(16, "Delete 3 files?", "y/n", None));
+        assert_eq!(row_body(&narrow), "Delete 3 f…  y/n");
+        let cjk = text(&dialog_line(
+            12,
+            "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{8cea}\u{554f}",
+            "y/n",
+            None,
+        ));
+        assert_eq!(row_body(&cjk), "\u{65e5}\u{672c}\u{8a9e}…  y/n");
+        // A pane narrower than the hint keeps as much of the hint as fits,
+        // and still no more than the pane.
+        let tiny = text(&dialog_line(4, "anything", "any key", None));
+        assert_eq!(width(row_body(&tiny)), 4, "{tiny:?}");
+    }
+
+    #[test]
+    fn a_prompt_on_the_row_shows_the_cursor_after_what_was_typed() {
+        let line = text(&dialog_line(40, "Your name?", "enter/esc", Some("Ada")));
+        assert!(
+            line.starts_with("\x1b[1;1H\x1b[K\x1b[7mYour name? Ada"),
+            "{line:?}"
+        );
+        // "Your name? " is eleven cells and "Ada" three, so the cursor is on
+        // the fifteenth.
+        assert!(line.ends_with("\x1b[0m\x1b[1;15H\x1b[?25h"), "{line:?}");
+        assert!(
+            !line.contains("enter/esc"),
+            "the answer has the room: {line:?}"
+        );
+
+        // A long question gets half the row, so the answer is not pushed off
+        // it; a long answer shows its end, where the typing is.
+        let long = "Please tell us, in your own words, what happened";
+        let line = text(&dialog_line(
+            30,
+            long,
+            "enter/esc",
+            Some("it all went wrong"),
+        ));
+        let body = line
+            .trim_start_matches("\x1b[1;1H\x1b[K\x1b[7m")
+            .split("\x1b[0m")
+            .next()
+            .unwrap_or_default();
+        assert_eq!(width(body), 30, "{body:?}");
+        assert!(body.starts_with("Please tell us… "), "{body:?}");
+        assert!(body.ends_with("went wrong"), "{body:?}");
+        assert!(line.ends_with("\x1b[1;31H\x1b[?25h"), "{line:?}");
+
+        // And the url bar is still the url bar, byte for byte.
+        assert_eq!(
+            status_line(20, "", Some("example.com")),
+            prompt_line(20, "url: ", "example.com")
+        );
+        // A prompt with no question is just the line.
+        let bare = text(&dialog_line(20, "", "enter/esc", Some("x")));
+        assert!(bare.starts_with("\x1b[1;1H\x1b[K\x1b[7mx "), "{bare:?}");
+        assert!(bare.ends_with("\x1b[1;2H\x1b[?25h"), "{bare:?}");
+    }
+
+    #[test]
+    fn the_strip_marks_a_tab_that_is_waiting_on_an_answer() {
+        let mut tabs = labels(&["One", "Two", "Three"], 0);
+        tabs[1].dialog = true;
+        assert_eq!(strip_text(80, &tabs, ""), "[1 One]  2! Two  3 Three");
+        // The mark is part of what the row counts: it still fills the width
+        // exactly, however narrow, and the numbers still come first.
+        for cols in [8u32, 13, 20, 40, 80] {
+            let line = String::from_utf8(tab_line(cols, &tabs, "https://example.com/page"))
+                .expect("ascii");
+            let body = row_body(&line)
+                .replace("\x1b[27m", "")
+                .replace("\x1b[7m", "");
+            assert_eq!(width(&body), cols as usize, "{cols} cols: {body:?}");
+        }
+        // The one in front is marked too, with its emphasis over the mark.
+        tabs[0].dialog = true;
+        let line = String::from_utf8(tab_line(80, &tabs, "")).expect("ascii");
+        assert!(line.contains("\x1b[27m1! One\x1b[7m"), "{line:?}");
     }
 
     #[test]

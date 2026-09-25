@@ -168,32 +168,44 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install the engine and the fonts
-        # chromium-shell is Debian's headless_shell. The CJK fonts are not
-        # decoration: without them a page of Japanese renders as boxes and the
-        # frames still look fine to an assertion.
+        # Chrome for Testing's chrome-headless-shell, pinned by version and by
+        # checksum, and not Debian's chromium-shell, which this job used to
+        # install on the belief that it was Debian's headless_shell. It is not:
+        # it is Chromium's content_shell. Run against a real content_shell
+        # build, the engine tests fail exactly as this job did on 153 --
+        # content_shell starts its DevTools listener whether or not it is asked
+        # to, so the engine keeps a TCP port open beside the pipe (#5); it
+        # answers a page's alert, confirm and prompt itself before anybody can
+        # (#7); it does not exit on Browser.close, so a profile is never
+        # flushed (#6); and its error page is titled "Error" (#8). Against
+        # chrome-headless-shell 141 and 153 all of them pass.
+        #
+        # The libraries are the ones `ldd` lists for the binary, by their
+        # bookworm package names. The CJK fonts are not decoration: without
+        # them a page of Japanese renders as boxes and the frames still look
+        # fine to an assertion.
+        env:
+          SHELL_VERSION: 153.0.8010.52
+          SHELL_SHA256: 944dc1eae654637fed4d57650198774f9c43b45f34e48febb84f43c541b5de76
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends chromium-shell fonts-noto-cjk
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl unzip fonts-liberation fonts-noto-cjk \
+            libasound2 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 \
+            libdbus-1-3 libdrm2 libexpat1 libgbm1 libglib2.0-0 libnspr4 \
+            libnss3 libudev1 libx11-6 libxcb1 libxcomposite1 libxdamage1 \
+            libxext6 libxfixes3 libxi6 libxkbcommon0 libxrandr2 libxrender1
           rm -rf /var/lib/apt/lists/*
-      # Which engine this run actually tested against. bookworm ships whatever
-      # chromium-shell it has that day, so a Debian security update can turn
-      # this job red with no commit to blame -- and the first question then is
-      # "what changed", which is unanswerable if the version was never recorded.
-      # It goes in the log rather than into a pin because pinning it would mean
-      # testing against an engine nobody is running.
-      #
-      # Asked of dpkg rather than of the binary. `chromium-shell --version`
-      # looks like the obvious way to do this and is not: Chromium refuses to
-      # run as root without --no-sandbox even to print its version, and then
-      # still initialises Ozone, picks X11 and dies on "Missing X server or
-      # $DISPLAY" unless --ozone-platform=headless is there too. Both of those
-      # are written down in tools/run.sh, and both were rediscovered here the
-      # expensive way. The package version is what apt installed, which is the
-      # thing that changes underneath this job anyway, and dpkg cannot fail to
-      # report it -- a line that exists to say what happened should not be
-      # able to decide whether the job passes.
-      - name: Say which engine this is
-        run: dpkg-query -W -f='chromium-shell ${Version}\n' chromium-shell
+          curl -fsSLo /tmp/shell.zip \
+            "https://storage.googleapis.com/chrome-for-testing-public/$SHELL_VERSION/linux64/chrome-headless-shell-linux64.zip"
+          echo "$SHELL_SHA256  /tmp/shell.zip" | sha256sum -c -
+          unzip -q /tmp/shell.zip -d /opt
+          rm /tmp/shell.zip
+          # Which engine this run tested against, in the log. The headless
+          # shell answers --version as root with no --no-sandbox and no
+          # --ozone-platform, unlike the chromium-shell this replaced -- it has
+          # no X11 to reach for -- which this line's own runs have shown.
+          /opt/chrome-headless-shell-linux64/chrome-headless-shell --version
       - uses: Swatinem/rust-cache@v2
       # --release because several of these tests assert on timings: the rest
       # interval before a still, the frame rate under a steady wheel, the cost
@@ -212,4 +224,4 @@ jobs:
       # without it. See src/engine.rs.
       - run: cargo test --release --locked -- --test-threads=1
         env:
-          BLINKTERM_ENGINE: chromium-shell
+          BLINKTERM_ENGINE: /opt/chrome-headless-shell-linux64/chrome-headless-shell
