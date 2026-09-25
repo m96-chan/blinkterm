@@ -137,6 +137,7 @@ pub mod motion;
 pub mod profile;
 pub mod screen;
 pub mod scroll;
+pub mod tablist;
 pub mod tabs;
 pub mod text;
 pub mod upload;
