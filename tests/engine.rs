@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use blinkterm::cdp::{Client, Pending};
 use blinkterm::engine::{self, Engine};
+use blinkterm::find::{self, Matches};
 use blinkterm::graphics::{Painter, Raw, IMAGE_ID};
 use blinkterm::input::{Key, KeyAction, KeyInput, Mods};
 use blinkterm::json::Json;
@@ -4239,6 +4240,548 @@ fn enter_submits_a_form_and_breaks_a_line_in_a_textarea() {
         Some("a\n"),
         "Enter in a textarea starts a new line"
     );
+
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Find in page (#12): the script in `blinkterm::find`, run the way the
+// program runs it — in an isolated world, through `Runtime.callFunctionOn` —
+// against pages served over HTTP, with what the page and a screenshot say
+// afterwards as the evidence.
+
+/// Serve the pages `build` makes, given the port they will be served on, for
+/// as long as the test binary runs; the port comes back.
+///
+/// A thread per connection, unlike [`serve`]: Chromium opens a speculative
+/// second connection that sends nothing, and with one thread its read held up
+/// every request after it — which is what the first measurement of find ran
+/// into. A path nobody made is a 404.
+fn serve_pages(build: impl FnOnce(u16) -> Vec<(String, String)>) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
+    let port = listener.local_addr().expect("an address").port();
+    let pages = Arc::new(build(port));
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let pages = Arc::clone(&pages);
+            std::thread::spawn(move || {
+                let mut head = [0u8; 2048];
+                let read = stream.read(&mut head).unwrap_or(0);
+                let request = String::from_utf8_lossy(&head[..read]).to_string();
+                let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+                let page = pages.iter().find(|(served, _)| *served == path);
+                let (status, body) = match page {
+                    Some((_, body)) => ("200 OK", body.as_str()),
+                    None => ("404 Not Found", "<title>not found</title>"),
+                };
+                let answer = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+/// A page with `fox` where a person can see it six times — three spellings in
+/// one paragraph, one split across `<b>`, two far down — and where nobody can
+/// in four more: a closed `<details>`, `display:none`, `visibility:hidden`
+/// and a `<textarea>`. The page `find`'s module doc was measured on.
+fn fox_page() -> String {
+    let filler: String = (0..200)
+        .map(|i| format!("<p>filler line {i}</p>"))
+        .collect();
+    format!(
+        "<!doctype html><meta charset=utf-8><title>foxes</title>\
+         <body style='margin:0;font:16px monospace;background:#fff;color:#000'>\
+         <h1>Top of the page</h1>\
+         <p>The quick brown fox jumps over the lazy dog. A Fox is here too, and a FOX.</p>\
+         <details><summary>closed</summary><p>hidden fox inside details</p></details>\
+         <p style='display:none'>display none fox</p>\
+         <p style='visibility:hidden'>visibility hidden fox</p>\
+         <textarea>fox in a textarea</textarea>\
+         <p>Split <b>fo</b>x across nodes.</p>\
+         {filler}\
+         <p id=deep>A deep fox near the bottom.</p>\
+         <p>and the last fox.</p></body>"
+    )
+}
+
+/// An engine on a page this test serves, sized as the pane would be, with the
+/// find script's world made in it.
+fn finding(url: &str, title: &str) -> Option<(Engine, Client, i64)> {
+    let (engine, mut client) = connect()?;
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    open(&mut client, url, title);
+    let context = find_world(&mut client);
+    Some((engine, client, context))
+}
+
+/// Go to `url` and wait for it to call itself `title`.
+fn open(client: &mut Client, url: &str, title: &str) {
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(client, title, Duration::from_secs(15)),
+        title,
+        "{url}"
+    );
+}
+
+/// The world the program makes on `ctrl+f`: the main frame, then a world of
+/// [`find::WORLD`]'s name in it.
+fn find_world(client: &mut Client) -> i64 {
+    let tree = client
+        .call("Page.getFrameTree", Json::empty())
+        .expect("the frame tree");
+    let frame = find::main_frame(&tree).expect("a main frame");
+    let world = client
+        .call("Page.createIsolatedWorld", find::world_params(&frame))
+        .expect("an isolated world");
+    find::context(&world).expect("the world's id")
+}
+
+/// One search or step, waited for, as the program sends it.
+fn search(client: &mut Client, context: i64, needle: &str, step: i32) -> Matches {
+    let ask = find::Ask {
+        needle: needle.to_string(),
+        step,
+    };
+    let reply = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            find::call_params(context, &ask),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers the search");
+    find::matches(&reply).unwrap_or_else(|| panic!("an answer of the script's shape: {reply}"))
+}
+
+/// How many yellow (`#ff0`, every match) and orange (`#f80`, the current
+/// one) pixels a PNG has, within 8 of each channel, inside `area` — `(x, y,
+/// width, height)` — or everywhere.
+fn highlight_pixels(png: &[u8], area: Option<(u32, u32, u32, u32)>) -> (usize, usize) {
+    let image = tos_term::png::decode(png, 64 * 1024 * 1024).expect("the PNG decodes");
+    let (x0, y0, w, h) = area.unwrap_or((0, 0, image.width, image.height));
+    let near = |pixel: &[u8], rgb: [u8; 3]| {
+        pixel
+            .iter()
+            .zip(rgb)
+            .all(|(&have, want)| have.abs_diff(want) <= 8)
+    };
+    let (mut yellow, mut orange) = (0, 0);
+    for y in y0..(y0 + h).min(image.height) {
+        for x in x0..(x0 + w).min(image.width) {
+            let at = ((y * image.width + x) * 4) as usize;
+            let pixel = &image.rgba[at..at + 3];
+            if near(pixel, [0xff, 0xff, 0x00]) {
+                yellow += 1;
+            } else if near(pixel, [0xff, 0x88, 0x00]) {
+                orange += 1;
+            }
+        }
+    }
+    (yellow, orange)
+}
+
+/// A number the page works out.
+fn page_number(client: &mut Client, expression: &str) -> f64 {
+    evaluate(client, expression)
+        .as_f64()
+        .unwrap_or_else(|| panic!("{expression} is a number"))
+}
+
+/// The acceptance criterion of #12: a needle is counted, and a match below the
+/// fold is brought into view — checked by where the page is, not by trusting
+/// the script's own word for it.
+#[test]
+fn a_needle_is_counted_and_the_current_match_is_scrolled_into_view() {
+    let port = serve_pages(|_| {
+        let paragraphs: String = (0..300)
+            .map(|i| {
+                format!(
+                    "<p id=p{i}>{i} The quick brown fox jumps over the lazy dog; \
+                     Lorem ipsum dolor sit amet, <b>consectetur</b> adipiscing elit.</p>"
+                )
+            })
+            .collect();
+        vec![(
+            "/".to_string(),
+            format!(
+                "<!doctype html><meta charset=utf-8><title>paragraphs</title>\
+                 <body style='font:14px sans-serif;background:#fff'>{paragraphs}</body>"
+            ),
+        )]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "paragraphs") else {
+        return;
+    };
+
+    let fox = search(&mut client, context, "fox", 0);
+    assert_eq!((fox.count, fox.current), (300, 1));
+    assert!(fox.highlighted, "the Custom Highlight API is there");
+    assert_eq!(scroll_y(&mut client), 0.0, "the first is already in view");
+
+    let far = search(&mut client, context, "250 The", 0);
+    assert_eq!((far.count, far.current), (1, 1));
+    assert!(scroll_y(&mut client) > 0.0, "the page moved to it");
+    let top = page_number(
+        &mut client,
+        "document.getElementById('p250').getBoundingClientRect().top",
+    );
+    assert!(
+        (0.0..HEIGHT as f64).contains(&top),
+        "paragraph 250 is on the screen: its top is at {top}"
+    );
+    let (_, orange) = highlight_pixels(&screenshot(&mut client, "png", None), None);
+    assert!(orange > 0, "the current match is painted");
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn next_and_previous_walk_the_matches_and_wrap() {
+    let port = serve_pages(|_| vec![("/".to_string(), fox_page())]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "foxes") else {
+        return;
+    };
+
+    let first = search(&mut client, context, "fox", 0);
+    assert_eq!((first.count, first.current), (6, 1));
+    assert_eq!(scroll_y(&mut client), 0.0);
+    let mut went = Vec::new();
+    for _ in 2..=6 {
+        let step = search(&mut client, context, "fox", 1);
+        went.push((step.current, scroll_y(&mut client)));
+    }
+    let currents: Vec<u32> = went.iter().map(|(current, _)| *current).collect();
+    assert_eq!(currents, [2, 3, 4, 5, 6]);
+    // The first four are on the first screen; the fifth is two hundred lines
+    // down, and the page goes to it.
+    assert_eq!(went[2].1, 0.0, "{went:?}");
+    assert!(went[3].1 > 0.0, "the fifth scrolled the page: {went:?}");
+    let wrapped = search(&mut client, context, "fox", 1);
+    assert_eq!(wrapped.current, 1, "past the last is the first");
+    assert_eq!(scroll_y(&mut client), 0.0, "and the page went back up");
+    let back = search(&mut client, context, "fox", -1);
+    assert_eq!(back.current, 6, "before the first is the last");
+    assert!(scroll_y(&mut client) > 0.0);
+    // A step of any size wraps, either way.
+    assert_eq!(search(&mut client, context, "fox", 13).current, 1);
+    assert_eq!(search(&mut client, context, "fox", -7).current, 6);
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn hidden_text_is_not_a_match_and_the_page_is_left_as_it_was() {
+    let port = serve_pages(|_| vec![("/".to_string(), fox_page())]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "foxes") else {
+        return;
+    };
+    let before = evaluate(&mut client, "document.body.innerHTML");
+    let selected = evaluate(
+        &mut client,
+        "var r=document.createRange();r.selectNodeContents(document.querySelector('h1'));\
+         getSelection().removeAllRanges();getSelection().addRange(r);String(getSelection())",
+    );
+    assert_eq!(selected.as_str(), Some("Top of the page"));
+
+    let fox = search(&mut client, context, "fox", 0);
+    assert_eq!(
+        fox.count, 6,
+        "details, display:none, visibility:hidden and the textarea are not matches; \
+         the split fo|x is"
+    );
+    let (yellow, orange) = highlight_pixels(&screenshot(&mut client, "png", None), None);
+    assert!(yellow > 0 && orange > 0, "{yellow} yellow, {orange} orange");
+
+    // Nothing in the page changed, and nothing of the script is in its world.
+    assert_eq!(evaluate(&mut client, "document.body.innerHTML"), before);
+    assert_eq!(
+        evaluate(&mut client, "typeof __blinktermFind").as_str(),
+        Some("undefined")
+    );
+    assert_eq!(
+        evaluate(&mut client, "String(getSelection())").as_str(),
+        Some("Top of the page"),
+        "the person's selection is theirs"
+    );
+    // Whitespace as the page shows it, and never across a block.
+    assert_eq!(search(&mut client, context, "lazy  dog", 0).count, 0);
+    assert_eq!(search(&mut client, context, "lazy dog", 0).count, 1);
+    assert_eq!(search(&mut client, context, "page the", 0).count, 0);
+
+    let cleared = search(&mut client, context, "", 0);
+    assert_eq!((cleared.count, cleared.current), (0, 0));
+    assert_eq!(
+        evaluate(&mut client, "CSS.highlights.size").as_f64(),
+        Some(0.0)
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(0.0)
+    );
+    let (yellow, orange) = highlight_pixels(&screenshot(&mut client, "png", None), None);
+    assert_eq!((yellow, orange), (0, 0), "nothing left painted");
+    assert_eq!(evaluate(&mut client, "document.body.innerHTML"), before);
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn cjk_text_is_found_counted_and_highlighted() {
+    let port = serve_pages(|_| {
+        vec![(
+            "/".to_string(),
+            "<!doctype html><meta charset=utf-8><title>nihongo</title>\
+             <body style='margin:0;font:20px sans-serif;background:#fff'>\
+             <p>東京は日本の首都です。</p>\
+             <p>日本語のテキストです。東京タワー。</p>\
+             <p>京都と東京と大阪。日本。</p>\
+             <p>TOKYO in capitals.</p></body>"
+                .to_string(),
+        )]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "nihongo") else {
+        return;
+    };
+
+    assert_eq!(search(&mut client, context, "東京", 0).count, 3);
+    assert_eq!(search(&mut client, context, "日本", 0).count, 3);
+    assert_eq!(search(&mut client, context, "日本の首都", 0).count, 1);
+    // A glyph box paints its background whether or not a font drew the glyph.
+    let (yellow, orange) = highlight_pixels(&screenshot(&mut client, "png", None), None);
+    assert!(yellow + orange > 0, "the match is painted");
+    assert_eq!(
+        search(&mut client, context, "tokyo", 0).count,
+        1,
+        "any case"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// Why a search is sent rather than called, and what the program does when
+/// the document it was searching has gone.
+#[test]
+fn a_search_is_collected_on_a_later_pass_and_a_stale_world_is_told_apart() {
+    let port = serve_pages(|_| {
+        let paragraphs: String = (0..2000)
+            .map(|i| {
+                format!(
+                    "<p>{i} The quick brown fox jumps over the lazy dog; Lorem ipsum \
+                     dolor sit amet, <b>consectetur</b> adipiscing elit.</p>"
+                )
+            })
+            .collect();
+        vec![
+            (
+                "/".to_string(),
+                format!("<!doctype html><title>long</title><body>{paragraphs}</body>"),
+            ),
+            (
+                "/other".to_string(),
+                "<!doctype html><title>other</title><body><p>a fox elsewhere</p></body>"
+                    .to_string(),
+            ),
+        ]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "long") else {
+        return;
+    };
+
+    let ask = find::Ask {
+        needle: "fox".to_string(),
+        step: 0,
+    };
+    let pending: Pending = client
+        .send("Runtime.callFunctionOn", find::call_params(context, &ask))
+        .expect("the search goes out");
+    assert!(
+        client.take_reply(&pending).is_none(),
+        "a walk of 2000 paragraphs is not back the moment it was sent"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let answer = loop {
+        if let Some(answer) = client.take_reply(&pending) {
+            break answer;
+        }
+        assert!(Instant::now() < deadline, "the search answered within 5 s");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let fox = find::matches(&answer.expect("a reply")).expect("the script's answer");
+    assert_eq!(fox.count, 2000);
+
+    open(&mut client, &format!("{url}other"), "other");
+    let gone = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            find::call_params(context, &ask),
+            Duration::from_secs(5),
+        )
+        .expect_err("the world went with its document");
+    assert!(find::stale_world(&gone), "{gone}");
+    let context = find_world(&mut client);
+    assert_eq!(search(&mut client, context, "fox", 0).count, 1);
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn a_match_in_a_same_origin_frame_is_reached_and_a_cross_origin_one_is_not() {
+    let port = serve_pages(|port| {
+        let inner: String = (0..30)
+            .map(|i| format!("<p>inner line {i}</p>"))
+            .collect::<String>()
+            + "<p>an inner fox</p>";
+        let outer: String = (0..40).map(|i| format!("<p>outer line {i}</p>")).collect();
+        vec![
+            (
+                "/inner".to_string(),
+                format!(
+                    "<!doctype html><meta charset=utf-8>\
+                     <body style='font:16px monospace;margin:0;background:#fff'>{inner}</body>"
+                ),
+            ),
+            (
+                "/".to_string(),
+                format!(
+                    "<!doctype html><meta charset=utf-8><title>loading</title>\
+                     <body style='font:16px monospace;margin:0;background:#fff'>\
+                     <p>outer fox</p>\
+                     <iframe id=same src='http://127.0.0.1:{port}/inner' \
+                     style='width:300px;height:120px'></iframe>\
+                     <iframe id=cross src='http://localhost:{port}/inner' \
+                     style='width:300px;height:120px'></iframe>\
+                     <iframe id=doc srcdoc='<p>srcdoc fox</p>'></iframe>\
+                     {outer}<p>last outer fox</p>\
+                     <script>onload=function(){{document.title='frames'}}</script></body>"
+                ),
+            ),
+        ]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let Some((mut engine, mut client, context)) = finding(&url, "frames") else {
+        return;
+    };
+    assert_eq!(
+        evaluate(
+            &mut client,
+            "document.getElementById('cross').contentDocument === null"
+        )
+        .as_bool(),
+        Some(true),
+        "the second frame really is another origin"
+    );
+
+    let fox = search(&mut client, context, "fox", 0);
+    assert_eq!(
+        (fox.count, fox.current),
+        (4, 1),
+        "outer, the same-origin frame, srcdoc, outer again; not the other origin"
+    );
+    let into = search(&mut client, context, "fox", 1);
+    assert_eq!(into.current, 2);
+    assert!(
+        page_number(
+            &mut client,
+            "document.getElementById('same').contentWindow.scrollY"
+        ) > 0.0,
+        "the frame scrolled to its match"
+    );
+    assert_eq!(scroll_y(&mut client), 0.0, "and the page stayed");
+    let area = |client: &mut Client, what: &str| {
+        page_number(
+            client,
+            &format!("document.getElementById('same').getBoundingClientRect().{what}"),
+        ) as u32
+    };
+    let frame = (
+        area(&mut client, "left"),
+        area(&mut client, "top"),
+        area(&mut client, "width"),
+        area(&mut client, "height"),
+    );
+    let (_, orange) = highlight_pixels(&screenshot(&mut client, "png", None), Some(frame));
+    assert!(orange > 0, "the current match is painted inside the frame");
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn a_search_that_asks_nothing_of_the_page_still_answers_on_about_blank_and_the_error_page() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("about:blank");
+    let context = find_world(&mut client);
+    let blank = search(&mut client, context, "fox", 0);
+    assert_eq!((blank.count, blank.current), (0, 0));
+    assert_eq!(search(&mut client, context, "fox", 1).current, 0);
+
+    // Port 1 is one the engine refuses to connect to, and says so with its
+    // own error page, at once.
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string("http://127.0.0.1:1/"))]),
+        )
+        .expect("the navigation is answered");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        // The error page's document arrives after the reply; until it has,
+        // the world asked for may be the one that is about to go.
+        let context = find_world(&mut client);
+        let ask = find::Ask {
+            needle: "fox".to_string(),
+            step: 0,
+        };
+        match client.call_within(
+            "Runtime.callFunctionOn",
+            find::call_params(context, &ask),
+            Duration::from_secs(5),
+        ) {
+            Ok(reply) => break find::matches(&reply),
+            Err(why) if find::stale_world(&why) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(why) => panic!("{why}"),
+        }
+    };
+    let error_page = answer.expect("the script's answer");
+    assert_eq!(error_page.count, 0);
 
     client.close();
     engine.kill();

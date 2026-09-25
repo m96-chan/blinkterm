@@ -60,6 +60,12 @@ carry, and the list is kept as things land rather than written at the end.
   completion; several files for a `multiple` input, one per `enter` and an
   empty `enter` to send them; `esc` sends nothing
   ([#11](https://github.com/m96-chan/blinkterm/issues/11)).
+- Find in page: `ctrl+f` opens a `find:` prompt on the status row, matches
+  are highlighted as you type with the current one scrolled into view and
+  counted (`3/17`), `enter`/`ctrl+g` next and `shift+enter` previous, `esc`
+  clears. Case-insensitive, CJK included, same-origin frames included,
+  hidden text excluded; nothing in the page is modified
+  ([#12](https://github.com/m96-chan/blinkterm/issues/12)).
 
 ### Changed
 

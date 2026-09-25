@@ -39,6 +39,7 @@ use crate::clipboard;
 use crate::dialog::{Answer, Dialog, Kind};
 use crate::download::{self, Downloads};
 use crate::engine::Engine;
+use crate::find;
 use crate::graphics::{Painter, Raw};
 use crate::history::{self, History};
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
@@ -146,6 +147,24 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// something else wrong with it, and the last motion frame stays up.
 const STILL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a search gets before the row gives up on it.
+///
+/// Sent and collected like the still, never waited for: see [`find`] for
+/// the measurements, which are 31 to 61 ms of renderer on a long article and
+/// up to a second on 2.4 million characters of text, more than anybody reads.
+/// Five, so that the largest page measured has room to spare and a page that
+/// takes longer has something else wrong with it. The clock does not run
+/// while the page is stopped behind a dialog: the search is queued behind the
+/// question like every other command, and lands when it has been answered.
+const FIND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long each of the two calls that make the find script's world gets.
+///
+/// Waited for, as [`SELECTION_TIMEOUT`] is and for the same reason: the
+/// person has just pressed `ctrl+f` and the first letter they type needs the
+/// world. Measured at 0.4 to 2.2 ms each.
+const WORLD_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The largest frame either decoder may produce, in bytes of pixels.
 ///
 /// A frame is a pane, so this is never reached; it is the ceiling that stops
@@ -223,6 +242,12 @@ struct Chrome {
     wheel: scroll::Wheel,
     /// `Some` while the url is being typed.
     bar: Option<UrlBar>,
+    /// `Some` while a needle is being typed into the find prompt. Asked about
+    /// every key after the url bar, drawn on the row when the bar is closed.
+    find: Option<Find>,
+    /// The needle the find prompt last closed with, offered whole by the
+    /// next `ctrl+f` as `ctrl+l` offers the url.
+    last_needle: String,
     /// The pages visited, which the url bar offers back; kept in the profile,
     /// or only in memory for a temporary one. See [`crate::history`].
     history: History,
@@ -271,6 +296,45 @@ struct UrlBar {
 impl UrlBar {
     fn new(line: Line) -> UrlBar {
         UrlBar { line, walk: None }
+    }
+}
+
+/// The find prompt while it is open, and the page it is searching.
+///
+/// The program's rather than a tab's, like [`Navigation`] and [`Still`], with
+/// the target beside it for the same reason: there is one row and one person
+/// typing on it, and an answer collected against a tab that is no longer in
+/// front would put one page's count under another's needle. A tab cannot be
+/// switched from the keyboard while the prompt is open, because the prompt
+/// takes every key; a page that opens a window, or closes itself, can put
+/// another tab in front all the same, and [`switched`] closes the prompt then.
+/// Per-tab prompts remembered behind every tab, which is Chrome's model, were
+/// left out: state nobody can see in a strip, and one more thing to keep in
+/// step with the engine.
+struct Find {
+    target: String,
+    finder: find::Finder,
+    /// The world the script runs in, once made for this document; `None` for
+    /// a page that did not answer when it was asked for one.
+    context: Option<i64>,
+    /// The search out with the engine, what it asked, and when it went.
+    pending: Option<(Pending, find::Ask, Instant)>,
+    /// What to ask next, once the answer is in: keys typed while a search is
+    /// out fold in here ([`find::Ask::merge`]), so at most one is ever out.
+    wanted: Option<find::Ask>,
+    /// Whether a world that went with its document has already been made
+    /// again for this ask, so that a page which keeps navigating under the
+    /// prompt is reported rather than chased.
+    remade: bool,
+}
+
+impl Find {
+    /// Fold `ask` into whatever is waiting to be sent.
+    fn want(&mut self, ask: find::Ask) {
+        self.wanted = Some(match self.wanted.take() {
+            Some(older) => older.merge(ask),
+            None => ask,
+        });
     }
 }
 
@@ -383,6 +447,8 @@ pub fn run(options: Options) -> Result<(), String> {
                 still: None,
                 wheel: scroll::Wheel::start(),
                 bar: None,
+                find: None,
+                last_needle: String::new(),
                 history: if engine.profile().is_temporary() {
                     History::in_memory()
                 } else {
@@ -594,6 +660,12 @@ fn drive(
             if tabs.active().map(Tab::line) != before {
                 redraw_row(pane, tabs, chrome)?;
             }
+        }
+        // The answer to a search, and the next one if keys were typed while it
+        // was out. After the page's events, so that a navigation which took
+        // the document away has already closed the prompt.
+        if pump_find(tabs, chrome) {
+            redraw_row(pane, tabs, chrome)?;
         }
         // And last, because it is the thing to do when nothing else happened:
         // a page that has stopped moving gets its lossless picture.
@@ -962,6 +1034,10 @@ fn switched(
     // forgetting it is the whole of stopping it. It also lets go of that
     // tab's session, which a tab that is closing needs.
     chrome.wheel.forget();
+    // The find prompt was searching the page being left. Closed before that
+    // page stops painting, so that the clear goes to it while it is still
+    // the one on the screen.
+    close_find(tabs, chrome);
     if let Some(was) = &was {
         deactivate(tabs, was);
     }
@@ -1134,15 +1210,16 @@ fn page_cells(metrics: Metrics) -> Cells {
 /// tab's line is what a person navigates by and a download is news, not a
 /// place. Behind the url bar and a dialog, like the tab's line itself.
 ///
-/// A file input's path, being typed, is the sixth, and takes the whole row
-/// after the url bar and a dialog: see [`row_owner`] for the order and why.
+/// The find prompt is a line being typed like the url bar, with its count at
+/// the right-hand end where a dialog's keys go; a file input's path, being
+/// typed, is another. Which of them has the row is [`row_owner`]'s to say.
 fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(), String> {
     let cols = chrome.metrics.cols;
     let Some(active) = tabs.active() else {
         return Ok(());
     };
     let downloading = chrome.downloads.line(Instant::now());
-    let bytes = if let Some(owner) = row_owner(tabs, chrome.bar.as_ref()) {
+    let bytes = if let Some(owner) = row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref()) {
         owned_row(cols, owner)
     } else if tabs.len() < 2 {
         match &downloading {
@@ -1175,6 +1252,9 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
 fn owned_row(cols: u32, owner: RowOwner<'_>) -> Vec<u8> {
     match owner {
         RowOwner::Bar(bar) => typing_row(cols, "url: ", &bar.line),
+        RowOwner::Find(find) => {
+            typing_row_beside(cols, "find: ", &find.finder.line, &find.finder.count_text())
+        }
         RowOwner::Dialog(dialog) if dialog.typing() => typing_row(
             cols,
             &screen::dialog_prompt(cols, &dialog.caption()),
@@ -1198,32 +1278,42 @@ fn owned_row(cols: u32, owner: RowOwner<'_>) -> Vec<u8> {
 /// shared is the one rule for which of them has the row and the cursor.
 enum RowOwner<'a> {
     Bar(&'a UrlBar),
+    /// `ctrl+f`'s prompt: the person's, like the bar, and not any page's.
+    Find(&'a Find),
     /// Any dialog: a `prompt()` is a line with the cursor, the others are a
     /// question answered by a key.
     Dialog(&'a Dialog),
     Upload(&'a Upload),
 }
 
-/// Which line owns the row: the url bar, then a dialog, then a file input's
-/// path — or nothing, and the row is the page's own.
+/// Which line owns the row: the url bar, then the find prompt, then a dialog,
+/// then a file input's path — or nothing, and the row is the page's own.
 ///
 /// The url bar first, because it was opened by the person, and a question
-/// that arrived while they were typing is there when they finish. A dialog
+/// that arrived while they were typing is there when they finish. The find
+/// prompt next, for the same reason; the keyboard cannot have both open. A dialog
 /// next, because the page is stopped behind it — even behind an upload
 /// prompt, since a chooser does not stop the page and a script can
 /// `alert()` while a path is half typed; the path waits underneath and comes
 /// back when the alert is answered. The upload prompt last, because it is
 /// the page's question and the page is not waiting on it.
 ///
-/// A line that joins them — find in the page, say — goes in here, in its
-/// place in that order, as one more arm of [`RowOwner`]; [`redraw_row`] and
+/// A line that joins them goes in here, in its place in that order, as one
+/// more arm of [`RowOwner`]; [`redraw_row`] and
 /// [`row_owns_cursor`] follow from it. What does not follow from it is which
 /// keys reach each one, which is [`handle_input`]'s, in the same order but
 /// with a rule of its own for each about which of the program's keys survive
 /// it; and [`paste`], which goes to the same place by the same order.
-fn row_owner<'a, C>(tabs: &'a Tabs<C>, bar: Option<&'a UrlBar>) -> Option<RowOwner<'a>> {
+fn row_owner<'a, C>(
+    tabs: &'a Tabs<C>,
+    bar: Option<&'a UrlBar>,
+    find: Option<&'a Find>,
+) -> Option<RowOwner<'a>> {
     if let Some(bar) = bar {
         return Some(RowOwner::Bar(bar));
+    }
+    if let Some(find) = find {
+        return Some(RowOwner::Find(find));
     }
     let tab = tabs.active()?;
     if let Some(dialog) = &tab.dialog {
@@ -1235,8 +1325,14 @@ fn row_owner<'a, C>(tabs: &'a Tabs<C>, bar: Option<&'a UrlBar>) -> Option<RowOwn
 /// The row as `line` being typed after `prompt`: as much of it as fits, with
 /// the cursor in sight.
 fn typing_row(cols: u32, prompt: &str, line: &Line) -> Vec<u8> {
-    let view = line.view(screen::prompt_room(cols, prompt));
-    screen::prompt_line(cols, prompt, &view.text, &view.hint, view.cursor)
+    typing_row_beside(cols, prompt, line, "")
+}
+
+/// The same, with `right` at the right-hand end of the row: the find
+/// prompt's count. With `right` empty it is [`typing_row`].
+fn typing_row_beside(cols: u32, prompt: &str, line: &Line, right: &str) -> Vec<u8> {
+    let view = line.view(screen::prompt_room_beside(cols, prompt, right));
+    screen::prompt_line_beside(cols, prompt, &view.text, &view.hint, view.cursor, right)
 }
 
 /// Everything the browser connection said: which pages there are.
@@ -1317,6 +1413,8 @@ fn handle_page_events(
     // The newest frame worth painting, still encoded.
     let mut newest_frame: Option<Vec<u8>> = None;
     let mut redraw = false;
+    // Whether the page the find prompt is searching has gone to another.
+    let mut find_left = false;
 
     for index in 0..tabs.len() {
         let Some(tab) = tabs.get_mut(index) else {
@@ -1379,6 +1477,15 @@ fn handle_page_events(
                     if let Some(landing) = load::landing(&params) {
                         tab.landed(landing);
                         redraw = true;
+                        // The matches, their highlights and the world they
+                        // were found from went with the document. The prompt
+                        // closes rather than searching a page the person has
+                        // not seen yet; the needle is kept for the next
+                        // `ctrl+f`.
+                        find_left |= chrome
+                            .find
+                            .as_ref()
+                            .is_some_and(|find| find.target == tab.target);
                     }
                 }
                 "Page.loadEventFired" => {
@@ -1447,6 +1554,9 @@ fn handle_page_events(
         }
     }
 
+    if find_left {
+        close_find(tabs, chrome);
+    }
     if redraw {
         redraw_row(pane, tabs, chrome)?;
     }
@@ -1487,14 +1597,37 @@ fn paint(
     Ok(())
 }
 
-/// Whether the row is a line being typed into: the url bar, the answer to a
-/// `prompt()` on the page in front, or a path for its file input — whichever
-/// [`row_owner`] says has the row.
+/// Whether the row is a line being typed into: the url bar, the find
+/// prompt, the answer to a `prompt()` on the page in front, or a path for its
+/// file input — whichever [`row_owner`] says has the row.
 fn row_owns_cursor(tabs: &Tabs<Client>, chrome: &Chrome) -> bool {
-    match row_owner(tabs, chrome.bar.as_ref()) {
-        Some(RowOwner::Bar(_) | RowOwner::Upload(_)) => true,
-        Some(RowOwner::Dialog(dialog)) => dialog.typing(),
-        None => false,
+    typing_line(tabs, chrome).is_some()
+}
+
+/// Which line being typed has the row, when one has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Typing {
+    /// `ctrl+l`, or a new tab.
+    Url,
+    /// `ctrl+f`.
+    Find,
+    /// A page's `prompt()`.
+    Prompt,
+    /// A path for the page's file input.
+    Upload,
+}
+
+/// The line a key, a paste and the cursor go to: [`row_owner`]'s order, less
+/// a dialog that is answered by a key rather than typed into — an alert has
+/// the row and no line, and a path half typed under it waits. Derived rather
+/// than decided again, so that what the row shows and where the typing goes
+/// cannot disagree.
+fn typing_line(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<Typing> {
+    match row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref())? {
+        RowOwner::Bar(_) => Some(Typing::Url),
+        RowOwner::Find(_) => Some(Typing::Find),
+        RowOwner::Dialog(dialog) => dialog.typing().then_some(Typing::Prompt),
+        RowOwner::Upload(_) => Some(Typing::Upload),
     }
 }
 
@@ -1726,8 +1859,14 @@ fn handle_input(
             if key.action != KeyAction::Release {
                 chrome.motion.input(Instant::now());
             }
-            if chrome.bar.is_some() {
-                return edit_url(pane, tabs, chrome, key);
+            // A line being typed on the row is asked about every key first;
+            // a `prompt()` is answered below, with the dialog it belongs to.
+            match typing_line(tabs, chrome) {
+                Some(Typing::Url) => return edit_url(pane, tabs, chrome, key),
+                Some(Typing::Find) => return edit_find(pane, tabs, chrome, key),
+                // A `prompt()` and a file input's path are answered below,
+                // after the program's own keys have had their say.
+                Some(Typing::Prompt | Typing::Upload) | None => {}
             }
             let was = tabs.active_target().map(str::to_string);
             let command = command(&key);
@@ -1785,6 +1924,10 @@ fn handle_input(
                     chrome.bar = tabs
                         .active()
                         .map(|tab| UrlBar::new(Line::selected(tab.url.clone())));
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(Command::Find) => {
+                    open_find(tabs, chrome);
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(Command::Reload) => {
@@ -1944,10 +2087,13 @@ enum Command {
     /// The nth tab, counted from one.
     SelectTab(usize),
     /// `alt+c`: the page's selection to the host's clipboard — or, with the
-    /// url bar, a `prompt()`'s line or a file input's path open, that line.
+    /// url bar, the find prompt, a `prompt()`'s line or a file input's path
+    /// open, that line.
     CopySelection,
     /// `alt+u`: the current url to the host's clipboard.
     CopyUrl,
+    /// `ctrl+f`: find in the page. See [`crate::find`].
+    Find,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -1966,7 +2112,8 @@ enum Command {
 /// touches the page not at all. Copying the selection does not, because it
 /// asks the page, and a page stopped behind a dialog answers nothing until the
 /// deadline — except on a `prompt()`, where it copies the line being typed,
-/// which [`handle_input`] does before it gets here.
+/// which [`handle_input`] does before it gets here. Find does not survive
+/// either, for the same reason: it asks the page.
 ///
 /// The same keys survive a file input's prompt, and the same wait, although
 /// that page is not stopped: what waits is still what would do something to
@@ -1984,7 +2131,8 @@ fn survives_dialog(command: Command) -> bool {
         | Command::Reload
         | Command::Back
         | Command::Forward
-        | Command::CopySelection => false,
+        | Command::CopySelection
+        | Command::Find => false,
     }
 }
 
@@ -2179,6 +2327,11 @@ fn stayed(tab: &mut Tab<Client>) {
 /// `alt+letter` is left to the program by Kitty, WezTerm and Ghostty alike.
 /// What it shadows on a page is an `accesskey` on `c` or `u`, on the same
 /// terms `alt+1`..`alt+9` already shadow the digits.
+///
+/// Find is `ctrl+f` because that is the reflex, and the compositor binds
+/// nothing on it. What it shadows is a page's own `ctrl+f` handler, which in
+/// a headless engine opened nothing anyway. Inside a line being typed it is
+/// readline's forward-a-character, because the line is asked first.
 fn command(key: &KeyInput) -> Option<Command> {
     if key.action == KeyAction::Release {
         return None;
@@ -2190,6 +2343,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('r') => Some(Command::Reload),
             Key::Char('t') => Some(Command::NewTab),
             Key::Char('w') => Some(Command::CloseTab),
+            Key::Char('f') => Some(Command::Find),
             Key::Tab if key.mods.shift() => Some(Command::PreviousTab),
             Key::Tab => Some(Command::NextTab),
             _ => None,
@@ -2218,25 +2372,13 @@ fn edit_url(
     if key.action == KeyAction::Release {
         return Ok(true);
     }
-    // The copy keys, before the editor sees them: they leave the line as it
-    // is, the selection included. What is on the row while the line is open
-    // is the line, so that is what `alt+c` copies.
-    match command(&key) {
-        Some(Command::CopySelection) => {
-            let typed = chrome
-                .bar
-                .as_ref()
-                .map(|bar| bar.line.text().to_string())
-                .unwrap_or_default();
-            copy_out(pane, tabs, &typed, Copied::Text)?;
-            return Ok(true);
-        }
-        Some(Command::CopyUrl) => {
-            let url = tabs.active().map(|tab| tab.url.clone()).unwrap_or_default();
-            copy_out(pane, tabs, &url, Copied::Url)?;
-            return Ok(true);
-        }
-        _ => {}
+    let typed = chrome
+        .bar
+        .as_ref()
+        .map(|bar| bar.line.text().to_string())
+        .unwrap_or_default();
+    if copy_from_row(pane, tabs, &key, &typed)? {
+        return Ok(true);
     }
     let Some(bar) = chrome.bar.as_mut() else {
         return Ok(true);
@@ -2264,13 +2406,219 @@ fn edit_url(
     Ok(true)
 }
 
+/// The copy keys, while a line is being typed on the row: `true` if `key`
+/// was one of them and has been done.
+///
+/// Before the editor sees the key: they leave the line as it is, the
+/// selection included. What is on the row while the line is open is the
+/// line, so that is what `alt+c` copies, as `typed`; `alt+u` is still the
+/// page's url.
+fn copy_from_row(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    key: &KeyInput,
+    typed: &str,
+) -> Result<bool, String> {
+    match command(key) {
+        Some(Command::CopySelection) => {
+            copy_out(pane, tabs, typed, Copied::Text)?;
+            Ok(true)
+        }
+        Some(Command::CopyUrl) => {
+            let url = tabs.active().map(|tab| tab.url.clone()).unwrap_or_default();
+            copy_out(pane, tabs, &url, Copied::Url)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Open the find prompt on the tab in front, offering the last needle.
+///
+/// The script's world is made now, in two calls ([`make_world`]), because
+/// the person has just pressed a key and the first letter they type is about
+/// to need it. A page that will not answer them in [`WORLD_TIMEOUT`] is a page
+/// that would not answer a search either: the prompt still opens, and the
+/// first search says so. With a needle remembered, the search for it goes at
+/// once, so that its highlights come straight back.
+fn open_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(tab) = tabs.active_mut() else {
+        return;
+    };
+    let finder = find::Finder::open(&chrome.last_needle);
+    let wanted = finder.initial();
+    chrome.find = Some(Find {
+        target: tab.target.clone(),
+        context: make_world(&mut tab.connection),
+        finder,
+        pending: None,
+        wanted,
+        remade: false,
+    });
+    pump_find(tabs, chrome);
+}
+
+/// The find script's world in the page's main frame: `Page.getFrameTree` for
+/// the frame, then `Page.createIsolatedWorld`, which answers with the same
+/// world for as long as the document lasts. `None` for a page that did not
+/// answer.
+fn make_world(client: &mut Client) -> Option<i64> {
+    let tree = client
+        .call_within("Page.getFrameTree", Json::empty(), WORLD_TIMEOUT)
+        .ok()?;
+    let frame = find::main_frame(&tree)?;
+    let world = client
+        .call_within(
+            "Page.createIsolatedWorld",
+            find::world_params(&frame),
+            WORLD_TIMEOUT,
+        )
+        .ok()?;
+    find::context(&world)
+}
+
+/// Type into the find prompt. Returns `false` only if the person quit.
+///
+/// Every key comes here first while the prompt is open, as it does to the url
+/// bar: the tab keys, `alt+←` and the rest do nothing until Escape, and
+/// `ctrl+f` moves the cursor. What the key asks of the page is folded into
+/// what is waiting and sent by [`pump_find`] when nothing is out.
+fn edit_find(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    key: KeyInput,
+) -> Result<bool, String> {
+    if key.action == KeyAction::Release {
+        return Ok(true);
+    }
+    let typed = chrome
+        .find
+        .as_ref()
+        .map(|find| find.finder.line.text().to_string())
+        .unwrap_or_default();
+    if copy_from_row(pane, tabs, &key, &typed)? {
+        return Ok(true);
+    }
+    let Some(find) = chrome.find.as_mut() else {
+        return Ok(true);
+    };
+    match find.finder.step(&key) {
+        find::Step::Typing(None) => {}
+        find::Step::Typing(Some(ask)) => find.want(ask),
+        find::Step::Close => close_find(tabs, chrome),
+        find::Step::Quit => return Ok(false),
+    }
+    pump_find(tabs, chrome);
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
+/// Collect the answer to a search if it has come, and send the next one if
+/// one is wanted and none is out. Never waits: a search is the still's shape,
+/// not a `call` (see [`crate::find`]). Returns whether the row should be drawn
+/// again.
+///
+/// One search out at a time, so that the answers arrive in the order the keys
+/// were typed and the count on the row is always for a needle that was on
+/// it. A world that went with its document — a navigation this program did
+/// not hear, because its event was binned with a tab's frames — is made again
+/// once and the search asked again; a second time is reported. Whatever goes
+/// wrong goes on the tab's note, which the row shows once the prompt closes.
+fn pump_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
+    let Some(find) = chrome.find.as_mut() else {
+        return false;
+    };
+    // A tab that is no longer in front is [`switched`]'s to close.
+    if tabs.active_target() != Some(find.target.as_str()) {
+        return false;
+    }
+    let Some(tab) = tabs.active_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some((pending, ask, sent)) = find.pending.take() {
+        match tab.connection.take_reply(&pending) {
+            // A page stopped behind a dialog answers when it has been
+            // answered; the wait for the person is not the page's.
+            None if tab.dialog.is_some() => find.pending = Some((pending, ask, Instant::now())),
+            None if sent.elapsed() < FIND_TIMEOUT => find.pending = Some((pending, ask, sent)),
+            None => {
+                tab.note = Some("the page did not answer the search".to_string());
+                changed = true;
+            }
+            Some(Ok(reply)) => {
+                find.finder.matches = find::matches(&reply);
+                find.remade = false;
+                changed = true;
+            }
+            Some(Err(why)) if find::stale_world(&why) && !find.remade => {
+                find.context = make_world(&mut tab.connection);
+                find.remade = true;
+                find.wanted = Some(match find.wanted.take() {
+                    Some(newer) => ask.merge(newer),
+                    None => ask,
+                });
+            }
+            Some(Err(why)) => {
+                tab.note = Some(why);
+                changed = true;
+            }
+        }
+    }
+    if find.pending.is_none() {
+        if let Some(ask) = find.wanted.take() {
+            let sent = match find.context {
+                Some(context) => tab
+                    .connection
+                    .send("Runtime.callFunctionOn", find::call_params(context, &ask)),
+                None => Err("the page did not answer the search".to_string()),
+            };
+            match sent {
+                Ok(pending) => find.pending = Some((pending, ask, Instant::now())),
+                Err(why) => {
+                    tab.note = Some(why);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Close the find prompt, from wherever it is closed: Escape, a tab switch,
+/// a navigation of the page it was searching. The needle is remembered for
+/// the next `ctrl+f`.
+///
+/// The page is told to clear as a notification: there is nothing to collect,
+/// and it is queued behind any search still out, so the page ends clear
+/// whichever of the two it reads first. Dropping the search still out
+/// withdraws the claim on its answer. Quitting does not come here: the
+/// engine is being stopped, and there is no page to leave clear.
+fn close_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(find) = chrome.find.take() else {
+        return;
+    };
+    chrome.last_needle = find.finder.line.text().to_string();
+    let (Some(context), Some(index)) = (find.context, tabs.index_of(&find.target)) else {
+        return;
+    };
+    if let Some(tab) = tabs.get_mut(index) {
+        let _ = tab
+            .connection
+            .notify("Runtime.callFunctionOn", find::clear_params(context));
+    }
+}
+
 /// A paste, put wherever the typing is.
 ///
 /// The url bar if it is open, because the person pressed `ctrl+l` and that
-/// is where they are typing; then a `prompt()`'s line on the page in front;
-/// then the path for its file input; then the page. A paste on an alert, a confirm or a "leave this page?" is
-/// dropped: a paste is not "any key", and answering "delete these files?"
-/// with the clipboard's contents would be worse than not pasting at all.
+/// is where they are typing; then the find prompt; then a `prompt()`'s line
+/// on the page in front; then the path for its file input; then the page —
+/// [`typing_line`]'s order. A paste on an alert, a confirm or a "leave this
+/// page?" is dropped: a paste is not "any key", and answering "delete these
+/// files?" with the clipboard's contents would be worse than not pasting at
+/// all.
 ///
 /// Into the page it is one `Input.insertText` carrying the whole paste, and
 /// never keystrokes. Measured against `chrome-headless-shell` 153, that is
@@ -2290,14 +2638,30 @@ fn paste(
     chrome: &mut Chrome,
     text: &str,
 ) -> Result<(), String> {
-    if let Some(bar) = chrome.bar.as_mut() {
-        if paste_into_line(&mut bar.line, text) {
-            // As a typed character does: the walk through history ends, and
-            // what was there to take is asked for again.
-            bar.walk = None;
-            bar.line.suggest(chrome.history.complete(bar.line.text()));
+    match typing_line(tabs, chrome) {
+        Some(Typing::Url) => {
+            if let Some(bar) = chrome.bar.as_mut() {
+                if paste_into_line(&mut bar.line, text) {
+                    // As a typed character does: the walk through history
+                    // ends, and what was there to take is asked for again.
+                    bar.walk = None;
+                    bar.line.suggest(chrome.history.complete(bar.line.text()));
+                }
+            }
+            return redraw_row(pane, tabs, chrome);
         }
-        return redraw_row(pane, tabs, chrome);
+        Some(Typing::Find) => {
+            if let Some(find) = chrome.find.as_mut() {
+                // As a typed character does: a search for what is there now.
+                if paste_into_line(&mut find.finder.line, text) {
+                    let needle = find.finder.line.text().to_string();
+                    find.want(find::Ask { needle, step: 0 });
+                }
+            }
+            pump_find(tabs, chrome);
+            return redraw_row(pane, tabs, chrome);
+        }
+        Some(Typing::Prompt | Typing::Upload) | None => {}
     }
     if asking(tabs) {
         let pasted = tabs
@@ -2324,7 +2688,8 @@ fn paste(
     Ok(())
 }
 
-/// A paste into a line being typed: the url bar's, or a `prompt()`'s.
+/// A paste into a line being typed: the url bar's, the find prompt's, or a
+/// `prompt()`'s.
 ///
 /// What is kept of it is [`clipboard::one_line`], put in at the cursor by
 /// [`Line::insert_str`] — which replaces a line still offered whole, as the
@@ -2883,8 +3248,9 @@ mod tests {
 
     #[test]
     fn the_row_goes_to_the_url_bar_then_a_dialog_then_a_file_input() {
-        let owner = |tabs: &Tabs<()>, bar: Option<&UrlBar>| match row_owner(tabs, bar) {
+        let owner = |tabs: &Tabs<()>, bar: Option<&UrlBar>| match row_owner(tabs, bar, None) {
             Some(RowOwner::Bar(_)) => "bar",
+            Some(RowOwner::Find(_)) => "find",
             Some(RowOwner::Dialog(_)) => "dialog",
             Some(RowOwner::Upload(_)) => "upload",
             None => "page",
@@ -2940,6 +3306,37 @@ mod tests {
         // selection has to be asked of a page that may be stopped.
         assert!(survives_dialog(Command::CopyUrl));
         assert!(!survives_dialog(Command::CopySelection));
+    }
+
+    #[test]
+    fn ctrl_f_is_find_and_does_not_survive_a_dialog() {
+        assert_eq!(
+            command(&key(Key::Char('f'), Mods::CTRL)),
+            Some(Command::Find)
+        );
+        // It asks the page, and a page behind a dialog answers nothing.
+        assert!(!survives_dialog(Command::Find));
+        // Only ctrl: `f` is typing, and the others are the page's.
+        assert_eq!(command(&key(Key::Char('f'), 0)), None);
+        assert_eq!(command(&key(Key::Char('f'), Mods::ALT)), None);
+        assert_eq!(command(&key(Key::Char('f'), Mods::CTRL | Mods::ALT)), None);
+        // The prompt's own next and previous are the prompt's, not commands
+        // a page loses when it is closed.
+        assert_eq!(command(&key(Key::Char('g'), Mods::CTRL)), None);
+    }
+
+    #[test]
+    fn the_find_prompt_draws_its_count_at_the_end_and_the_url_bar_is_unchanged() {
+        let line = Line::selected("fox");
+        assert_eq!(
+            typing_row_beside(40, "url: ", &line, ""),
+            screen::prompt_line(40, "url: ", "fox", "", 3)
+        );
+        let row = String::from_utf8(typing_row_beside(40, "find: ", &line, "3/17"))
+            .expect("a row is UTF-8");
+        assert!(row.contains("find: fox "), "{row:?}");
+        assert!(row.contains("  3/17\x1b[0m"), "{row:?}");
+        assert!(row.ends_with("\x1b[1;10H\x1b[?25h"), "{row:?}");
     }
 
     #[test]

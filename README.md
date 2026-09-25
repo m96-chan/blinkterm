@@ -187,14 +187,15 @@ not a thing a terminal has.
 | | |
 | --- | --- |
 | `ctrl+l` | type a url. In the url bar, `←`/`→`, `home`/`end`, `ctrl+a`/`ctrl+e` and `alt+b`/`alt+f` (or `ctrl+←`/`ctrl+→`) move; `ctrl+w`/`alt+backspace` and `alt+d` delete a word; `ctrl+u`/`ctrl+k` delete to either end; `↑`/`↓` walk the pages visited; a dim suggestion after what you typed is taken with `tab` or `→` |
+| `ctrl+f` | find in the page. Type and the matches are highlighted as you go, the current one in orange and scrolled into view; the row says `3/17`. `enter`/`ctrl+g`/`↓` next, `shift+enter`/`ctrl+shift+g`/`↑` previous; the same editing keys as the url bar; `esc` closes and clears. The next `ctrl+f` offers the last needle again |
 | `ctrl+r` | reload |
 | `alt+left` / `alt+right` | back and forward |
 | `ctrl+t` | a new tab, with the cursor in the url bar |
 | `ctrl+w` | close this tab; closing the last one quits |
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
 | `alt+1` … `alt+9` | the nth tab |
-| your terminal's paste key | pastes into the page, the url bar, a `prompt()` or a file input's path — whichever has the cursor |
-| `alt+c` | copy the page's selection to your clipboard; with the url bar, a `prompt()` or a file input's path open, copy that line |
+| your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
+| `alt+c` | copy the page's selection to your clipboard; with the url bar, the find prompt, a `prompt()` or a file input's path open, copy that line |
 | `alt+u` | copy the page's url to your clipboard |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
@@ -212,7 +213,17 @@ OSC 52, which your terminal may need to be told to allow.
 
 The url bar is asked about every key first while it is open, so `alt+←`/`→`
 are back and forward only when it is closed — in the bar they move by a word —
-and `ctrl+w`, `ctrl+t` and the rest do nothing there; `esc` closes it.
+and `ctrl+w`, `ctrl+t` and the rest do nothing there; `esc` closes it. The
+find prompt is the same.
+
+Find is case-insensitive, matches text as the page shows it — spaces
+collapsed, a word split across `<b>` still one word, never across a
+paragraph — and looks in same-origin frames but not cross-origin ones, nor in
+hidden text, a closed `<details>`, or the value of an `<input>`. Every match
+is counted; the first ten thousand are highlighted. Nothing is changed in the
+page: the highlights are the CSS Custom Highlight API from a world of their
+own, and the page's selection is left alone. A page that navigates closes the
+prompt.
 
 ### Searching
 

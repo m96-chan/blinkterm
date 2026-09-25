@@ -123,6 +123,7 @@ pub mod clipboard;
 pub mod dialog;
 pub mod download;
 pub mod engine;
+pub mod find;
 pub mod graphics;
 pub mod history;
 pub mod input;
