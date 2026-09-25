@@ -481,6 +481,11 @@ pub struct TabLabel<'a> {
 /// nothing and takes the space the titles wanted.
 const URL_MINIMUM: usize = 12;
 
+/// Below this many cells of title a tab in the strip is a number and an
+/// ellipsis, which says nothing; the strip scrolls rather than show one.
+/// Six is `Docum…`, the shortest cut that still reads.
+pub const LABEL_MINIMUM: usize = 6;
+
 /// The top row when there is more than one tab: `1 title  2 title  3 title`,
 /// and the active tab's url after them if anything is left over.
 ///
@@ -489,11 +494,23 @@ const URL_MINIMUM: usize = 12;
 /// (`\x1b[27m`), which against a reversed row is the same emphasis the other
 /// way round and needs no colour. Colour would have to be chosen against a
 /// theme this program cannot see.
+///
+/// This is [`tab_line_from`] with no window remembered, which is the strip
+/// it always was whenever every tab fits.
 pub fn tab_line(cols: u32, tabs: &[TabLabel], url: &str) -> Vec<u8> {
+    tab_line_from(cols, tabs, url, 0).0
+}
+
+/// [`tab_line`] with a memory: `first` is the strip's window start from the
+/// last draw, and the second half of the answer is the start it chose, for
+/// the caller to keep. `tab_line(cols, tabs, url)` is `tab_line_from(cols,
+/// tabs, url, 0).0`, so the strip that fits is the strip it always was.
+pub fn tab_line_from(cols: u32, tabs: &[TabLabel], url: &str, first: usize) -> (Vec<u8>, usize) {
     let cols = cols.max(1) as usize;
     let mut out = b"\x1b[1;1H\x1b[K\x1b[7m".to_vec();
     let mut used = 0;
-    for (text, active) in strip(cols, tabs, url) {
+    let (runs, first) = strip_from(cols, tabs, url, first);
+    for (text, active) in runs {
         used += width(&text);
         if active {
             out.extend_from_slice(b"\x1b[27m");
@@ -505,25 +522,28 @@ pub fn tab_line(cols: u32, tabs: &[TabLabel], url: &str) -> Vec<u8> {
     }
     out.extend(std::iter::repeat_n(b' ', cols.saturating_sub(used)));
     out.extend_from_slice(b"\x1b[0m\x1b[?25l");
-    out
+    (out, first)
 }
 
 /// The strip as the runs it is drawn in: the text, and whether it is the
-/// active tab and so emphasised.
+/// active tab and so emphasised; and the first tab it shows, for the next
+/// draw's `first`.
 ///
 /// Separate from the escapes so that what fits can be tested as what fits.
-fn strip(cols: usize, tabs: &[TabLabel], url: &str) -> Vec<(String, bool)> {
-    // What every tab costs before its title: its number, the mark of a
-    // dialog if it has one, a space, and the two spaces that separate it from
-    // the one before.
-    let fixed: usize = tabs
-        .iter()
-        .enumerate()
-        .map(|(index, tab)| {
-            number_width(index + 1) + usize::from(tab.dialog) + 1 + if index == 0 { 0 } else { 2 }
-        })
-        .sum();
-    let budget = cols.saturating_sub(fixed);
+///
+/// When every tab can have [`LABEL_MINIMUM`] cells of title — or all of its
+/// title, when that is shorter — the strip is every tab, sharing the row as
+/// it always did. When they cannot, it is a run of consecutive tabs that
+/// includes the one in front, with `+N` at either end for how many are off
+/// it: which run is [`window`]'s to say. The marker is ASCII and cannot be
+/// read as a tab, since every tab begins with its digit, and the number in
+/// it is the one thing a person wants to know when the strip does not fit.
+fn strip_from(
+    cols: usize,
+    tabs: &[TabLabel],
+    url: &str,
+    first: usize,
+) -> (Vec<(String, bool)>, usize) {
     // Measured as they will be drawn. `clip_to` would clean them anyway, but
     // after the room was shared out, and a title of forty zero-width spaces
     // would be given forty cells and show nothing in them.
@@ -533,36 +553,52 @@ fn strip(cols: usize, tabs: &[TabLabel], url: &str) -> Vec<(String, bool)> {
         .collect();
     let url = crate::text::sanitize(url);
     let wanted: Vec<usize> = names.iter().map(|name| width(name)).collect();
-    let given = shares(budget, &wanted);
+    let shown = window(cols, tabs, &wanted, first);
+    let before = shown.start;
+    let after = tabs.len() - shown.end;
+
+    // What every tab shown costs before its title: its number, the mark of a
+    // dialog if it has one, a space, and the two spaces that separate it
+    // from the one before; and each marker with its gap.
+    let fixed: usize = shown
+        .clone()
+        .map(|index| fixed_cost(index, &tabs[index]))
+        .sum::<usize>()
+        + 2 * shown.len().saturating_sub(1)
+        + marker_cost(before)
+        + marker_cost(after);
+    let budget = cols.saturating_sub(fixed);
+    let given = shares(budget, &wanted[shown.clone()]);
 
     let mut runs: Vec<(String, bool)> = Vec::new();
-    let mut used = 0;
-    for (index, tab) in tabs.iter().enumerate() {
-        if index > 0 {
+    if before > 0 {
+        runs.push((format!("+{before}  "), false));
+    }
+    for (at, index) in shown.clone().enumerate() {
+        let tab = &tabs[index];
+        if at > 0 {
             runs.push(("  ".to_string(), false));
-            used += 2;
         }
         let mark = if tab.dialog { "!" } else { "" };
-        let text = format!(
-            "{}{mark} {}",
-            index + 1,
-            clip_to(&names[index], given[index])
-        );
-        used += width(&text);
+        let text = format!("{}{mark} {}", index + 1, clip_to(&names[index], given[at]));
         runs.push((text, tab.active));
     }
+    if after > 0 {
+        runs.push((format!("  +{after}"), false));
+    }
+    let used: usize = runs.iter().map(|(text, _)| width(text)).sum();
 
     // The url gets whatever the titles did not want, and only if that is
-    // enough to read: the strip is what this row is for now.
+    // enough to read: the strip is what this row is for now. With a window
+    // there is never any over, since the window is as wide as fits.
     let left = cols.saturating_sub(used);
     if !url.is_empty() && left >= URL_MINIMUM + 2 {
         runs.push((format!("  {}", clip_to(&url, left - 2)), false));
     }
 
-    // Titles can be clipped to nothing but numbers cannot, so a pane narrower
-    // than `1  2  3 …` still has more strip than row. The row wins: what is
-    // past the edge is cut, and the numbers that are left still say which tab
-    // is which, because the order never changes.
+    // A pane too narrow for even the tab in front at its minimum still has
+    // more strip than row. The row wins: what is past the edge is cut, and
+    // the numbers that are left still say which tab is which.
     let mut fitted = Vec::with_capacity(runs.len());
     let mut used = 0;
     for (text, active) in runs {
@@ -577,7 +613,74 @@ fn strip(cols: usize, tabs: &[TabLabel], url: &str) -> Vec<(String, bool)> {
         }
         break;
     }
-    fitted
+    (fitted, shown.start)
+}
+
+/// What tab `index` costs before its title: its number, the `!` of a
+/// question if it has one, and a space.
+fn fixed_cost(index: usize, tab: &TabLabel) -> usize {
+    number_width(index + 1) + usize::from(tab.dialog) + 1
+}
+
+/// What `+n` at one end of the strip costs with its gap, or nothing for no
+/// tabs off that end.
+fn marker_cost(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        1 + number_width(n) + 2
+    }
+}
+
+/// Which tabs the strip shows: all of them when each can have
+/// [`LABEL_MINIMUM`], else a run that includes the active one.
+///
+/// Pure, so that the worked examples in the tests are the algorithm. The run
+/// starts where it did last time (`first`), or at the tab in front if that
+/// is left of it, and gives up room on the left until the tab in front fits;
+/// then it fills to the right, and then to the left, which only ever fits
+/// at the right-hand end. So it stays where it is until the tab in front
+/// leaves it, and then moves by as little as it can — `ctrl+tab` along a
+/// long strip walks the highlight to the edge and then slides the run one
+/// tab at a time, the way every browser's strip does. At worst it is the
+/// tab in front alone, whatever fits of it.
+///
+/// What a tab *needs* is the smaller of its title and the minimum: a
+/// two-letter title needs two cells, not six, which is what keeps every
+/// strip that fitted before this the strip it was.
+fn window(
+    cols: usize,
+    tabs: &[TabLabel],
+    wanted: &[usize],
+    first: usize,
+) -> std::ops::Range<usize> {
+    let len = tabs.len();
+    let fits = |start: usize, end: usize| {
+        let tabs_cost: usize = (start..end)
+            .map(|i| fixed_cost(i, &tabs[i]) + wanted[i].min(LABEL_MINIMUM))
+            .sum();
+        tabs_cost
+            + 2 * (end - start).saturating_sub(1)
+            + marker_cost(start)
+            + marker_cost(len - end)
+            <= cols
+    };
+    if fits(0, len) {
+        return 0..len;
+    }
+    let active = tabs.iter().position(|tab| tab.active).unwrap_or(0);
+    let mut start = first.min(active);
+    while start < active && !fits(start, active + 1) {
+        start += 1;
+    }
+    let mut end = active + 1;
+    while end < len && fits(start, end + 1) {
+        end += 1;
+    }
+    while start > 0 && fits(start - 1, end) {
+        start -= 1;
+    }
+    start..end
 }
 
 /// Share `budget` cells between titles that want `wanted`.
@@ -622,6 +725,60 @@ fn number_width(n: usize) -> usize {
     } else {
         n.to_string().len()
     }
+}
+
+/// One tab as the tab list shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListItem<'a> {
+    /// The tab's number in the strip, from one.
+    pub number: usize,
+    pub title: &'a str,
+    pub url: &'a str,
+    /// The one Enter would switch to: drawn in reverse video.
+    pub picked: bool,
+    /// Waiting on a dialog or a path: marked `!` as the strip marks it.
+    pub asks: bool,
+}
+
+/// The rows under the status row while the tab list is open: from `row`
+/// (one-based) for `rows` rows, one item each, `  3  title  —  url` clipped
+/// to the pane, the picked one in reverse video, every row cleared to the
+/// edge, and the rows left over cleared.
+///
+/// Text over where the picture was, which is only readable because the
+/// caller deleted the placement first: a Kitty-protocol image with no `z` is
+/// drawn above text. Sanitized where everything on the row is, in
+/// [`clip_to`], since a title and a url are the page's to choose. The cursor
+/// is left wherever the last row ends, so the caller writes these before
+/// the row that puts it back.
+pub fn list_rows(cols: u32, row: u32, rows: u32, items: &[ListItem]) -> Vec<u8> {
+    let cols = cols.max(1) as usize;
+    let mut out = Vec::new();
+    for at in 0..rows {
+        out.extend_from_slice(format!("\x1b[{};1H\x1b[K", row + at).as_bytes());
+        let Some(item) = items.get(at as usize) else {
+            continue;
+        };
+        let mark = if item.asks { "!" } else { "" };
+        let mut text = format!("  {}{mark}  {}", item.number, item.title);
+        if !item.url.is_empty() {
+            text.push_str("  —  ");
+            text.push_str(item.url);
+        }
+        let shown = clip_to(&text, cols);
+        if item.picked {
+            out.extend_from_slice(b"\x1b[7m");
+            out.extend_from_slice(shown.as_bytes());
+            out.extend(std::iter::repeat_n(
+                b' ',
+                cols.saturating_sub(width(&shown)),
+            ));
+            out.extend_from_slice(b"\x1b[0m");
+        } else {
+            out.extend_from_slice(shown.as_bytes());
+        }
+    }
+    out
 }
 
 /// How wide a string is in cells, counting each cluster once.
@@ -1205,7 +1362,8 @@ mod tests {
 
     /// What the strip reads as, with the emphasis written as brackets.
     fn strip_text(cols: usize, tabs: &[TabLabel], url: &str) -> String {
-        strip(cols, tabs, url)
+        strip_from(cols, tabs, url, 0)
+            .0
             .into_iter()
             .map(
                 |(text, active)| {
@@ -1291,6 +1449,183 @@ mod tests {
         let text = strip_text(10, &tabs, "https://example.com");
         assert!(width(&text) <= 10 + 2, "{text:?}");
         assert!(text.starts_with("[1"), "{text:?}");
+    }
+
+    /// The strip from a remembered start, with the start it chose.
+    fn strip_from_text(cols: usize, tabs: &[TabLabel], url: &str, first: usize) -> (String, usize) {
+        let (runs, first) = strip_from(cols, tabs, url, first);
+        let text = runs
+            .into_iter()
+            .map(|(text, active)| if active { format!("[{text}]") } else { text })
+            .collect();
+        (text, first)
+    }
+
+    #[test]
+    fn a_strip_that_fits_is_the_strip_it_always_was() {
+        let cases: [(u32, Vec<&str>, usize, &str); 5] = [
+            (80, vec!["One", "Two", "Three"], 1, ""),
+            (
+                40,
+                vec!["ok", "a title that will not fit in ten cells", "also ok"],
+                0,
+                "",
+            ),
+            (60, vec!["A", "B"], 0, "https://example.com/a"),
+            (12, vec!["A", "B"], 0, "https://example.com/a"),
+            (20, vec!["One", "x", "A long title"], 0, ""),
+        ];
+        for (cols, titles, active, url) in cases {
+            let tabs = labels(&titles, active);
+            // Whatever start is remembered: a strip that fits has no window.
+            let (line, first) = tab_line_from(cols, &tabs, url, 7);
+            assert_eq!(line, tab_line(cols, &tabs, url), "{titles:?} at {cols}");
+            assert_eq!(first, 0);
+        }
+    }
+
+    #[test]
+    fn a_strip_wider_than_the_pane_scrolls_to_keep_the_tab_in_front_in_view() {
+        let titles = ["Documentation"; 8];
+        let (row, first) = strip_from_text(40, &labels(&titles, 5), "", 0);
+        assert_eq!(row, "+3  4 Documen…  5 Docume…  [6 Docume…]  +2");
+        assert_eq!(width(&row) - 2, 40, "the brackets are the test's");
+        assert_eq!(first, 3);
+
+        let (row, first) = strip_from_text(40, &labels(&titles, 6), "", first);
+        assert_eq!(row, "+4  5 Documen…  6 Docume…  [7 Docume…]  +1");
+        assert_eq!(first, 4);
+
+        let (row, first) = strip_from_text(40, &labels(&titles, 7), "", first);
+        assert_eq!(row, "+5  6 Document…  7 Document…  [8 Documen…]");
+        assert_eq!(first, 5);
+
+        // `ctrl+tab` round the end: the run goes back to the start.
+        let (row, first) = strip_from_text(40, &labels(&titles, 0), "", first);
+        assert_eq!(row, "[1 Document…]  2 Document…  3 Documen…  +5");
+        assert_eq!(first, 0);
+
+        // And the row with its escapes is exactly the pane.
+        let (line, _) = tab_line_from(40, &labels(&titles, 5), "https://example.com", 0);
+        assert_eq!(cells(&line), 40);
+    }
+
+    #[test]
+    fn the_strip_window_stays_put_until_the_tab_in_front_leaves_it() {
+        let titles = ["Documentation"; 8];
+        let (_, first) = strip_from_text(40, &labels(&titles, 5), "", 0);
+        assert_eq!(first, 3);
+        let (row, first) = strip_from_text(40, &labels(&titles, 4), "", first);
+        assert_eq!(row, "+3  4 Documen…  [5 Docume…]  6 Docume…  +2");
+        assert_eq!(first, 3);
+        let (row, first) = strip_from_text(40, &labels(&titles, 3), "", first);
+        assert_eq!(row, "+3  [4 Documen…]  5 Docume…  6 Docume…  +2");
+        assert_eq!(first, 3);
+        let (row, first) = strip_from_text(40, &labels(&titles, 2), "", first);
+        assert_eq!(row, "+2  [3 Documen…]  4 Docume…  5 Docume…  +3");
+        assert_eq!(first, 2);
+    }
+
+    #[test]
+    fn the_markers_count_the_tabs_off_each_end_and_a_wide_number_is_measured() {
+        let titles = ["Documentation"; 12];
+        let (row, first) = strip_from_text(40, &labels(&titles, 11), "", 0);
+        assert!(row.starts_with("+9  10 "), "{row:?}");
+        assert!(row.ends_with("[12 Docume…]"), "{row:?}");
+        assert_eq!(first, 9);
+        assert_eq!(width(&row) - 2, 40, "{row:?}");
+        let (line, _) = tab_line_from(40, &labels(&titles, 11), "", 0);
+        assert_eq!(cells(&line), 40);
+    }
+
+    #[test]
+    fn a_pane_too_narrow_for_one_tab_still_shows_the_one_in_front() {
+        // Example B: the existing narrow strip, and what it now says.
+        let titles: Vec<String> = (1..=9).map(|n| format!("Tab {n}")).collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let (row, _) = strip_from_text(10, &labels(&refs, 0), "https://example.com", 0);
+        assert_eq!(row, "[1 Tab…]  +8");
+
+        // Example C: the last of nine in front, at eight and at thirteen.
+        let titles: Vec<String> = (1..=9).map(|n| format!("Title number {n}")).collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let (row, first) = strip_from_text(8, &labels(&refs, 8), "", 0);
+        assert_eq!(row, "+8  [9 T…]");
+        assert_eq!(first, 8);
+        let (row, _) = strip_from_text(13, &labels(&refs, 8), "", 0);
+        assert_eq!(row, "+8  [9 Title …]");
+    }
+
+    #[test]
+    fn the_list_rows_fill_the_width_mark_the_pick_and_clear_what_is_left() {
+        let items = [
+            ListItem {
+                number: 3,
+                title: "Build log",
+                url: "https://ci.example/build/4471",
+                picked: true,
+                asks: false,
+            },
+            ListItem {
+                number: 9,
+                title: "Changelog",
+                url: "https://docs.example/changelog/a/very/long/path",
+                picked: false,
+                asks: true,
+            },
+            ListItem {
+                number: 12,
+                title: "Mail",
+                url: "",
+                picked: false,
+                asks: false,
+            },
+        ];
+        let rows = text(&list_rows(40, 2, 4, &items));
+        let picked = format!(
+            "\x1b[2;1H\x1b[K\x1b[7m{}\x1b[0m",
+            clip_to("  3  Build log  —  https://ci.example/build/4471", 40)
+        );
+        assert!(rows.starts_with(&picked), "{rows:?}");
+        assert_eq!(
+            cells(picked.replace("\x1b[2;1H", "\x1b[1;1H").as_bytes()),
+            40
+        );
+        let behind = format!(
+            "\x1b[3;1H\x1b[K{}\x1b[4;1H",
+            clip_to(
+                "  9!  Changelog  —  https://docs.example/changelog/a/very/long/path",
+                40
+            )
+        );
+        assert!(rows.contains(&behind), "{rows:?}");
+        assert!(behind.contains('…'), "a long url says it was cut");
+        assert!(
+            rows.contains("\x1b[4;1H\x1b[K  12  Mail\x1b[5;1H"),
+            "{rows:?}"
+        );
+        assert!(rows.ends_with("\x1b[5;1H\x1b[K"), "{rows:?}");
+    }
+
+    /// Whether the list's rows are text between their own escapes.
+    fn only_the_lists_own_escapes(rows: &[u8]) -> bool {
+        let mut text = String::from_utf8(rows.to_vec()).expect("rows are UTF-8");
+        for framing in ["\x1b[K", "\x1b[7m", "\x1b[0m"] {
+            text = text.replace(framing, "");
+        }
+        while let Some(at) = text.find("\x1b[") {
+            let rest = &text[at + 2..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 || !rest[digits..].starts_with(";1H") {
+                return false;
+            }
+            text.replace_range(at..at + 2 + digits + 3, "");
+        }
+        let bytes = text.as_bytes();
+        let c1 = bytes
+            .windows(2)
+            .any(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]));
+        !c1 && bytes.iter().all(|&b| b >= 0x20 && b != 0x7f)
     }
 
     #[test]
@@ -1522,11 +1857,34 @@ mod tests {
                     dialog_line(cols, hostile, "y/n"),
                     answering(cols, hostile, hostile),
                 ];
-                for count in [2, 9] {
+                for count in [2, 9, 12] {
                     let titles = vec![hostile; count];
                     rows.push(tab_line(cols, &labels(&titles, 0), hostile));
                     rows.push(tab_line(cols, &labels(&titles, count - 1), hostile));
+                    rows.push(tab_line_from(cols, &labels(&titles, count / 2), hostile, 3).0);
                 }
+                let items = [
+                    ListItem {
+                        number: 1,
+                        title: hostile,
+                        url: hostile,
+                        picked: true,
+                        asks: true,
+                    },
+                    ListItem {
+                        number: 2,
+                        title: hostile,
+                        url: hostile,
+                        picked: false,
+                        asks: false,
+                    },
+                ];
+                let list = list_rows(cols, 2, 3, &items);
+                assert!(
+                    only_the_lists_own_escapes(&list),
+                    "{cols} cols, {hostile:?}: {:?}",
+                    text(&list)
+                );
                 for row in rows {
                     assert!(
                         only_the_rows_own_escapes(&row),

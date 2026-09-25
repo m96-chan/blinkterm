@@ -10,10 +10,59 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Added
+
+- A settings file, `$XDG_CONFIG_HOME/blinkterm/config`: every option as
+  `name = value`, `engine-arg` repeatable. The command line wins over the
+  file; `$BLINKTERM_ENGINE` sits between. `--config <path>`, `--no-config`
+  ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
+- `--engine <path>`, `--engine-arg <flag>` (repeatable; four that would
+  reopen the DevTools port or move the profile are refused),
+  `--user-agent <text>`, `--proxy <host:port>`, `--home <url>`
+  ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
+- Several urls on the command line open one tab each, the first in front
+  ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
+- `--doctor` starts the engine and asks the terminal whether it speaks the
+  Kitty graphics and keyboard protocols; `--print-engine` says which engine
+  would run ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
+- Tabs: `alt+9` is the last tab; the strip scrolls with `+N` markers when
+  the titles do not fit; `ctrl+shift+a`/`alt+a` lists every tab with a
+  filter; `ctrl+shift+pageup`/`pagedown` (`alt+shift+…`) move the current
+  tab; a middle click or `ctrl`+click on a link opens it in a tab behind
+  ([#19](https://github.com/m96-chan/blinkterm/issues/19)).
+- Normal mode, `ctrl+.`: link hints (`f`/`F`), scrolling from the
+  keyboard (`j`/`k`/`d`/`u`/`gg`/`G`), `H`/`L`/`r`/`o`/`O`/`/`, `i` back to
+  the page. `F` opens a link in a tab behind. Off by default; nothing
+  changes until it is turned on, or `--normal-mode` starts in it
+  ([#13](https://github.com/m96-chan/blinkterm/issues/13)).
+- Bookmarks: `ctrl+d` bookmarks the page (again removes it) to
+  `$XDG_DATA_HOME/blinkterm/bookmarks`, one `url<TAB>title` per line,
+  hand-editable, shared by every profile; the url bar offers them before the
+  history ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
+- The open tabs are saved in the profile (`session`) as they change;
+  `--restore` reopens them, loading each when it is first looked at, and
+  after a crash the next start offers to. `ctrl+shift+t` — or `alt+t`, which
+  reaches a tOS pane and a legacy terminal — reopens the last closed tab
+  ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
+
 ### Changed
 
 - `brew install m96-chan/tap/blinkterm` installs the tagged release; `--HEAD`
   is only needed for main.
+- `blinkterm a b` opens two tabs rather than refusing with "one page at a
+  time".
+- A page whose renderer crashes keeps its tab, with `this page crashed;
+  ctrl+r reloads it` on the row, rather than the tab closing
+  ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
+- When the engine dies the exit message says the tabs are saved and how to
+  get them back ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
+
+### Fixed
+
+- A middle click or `ctrl`+click on a link used to open a page the
+  program never attached to — a renderer running for nobody until the
+  engine exited — because the engine announces such a page with no opener
+  and the tab list required one.
 
 ## [0.1.0] - 2026-09-25
 

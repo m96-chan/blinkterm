@@ -732,6 +732,29 @@ style='position:absolute;left:0;top:0;width:240px;height:80px;background:#cc3'>o
 const SECOND_PAGE: &str = "<!doctype html><body style='margin:0;background:#39c'>\
 <script>document.title='second'</script></body>";
 
+/// A page of the ways a click can ask for another page, at known points: a
+/// plain link at (40, 30), something that is not a link at (340, 30), and a
+/// link with `target=_blank` at (40, 130). What the page's own listeners saw
+/// is kept in `window.log`, and a box moves every animation frame so that the
+/// screencast has something to send.
+const OPENS_PAGE: &str = "<!doctype html><title>opens</title>\
+<body style='margin:0;background:#fff'>\
+<a href='/plain' style='position:absolute;left:0;top:0;width:240px;height:60px;\
+background:#cc3'>plain</a>\
+<div style='position:absolute;left:300px;top:0;width:200px;height:60px;\
+background:#ccc'>not a link</div>\
+<a href='/plain' target=_blank style='position:absolute;left:0;top:100px;\
+width:240px;height:60px;background:#3c3'>blank</a>\
+<div id=box style='position:absolute;left:0;top:200px;width:40px;height:40px;\
+background:#c33'></div>\
+<script>window.log=[];\
+for(const t of ['click','auxclick'])addEventListener(t,e=>log.push(t+':'+e.button+':'+e.ctrlKey));\
+let x=0;(function f(){x=(x+4)%600;box.style.left=x+'px';requestAnimationFrame(f)})();\
+</script></body>";
+
+/// Where the links on [`OPENS_PAGE`] go.
+const PLAIN_PAGE: &str = "<!doctype html><title>plain</title><body>plain</body>";
+
 /// Serve those two pages on a port of the kernel's choosing, for as long as
 /// the test binary runs.
 fn serve() -> String {
@@ -745,6 +768,10 @@ fn serve() -> String {
             let request = String::from_utf8_lossy(&head[..read]).to_string();
             let body = if request.starts_with("GET /second") {
                 SECOND_PAGE
+            } else if request.starts_with("GET /opens") {
+                OPENS_PAGE
+            } else if request.starts_with("GET /plain") {
+                PLAIN_PAGE
             } else {
                 FIRST_PAGE
             };
@@ -804,12 +831,7 @@ fn pump(
             });
             match outcome {
                 Outcome::Failed(why) => panic!("a tab that would not open: {why}"),
-                Outcome::Gone { mut tab, why } => {
-                    if let Some(why) = why {
-                        eprintln!("a tab went: {why}");
-                    }
-                    tab.connection.close();
-                }
+                Outcome::Gone { mut tab } => tab.connection.close(),
                 _ => {}
             }
         }
@@ -948,6 +970,281 @@ fn a_link_that_wants_a_window_becomes_the_tab_in_front() {
     let png = wait_for_frame(&mut second.connection, Duration::from_secs(10))
         .expect("the tab in front paints");
     assert_eq!(&png[..4], b"\x89PNG");
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// A press and a release at `at`, as `send_mouse` sends them: `button` with
+/// its bit in `buttons` on the press and none on the release, and the
+/// modifiers as CDP counts them (Alt 1, Ctrl 2, Meta 4, Shift 8).
+fn click_with(client: &mut Client, at: (i32, i32), button: &str, bit: u32, modifiers: u32) {
+    for (kind, buttons) in [("mousePressed", bit), ("mouseReleased", 0)] {
+        client
+            .call(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(at.0)),
+                    ("y", Json::number(at.1)),
+                    ("button", Json::string(button)),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(modifiers)),
+                ]),
+            )
+            .expect("the click is dispatched");
+    }
+}
+
+/// Everything a page's session says for `within`, every screencast frame
+/// acknowledged as `handle_page_events` acknowledges them: how many frames
+/// came, and the other events.
+fn watch_page(client: &mut Client, within: Duration) -> (usize, Vec<blinkterm::cdp::Event>) {
+    let deadline = Instant::now() + within;
+    let mut frames = 0;
+    let mut others = Vec::new();
+    while Instant::now() < deadline {
+        for event in client.events() {
+            if event.method != "Page.screencastFrame" {
+                others.push(event);
+                continue;
+            }
+            frames += 1;
+            if let Some(session) = event.params.get("sessionId").and_then(Json::as_i64) {
+                let _ = client.notify(
+                    "Page.screencastFrameAck",
+                    Json::object(vec![("sessionId", Json::number(session as f64))]),
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    (frames, others)
+}
+
+/// What the page's own listeners saw, from [`OPENS_PAGE`]'s `window.log`.
+fn page_log(client: &mut Client) -> String {
+    match evaluate(client, "JSON.stringify(window.log)") {
+        Json::String(log) => log,
+        other => panic!("the page's log: {other:?}"),
+    }
+}
+
+/// A middle click and a ctrl+click on a link: the engine opens the page, the
+/// target it announces has no opener, and it becomes a tab *behind* the one
+/// in front — which goes on casting and is never switched from. Measured in
+/// `src/tabs.rs`; this is that measurement kept true. Before this, such a
+/// target was refused for having no opener, and the page loaded for nobody.
+#[test]
+fn a_middle_click_and_a_ctrl_click_on_a_link_open_a_tab_behind_the_one_in_front() {
+    let Some((mut engine, page, target)) = connect_with_target() else {
+        return;
+    };
+    let base = serve();
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+
+    {
+        let first = tabs.active_mut().expect("the first tab");
+        first
+            .connection
+            .call("Page.enable", Json::empty())
+            .expect("Page.enable");
+        viewport(&mut first.connection);
+        first
+            .connection
+            .call(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(format!("{base}opens")))]),
+            )
+            .expect("the page loads");
+        assert_eq!(
+            wait_for_title(&mut first.connection, "opens", Duration::from_secs(10)),
+            "opens"
+        );
+        cast(&mut first.connection, "jpeg", None, WIDTH, HEIGHT);
+        let (settling, _) = watch_page(&mut first.connection, Duration::from_millis(500));
+        assert!(settling > 0, "the page in front never cast a frame");
+
+        // The middle button on the plain link.
+        click_with(&mut first.connection, (40, 30), "middle", 4, 0);
+        let (frames, events) = watch_page(&mut first.connection, Duration::from_secs(1));
+        let dispositions: Vec<String> = events
+            .iter()
+            .filter(|event| event.method == "Page.frameRequestedNavigation")
+            .filter_map(|event| event.params.get("disposition").and_then(Json::as_str))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            dispositions.iter().any(|word| word == "newTab"),
+            "the engine did not say newTab for a middle click: {dispositions:?}"
+        );
+        assert!(
+            frames >= 10,
+            "the page in front stopped casting after a tab opened behind it: {frames} frames"
+        );
+    }
+
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            Duration::from_secs(15),
+            |tabs| tabs.len() == 2
+        ),
+        "a middle click on a link opened no tab"
+    );
+    assert_eq!(tabs.active_index(), 0, "the tab opened behind");
+    assert!(
+        pump(&mut browser, &mut tabs, Duration::from_secs(10), |tabs| {
+            tabs.iter()
+                .nth(1)
+                .is_some_and(|tab| tab.url.ends_with("/plain"))
+        }),
+        "the tab behind never said where it was: {:?}",
+        tabs.iter().map(|tab| tab.url.clone()).collect::<Vec<_>>()
+    );
+    let log = page_log(&mut tabs.active_mut().expect("a tab").connection);
+    assert!(log.contains("auxclick:1"), "{log}");
+
+    // It loads, and has its title, without ever being brought to the front.
+    {
+        let behind = tabs.get_mut(1).expect("the tab behind");
+        behind
+            .connection
+            .call("Page.enable", Json::empty())
+            .expect("Page.enable");
+        assert_eq!(
+            wait_for_title(&mut behind.connection, "plain", Duration::from_secs(10)),
+            "plain"
+        );
+    }
+
+    // The ctrl key on the left button: the same.
+    let first = &mut tabs.active_mut().expect("the first tab").connection;
+    click_with(first, (40, 30), "left", 1, 2);
+    let _ = watch_page(first, Duration::from_millis(200));
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            Duration::from_secs(15),
+            |tabs| tabs.len() == 3
+        ),
+        "a ctrl+click on a link opened no tab"
+    );
+    assert_eq!(tabs.active_index(), 0, "still behind");
+    let first = &mut tabs.active_mut().expect("the first tab").connection;
+    let log = page_log(first);
+    assert!(log.contains("click:0:true"), "{log}");
+
+    // A ctrl+click on something that is not a link is the page's, and opens
+    // nothing.
+    click_with(first, (340, 30), "left", 1, 2);
+    let _ = watch_page(first, Duration::from_millis(200));
+    assert!(
+        !pump(&mut browser, &mut tabs, Duration::from_secs(2), |tabs| tabs
+            .len()
+            > 3),
+        "a ctrl+click on nothing opened a tab"
+    );
+    let first = &mut tabs.active_mut().expect("the first tab").connection;
+    let clicks = |log: &str| log.matches("click:0:true").count();
+    let after = page_log(first);
+    assert_eq!(clicks(&after), clicks(&log) + 1, "{after}");
+
+    // And a link that asks for a window still comes to the front.
+    click_with(first, (40, 130), "left", 1, 0);
+    let _ = watch_page(first, Duration::from_millis(200));
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            Duration::from_secs(15),
+            |tabs| tabs.len() == 4
+        ),
+        "the target=_blank link opened no tab"
+    );
+    assert_eq!(
+        tabs.active_index(),
+        3,
+        "a page that asked for a window is in front"
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// [`blinkterm::app::open_behind`]: the program's own way to a tab behind,
+/// for a url rather than a click. The engine accepts `background: true`,
+/// which is documented as Chrome's only; the engine's announcement of the
+/// target is not a second tab; the page loads with nobody looking; and
+/// moving a tab in the strip is this program's order, not the engine's.
+#[test]
+fn a_tab_opened_behind_by_this_program_loads_without_being_looked_at() {
+    let Some((mut engine, page, target)) = connect_with_target() else {
+        return;
+    };
+    let base = serve();
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+    let appearance =
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+
+    let index = blinkterm::app::open_behind(
+        &mut tabs,
+        &mut browser,
+        &appearance,
+        &format!("{base}plain"),
+    )
+    .expect("the engine opens a page behind");
+    assert_eq!(index, 1);
+    assert_eq!(tabs.active_index(), 0, "the tab in front stays in front");
+    assert!(
+        !pump(&mut browser, &mut tabs, Duration::from_secs(3), |tabs| tabs
+            .len()
+            > 2),
+        "the tab this program opened behind was counted twice"
+    );
+    assert_eq!(tabs.active_index(), 0, "and was not pulled forward");
+    let behind = tabs.get_mut(1).expect("the tab behind");
+    assert_eq!(
+        wait_for_title(&mut behind.connection, "plain", Duration::from_secs(10)),
+        "plain"
+    );
+
+    // The engine's order of its targets, before and after the strip's
+    // changes: a future engine that reordered on activation would show up
+    // here as a mismatch nobody expected.
+    let order = |browser: &mut Client| -> Vec<String> {
+        let reply = browser
+            .call("Target.getTargets", Json::empty())
+            .expect("the targets");
+        reply
+            .get("targetInfos")
+            .and_then(Json::as_array)
+            .map(|infos| {
+                infos
+                    .iter()
+                    .filter(|info| info.get("type").and_then(Json::as_str) == Some("page"))
+                    .filter_map(|info| info.get("targetId").and_then(Json::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let before = order(&mut browser);
+    let targets: Vec<String> = tabs.iter().map(|tab| tab.target.clone()).collect();
+    assert!(tabs.move_active(1));
+    assert_eq!(tabs.active_index(), 1);
+    assert_eq!(
+        tabs.iter()
+            .map(|tab| tab.target.clone())
+            .collect::<Vec<_>>(),
+        [targets[1].clone(), targets[0].clone()]
+    );
+    assert_eq!(order(&mut browser), before, "the engine's order is its own");
 
     browser.close();
     drop(tabs);
@@ -2814,6 +3111,11 @@ fn follow(tab: &mut Tab<Client>, timeout: Duration) -> Vec<Landing> {
                         tab.landed(landing);
                         loaded = false;
                     }
+                }
+                // A crashed page's new renderer, which is what makes the
+                // landing after it the page back (`Tab::reviving`).
+                "Inspector.targetReloadedAfterCrash" if tab.is_crashed() => {
+                    tab.reviving = true;
                 }
                 "Page.loadEventFired" if !landings.is_empty() => {
                     tab.loading = false;
@@ -5691,5 +5993,1428 @@ fn the_still_at_a_fractional_level_is_cut_to_the_pane() {
     }
 
     client.close();
+    engine.kill();
+}
+
+/// An engine started with extras, and a session on its first page: what
+/// `connect_in_with_target` is for `Engine::launch`, for
+/// `Engine::launch_with`. On a temporary profile, and skipping as the rest
+/// do.
+fn launched(launch: &engine::Launch) -> Option<(Engine, Client, Client)> {
+    if std::env::var_os(engine::ENGINE_ENV).is_none() {
+        eprintln!(
+            "skipped: {} is not set; name a Chromium to run this against",
+            engine::ENGINE_ENV
+        );
+        return None;
+    }
+    let profile = Profile::temporary().expect("a temporary profile");
+    let engine =
+        Engine::launch_with(profile, Duration::from_secs(30), launch).expect("the engine starts");
+    let mut browser = engine.browser().expect("the browser's client");
+    let target =
+        engine::first_page_target(&mut browser, Duration::from_secs(20)).expect("a first page");
+    let page = browser
+        .attach(&target, Duration::from_secs(10))
+        .expect("a session on the page");
+    Some((engine, browser, page))
+}
+
+/// `--user-agent` and `--proxy` are engine flags and nothing else, measured
+/// to cover the browser, the first page and a target made later; a proxy
+/// that refuses connections is the fastest proof the proxy took, and a
+/// `data:` url never goes through it.
+#[test]
+fn a_user_agent_and_a_proxy_reach_the_engine_and_the_agent_covers_a_later_tab() {
+    let launch = engine::Launch {
+        user_agent: Some("blinkterm-test/1".to_string()),
+        proxy: Some("127.0.0.1:1".to_string()),
+        ..engine::Launch::default()
+    };
+    let Some((mut engine, mut browser, mut page)) = launched(&launch) else {
+        return;
+    };
+    let version = browser
+        .call("Browser.getVersion", Json::empty())
+        .expect("a version");
+    assert_eq!(
+        version.get("userAgent").and_then(Json::as_str),
+        Some("blinkterm-test/1")
+    );
+    assert_eq!(
+        evaluate(&mut page, "navigator.userAgent").as_str(),
+        Some("blinkterm-test/1"),
+        "the first page"
+    );
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("a new target");
+    let later = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("the engine says which")
+        .to_string();
+    let mut later = browser
+        .attach(&later, Duration::from_secs(10))
+        .expect("a session on the later page");
+    assert_eq!(
+        evaluate(&mut later, "navigator.userAgent").as_str(),
+        Some("blinkterm-test/1"),
+        "a page made later"
+    );
+
+    let reply = page
+        .call_within(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string("http://example.test/"))]),
+            Duration::from_secs(20),
+        )
+        .expect("a reply");
+    let error = reply
+        .get("errorText")
+        .and_then(Json::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(error, "net::ERR_PROXY_CONNECTION_FAILED", "{reply:?}");
+    assert_eq!(load::reason(&error), "the proxy would not connect");
+
+    page.call(
+        "Page.navigate",
+        Json::object(vec![(
+            "url",
+            Json::string("data:text/html,<title>not proxied</title>"),
+        )]),
+    )
+    .expect("a data url loads");
+    assert_eq!(
+        wait_for_title(&mut page, "not proxied", Duration::from_secs(10)),
+        "not proxied"
+    );
+
+    later.close();
+    page.close();
+    browser.close();
+    engine.kill();
+}
+
+/// An `--engine-arg` goes to the engine as written: `--accept-lang=ja` is
+/// the language flag the headless shell was measured to honour.
+#[test]
+fn an_engine_arg_goes_through_as_written() {
+    let launch = engine::Launch {
+        args: vec!["--accept-lang=ja".to_string()],
+        ..engine::Launch::default()
+    };
+    let Some((mut engine, mut browser, mut page)) = launched(&launch) else {
+        return;
+    };
+    assert_eq!(
+        evaluate(&mut page, "navigator.language").as_str(),
+        Some("ja")
+    );
+    page.close();
+    browser.close();
+    engine.kill();
+}
+
+/// What `drive` does with three urls, without the pane: the first tab told
+/// to load, a tab each for the rest through `Target.createTarget`, the first
+/// put back in front. Three tabs, the first in front and still a visible
+/// page without being raised again, each at the url it was given, and none of the ones
+/// this program made counted twice when the engine announces them.
+#[test]
+fn several_urls_open_several_tabs_with_the_first_in_front() {
+    let Some((mut engine, page, target)) = connect_with_target() else {
+        return;
+    };
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+    let urls = [
+        "data:text/html,<title>one</title>",
+        "data:text/html,<title>two</title>",
+        "data:text/html,<title>three</title>",
+    ];
+    {
+        let first = tabs.active_mut().expect("the first tab");
+        first.url = urls[0].to_string();
+        first
+            .connection
+            .call(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(urls[0]))]),
+            )
+            .expect("the first page loads");
+    }
+    for &url in &urls[1..] {
+        let created = browser
+            .call(
+                "Target.createTarget",
+                Json::object(vec![("url", Json::string(url))]),
+            )
+            .expect("a new target");
+        let opened = created
+            .get("targetId")
+            .and_then(Json::as_str)
+            .expect("the engine says which")
+            .to_string();
+        let connection = browser
+            .attach(&opened, Duration::from_secs(10))
+            .expect("a session on it");
+        tabs.open(Tab::new(opened, connection, url));
+    }
+    assert!(tabs.select(1));
+
+    assert!(!pump(
+        &mut browser,
+        &mut tabs,
+        Duration::from_secs(2),
+        |tabs| tabs.len() > 3
+    ));
+    assert_eq!(tabs.len(), 3);
+    assert_eq!(tabs.active_index(), 0, "the first url is the tab in front");
+    for (index, (url, name)) in urls.iter().zip(["one", "two", "three"]).enumerate() {
+        let tab = tabs.get_mut(index).expect("a tab");
+        assert_eq!(tab.url, *url, "tab {index}");
+        assert_eq!(
+            wait_for_title(&mut tab.connection, name, Duration::from_secs(10)),
+            name,
+            "tab {index} loaded what it was given"
+        );
+    }
+    let front = tabs.active_mut().expect("the first tab");
+    assert_eq!(
+        evaluate(&mut front.connection, "document.visibilityState").as_str(),
+        Some("visible"),
+        "the tab in front is a page that paints"
+    );
+
+    drop(tabs);
+    browser.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Normal mode: link hints and the scroll keys
+// ---------------------------------------------------------------------------
+
+use blinkterm::hints::{self, Hint, Hints, Kind};
+use blinkterm::normal;
+
+/// The frame the hint page puts beside its own links: a link, a button, and
+/// enough below them that the frame scrolls.
+fn hint_frame() -> String {
+    let filler: String = (0..60)
+        .map(|i| format!("<p>frame filler {i}</p>"))
+        .collect();
+    format!(
+        "<!doctype html><body style='margin:0;font:14px sans-serif'>\
+         <p><a id=inner href='/inner-target'>a link inside the frame</a></p>\
+         <p><button id=innerbtn>frame button</button></p>{filler}\
+         <p><a id=innerdeep href='/inner-deep'>deep in the frame</a></p></body>"
+    )
+}
+
+/// The page [`hints`]'s module doc was measured on: every kind of thing that
+/// is clickable, and every way of being clickable and not a hint — hidden
+/// three ways, inside a closed `<details>`, covered by another element, in a
+/// cross-origin frame, an image map's area, and below the fold. At `/`, with
+/// its frame at `/inner` and the same frame again on `localhost`, which is
+/// another origin.
+fn hint_pages(port: u16) -> Vec<(String, String)> {
+    let below: String = (0..80)
+        .map(|i| format!("<p><a href='/below/{i}'>below the fold link {i}</a></p>"))
+        .collect();
+    let page = format!(
+        "<!doctype html><meta charset=utf-8><title>loading</title>\
+         <body style='margin:0;font:14px sans-serif;background:#fff;color:#000'>\
+         <h1>Hint targets</h1>\
+         <p><a id=a1 href='/one'>plain link</a> and <a id=a2 href='/two'>another with <b>bold</b> inside</a>\
+          and <a id=a3 href='javascript:void(0)'>a javascript: link</a> and <a>an anchor with no href</a>\
+          and <a id=a4 href='#frag'>a fragment</a></p>\
+         <p><a id=wrap href='/wrap' style='display:inline'>a link that is long enough to wrap onto a \
+         second line when the viewport is six hundred and forty pixels wide, which this one is, so it \
+         has two client rects</a></p>\
+         <p><button id=b1>button</button> <button id=b2 disabled>disabled</button>\
+          <input id=i1 type=text placeholder=text> <input id=i2 type=checkbox> <input type=hidden value=x>\
+          <input id=i3 type=submit value=Go> <select id=s1><option>one</option></select> <textarea id=t1></textarea></p>\
+         <p><span id=oc onclick='1'>onclick span</span> <span id=rl role=link tabindex=0>role=link</span>\
+          <span id=rb role=button>role=button</span> <div id=ce contenteditable>editable div</div></p>\
+         <p><label for=i1 id=lab>label for the text input</label> <label id=lab2><input id=i4 type=radio> radio in a label</label></p>\
+         <div id=ptr style='cursor:pointer;width:100px;height:20px;background:#eee'><span>cursor:pointer div</span></div>\
+         <div style='cursor:pointer;width:100px;height:20px'><div style='cursor:pointer'>nested pointer (one hint)</div></div>\
+         <p style='display:none'><a id=hid1 href='/hidden'>display:none</a></p>\
+         <p style='visibility:hidden'><a id=hid2 href='/hidden2'>visibility:hidden</a></p>\
+         <p style='opacity:0'><a id=hid3 href='/hidden3'>opacity:0</a></p>\
+         <details><summary id=sum>a summary</summary><a id=hid4 href='/closed'>inside closed details</a></details>\
+         <div style='position:relative;height:30px'><a id=under href='/under' style='position:absolute;left:0;top:0'>covered link</a>\
+          <div id=cover style='position:absolute;left:0;top:0;width:200px;height:30px;background:#ccc'></div></div>\
+         <div id=sh></div>\
+         <iframe id=same src='/inner' style='width:300px;height:100px;border:2px solid #000'></iframe>\
+         <iframe id=cross src='http://localhost:{port}/inner' style='width:300px;height:100px'></iframe>\
+         <map name=m><area id=ar shape=rect coords='0,0,50,50' href='/area'></map>\
+         <img usemap='#m' width=60 height=60 alt='' style='display:block;background:#8cf'>\
+         {below}\
+         <script>\
+         var sh = document.getElementById('sh').attachShadow({{mode:'open'}});\
+         sh.innerHTML = '<a id=shadowlink href=\"/shadow\">a link in an open shadow root</a> <button id=shadowbtn>shadow button</button>';\
+         onload = function () {{ document.title = 'ready'; }};\
+         </script></body>"
+    );
+    vec![
+        ("/".to_string(), page),
+        ("/inner".to_string(), hint_frame()),
+    ]
+}
+
+/// An engine on the hint page at `WIDTH` by `height`, with the world the
+/// program makes for find and hints alike, and the page's url.
+fn hinting(height: u32) -> Option<(Engine, Client, String, i64, String)> {
+    let port = serve_pages(hint_pages);
+    let (engine, mut client, target) = connect_with_target()?;
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(WIDTH)),
+                ("height", Json::number(height)),
+                ("deviceScaleFactor", Json::number(1)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("the viewport");
+    let url = format!("http://127.0.0.1:{port}/");
+    open(&mut client, &url, "ready");
+    let context = find_world(&mut client);
+    Some((engine, client, target, context, url))
+}
+
+/// `f`'s question, waited for: the hints in view, labelled.
+fn collect(client: &mut Client, context: i64, px: f64) -> Hints {
+    let reply = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            hints::collect_params(context, px),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers the collect");
+    Hints::from_reply(&reply, false)
+        .unwrap_or_else(|| panic!("an answer of the script's shape: {reply}"))
+}
+
+/// Put the labels up, a cell of `px` CSS pixels tall.
+fn show(client: &mut Client, context: i64, hints: &Hints, px: f64) {
+    let reply = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            hints::show_params(context, &hints.labels, px),
+            Duration::from_secs(5),
+        )
+        .expect("the page draws the labels");
+    assert!(reply.get("exceptionDetails").is_none(), "{reply}");
+}
+
+/// Take them down.
+fn clear(client: &mut Client, context: i64) {
+    client
+        .call_within(
+            "Runtime.callFunctionOn",
+            hints::clear_params(context),
+            Duration::from_secs(5),
+        )
+        .expect("the page takes the labels away");
+}
+
+/// How many pixels of a PNG are the labels' yellow, `#ffd400`, within 8 of
+/// each channel.
+fn label_pixels(png: &[u8]) -> usize {
+    let image = tos_term::png::decode(png, 64 * 1024 * 1024).expect("the PNG decodes");
+    image
+        .rgba
+        .chunks_exact(4)
+        .filter(|pixel| {
+            pixel[..3]
+                .iter()
+                .zip([0xff, 0xd4, 0x00])
+                .all(|(&have, want): (&u8, u8)| have.abs_diff(want) <= 8)
+        })
+        .count()
+}
+
+/// A still once the labels have had a frame to paint in.
+fn labelled_still(client: &mut Client) -> Vec<u8> {
+    std::thread::sleep(Duration::from_millis(200));
+    screenshot(client, "png", None)
+}
+
+/// The three mouse events a typed label sends, as calls so that the test
+/// knows they have landed.
+fn click_hint(client: &mut Client, hint: &Hint) {
+    for params in hints::click_params(hint.at) {
+        client
+            .call("Input.dispatchMouseEvent", params)
+            .expect("the click is dispatched");
+    }
+}
+
+/// Type `hint`'s label into a fresh set of labels, a key at a time, and hand
+/// back what the typing chose — so that the label and the hint under it are
+/// the program's, not the test's.
+fn type_label(hints: &Hints, index: usize) -> Hint {
+    let mut typing = hints.clone();
+    let label = hints.labels[index].clone();
+    let mut chosen = None;
+    for c in label.chars() {
+        let key = KeyInput {
+            key: Key::Char(c),
+            mods: Mods::default(),
+            action: KeyAction::Press,
+            text: Some(c),
+        };
+        match typing.step(&key) {
+            hints::Typed::Chosen(hint) => chosen = Some(hint),
+            hints::Typed::Narrowed(n) => assert!(n >= 1),
+            other => panic!("{c} of {label}: {other:?}"),
+        }
+    }
+    chosen.unwrap_or_else(|| panic!("{label} chose nothing"))
+}
+
+/// The first hint whose `at` is on the element `id` in the page.
+fn hint_on(client: &mut Client, hints: &Hints, id: &str) -> usize {
+    let mut rect = |what: &str| {
+        page_number(
+            client,
+            &format!("document.getElementById('{id}').getBoundingClientRect().{what}"),
+        )
+    };
+    let (left, top, right, bottom) = (rect("left"), rect("top"), rect("right"), rect("bottom"));
+    hints
+        .hints
+        .iter()
+        .position(|hint| (left..=right).contains(&hint.at.0) && (top..=bottom).contains(&hint.at.1))
+        .unwrap_or_else(|| panic!("no hint on #{id}: {:?}", hints.hints))
+}
+
+/// The acceptance criterion of #13 for "collect the clickable elements in the
+/// viewport": the measured set, no more and no less.
+#[test]
+fn the_clickable_things_in_view_are_found_and_the_hidden_covered_and_offscreen_ones_are_not() {
+    let Some((mut engine, mut client, _, context, _)) = hinting(HEIGHT) else {
+        return;
+    };
+    let found = collect(&mut client, context, 16.0);
+    let count = |kind: Kind| found.hints.iter().filter(|hint| hint.kind == kind).count();
+    eprintln!(
+        "{} hints at {WIDTH}x{HEIGHT}: {:?}",
+        found.hints.len(),
+        found.hints
+    );
+    assert_eq!(found.hints.len(), 18, "{:?}", found.hints);
+    assert_eq!(
+        (count(Kind::Link), count(Kind::Edit), count(Kind::Click)),
+        (4, 4, 10)
+    );
+    let first = &found.hints[0];
+    assert!(
+        (first.at.0 - 27.0).abs() <= 1.0 && (first.at.1 - 78.0).abs() <= 1.0,
+        "the first hint, the first link, at {:?}",
+        first.at
+    );
+    assert!(found.hints[0].href.ends_with("/one"));
+    for hidden in [
+        "/hidden", "/hidden2", "/hidden3", "/closed", "/under", "/area",
+    ] {
+        assert!(
+            !found.hints.iter().any(|hint| hint.href.ends_with(hidden)),
+            "{hidden} is not a hint"
+        );
+    }
+    assert!(
+        !found.hints.iter().any(|hint| hint.href.contains("/below/")),
+        "nothing below the fold"
+    );
+    assert!(found
+        .hints
+        .iter()
+        .all(|hint| hint.kind == Kind::Link || hint.href.is_empty()));
+    assert!(
+        !found
+            .hints
+            .iter()
+            .any(|hint| hint.href.starts_with("javascript:")),
+        "a javascript: link is a click, not a link to open"
+    );
+
+    // Taller, and the shadow root, the frames and the summary come into view.
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(WIDTH)),
+                ("height", Json::number(HEIGHT * 2)),
+                ("deviceScaleFactor", Json::number(1)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("the viewport");
+    wait_until(&mut client, f64::from(HEIGHT * 2), |client| {
+        page_number(client, "innerHeight")
+    });
+    let tall = collect(&mut client, context, 16.0);
+    eprintln!("{} hints at {WIDTH}x{}", tall.hints.len(), HEIGHT * 2);
+    // 26: the eighteen, the summary and the details, the shadow root's link
+    // and button, the frame's link and button, and two links below the old
+    // fold. (27 is what the same page has at 1280x720, which is 50%.)
+    assert_eq!(tall.hints.len(), 26, "{:?}", tall.hints);
+    assert!(
+        tall.hints.iter().any(|hint| hint.href.ends_with("/shadow")),
+        "a link in an open shadow root"
+    );
+    let rect = |client: &mut Client, what: &str| {
+        page_number(
+            client,
+            &format!("document.getElementById('same').getBoundingClientRect().{what}"),
+        )
+    };
+    let (left, top) = (rect(&mut client, "left"), rect(&mut client, "top"));
+    let (right, bottom) = (rect(&mut client, "right"), rect(&mut client, "bottom"));
+    let framed = tall
+        .hints
+        .iter()
+        .find(|hint| hint.href.ends_with("/inner-target"))
+        .expect("the same-origin frame's link");
+    assert!(
+        (left..=right).contains(&framed.at.0) && (top..=bottom).contains(&framed.at.1),
+        "the frame's link is inside the frame's box: {:?} in {left},{top}..{right},{bottom}",
+        framed.at
+    );
+    assert!(
+        !tall
+            .hints
+            .iter()
+            .any(|hint| hint.href.contains("localhost")),
+        "nothing from the cross-origin frame"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn labels_are_drawn_by_the_page_and_taken_away_without_a_trace() {
+    let Some((mut engine, mut client, _, context, _)) = hinting(HEIGHT) else {
+        return;
+    };
+    let body = page_number(&mut client, "document.body.innerHTML.length");
+    assert_eq!(label_pixels(&labelled_still(&mut client)), 0);
+    let found = collect(&mut client, context, 16.0);
+    show(&mut client, context, &found, 16.0);
+    let shown = label_pixels(&labelled_still(&mut client));
+    eprintln!("{} labels, {shown} yellow pixels", found.labels.len());
+    assert!(shown > 1000, "the labels are on the screen: {shown}");
+    assert_eq!(
+        page_number(&mut client, "document.documentElement.children.length"),
+        3.0,
+        "one element, on <html>"
+    );
+    assert_eq!(
+        page_number(&mut client, "document.body.innerHTML.length"),
+        body,
+        "and nothing in the body"
+    );
+    assert_eq!(
+        evaluate(
+            &mut client,
+            "document.querySelector('blinkterm-hints').shadowRoot === null"
+        )
+        .as_bool(),
+        Some(true),
+        "the page cannot reach the labels"
+    );
+    assert_eq!(
+        evaluate(&mut client, "typeof __blinktermHints").as_str(),
+        Some("undefined"),
+        "nor the script's state"
+    );
+
+    // Narrowed to the labels starting with the first letter: fewer.
+    let prefix = &found.labels[0][..1];
+    client
+        .call_within(
+            "Runtime.callFunctionOn",
+            hints::narrow_params(context, prefix),
+            Duration::from_secs(5),
+        )
+        .expect("the page narrows");
+    let narrowed = label_pixels(&labelled_still(&mut client));
+    assert!(
+        narrowed > 0 && narrowed < shown,
+        "{narrowed} of {shown} after {prefix}"
+    );
+
+    clear(&mut client, context);
+    assert_eq!(label_pixels(&labelled_still(&mut client)), 0);
+    assert_eq!(
+        page_number(&mut client, "document.documentElement.children.length"),
+        2.0
+    );
+    assert_eq!(
+        page_number(&mut client, "document.body.innerHTML.length"),
+        body
+    );
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn typing_a_label_clicks_the_thing_under_it_and_a_field_is_insert_mode() {
+    let Some((mut engine, mut client, _, context, url)) = hinting(HEIGHT) else {
+        return;
+    };
+    let found = collect(&mut client, context, 16.0);
+    let link = type_label(&found, hint_on(&mut client, &found, "a1"));
+    assert_eq!(link.kind, Kind::Link);
+    click_hint(&mut client, &link);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut href = String::new();
+    while Instant::now() < deadline {
+        href = evaluate(&mut client, "location.href")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if href.ends_with("/one") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(href.ends_with("/one"), "the link was followed: {href}");
+
+    open(&mut client, &url, "ready");
+    let context = find_world(&mut client);
+    let found = collect(&mut client, context, 16.0);
+    let field = type_label(&found, hint_on(&mut client, &found, "i1"));
+    assert_eq!(field.kind, Kind::Edit, "a text input is typed into");
+    click_hint(&mut client, &field);
+    assert_eq!(
+        evaluate(&mut client, "document.activeElement.id").as_str(),
+        Some("i1")
+    );
+    // And the question asked after a click in normal mode says so.
+    let focused = client
+        .call("Runtime.evaluate", hints::focused_params())
+        .expect("the page answers");
+    assert_eq!(hints::focused_editable(&focused), Some(true));
+
+    let checkbox = type_label(&found, hint_on(&mut client, &found, "i2"));
+    assert_eq!(checkbox.kind, Kind::Click);
+    click_hint(&mut client, &checkbox);
+    assert_eq!(
+        evaluate(&mut client, "document.getElementById('i2').checked").as_bool(),
+        Some(true)
+    );
+    let focused = client
+        .call("Runtime.evaluate", hints::focused_params())
+        .expect("the page answers");
+    assert_eq!(
+        hints::focused_editable(&focused),
+        Some(false),
+        "a checkbox is not a field"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn a_hint_inside_a_same_origin_frame_is_clicked_in_the_frame() {
+    let Some((mut engine, mut client, _, context, url)) = hinting(HEIGHT * 2) else {
+        return;
+    };
+    let found = collect(&mut client, context, 16.0);
+    let index = found
+        .hints
+        .iter()
+        .position(|hint| hint.href.ends_with("/inner-target"))
+        .expect("the frame's link");
+    let hint = type_label(&found, index);
+    click_hint(&mut client, &hint);
+    let inner = |client: &mut Client| {
+        evaluate(
+            client,
+            "document.getElementById('same').contentWindow.location.href",
+        )
+        .as_str()
+        .unwrap_or_default()
+        .ends_with("/inner-target")
+    };
+    assert!(wait_until(&mut client, true, inner), "the frame navigated");
+    assert_eq!(
+        evaluate(&mut client, "location.href").as_str(),
+        Some(url.as_str()),
+        "and the page did not"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// `F`: the href goes to a tab this program opens behind the one in front,
+/// the way `app::open_behind` opens one, and the engine's announcement of it
+/// — which has no opener — is not taken for a second tab. And a ctrl+click
+/// on a hint's point, for comparison, is the tab behind that #19 adopts.
+#[test]
+fn a_hint_opened_in_a_new_tab_is_a_target_this_program_made() {
+    let Some((mut engine, mut client, target, context, _)) = hinting(HEIGHT) else {
+        return;
+    };
+    let found = collect(&mut client, context, 16.0);
+    let hint = type_label(&found, hint_on(&mut client, &found, "a1"));
+    assert!(hint.href.ends_with("/one"));
+    let (mut browser, mut tabs) = tabbed(&engine, client, target);
+
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![
+                ("url", Json::string(&hint.href)),
+                ("background", Json::Bool(true)),
+            ]),
+        )
+        .expect("a new target");
+    let opened = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("the engine says which")
+        .to_string();
+    let connection = browser
+        .attach(&opened, Duration::from_secs(10))
+        .expect("a session on the new page");
+    let index = tabs.open_behind(Tab::new(opened, connection, &hint.href));
+    assert_eq!((index, tabs.active_index()), (1, 0), "behind the first");
+    assert!(!pump(
+        &mut browser,
+        &mut tabs,
+        Duration::from_secs(2),
+        |tabs| tabs.len() > 2
+    ));
+    assert_eq!(tabs.len(), 2, "its announcement is not a second tab");
+    assert_eq!(tabs.active_index(), 0, "and does not bring it to the front");
+    let tab = tabs.get_mut(1).expect("the new tab");
+    let arrived = |client: &mut Client| {
+        evaluate(client, "location.href")
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("/one")
+    };
+    assert!(
+        wait_until(&mut tab.connection, true, arrived),
+        "the new tab is at the href"
+    );
+
+    // Now the ctrl+click, on the other link, from the first tab.
+    assert_eq!(tabs.active_index(), 0);
+    let two = found
+        .hints
+        .iter()
+        .find(|hint| hint.href.ends_with("/two"))
+        .expect("the second link")
+        .clone();
+    let page = &mut tabs.active_mut().expect("the first tab").connection;
+    for params in hints::click_params(two.at) {
+        let Json::Object(mut fields) = params else {
+            panic!("the params are an object");
+        };
+        for (name, value) in fields.iter_mut() {
+            if name == "modifiers" {
+                *value = Json::number(2);
+            }
+        }
+        page.call("Input.dispatchMouseEvent", Json::Object(fields))
+            .expect("the ctrl+click is dispatched");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut adopted = None;
+    while adopted.is_none() && Instant::now() < deadline {
+        for event in browser.events() {
+            let created = event.method == "Target.targetCreated"
+                && event
+                    .params
+                    .path(&["targetInfo", "type"])
+                    .and_then(Json::as_str)
+                    == Some("page");
+            if !created {
+                continue;
+            }
+            let id = event
+                .params
+                .path(&["targetInfo", "targetId"])
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if tabs.index_of(&id).is_some() {
+                continue;
+            }
+            let opener = event.params.path(&["targetInfo", "openerId"]).is_some();
+            let outcome = tabs.take(&event, |target| {
+                browser.attach(target, Duration::from_secs(5))
+            });
+            adopted = Some((
+                opener,
+                matches!(outcome, Outcome::OpenedBehind { index: 2 }),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!("a ctrl+click's target: (has an opener, a tab behind) = {adopted:?}");
+    assert_eq!(
+        adopted,
+        Some((false, true)),
+        "a ctrl+click makes a target with no opener, which is a tab behind"
+    );
+    assert_eq!((tabs.len(), tabs.active_index()), (3, 0));
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// The scroll keys through the program's own wheel thread and dispatch, with
+/// the distances [`normal::Scroll`] names: a notch, half a screen, and the two
+/// ends, which the engine clamps.
+#[test]
+fn the_scroll_keys_move_the_page_through_the_wheel() {
+    let Some((mut engine, mut client, target)) = connect_with_target() else {
+        return;
+    };
+    a_page_to_scroll(&mut client);
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    let viewport = blinkterm::zoom::Viewport::fit((WIDE, TALL), 1.0);
+    let at = (WIDE as i32 / 2, TALL as i32 / 2);
+    let wheel = Wheel::start();
+    let wire = Arc::new(blinkterm::app::Wire::new(client.notifier()));
+    let key = |client: &mut Client, scroll: normal::Scroll, wanted: f64| {
+        let distance = match scroll {
+            normal::Scroll::Notch(n) => viewport.notch((0, n), blinkterm::app::WHEEL_PIXELS),
+            normal::Scroll::HalfPage(n) => (0.0, f64::from(n) * f64::from(viewport.css.1) / 2.0),
+            normal::Scroll::End(n) => (0.0, f64::from(n) * normal::FAR),
+        };
+        wheel.notch(&target, wire.clone(), at, distance);
+        let landed = wait_until(client, wanted, scroll_y);
+        assert_eq!(landed, wanted, "{scroll:?}");
+        // The page is where it was sent, but a curve for one of the ends
+        // pays out the rest of its ten million pixels for the rest of
+        // `scroll::D`, clamped by the engine; the next key waits it out, as
+        // a person's would.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while wheel.owed() != (0.0, 0.0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    key(&mut client, normal::Scroll::Notch(1), 120.0);
+    key(
+        &mut client,
+        normal::Scroll::HalfPage(1),
+        120.0 + f64::from(TALL) / 2.0,
+    );
+    let bottom = page_number(
+        &mut client,
+        "document.documentElement.scrollHeight - innerHeight",
+    );
+    key(&mut client, normal::Scroll::End(1), bottom);
+    key(&mut client, normal::Scroll::Notch(-1), bottom - 120.0);
+    key(&mut client, normal::Scroll::End(-1), 0.0);
+
+    client.close();
+    engine.kill();
+}
+
+/// A label is about a cell tall on the screen at every level, because it is
+/// sized from the CSS pixels a cell is: at 50% the page's text is half the
+/// height and the labels are not.
+#[test]
+fn labels_stay_a_cell_tall_at_every_zoom_level() {
+    let Some((mut engine, mut client, _, context, _)) = hinting(HEIGHT) else {
+        return;
+    };
+    for factor in [1.0, 0.5, 2.0] {
+        zoom_to(&mut client, factor);
+        wait_until(&mut client, factor, |client| page_metrics(client).2);
+        let px = f64::from(CELL.1) / factor;
+        let found = collect(&mut client, context, px);
+        show(&mut client, context, &found, px);
+        let yellow = label_pixels(&labelled_still(&mut client));
+        let each = yellow / found.hints.len().max(1);
+        eprintln!(
+            "at {factor}: {} hints, {yellow} yellow pixels, {each} a label",
+            found.hints.len()
+        );
+        assert!(!found.hints.is_empty(), "at {factor}");
+        assert!(
+            (100..=300).contains(&each),
+            "{each} pixels a label at {factor}"
+        );
+        clear(&mut client, context);
+    }
+
+    client.close();
+    engine.kill();
+}
+
+#[test]
+fn hints_on_about_blank_and_the_error_page_are_none_and_no_exception() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("about:blank");
+    let context = find_world(&mut client);
+    assert!(collect(&mut client, context, 16.0).hints.is_empty());
+
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string("http://127.0.0.1:1/"))]),
+        )
+        .expect("the navigation is answered");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        // As for find: until the error page's document has arrived, the world
+        // asked for may be the one about to go.
+        let context = find_world(&mut client);
+        match client.call_within(
+            "Runtime.callFunctionOn",
+            hints::collect_params(context, 16.0),
+            Duration::from_secs(5),
+        ) {
+            Ok(reply) => break Hints::from_reply(&reply, false),
+            Err(why) if find::stale_world(&why) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(why) => panic!("{why}"),
+        }
+    };
+    let error_page = answer.expect("the script's answer, not an exception");
+    assert!(
+        error_page.hints.is_empty(),
+        "the error page: {:?}",
+        error_page.hints
+    );
+
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Crashed pages, the session, and dormant tabs (#18)
+// ---------------------------------------------------------------------------
+
+use blinkterm::session::{self, Session, Snapshot, State};
+use tos_preview::fit::Metrics;
+
+/// A page that paints every frame, so that a screencast of it is a count.
+/// No `%` and no `#` in it: this is a url, and `#` would start its fragment.
+const ANIMATED: &str = "data:text/html,<title>anim</title>\
+<div id=b style='position:absolute;width:40px;height:40px;background:red'></div>\
+<script>var n=0,b=document.getElementById('b');\
+function f(){n=n>400?0:n+3;b.style.left=n+'px';requestAnimationFrame(f)}f()</script>";
+
+/// How many screencast frames arrive in `window`, acknowledged as they come.
+fn frames_in(client: &mut Client, window: Duration) -> usize {
+    let deadline = Instant::now() + window;
+    let mut count = 0;
+    while Instant::now() < deadline {
+        count += take_frames(client).len();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    count
+}
+
+/// How long a renderer's death may take to reach the browser. On a
+/// workstation it is about 20 ms; on the CI runner it took more than the
+/// second these tests first allowed, probably because the kernel pipes the
+/// dead renderer's core to the host's crash collector before the process is
+/// gone. The program reads the event whenever it comes, so only the tests
+/// wait on it, and they print how long it took.
+const CRASH_NOTICE: Duration = Duration::from_secs(20);
+
+/// The browser's events until one is `method` about `target`, or the time is
+/// up; everything read on the way is handed to `seen` as well.
+fn browser_event(
+    browser: &mut Client,
+    method: &str,
+    target: &str,
+    timeout: Duration,
+    mut seen: impl FnMut(&blinkterm::cdp::Event),
+) -> Option<blinkterm::cdp::Event> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for event in browser.events() {
+            seen(&event);
+            let about = event
+                .params
+                .get("targetId")
+                .and_then(Json::as_str)
+                .map(str::to_string);
+            if event.method == method && about.as_deref() == Some(target) {
+                return Some(event);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+/// The page session's events for `window`, by method.
+fn page_events(client: &mut Client, window: Duration) -> Vec<blinkterm::cdp::Event> {
+    let deadline = Instant::now() + window;
+    let mut events = Vec::new();
+    while Instant::now() < deadline {
+        events.extend(client.events());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    events
+}
+
+/// A renderer that dies leaves its tab, as a sad tab does in Chrome, and
+/// `ctrl+r` brings the page back: at the size it was, and — once the
+/// screencast is started again, which is `app::revive` — painting.
+///
+/// Not done here, and documented instead: sending
+/// `Emulation.setDeviceMetricsOverride` to the crashed tab. Measured in the
+/// #18 design, it takes the whole browser down with SIGSEGV every time,
+/// which is why the program never does; proving it again on every run would
+/// prove only that the engine still has the bug.
+#[test]
+fn a_crashed_page_keeps_its_tab_and_a_reload_brings_it_back_casting() {
+    let Some((mut engine, mut page, target)) = connect_with_target() else {
+        return;
+    };
+    page.call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    let (mut browser, mut tabs) = tabbed(&engine, page, target.clone());
+    browser
+        .call(
+            "Target.activateTarget",
+            Json::object(vec![("targetId", Json::string(&target))]),
+        )
+        .expect("the tab in front");
+    {
+        let tab = tabs.active_mut().expect("the tab");
+        viewport(&mut tab.connection);
+        navigate_tab(tab, ANIMATED);
+        follow(tab, Duration::from_secs(5));
+        cast(&mut tab.connection, "jpeg", Some(85), WIDTH, HEIGHT);
+        let before = frames_in(&mut tab.connection, Duration::from_secs(1));
+        eprintln!("frames in a second before the crash: {before}");
+        assert!(before >= 10, "{before} frames before the crash");
+    }
+
+    let _crash = tabs
+        .active_mut()
+        .expect("the tab")
+        .connection
+        .send("Page.crash", Json::empty())
+        .expect("Page.crash sent");
+    let asked = Instant::now();
+    let crashed = browser_event(
+        &mut browser,
+        "Target.targetCrashed",
+        &target,
+        CRASH_NOTICE,
+        |_| {},
+    )
+    .expect("Target.targetCrashed");
+    eprintln!("Target.targetCrashed after {:?}", asked.elapsed());
+    eprintln!("crashed: {}", crashed.params);
+    assert_eq!(
+        crashed.params.get("status").and_then(Json::as_str),
+        Some("crashed")
+    );
+    assert!(
+        crashed.params.get("errorCode").is_some(),
+        "{}",
+        crashed.params
+    );
+    assert!(matches!(
+        tabs.take(&crashed, |_| Err("no new tab".to_string())),
+        Outcome::Crashed { index: 0 }
+    ));
+    let tab = tabs.active_mut().expect("the tab stays");
+    assert!(tab.is_crashed());
+    assert_eq!(tab.line(), "this page crashed; ctrl+r reloads it");
+    assert!(tab.connection.ended().is_none(), "the session goes on");
+
+    let events = page_events(&mut tab.connection, Duration::from_millis(300));
+    let inspector = events
+        .iter()
+        .find(|event| event.method == "Inspector.targetCrashed")
+        .expect("the page session's own word of it, without Inspector.enable");
+    assert_eq!(inspector.params, Json::empty());
+
+    // What the program no longer asks a crashed page: it would wait.
+    let held = tab
+        .connection
+        .send(
+            "Runtime.evaluate",
+            Json::object(vec![("expression", Json::string("1"))]),
+        )
+        .expect("sent");
+    std::thread::sleep(Duration::from_millis(500));
+    let answer = tab.connection.take_reply(&held);
+    eprintln!("Runtime.evaluate on the crashed page after 500 ms: {answer:?}");
+    assert!(answer.is_none(), "a dead renderer answered: {answer:?}");
+    drop(held);
+    let dead = frames_in(&mut tab.connection, Duration::from_secs(1));
+    assert_eq!(dead, 0, "frames from a dead renderer");
+
+    // What `ctrl+r` does.
+    let started = Instant::now();
+    tab.connection
+        .call_within("Page.reload", Json::empty(), Duration::from_secs(1))
+        .expect("Page.reload answers on a crashed page");
+    eprintln!("Page.reload answered in {:?}", started.elapsed());
+    follow(tab, Duration::from_secs(2));
+    assert_eq!(tab.problem, None, "the landing brought it back");
+    assert!(!tab.is_crashed());
+    assert_eq!(tab.title, "anim");
+    let width = evaluate(&mut tab.connection, "innerWidth");
+    assert_eq!(
+        width.as_f64(),
+        Some(WIDTH as f64),
+        "the size told before the crash is kept across the reload: {width}"
+    );
+
+    // Whether the screencast survives is not something to lean on either way. The
+    // design's probe saw none until it was started again; here, with every
+    // frame acknowledged as it came, the cast carried on across the reload
+    // (61 frames in the second). An acknowledgement owed when the renderer
+    // died is the likely difference. So it is printed, not asserted, and
+    // `revive` starts the cast again whatever happened, which is idempotent.
+    let unstarted = frames_in(&mut tab.connection, Duration::from_secs(1));
+    eprintln!("frames in a second after the reload, the cast untouched: {unstarted}");
+    blinkterm::app::revive(
+        &mut tab.connection,
+        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+        blinkterm::zoom::Viewport::fit((WIDTH, HEIGHT), 1.0),
+        Metrics {
+            cols: WIDTH / CELL.0,
+            rows: HEIGHT / CELL.1 + 1,
+            cell: CELL,
+        },
+    );
+    let after = frames_in(&mut tab.connection, Duration::from_secs(1));
+    eprintln!("frames in a second after revive: {after}");
+    assert!(after >= 10, "{after} frames after revive");
+    engine.check().expect("the engine lived through all of it");
+
+    drop(tabs);
+    browser.close();
+    engine.kill();
+}
+
+/// `chrome://crash` is the same crash by navigation: the navigation's reply
+/// is `net::ERR_ABORTED`, which is not a failure to report, and the crash
+/// follows. What `alt+left` does on the crashed tab — the browser's history
+/// and a step through it — answers and lands, and closing a crashed tab is
+/// what closing any tab is.
+#[test]
+fn chrome_crash_is_the_same_crash_with_its_navigation_aborted() {
+    let Some((mut engine, mut page, target)) = connect_with_target() else {
+        return;
+    };
+    page.call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    let (mut browser, mut tabs) = tabbed(&engine, page, target.clone());
+    let tab = tabs.active_mut().expect("the tab");
+    viewport(&mut tab.connection);
+    navigate_tab(tab, "data:text/html,<title>one</title>one");
+    follow(tab, Duration::from_secs(5));
+    navigate_tab(tab, "data:text/html,<title>two</title>two");
+    follow(tab, Duration::from_secs(5));
+
+    let reply = navigate_tab(tab, "chrome://crash");
+    eprintln!("chrome://crash: {reply}");
+    assert_eq!(
+        reply.get("errorText").and_then(Json::as_str),
+        Some("net::ERR_ABORTED")
+    );
+    assert_eq!(load::failed(&reply), None, "not a failure to report");
+
+    let asked = Instant::now();
+    let crashed = browser_event(
+        &mut browser,
+        "Target.targetCrashed",
+        &target,
+        CRASH_NOTICE,
+        |_| {},
+    )
+    .expect("Target.targetCrashed");
+    eprintln!("Target.targetCrashed after {:?}", asked.elapsed());
+    assert!(
+        crashed.params.get("errorCode").is_some(),
+        "{}",
+        crashed.params
+    );
+    assert!(matches!(
+        tabs.take(&crashed, |_| Err("no new tab".to_string())),
+        Outcome::Crashed { index: 0 }
+    ));
+    let tab = tabs.active_mut().expect("the tab stays");
+    let events = page_events(&mut tab.connection, Duration::from_millis(300));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.method == "Page.frameStoppedLoading"),
+        "the aborted load stops"
+    );
+    assert!(tab.is_crashed());
+
+    // Back: the browser's history answers on a crashed tab, and a step
+    // through it is a new renderer landing.
+    let started = Instant::now();
+    let history = tab
+        .connection
+        .call_within(
+            "Page.getNavigationHistory",
+            Json::empty(),
+            Duration::from_secs(1),
+        )
+        .expect("the history, from the browser side");
+    let index = history
+        .get("currentIndex")
+        .and_then(Json::as_i64)
+        .expect("an index");
+    let entries = history
+        .get("entries")
+        .and_then(Json::as_array)
+        .expect("entries");
+    assert!(index >= 1, "somewhere to go back to: {history}");
+    let id = entries[index as usize - 1]
+        .get("id")
+        .and_then(Json::as_i64)
+        .expect("an entry id");
+    tab.connection
+        .call_within(
+            "Page.navigateToHistoryEntry",
+            Json::object(vec![("entryId", Json::number(id as f64))]),
+            Duration::from_secs(1),
+        )
+        .expect("the step answers on a crashed page");
+    eprintln!("history and the step in {:?}", started.elapsed());
+    follow(tab, Duration::from_secs(5));
+    assert_eq!(tab.problem, None, "the entry landed");
+    assert!(!tab.is_crashed());
+
+    // Crash once more, and close it the way `ctrl+w` does.
+    let _crash = tab
+        .connection
+        .send("Page.crash", Json::empty())
+        .expect("Page.crash sent");
+    browser_event(
+        &mut browser,
+        "Target.targetCrashed",
+        &target,
+        Duration::from_secs(1),
+        |_| {},
+    )
+    .expect("crashed again");
+    let started = Instant::now();
+    let closed = browser
+        .call_within(
+            "Target.closeTarget",
+            Json::object(vec![("targetId", Json::string(&target))]),
+            Duration::from_secs(1),
+        )
+        .expect("closeTarget answers on a crashed tab");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(closed.get("success").and_then(Json::as_bool), Some(true));
+    let tab = tabs.active_mut().expect("the tab, until the list hears");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while tab.connection.ended().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ended = tab.connection.ended().expect("the session ends");
+    assert!(ended.contains("detached"), "{ended}");
+
+    drop(tabs);
+    browser.close();
+    engine.kill();
+}
+
+/// The engine dying outright ends every session on the pipe at once, and the
+/// session file it leaves says the run did not quit — which is what the next
+/// start reads to offer the tabs back.
+#[test]
+fn an_engine_that_dies_ends_every_session_at_once_and_leaves_the_session_file_open() {
+    let root = temp_dir("session-died");
+    let dir = root.join("profile");
+    let profile = Profile::take(Choice::At(dir.clone())).expect("a kept profile");
+    let Some((mut engine, page)) = connect_in(profile) else {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let browser = engine.browser().expect("the browser's client");
+
+    let mut kept = Session::load(&dir);
+    let two = Snapshot {
+        tabs: vec![
+            session::Entry {
+                url: "https://a.example/".to_string(),
+                title: "A".to_string(),
+            },
+            session::Entry {
+                url: "https://b.example/".to_string(),
+                title: String::new(),
+            },
+        ],
+        active: 1,
+    };
+    let now = Instant::now();
+    kept.record(two.clone(), now);
+    kept.flush(now).expect("written");
+
+    let group = engine.group().expect("a group of its own");
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{group}")])
+        .status()
+        .expect("kill runs");
+    assert!(killed.success());
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while (browser.ended().is_none() || page.ended().is_none()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let ended = browser.ended().expect("the browser's client ends");
+    assert!(ended.contains("closed its end"), "{ended}");
+    let ended = page.ended().expect("the page's session ends");
+    assert!(ended.contains("closed its end"), "{ended}");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while engine.check().is_ok() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let why = engine.check().unwrap_err();
+    eprintln!("{why}");
+
+    let saved = Session::load(&dir).saved().cloned().expect("a session");
+    assert_eq!(saved.state, State::Open, "the run did not quit");
+    assert_eq!(saved.snapshot, two);
+    kept.finish(false);
+    assert_eq!(
+        Session::load(&dir).saved().map(|saved| saved.state),
+        Some(State::Open)
+    );
+    kept.finish(true);
+    assert_eq!(
+        Session::load(&dir).saved().map(|saved| saved.state),
+        Some(State::Closed)
+    );
+
+    drop(page);
+    drop(browser);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A restored tab is a blank target wearing the saved url and title: the
+/// engine's own news about the blank page does not change them, nothing is
+/// loaded until it is asked for, and once asked for it lands like any page.
+#[test]
+fn a_dormant_tab_is_a_blank_target_that_keeps_its_name_and_loads_when_asked() {
+    let Some((mut engine, mut page, target)) = connect_with_target() else {
+        return;
+    };
+    page.call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+    let saved = session::Entry {
+        url: "data:text/html,<title>saved</title>saved".to_string(),
+        title: "Saved".to_string(),
+    };
+
+    // As `open_dormant` does it.
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("a target");
+    let id = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("its id")
+        .to_string();
+    let mut connection = browser
+        .attach(&id, Duration::from_secs(5))
+        .expect("a session on it");
+    connection
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    let mut tab = Tab::new(id.clone(), connection, "about:blank");
+    tab.url = saved.url.clone();
+    tab.title = saved.title.clone();
+    tab.dormant = true;
+    tabs.open(tab);
+
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let mut about_it = 0;
+    let mut started = 0;
+    while Instant::now() < deadline {
+        for event in browser.events() {
+            let ours = event
+                .params
+                .path(&["targetInfo", "targetId"])
+                .and_then(Json::as_str)
+                == Some(id.as_str());
+            let outcome = tabs.take(&event, |_| Err("no new tab".to_string()));
+            if ours {
+                about_it += 1;
+                assert!(
+                    matches!(outcome, Outcome::Ignored),
+                    "{}: {}",
+                    event.method,
+                    event.params
+                );
+            }
+        }
+        let tab = tabs.active_mut().expect("the dormant tab");
+        started += tab
+            .connection
+            .events()
+            .iter()
+            .filter(|event| event.method == "Page.frameStartedNavigating")
+            .count();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!("{about_it} events about the blank target while it slept");
+    let tab = tabs.active_mut().expect("the dormant tab");
+    assert_eq!(tab.url, saved.url, "the saved url stands");
+    assert_eq!(tab.title, saved.title, "and the saved title");
+    assert_eq!(started, 0, "nothing was loaded");
+
+    // Woken: the flag first, then the page.
+    tab.dormant = false;
+    navigate_tab(tab, &saved.url);
+    let landings = follow(tab, Duration::from_secs(2));
+    assert!(
+        matches!(landings.as_slice(), [Landing::Document(_)]),
+        "{landings:?}"
+    );
+    assert_eq!(tab.title, "saved");
+    assert!(!tab.dormant);
+
+    drop(tabs);
+    browser.close();
     engine.kill();
 }

@@ -1,19 +1,19 @@
 //! `blinkterm`: a web page in a terminal pane.
+//!
+//! Everything between `argv` and `app::run` is `blinkterm::options`; this
+//! file is the help text and what to do with the answer.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
-use blinkterm::app::{self, Options};
-use blinkterm::appearance;
-use blinkterm::download;
+use blinkterm::app;
+use blinkterm::doctor;
 use blinkterm::engine;
-use blinkterm::profile::Choice;
-use blinkterm::zoom::Scale;
+use blinkterm::options::{self, Invocation};
 
 const USAGE: &str = "\
 blinkterm, a real browser in a terminal pane
 
-usage: blinkterm [options] [url]
+usage: blinkterm [options] [url ...]
 
 options:
   -h, --help       show this message
@@ -37,15 +37,50 @@ options:
                    auto (the default) asks the terminal its background
   --force-dark     paint every page dark, even one with no dark style
                    (Chromium's auto dark mode)
+  --engine <path>  the Chromium to run (default: $BLINKTERM_ENGINE, else
+                   the first of chrome-headless-shell, chromium,
+                   chromium-browser, google-chrome, chromium-shell on PATH)
+  --engine-arg <--flag>
+                   one more argument for the engine; repeatable
+                   (--accept-lang=ja, --disable-features=...). Four are
+                   refused because they would undo what this program set:
+                   --remote-debugging-port, --remote-allow-origins,
+                   --remote-debugging-pipe, --user-data-dir
+  --user-agent <text>
+                   what pages are told the browser is
+  --proxy <host:port|scheme://host:port|direct://>
+                   send requests through a proxy (loopback never is)
+  --home <url>     the page opened when no url is given (default: about:blank)
+  --restore        reopen the tabs the last run had
+  --normal-mode    start in normal mode (ctrl+., below)
+  --config <path>  read settings from <path> instead of
+                   $XDG_CONFIG_HOME/blinkterm/config (~/.config/blinkterm/config)
+  --no-config      read no settings file
+  --print-engine   print which engine would be run, and exit
+  --doctor         start the engine, ask the terminal whether it speaks the
+                   Kitty graphics and keyboard protocols, print what was
+                   found, and exit; 1 if something is missing
+  --               everything after it is a url
+
+Several urls open one tab each, the first in front.
+
+Settings can be kept in $XDG_CONFIG_HOME/blinkterm/config, one per line as
+\"name = value\", where the names are the options above without their --
+(scale = 2, color-scheme = dark, engine-arg = --accept-lang=ja, which may
+be repeated; a line starting with # is a comment). The command line
+overrides the file; $BLINKTERM_ENGINE sits between them.
 
 The page is rendered by a headless Chromium, which this program starts and
-stops. It is looked for in $BLINKTERM_ENGINE first, then on PATH as
-chrome-headless-shell, chromium, chromium-browser, google-chrome or
-chromium-shell. blinkterm does not ship one; install the one you want.
+stops. It is looked for in --engine, then $BLINKTERM_ENGINE, then the
+settings file, then on PATH as chrome-headless-shell, chromium,
+chromium-browser, google-chrome or chromium-shell. blinkterm does not ship
+one; install the one you want.
 
 A profile is made readable by you alone (0700), and one blinkterm uses it at a
 time: a second one started on the same profile is refused, and told which pid
-has it.
+has it. The open tabs are saved in the profile; --restore reopens them, and
+after a crash the next start offers to. Bookmarks are one file for every
+profile, $XDG_DATA_HOME/blinkterm/bookmarks, one url<TAB>title per line.
 
 A file a page offers — a link to a PDF, a Content-Disposition: attachment —
 is saved in the download directory under its own name, \"report (1).pdf\" if
@@ -64,10 +99,24 @@ keys:
   alt+left/right back and forward
   ctrl+t         a new tab, with the cursor in the url bar
   ctrl+w         close this tab; closing the last one quits
+  ctrl+shift+t   reopen the last tab closed (alt+t where the terminal or the
+                 compositor keeps ctrl+shift+t)
+  ctrl+d         bookmark this page, or remove the bookmark
   ctrl+tab       the next tab, ctrl+shift+tab the one before
-  alt+1 .. alt+9 the nth tab
+  alt+1 .. alt+8 the nth tab; alt+9 the last tab
+  ctrl+shift+a   the tab list (alt+a too): type to filter, up/down to pick,
+                 enter to switch, esc to close
+  ctrl+shift+pageup/pagedown
+                 move this tab left, right (alt+shift+pageup/pagedown too)
+  middle click or ctrl+click on a link
+                 open it in a tab behind this one
   alt+= / alt+-  zoom in, out (ctrl+= / ctrl+- where the terminal lets them
                  through); alt+0 / ctrl+0 back to 100%
+  ctrl+.         normal mode on or off; in it the letters are keys: f labels
+                 what can be clicked and typing a label clicks it (F opens a
+                 link in a tab behind), j/k scroll a notch, d/u half a
+                 screen, gg/G to the ends, H/L back and forward, r reload,
+                 o the url bar, O a new tab, / find, i back to the page
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no
 Everything else goes to the page. A link that asks for a new window gets a
@@ -76,22 +125,31 @@ new tab, and the tab is switched to.
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{USAGE}");
-        return ExitCode::SUCCESS;
-    }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("blinkterm {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
-    }
-
-    let options = match parse(&args) {
-        Ok(options) => options,
+    let invocation = match options::invocation(&args) {
+        Ok(invocation) => invocation,
         Err(why) => {
+            // A settings file is the person's own text and can hold anything,
+            // so the sentence that quotes it is plain text first.
+            let why = blinkterm::text::sanitize(&why);
             eprintln!("blinkterm: {why}");
             eprintln!("try 'blinkterm --help'");
             return ExitCode::from(2);
         }
+    };
+    let options = match invocation {
+        Invocation::Help => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Invocation::Version => {
+            println!("blinkterm {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Invocation::PrintEngine(options) => return exit(doctor::print_engine(&options)),
+        Invocation::Doctor(options, provenance) => {
+            return exit(doctor::report(&options, &provenance));
+        }
+        Invocation::Run(options) => options,
     };
 
     match app::run(options) {
@@ -114,363 +172,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// The command line, less `--help` and `--version`, which have been answered
-/// by the time this is called.
-///
-/// Both spellings of `--profile` are taken — `--profile DIR` and
-/// `--profile=DIR` — because both are what people type. `--profile` and
-/// `--temp-profile` together is a contradiction rather than a preference, so it
-/// is refused instead of one of them quietly winning, and so is either one
-/// twice. `--download-dir` is taken the same two ways and refused twice for
-/// the same reason.
-///
-/// `--search-url` is taken the same two ways, and refused without a `%s`,
-/// which is where the words go: a search url without one would send every
-/// search to the same page, and the person would find that out by searching.
-///
-/// `--scale` and `--color-scheme` are taken the same two ways and refused
-/// twice for the same reason, each with its own parser's sentence for a value
-/// it does not know. `--force-dark` is a flag with nothing after it, and is
-/// refused twice as everything else is: a command line that says a thing
-/// twice was put together by something that meant two different things.
-fn parse(args: &[String]) -> Result<Options, String> {
-    let mut url = None;
-    let mut profile = None;
-    let mut downloads = None;
-    let mut search_url = None;
-    let mut scale = None;
-    let mut scheme = None;
-    let mut force_dark = false;
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        let dir = if arg == "--download-dir" {
-            Some(
-                args.next()
-                    .filter(|dir| !dir.is_empty())
-                    .ok_or(DOWNLOAD_DIR_NEEDED)?
-                    .as_str(),
-            )
-        } else if let Some(dir) = arg.strip_prefix("--download-dir=") {
-            if dir.is_empty() {
-                return Err(DOWNLOAD_DIR_NEEDED.to_string());
-            }
-            Some(dir)
-        } else {
-            None
-        };
-        if let Some(dir) = dir {
-            if downloads.replace(PathBuf::from(dir)).is_some() {
-                return Err("one download directory at a time".to_string());
-            }
-            continue;
-        }
-        let search = if arg == "--search-url" {
-            Some(args.next().map(String::as_str).unwrap_or_default())
-        } else {
-            arg.strip_prefix("--search-url=")
-        };
-        if let Some(search) = search {
-            if search.is_empty() {
-                return Err("--search-url needs a url: --search-url <url with %s>".to_string());
-            }
-            if !search.contains("%s") {
-                return Err("--search-url needs a %s where the words go".to_string());
-            }
-            if search_url.replace(search.to_string()).is_some() {
-                return Err("one search url at a time".to_string());
-            }
-            continue;
-        }
-        if let Some(text) = value_of(arg, "--scale", &mut args) {
-            if scale.replace(Scale::parse(text)?).is_some() {
-                return Err("one scale at a time".to_string());
-            }
-            continue;
-        }
-        if let Some(text) = value_of(arg, "--color-scheme", &mut args) {
-            if scheme.replace(appearance::Choice::parse(text)?).is_some() {
-                return Err("one colour scheme at a time".to_string());
-            }
-            continue;
-        }
-        if arg == "--force-dark" {
-            if force_dark {
-                return Err("--force-dark once is enough".to_string());
-            }
-            force_dark = true;
-            continue;
-        }
-        let chosen = if arg == "--temp-profile" {
-            Some(Choice::Temporary)
-        } else if arg == "--profile" {
-            let dir = args
-                .next()
-                .ok_or("--profile needs a directory: --profile <dir>")?;
-            Some(Choice::At(PathBuf::from(dir)))
-        } else if let Some(dir) = arg.strip_prefix("--profile=") {
-            if dir.is_empty() {
-                return Err("--profile needs a directory: --profile <dir>".to_string());
-            }
-            Some(Choice::At(PathBuf::from(dir)))
-        } else {
-            None
-        };
-        if let Some(chosen) = chosen {
-            if profile.replace(chosen).is_some() {
-                return Err("one profile at a time".to_string());
-            }
-            continue;
-        }
-        if arg.starts_with('-') && arg.len() > 1 {
-            return Err(format!("unknown option: {arg}"));
-        }
-        if url.replace(arg.clone()).is_some() {
-            return Err("one page at a time".to_string());
-        }
-    }
-    Ok(Options {
-        url: url.unwrap_or_else(|| "about:blank".to_string()),
-        profile: profile.unwrap_or(Choice::Default),
-        download: downloads.map_or(download::Choice::Default, download::Choice::At),
-        search_url,
-        scale: scale.unwrap_or(Scale::Auto),
-        scheme: scheme.unwrap_or_default(),
-        force_dark,
-    })
-}
-
-/// The value of `--name value` or `--name=value`, when `arg` is that option:
-/// what came after it, or an empty string when nothing did, for the option's
-/// own parser to refuse by name.
-fn value_of<'a>(
-    arg: &'a str,
-    name: &str,
-    rest: &mut std::slice::Iter<'a, String>,
-) -> Option<&'a str> {
-    if arg == name {
-        return Some(rest.next().map(String::as_str).unwrap_or_default());
-    }
-    arg.strip_prefix(name)?.strip_prefix('=')
-}
-
-const DOWNLOAD_DIR_NEEDED: &str = "--download-dir needs a directory: --download-dir <dir>";
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parsed(args: &[&str]) -> Result<Options, String> {
-        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-        parse(&args)
-    }
-
-    #[test]
-    fn with_no_flags_the_profile_is_the_default_one() {
-        let options = parsed(&[]).expect("nothing is fine");
-        assert_eq!(options.profile, Choice::Default);
-        assert_eq!(options.download, download::Choice::Default);
-        assert_eq!(options.url, "about:blank");
-        assert_eq!(options.search_url, None, "nothing typed is searched");
-    }
-
-    #[test]
-    fn a_search_url_can_be_named_either_way_round_the_equals_sign() {
-        let search = "https://duckduckgo.com/?q=%s";
-        for args in [
-            &["--search-url", search, "example.com"][..],
-            &["--search-url=https://duckduckgo.com/?q=%s", "example.com"][..],
-            &["example.com", "--search-url", search][..],
-        ] {
-            let options = parsed(args).expect("a search url");
-            assert_eq!(options.search_url.as_deref(), Some(search), "{args:?}");
-            assert_eq!(options.url, "example.com", "{args:?}");
-        }
-    }
-
-    #[test]
-    fn a_search_url_needs_a_percent_s() {
-        let why = parsed(&["--search-url", "https://duckduckgo.com/"])
-            .err()
-            .expect("refused");
-        assert!(why.contains("%s"), "{why}");
-        for args in [&["--search-url"][..], &["--search-url="][..]] {
-            let why = parsed(args).err().expect("refused");
-            assert!(why.contains("--search-url"), "{args:?}: {why}");
-        }
-    }
-
-    #[test]
-    fn two_search_urls_are_one_too_many() {
-        let why = parsed(&["--search-url=a%s", "--search-url", "b%s"])
-            .err()
-            .expect("refused");
-        assert_eq!(why, "one search url at a time");
-    }
-
-    #[test]
-    fn with_no_flags_the_scale_and_the_scheme_are_auto() {
-        let options = parsed(&[]).expect("nothing is fine");
-        assert_eq!(options.scale, Scale::Auto);
-        assert_eq!(options.scheme, appearance::Choice::Auto);
-        assert!(!options.force_dark, "nothing is painted dark unasked");
-    }
-
-    #[test]
-    fn a_scale_can_be_named_either_way_round_the_equals_sign() {
-        for args in [
-            &["--scale", "2", "example.com"][..],
-            &["--scale=2", "example.com"][..],
-            &["example.com", "--scale", "2"][..],
-        ] {
-            let options = parsed(args).expect("a scale");
-            assert_eq!(options.scale, Scale::Fixed(2.0), "{args:?}");
-            assert_eq!(options.url, "example.com", "{args:?}");
-        }
-        let options = parsed(&["--scale=auto"]).expect("auto");
-        assert_eq!(options.scale, Scale::Auto);
-    }
-
-    #[test]
-    fn a_scale_that_is_not_a_number_in_range_is_an_error_that_names_the_option() {
-        for args in [
-            &["--scale"][..],
-            &["--scale="][..],
-            &["--scale", "0"][..],
-            &["--scale=5"][..],
-            &["--scale", "big"][..],
-        ] {
-            let why = parsed(args).err().expect("refused");
-            assert!(why.contains("--scale"), "{args:?}: {why}");
-        }
-    }
-
-    #[test]
-    fn two_scales_are_one_too_many() {
-        let why = parsed(&["--scale=2", "--scale", "auto"])
-            .err()
-            .expect("refused");
-        assert_eq!(why, "one scale at a time");
-    }
-
-    #[test]
-    fn a_colour_scheme_is_one_of_three_words() {
-        for (word, choice) in [
-            ("auto", appearance::Choice::Auto),
-            ("light", appearance::Choice::Light),
-            ("dark", appearance::Choice::Dark),
-        ] {
-            let options = parsed(&["--color-scheme", word]).expect("a scheme");
-            assert_eq!(options.scheme, choice, "{word}");
-            let options = parsed(&[&format!("--color-scheme={word}")]).expect("a scheme");
-            assert_eq!(options.scheme, choice, "{word}");
-        }
-        for args in [&["--color-scheme"][..], &["--color-scheme=black"][..]] {
-            let why = parsed(args).err().expect("refused");
-            assert!(why.contains("--color-scheme"), "{args:?}: {why}");
-        }
-        let why = parsed(&["--color-scheme=dark", "--color-scheme=light"])
-            .err()
-            .expect("refused");
-        assert_eq!(why, "one colour scheme at a time");
-    }
-
-    #[test]
-    fn force_dark_is_a_flag_with_nothing_after_it() {
-        let options = parsed(&["--force-dark", "example.com"]).expect("a flag");
-        assert!(options.force_dark);
-        assert_eq!(options.url, "example.com", "what follows is the page");
-        let why = parsed(&["--force-dark=yes"]).err().expect("refused");
-        assert!(why.contains("--force-dark=yes"), "{why}");
-        let why = parsed(&["--force-dark", "--force-dark"])
-            .err()
-            .expect("refused");
-        assert_eq!(why, "--force-dark once is enough");
-    }
-
-    #[test]
-    fn a_profile_can_be_named_either_way_round_the_equals_sign() {
-        for args in [
-            &["--profile", "x", "example.com"][..],
-            &["--profile=x", "example.com"][..],
-            &["example.com", "--profile", "x"][..],
-        ] {
-            let options = parsed(args).expect("a profile");
-            assert_eq!(options.profile, Choice::At(PathBuf::from("x")), "{args:?}");
-            assert_eq!(options.url, "example.com", "{args:?}");
-        }
-    }
-
-    #[test]
-    fn a_temporary_profile_is_asked_for_by_name() {
-        let options = parsed(&["--temp-profile"]).expect("a temporary profile");
-        assert_eq!(options.profile, Choice::Temporary);
-    }
-
-    #[test]
-    fn two_profiles_are_one_too_many() {
-        for args in [
-            &["--profile", "x", "--temp-profile"][..],
-            &["--temp-profile", "--profile=x"][..],
-            &["--profile=x", "--profile=y"][..],
-        ] {
-            let why = parsed(args).err().expect("refused");
-            assert_eq!(why, "one profile at a time", "{args:?}");
-        }
-    }
-
-    #[test]
-    fn a_profile_with_no_directory_is_an_error_that_names_the_option() {
-        for args in [&["--profile"][..], &["--profile="][..]] {
-            let why = parsed(args).err().expect("refused");
-            assert!(why.contains("--profile"), "{args:?}: {why}");
-        }
-    }
-
-    #[test]
-    fn a_download_directory_can_be_named_either_way_round_the_equals_sign() {
-        for args in [
-            &["--download-dir", "x", "example.com"][..],
-            &["--download-dir=x", "example.com"][..],
-            &["example.com", "--download-dir", "x", "--temp-profile"][..],
-        ] {
-            let options = parsed(args).expect("a download directory");
-            assert_eq!(
-                options.download,
-                download::Choice::At(PathBuf::from("x")),
-                "{args:?}"
-            );
-            assert_eq!(options.url, "example.com", "{args:?}");
-        }
-    }
-
-    #[test]
-    fn two_download_directories_are_one_too_many() {
-        for args in [
-            &["--download-dir", "x", "--download-dir", "y"][..],
-            &["--download-dir=x", "--download-dir=x"][..],
-        ] {
-            let why = parsed(args).err().expect("refused");
-            assert_eq!(why, "one download directory at a time", "{args:?}");
-        }
-    }
-
-    #[test]
-    fn a_download_directory_with_no_directory_is_an_error_that_names_the_option() {
-        for args in [
-            &["--download-dir"][..],
-            &["--download-dir="][..],
-            &["--download-dir", ""][..],
-        ] {
-            let why = parsed(args).err().expect("refused");
-            assert!(why.contains("--download-dir"), "{args:?}: {why}");
-        }
-    }
-
-    #[test]
-    fn one_page_at_a_time_and_no_options_that_do_not_exist() {
-        let why = parsed(&["a.com", "b.com"]).err().expect("refused");
-        assert_eq!(why, "one page at a time");
-        let why = parsed(&["--incognito"]).err().expect("refused");
-        assert!(why.contains("--incognito"), "{why}");
+/// 0 for a yes, 1 for a no.
+fn exit(fine: bool) -> ExitCode {
+    if fine {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

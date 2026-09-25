@@ -66,11 +66,32 @@
 //!
 //! `wire` is how the two descriptors get to be 3 and 4, and every step of it
 //! is there because the obvious version was wrong.
+//!
+//! # What a person may add, and the four they may not
+//!
+//! The flags above stay a constant. What `--engine-arg`, `--user-agent` and
+//! `--proxy` add is appended to them in a [`Launch`], after the fixed flags
+//! and before the url, so that where an extra repeats a fixed flag the
+//! engine's rule — the last one wins, measured against
+//! `chrome-headless-shell` 153 — lets the person's win. `--user-agent=` is
+//! process-wide: measured, it is what `Browser.getVersion` reports, what the
+//! first page and every target made later see in `navigator.userAgent`, and
+//! what an origin receives, so no per-session override is needed.
+//!
+//! Four are refused by name, [`RESERVED_ARGS`], because each would silently
+//! undo a paragraph above. `--remote-debugging-port=0` added beside the pipe
+//! was measured to answer on the pipe *and* print `DevTools listening on`,
+//! write `DevToolsActivePort` into the profile and hold one more listening
+//! socket: exactly the hole the pipe closed. `--remote-allow-origins` is only
+//! meaningful with that port. `--user-data-dir` is what `--profile` names,
+//! and the lock is taken on that directory, not on one the engine was told
+//! about behind its back. A second `--remote-debugging-pipe` is already
+//! there.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -104,6 +125,77 @@ pub const CANDIDATES: [&str; 5] = [
 
 /// The environment variable that overrides the search.
 pub const ENGINE_ENV: &str = "BLINKTERM_ENGINE";
+
+/// The engine arguments `--engine-arg` refuses, each with why; see the
+/// module's section on them.
+///
+/// Matched on the flag's name — the part before any `=` — so that
+/// `--remote-debugging-port=0` is refused and a flag whose name merely
+/// begins with the same letters is not.
+pub const RESERVED_ARGS: [(&str, &str); 4] = [
+    (
+        "--remote-debugging-port",
+        "it would open a port beside the pipe",
+    ),
+    (
+        "--remote-allow-origins",
+        "it lets web pages reach a debugging port",
+    ),
+    ("--remote-debugging-pipe", "the pipe is already there"),
+    ("--user-data-dir", "it is what --profile sets"),
+];
+
+/// Why `arg` may not be handed to the engine, if it may not: one of
+/// [`RESERVED_ARGS`], by name.
+pub fn reserved(arg: &str) -> Option<&'static str> {
+    let name = arg.split('=').next().unwrap_or(arg);
+    RESERVED_ARGS
+        .iter()
+        .find(|(reserved, _)| *reserved == name)
+        .map(|(_, why)| *why)
+}
+
+/// How the engine is started, beyond the profile: the answer to `--engine`,
+/// `--engine-arg`, `--user-agent` and `--proxy`. Every field's default is
+/// what the program did before there were options.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Launch {
+    /// `--engine`, or `$BLINKTERM_ENGINE`, or `engine =`, already folded in
+    /// that order; `None` is [`locate`]'s search.
+    pub path: Option<PathBuf>,
+    /// `--engine-arg`s, in order, after [`flags`] and before the url. None
+    /// of them is one of [`RESERVED_ARGS`]; the option parser saw to that.
+    pub args: Vec<String>,
+    /// `--user-agent`: the engine's `--user-agent=`.
+    pub user_agent: Option<String>,
+    /// `--proxy`: the engine's `--proxy-server=`.
+    pub proxy: Option<String>,
+}
+
+impl Launch {
+    /// The engine's whole argument list after `--user-data-dir`: the fixed
+    /// flags, then `--user-agent=`, `--proxy-server=`, then `args`, then the
+    /// url. Pure; this is what the unit test checks.
+    pub fn arguments(&self, as_root: bool) -> Vec<String> {
+        let mut fixed: Vec<String> = flags(as_root).into_iter().map(String::from).collect();
+        let url = fixed.pop();
+        if let Some(agent) = &self.user_agent {
+            fixed.push(format!("--user-agent={agent}"));
+        }
+        if let Some(proxy) = &self.proxy {
+            fixed.push(format!("--proxy-server={proxy}"));
+        }
+        fixed.extend(self.args.iter().cloned());
+        fixed.extend(url);
+        fixed
+    }
+
+    /// Whether the person's own arguments turn the sandbox off, which is
+    /// said out loud as root's `--no-sandbox` is.
+    fn unsandboxed(&self) -> bool {
+        self.args.iter().any(|arg| arg == "--no-sandbox")
+    }
+}
 
 /// How many lines of the engine's stderr are kept to explain a death: the
 /// first `HEAD` and the last `TAIL`, with whatever came between dropped.
@@ -341,18 +433,42 @@ fn state_and_group(stat: &str) -> Option<(char, i32)> {
 /// Where the engine is, or a sentence about why there is none.
 pub fn locate() -> Result<PathBuf, String> {
     if let Some(named) = std::env::var_os(ENGINE_ENV) {
-        let path = PathBuf::from(&named);
-        if is_executable(&path) {
-            return Ok(path);
-        }
-        if let Some(found) = search_path(&path.to_string_lossy()) {
-            return Ok(found);
-        }
-        return Err(format!(
-            "{ENGINE_ENV} names {}, which is not an executable",
-            path.display()
-        ));
+        return named_engine(Path::new(&named), ENGINE_ENV);
     }
+    search_candidates()
+}
+
+/// [`locate`], with an engine already named by the command line, the
+/// environment or the config file — folded, in that order, by
+/// [`crate::options::resolve`] — in front of the search.
+///
+/// `named` is taken as `$BLINKTERM_ENGINE` is: a path that is executable,
+/// else a name searched on `PATH`, else a sentence. `None` is [`locate`]
+/// itself, variable and all, which is what a run with no engine named
+/// anywhere does.
+pub fn locate_with(named: Option<&Path>) -> Result<PathBuf, String> {
+    match named {
+        Some(path) => named_engine(path, "the engine setting"),
+        None => locate(),
+    }
+}
+
+/// An engine somebody named, by `source`, which is only for the sentence.
+fn named_engine(path: &Path, source: &str) -> Result<PathBuf, String> {
+    if is_executable(path) {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(found) = search_path(&path.to_string_lossy()) {
+        return Ok(found);
+    }
+    Err(format!(
+        "{source} names {}, which is not an executable",
+        path.display()
+    ))
+}
+
+/// The `PATH` search over [`CANDIDATES`].
+fn search_candidates() -> Result<PathBuf, String> {
     for candidate in CANDIDATES {
         if let Some(found) = search_path(candidate) {
             return Ok(found);
@@ -375,7 +491,7 @@ fn search_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
-fn is_executable(path: &std::path::Path) -> bool {
+fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
@@ -421,20 +537,36 @@ impl Engine {
     /// the engine is: see [`crate::profile`] for why the directory is always
     /// named, and why the lock on it is this program's.
     pub fn launch(profile: Profile, timeout: Duration) -> Result<Engine, String> {
-        let path = locate()?;
+        Engine::launch_with(profile, timeout, &Launch::default())
+    }
+
+    /// [`Engine::launch`], started the way `launch` says: which engine, and
+    /// what is added to its fixed flags.
+    pub fn launch_with(
+        profile: Profile,
+        timeout: Duration,
+        launch: &Launch,
+    ) -> Result<Engine, String> {
+        let path = locate_with(launch.path.as_deref())?;
         // SAFETY: `geteuid(2)` takes nothing, reads no memory and cannot fail.
         let as_root = unsafe { libc::geteuid() } == 0;
-        if as_root {
+        // Root is told by the flag this program adds; anyone else who added
+        // it with `--engine-arg` is told the same, for the same reason.
+        if as_root || launch.unsandboxed() {
             // Said out loud, because `--no-sandbox` is added silently below and
             // it is the one flag here that takes a protection away rather than
             // adding one. The renderer is the part of Chromium that parses
             // what a page sends; the sandbox is what stops a bug in it from
             // being the machine. This runs before `Pane::enter`, so it lands
             // on the ordinary screen rather than under the alternate one.
-            eprintln!(
-                "blinkterm: running as root, so the engine gets --no-sandbox: \
-                 Chromium will not start as root without it."
-            );
+            if as_root {
+                eprintln!(
+                    "blinkterm: running as root, so the engine gets --no-sandbox: \
+                     Chromium will not start as root without it."
+                );
+            } else {
+                eprintln!("blinkterm: --engine-arg --no-sandbox was given, so the engine has it.");
+            }
             eprintln!(
                 "blinkterm: that is the sandbox off, on the program that renders \
                  untrusted pages. Run as an ordinary user if you can."
@@ -451,7 +583,7 @@ impl Engine {
         let mut command = Command::new(&path);
         command
             .arg(format!("--user-data-dir={}", profile.dir().display()))
-            .args(flags(as_root))
+            .args(launch.arguments(as_root))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -926,6 +1058,67 @@ mod tests {
     fn an_override_that_names_a_real_program_is_taken() {
         let found = with_engine_env(Some("/bin/sh"), locate);
         assert_eq!(found.as_deref().map(|p| p.to_str().unwrap()), Ok("/bin/sh"));
+    }
+
+    #[test]
+    fn a_launch_puts_its_extras_after_the_flags_and_before_the_url() {
+        for as_root in [false, true] {
+            let plain: Vec<String> = flags(as_root).into_iter().map(String::from).collect();
+            assert_eq!(Launch::default().arguments(as_root), plain);
+        }
+        let launch = Launch {
+            path: None,
+            args: vec!["--accept-lang=ja".into(), "--headless=old".into()],
+            user_agent: Some("blinkterm-test/1.0 (measured)".into()),
+            proxy: Some("socks5://127.0.0.1:1080".into()),
+        };
+        let mut wanted: Vec<String> = flags(false).into_iter().map(String::from).collect();
+        let url = wanted.pop().expect("a url");
+        wanted.extend([
+            "--user-agent=blinkterm-test/1.0 (measured)".to_string(),
+            "--proxy-server=socks5://127.0.0.1:1080".to_string(),
+            "--accept-lang=ja".to_string(),
+            "--headless=old".to_string(),
+            url,
+        ]);
+        assert_eq!(launch.arguments(false), wanted);
+    }
+
+    #[test]
+    fn the_reserved_arguments_are_the_ones_that_would_reopen_the_port_or_move_the_profile() {
+        let names: Vec<&str> = RESERVED_ARGS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            [
+                "--remote-debugging-port",
+                "--remote-allow-origins",
+                "--remote-debugging-pipe",
+                "--user-data-dir",
+            ]
+        );
+        assert!(reserved("--remote-debugging-port=0").is_some());
+        assert!(reserved("--remote-debugging-port").is_some());
+        assert!(reserved("--user-data-dir=/x").is_some());
+        assert_eq!(
+            reserved("--remote-debugging-portal"),
+            None,
+            "a name, not letters"
+        );
+        assert_eq!(reserved("--accept-lang=ja"), None);
+    }
+
+    #[test]
+    fn an_engine_named_on_the_command_line_is_taken_before_the_variable() {
+        let found = with_engine_env(Some("/nonexistent/chromium"), || {
+            locate_with(Some(Path::new("/bin/sh")))
+        });
+        assert_eq!(found, Ok(PathBuf::from("/bin/sh")));
+        let failed = with_engine_env(Some("/nonexistent/chromium"), || locate_with(None))
+            .expect_err("the variable's engine is not there");
+        assert!(failed.contains(ENGINE_ENV), "{failed}");
+        let failed = with_engine_env(None, || locate_with(Some(Path::new("/nonexistent/x"))))
+            .expect_err("nor is this one");
+        assert!(failed.contains("/nonexistent/x"), "{failed}");
     }
 
     /// Set the variable, run, put it back. The tests that use it are in one

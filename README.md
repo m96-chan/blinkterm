@@ -95,7 +95,8 @@ It wants the usual Chromium libraries (its `deb.deps` lists them) and, if you
 read any CJK, `fonts-noto-cjk`: without it every Japanese glyph is a box.
 
 Anything Chromium-shaped will do, with one caution. `blinkterm` looks at
-`$BLINKTERM_ENGINE` first, then on `PATH` for `chrome-headless-shell`,
+`--engine <path>` first, then `$BLINKTERM_ENGINE`, then `engine = <path>` in
+the [settings](#settings), then on `PATH` for `chrome-headless-shell`,
 `chromium`, `chromium-browser`, `google-chrome` and `chromium-shell`, in that
 order. Debian's `chromium-shell` is last because it is Chromium's
 `content_shell`, not a headless shell: it keeps a DevTools port open beside
@@ -155,6 +156,107 @@ you alone (0600) too, and keeps the last 500. `--temp-profile` keeps the
 levels in memory for the run and writes none; deleting the file forgets
 every level.
 
+### Bookmarks
+
+`ctrl+d` bookmarks the page in front, and `ctrl+d` again removes the
+bookmark; the row says which. They are kept in one file for every profile,
+`$XDG_DATA_HOME/blinkterm/bookmarks` (or `~/.local/share/blinkterm/bookmarks`),
+beside the default profile rather than in any of them — the same file under
+`--profile` and under `--temp-profile`, because a profile is the engine's data
+and a bookmark is yours: pressing `ctrl+d` in a throwaway profile is asking
+for that one page to outlive it. The file is readable by you alone (0600), one
+bookmark a line:
+
+```text
+https://example.com/<TAB>Example Domain
+# a comment
+https://a.example/notitle
+```
+
+A url and its title, separated by a tab; a line that is only a url is a
+bookmark with no title, and anything else — a `#` comment, a blank, a
+mistake — is left exactly where it is when `blinkterm` changes the file. Edit
+it with anything; `grep` it to see what is kept. A url is matched exactly, so
+`https://example.com/` and `https://example.com` are two bookmarks. The url
+bar offers bookmarks before the pages you visited: the dim suggestion is a
+bookmark's when one starts with what you typed, and `↑` walks the bookmarks
+that match before the history. Two `blinkterm`s can share the file: every
+change takes a lock on `bookmarks.lock` and reads the file again first, so
+neither loses the other's bookmark; what one adds shows up in the other after
+its next `ctrl+d` or its next start.
+
+### The session
+
+The tabs you have open — their urls, their titles and which one is in front —
+are kept in the profile, in a file called `session`, readable by you alone
+(0600) and written within half a second of any change. Nothing else of a tab
+is: not how far down a page you were, not what you had typed into a form.
+`blinkterm --restore` (or `restore = true` in the configuration file) reopens
+them at start, in order, with the one that was in front in front; a url on
+the command line as well opens in one more tab, in front of them. A restored
+tab loads its page the first time you look at it, not all at once: the strip
+shows the saved titles straight away, and twenty tabs cost half a second of
+start rather than twenty pages fetched. At most 100 tabs are restored.
+
+After a run that did not end with a quit — a crash, a `kill -9`, the engine
+dying — the next start asks on the row: `restore 3 tabs from last time?
+y/n`. `y` or `enter` restores them; `n`, `esc`, or simply getting on with
+something else declines, and the question waits under anything else that
+wants the row. How a run that did not quit is known is the file's first line,
+`# blinkterm session: open` until the run quits and writes `closed`.
+`--temp-profile` keeps the session in memory, for `ctrl+shift+t`, and writes
+nothing.
+## Settings
+
+Everything on the command line can also be kept in
+`$XDG_CONFIG_HOME/blinkterm/config` — `~/.config/blinkterm/config` when
+`XDG_CONFIG_HOME` is not set — one setting per line, named as the option is
+without its `--`:
+
+    # what a page is told about you
+    color-scheme = dark
+    scale = 2
+    user-agent = Mozilla/5.0 (X11; Linux x86_64) blinkterm
+    # the engine
+    engine = /opt/chrome-headless-shell-linux64/chrome-headless-shell
+    engine-arg = --accept-lang=ja
+    engine-arg = --disable-features=Translate
+    proxy = socks5://127.0.0.1:1080
+
+The command line wins over the file, and `$BLINKTERM_ENGINE` sits between
+the two for `engine`. `--config <path>` reads another file, `--no-config`
+none. A line the program does not understand stops it with the file and
+line number; a missing file is nothing. A flag is `true` or `false`
+(`force-dark = true`), and a path may start with `~/`. There is no `url`
+setting: the page to open is what the command line is for, and
+`home = <url>` is the page opened when none is given. `normal-mode = true`
+starts in normal mode (`ctrl+.`), and `restore = true`
+reopens the last session's tabs (see [The session](#the-session)).
+
+`--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
+repeatable. Four are refused because they would undo something this
+program set on purpose: `--remote-debugging-port` and
+`--remote-allow-origins` would open the DevTools port the pipe replaced
+([#5](https://github.com/m96-chan/blinkterm/issues/5)), `--user-data-dir`
+is `--profile`, and `--remote-debugging-pipe` is already there. Everything
+else goes through as written, and where it repeats a flag the program set,
+Chromium takes the last. `--user-agent` and `--proxy` are the two everybody
+wants and have names of their own; loopback never goes through the proxy.
+(`--lang=ja` does nothing in the headless shell; `--accept-lang=ja` is the
+one that changes what pages are told.)
+
+Several urls open several tabs, the first in front:
+
+    blinkterm https://example.com https://example.org
+
+`--doctor` is the first thing to run in a new terminal: it starts the engine
+on a throwaway profile, asks the terminal whether it speaks the Kitty
+graphics and keyboard protocols, and prints one line per answer, exiting 1
+when the engine did not answer or the terminal answered neither. In tmux
+without `allow-passthrough` it will tell you the terminal did not answer,
+which is the truth. `--print-engine` prints the path the search finds and
+nothing else, for scripts.
+
 ## Downloads
 
 A file a page offers — a link to a PDF, anything served as
@@ -212,12 +314,17 @@ not a thing a terminal has.
 | --- | --- |
 | `ctrl+l` | type a url. In the url bar, `←`/`→`, `home`/`end`, `ctrl+a`/`ctrl+e` and `alt+b`/`alt+f` (or `ctrl+←`/`ctrl+→`) move; `ctrl+w`/`alt+backspace` and `alt+d` delete a word; `ctrl+u`/`ctrl+k` delete to either end; `↑`/`↓` walk the pages visited; a dim suggestion after what you typed is taken with `tab` or `→` |
 | `ctrl+f` | find in the page. Type and the matches are highlighted as you go, the current one in orange and scrolled into view; the row says `3/17`. `enter`/`ctrl+g`/`↓` next, `shift+enter`/`ctrl+shift+g`/`↑` previous; the same editing keys as the url bar; `esc` closes and clears. The next `ctrl+f` offers the last needle again |
-| `ctrl+r` | reload |
+| `ctrl+r` | reload; a page whose renderer crashed comes back with it |
 | `alt+left` / `alt+right` | back and forward |
 | `ctrl+t` | a new tab, with the cursor in the url bar |
 | `ctrl+w` | close this tab; closing the last one quits |
+| `ctrl+shift+t` / `alt+t` | reopen the tab closed last, and the one before it on the next press (up to twenty, this run). `alt+t` is there because `ctrl+shift+t` is `ctrl+t` in a terminal without the Kitty keyboard protocol, and never reaches a tOS pane, whose compositor takes it for a workspace |
+| `ctrl+d` | bookmark this page; again to remove the bookmark |
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
-| `alt+1` … `alt+9` | the nth tab |
+| `alt+1` … `alt+8`, `alt+9` | the nth tab, the last tab |
+| `ctrl+shift+a` (or `alt+a`) | the tab list: type to filter by title or url, `↑`/`↓` to pick, `enter` to switch, `esc` to close |
+| `ctrl+shift+pageup` / `pagedown` (or `alt+shift+pageup` / `pagedown`) | move this tab left or right |
+| middle click or `ctrl`+click on a link | open it in a tab behind this one |
 | `alt+=` / `alt+-` | zoom in and out (`ctrl+=` / `ctrl+-` where your terminal lets them through) |
 | `alt+0` / `ctrl+0` | back to 100% |
 | your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
@@ -227,9 +334,21 @@ not a thing a terminal has.
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
 | `esc` | while a page is loading and nothing else has the row, stop it |
+| `ctrl+.` | normal mode on or off. In normal mode the letters are keys of their own and the row says `normal`: `f` labels everything clickable on the screen and typing a label clicks it (`F` opens a link in a tab behind this one); `j`/`k` scroll a notch, `d`/`u` half a screen, `gg`/`G` to the top and bottom; `H`/`L` back and forward, `r` reload, `o` the url bar, `O` a new tab, `/` find; `i` goes back to typing into the page, as does clicking into a field. Off by default: nothing changes until you press it |
 
 Everything else goes to the page, including the mouse. A link that asks for a
 new window gets a new tab, and the tab is switched to.
+
+With more tabs than the row can name, the strip shows a run of them around
+the one in front and `+N` at either end for how many are past it; it scrolls
+when the tab in front reaches an edge. The list (`ctrl+shift+a`) shows all of
+them. Kitty and Ghostty keep `ctrl+shift+a` for themselves and every terminal
+keeps `ctrl+shift+pageup`/`pagedown` — Kitty and tOS for the scrollback,
+WezTerm and Ghostty for their own tabs — so each has an `alt` form that
+reaches the program everywhere. Ghostty also keeps `alt+1`..`alt+9` for its
+tabs; its `alt+9` is its last tab, as it is here. A middle or `ctrl` click
+opens a link behind the current tab, as a desktop browser does; a link that
+asks for a window (`target=_blank`) still comes to the front.
 
 `ctrl+c` and `ctrl+v` are the page's own: they copy and paste within the
 engine, not with your clipboard. Your terminal's paste key (`ctrl+shift+v`, a
@@ -241,7 +360,19 @@ OSC 52, which your terminal may need to be told to allow.
 The url bar is asked about every key first while it is open, so `alt+←`/`→`
 are back and forward only when it is closed — in the bar they move by a word —
 and `ctrl+w`, `ctrl+t` and the rest do nothing there; `esc` closes it. The
-find prompt is the same.
+find prompt and the tab list are the same.
+
+Normal mode is for browsing without a mouse. The labels are drawn by the
+page itself, in one element this program adds to the document while they
+show and takes away after; a page can see that element and could remove
+it, and the next key puts it back. Labelled: links, buttons, fields,
+anything with `onclick`, a `role`, or a pointer cursor, in the page and in
+its same-origin frames and open shadow roots; not hidden things, not what
+something else covers, not image-map areas, not cross-origin frames. In
+normal mode an unbound letter does nothing, so nothing is typed into a
+field by mistake; arrows, Tab, Enter, Space and every `ctrl`/`alt` key
+still reach the page. `esc` takes the labels off; `ctrl+.` turns the mode
+off.
 
 Find is case-insensitive, matches text as the page shows it — spaces
 collapsed, a word split across `<b>` still one word, never across a
@@ -329,7 +460,16 @@ link and an I-beam over a text field; the rest ignore it. A zoom that is not
 
 The url bar, the find prompt, a page's dialog and a file input's path take
 the whole row while they are open, and `esc` goes to whichever of them has it
-before it stops a load; no link is shown while one of them is there.
+before it stops a load; no link is shown while one of them is there. The
+offer to restore the last run's tabs takes it too, after all of them.
+
+A page whose renderer crashes stays in its tab: the picture goes, and the row
+says `this page crashed; ctrl+r reloads it` — a tab behind that crashed says
+the same in the strip. `ctrl+r` brings it back, painting, at the size it was;
+`ctrl+w` closes it; keys and the mouse do nothing to it until then. When the
+engine itself dies `blinkterm` exits, and the message says how many tabs were
+saved and that `blinkterm --restore` reopens them; the next plain start
+offers to.
 
 To know what is under the pointer the terminal is asked to report every
 mouse movement, not only presses (`?1003h`), so the page now sees the

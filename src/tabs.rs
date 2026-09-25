@@ -44,6 +44,33 @@
 //! says it has finished loading. That is one `Runtime.evaluate` per load per
 //! tab — event-driven rather than polled, and a background tab that never
 //! loads anything costs nothing at all.
+//!
+//! # A link opened with a modifier has no opener
+//!
+//! A target the engine announces is a tab when the list does not have it
+//! already, and whether it comes to the front is decided by one field:
+//! `openerId`. Measured against `chrome-headless-shell` 153, a click on a link
+//! sent as this program sends every click:
+//!
+//! | click | opener's session | new target's `openerId` | current tab |
+//! | --- | --- | --- | --- |
+//! | left, plain link | `frameRequestedNavigation {disposition: "currentTab"}` | — | goes there |
+//! | middle, plain link | `… {disposition: "newTab"}` | absent | stays |
+//! | ctrl+left, plain link | `… {disposition: "newTab"}` | absent | stays |
+//! | shift+left, plain link | `… {disposition: "newWindow"}` | absent | stays |
+//! | left, `target=_blank` | `Page.windowOpen` | present | stays |
+//! | middle or ctrl, `javascript:` link or not a link | nothing opens | — | stays |
+//!
+//! So a page that asks for a window names itself as the opener, and a link
+//! the *person* opened with a modifier names nobody. The first comes to the
+//! front, as it does in a desktop browser; the second goes behind, because a
+//! person who pressed a modifier is asking for the page later. This list used
+//! to refuse a page target with no opener at all, on the reasoning that the
+//! only such targets were this program's own — and every middle click was a
+//! page the engine loaded, rendered and kept for nobody until it exited. The
+//! disposition on the opener's session says the same thing in words, but it
+//! arrives on another connection a moment before the target, and the loop
+//! reads the browser's mailbox first; the opener's absence is enough.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -137,6 +164,20 @@ pub struct Tab<C> {
     /// A page with a host takes its host's level when it lands and when its
     /// tab comes to the front, so two tabs on one site zoom together.
     pub zoom: Zoom,
+    /// Whether the page is one that has not been asked for yet: a restored
+    /// tab, whose target is an `about:blank` carrying the url and title it
+    /// will have, loaded the first time the tab comes to the front (see
+    /// [`crate::session`]). While it is, the engine's renames of the blank
+    /// target it was made as are not taken — they would put `about:blank`
+    /// over the saved url.
+    pub dormant: bool,
+    /// Whether a crashed page has a new renderer on its way: the engine said
+    /// `Inspector.targetReloadedAfterCrash`, which comes first on every road
+    /// back — a reload, a history step, a typed url (measured) — so the next
+    /// landing is the page back. A landing read before it is one from before
+    /// the crash, which the same pass can still be holding, and does not
+    /// revive anything. See [`Tab::crashed`].
+    pub reviving: bool,
 }
 
 impl<C> Tab<C> {
@@ -156,7 +197,40 @@ impl<C> Tab<C> {
             committed: true,
             trust: Trust::Plain,
             zoom: Zoom::DEFAULT,
+            dormant: false,
+            reviving: false,
         }
+    }
+
+    /// `Target.targetCrashed`: the renderer behind this page died.
+    ///
+    /// The tab stays — the target is still there, and a reload brings a new
+    /// renderer (measured in the #18 design against chrome-headless-shell
+    /// 153) — with everything that was true of the old renderer taken off it:
+    /// nothing is loading, no dialog is open (its renderer went with the
+    /// alert), no file input is asking, and the page answers nothing until it
+    /// lands again — after [`Tab::reviving`], so that a landing from before
+    /// the crash read in the same pass is not taken for the page coming back
+    /// — which [`Tab::landed`] notices by clearing the problem. Nothing but
+    /// a landing clears it: a load starting or a `Page.navigate` failing is
+    /// still the dead renderer's tab until something has landed. A dormant
+    /// tab is left dormant: it has no page of its own to crash.
+    pub fn crashed(&mut self) {
+        self.problem = Some(Problem::Crashed);
+        self.reviving = false;
+        self.loading = false;
+        self.since = None;
+        self.note = None;
+        self.dialog = None;
+        self.upload = None;
+        self.committed = false;
+    }
+
+    /// Whether the renderer is dead: nothing renderer-bound may be sent to
+    /// it, and one command in particular takes the whole engine down (see
+    /// [`crate::app::revive`]).
+    pub fn is_crashed(&self) -> bool {
+        matches!(self.problem, Some(Problem::Crashed))
     }
 
     /// `Page.frameStartedNavigating` for the main frame: the page is leaving
@@ -179,7 +253,10 @@ impl<C> Tab<C> {
         }
         self.loading = true;
         self.committed = false;
-        self.problem = None;
+        // A crash stays said until the new renderer has landed something.
+        if !self.is_crashed() {
+            self.problem = None;
+        }
     }
 
     /// `Page.frameStoppedLoading` for the main frame: the load is over,
@@ -241,6 +318,13 @@ impl<C> Tab<C> {
     /// is what keeps "still loading" honest against a `Page.navigate` that
     /// timed out here and failed in the engine afterwards.
     pub fn landed(&mut self, landing: Landing) {
+        // A crashed page's landing that came before the engine said a new
+        // renderer was coming is the old renderer's last word, read late: the
+        // tab is still dead, and nothing about it changes.
+        if self.is_crashed() && !self.reviving {
+            return;
+        }
+        self.reviving = false;
         // Read before it is set below: it says whether a reason from
         // `failed_to_reach` belongs to this landing.
         let ours = self.loading;
@@ -294,6 +378,11 @@ impl<C> Tab<C> {
     /// been and gone. An unreachable problem on the tab can only be this
     /// navigation's, because `navigate` cleared it before sending.
     pub fn failed_to_reach(&mut self, url: &str, code: &str) {
+        // A crashed tab keeps saying so until something lands; the error
+        // page's landing says the rest.
+        if self.is_crashed() {
+            return;
+        }
         self.note = None;
         if let Some(Problem::Unreachable { reason, .. }) = &mut self.problem {
             reason.get_or_insert_with(|| code.to_string());
@@ -394,7 +483,9 @@ impl<C> Tab<C> {
         // of them: a 404 page has both, and the site's own words for what went
         // wrong are usually in the title.
         let status = match &self.problem {
-            Some(problem @ Problem::Unreachable { .. }) => return load::sentence(problem),
+            Some(problem @ (Problem::Unreachable { .. } | Problem::Crashed)) => {
+                return load::sentence(problem)
+            }
             Some(Problem::Status(status)) => Some(load::status_phrase(*status)),
             None => None,
         };
@@ -426,7 +517,7 @@ impl<C> Tab<C> {
         if let Some(note) = &self.note {
             return Cow::Borrowed(note);
         }
-        if let Some(problem @ Problem::Unreachable { .. }) = &self.problem {
+        if let Some(problem @ (Problem::Unreachable { .. } | Problem::Crashed)) = &self.problem {
             return Cow::Owned(load::sentence(problem));
         }
         if !self.title.is_empty() {
@@ -505,6 +596,33 @@ impl<C> Tabs<C> {
         self.active
     }
 
+    /// Add a tab at the end and leave the one in front where it is.
+    ///
+    /// A link the person opened with a modifier — middle, ctrl, shift — is
+    /// asking for the page *later*; taking them to it now would be the one
+    /// thing they pressed a modifier to avoid. The index is where it went.
+    pub fn open_behind(&mut self, tab: Tab<C>) -> usize {
+        self.tabs.push(tab);
+        self.tabs.len() - 1
+    }
+
+    /// Swap the tab in front with its neighbour on the left (`-1`) or the
+    /// right (`+1`); it stays in front. `false` at an end, so that a row that
+    /// did not change is not redrawn: a strip that wrapped the last tab round
+    /// to the first would be a strip whose order changed under the numbers
+    /// the person was reading.
+    pub fn move_active(&mut self, direction: isize) -> bool {
+        let Some(to) = self.active.checked_add_signed(direction.signum()) else {
+            return false;
+        };
+        if direction == 0 || to >= self.tabs.len() {
+            return false;
+        }
+        self.tabs.swap(self.active, to);
+        self.active = to;
+        true
+    }
+
     /// Take a tab out of the list and hand it back, so that the caller can
     /// close its connection where a failure can be reported.
     ///
@@ -558,6 +676,18 @@ impl<C> Tabs<C> {
         moved
     }
 
+    /// The last tab, whatever its number: `alt+9`. `false` when already
+    /// there, or when there is no tab at all.
+    ///
+    /// Not `select(9)`: with twelve tabs the ninth is nobody's reflex, and
+    /// Chrome, Firefox and Ghostty all make the 9 key "the last one".
+    pub fn select_last(&mut self) -> bool {
+        match self.tabs.len().checked_sub(1) {
+            Some(last) => self.switch_to(last),
+            None => false,
+        }
+    }
+
     /// Make `index` the tab in front.
     pub fn switch_to(&mut self, index: usize) -> bool {
         if index >= self.tabs.len() || index == self.active {
@@ -581,20 +711,32 @@ impl<C> Tabs<C> {
             return Outcome::Ignored;
         };
         match change {
-            Change::Opened { target, url } => {
-                if let Some(index) = self.index_of(&target) {
-                    // Already ours — the engine says so twice when a target is
-                    // created and then attached.
-                    return if self.switch_to(index) {
-                        Outcome::Opened
-                    } else {
-                        Outcome::Ignored
-                    };
+            Change::Opened {
+                target,
+                url,
+                opener,
+            } => {
+                if self.index_of(&target).is_some() {
+                    // Already ours: a target this program asked for, which is
+                    // in the list before its announcement is read, or the
+                    // engine saying so twice. Not switched to — a tab opened
+                    // behind is ours and not in front, and its own
+                    // announcement a pass later is not the person asking
+                    // for it.
+                    return Outcome::Ignored;
                 }
                 match open(&target) {
                     Ok(connection) => {
-                        self.open(Tab::new(target, connection, url));
-                        Outcome::Opened
+                        let tab = Tab::new(target, connection, url);
+                        if opener.is_some() {
+                            Outcome::Opened {
+                                index: self.open(tab),
+                            }
+                        } else {
+                            Outcome::OpenedBehind {
+                                index: self.open_behind(tab),
+                            }
+                        }
                     }
                     Err(why) => Outcome::Failed(format!("that link wanted a new tab: {why}")),
                 }
@@ -605,8 +747,11 @@ impl<C> Tabs<C> {
                 };
                 let tab = &mut self.tabs[index];
                 // An empty url in a target's information means the engine has
-                // not decided yet, not that the page has no address.
-                if url.is_empty() || tab.url == url {
+                // not decided yet, not that the page has no address. And a
+                // dormant tab is an `about:blank` wearing the name of the page
+                // it will load: the engine renaming the blank target is not
+                // news, and taking it would lose the saved url and title.
+                if url.is_empty() || tab.url == url || tab.dormant {
                     return Outcome::Ignored;
                 }
                 tab.url = url;
@@ -617,24 +762,22 @@ impl<C> Tabs<C> {
                 tab.note = None;
                 Outcome::Renamed
             }
-            Change::Closed { target } => self.gone(&target, None),
-            Change::Crashed { target } => self.gone(
-                &target,
-                Some("the page in that tab stopped answering, so the tab is gone".to_string()),
-            ),
-        }
-    }
-
-    fn gone(&mut self, target: &str, why: Option<String>) -> Outcome<C> {
-        match self.index_of(target) {
-            Some(index) => match self.close(index) {
-                Some(tab) => Outcome::Gone {
-                    tab: Box::new(tab),
-                    why,
+            Change::Closed { target } => match self.index_of(&target) {
+                Some(index) => match self.close(index) {
+                    Some(tab) => Outcome::Gone { tab: Box::new(tab) },
+                    None => Outcome::Ignored,
                 },
                 None => Outcome::Ignored,
             },
-            None => Outcome::Ignored,
+            // A crashed tab is not closed: the target is still there and a
+            // reload brings the page back, which is Chrome's own sad tab.
+            Change::Crashed { target } => match self.index_of(&target) {
+                Some(index) => {
+                    self.tabs[index].crashed();
+                    Outcome::Crashed { index }
+                }
+                None => Outcome::Ignored,
+            },
         }
     }
 }
@@ -643,17 +786,19 @@ impl<C> Tabs<C> {
 pub enum Outcome<C> {
     /// Nothing the list cares about.
     Ignored,
-    /// A tab was added and is now in front.
-    Opened,
+    /// A tab was added and is now in front: the page asked for a window.
+    Opened { index: usize },
+    /// A tab was added behind the one in front: the person asked for a page
+    /// later. The row is out of date and nothing else is.
+    OpenedBehind { index: usize },
     /// A tab's title or url moved, so the row is out of date.
     Renamed,
     /// A tab is no longer in the list. Its connection comes back with it, to
-    /// be closed by the caller, and `why` is the sentence to put on the row
-    /// when the page did not simply close itself.
-    Gone {
-        tab: Box<Tab<C>>,
-        why: Option<String>,
-    },
+    /// be closed by the caller.
+    Gone { tab: Box<Tab<C>> },
+    /// The renderer behind the tab at `index` died. The tab stays, marked
+    /// [`Tab::is_crashed`], until a reload brings it back.
+    Crashed { index: usize },
     /// A target that should have become a tab could not be connected to.
     Failed(String),
 }
@@ -665,9 +810,16 @@ pub enum Outcome<C> {
 /// against a list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    /// A page target somebody else opened: a link with `target=_blank`, or the
-    /// `window.open` a click ran.
-    Opened { target: String, url: String },
+    /// A page target somebody else made.
+    Opened {
+        target: String,
+        url: String,
+        /// The target that asked for it, when one did: a `target=_blank`
+        /// link, a `window.open`. `None` for a link the person opened with a
+        /// modifier, which the engine announces with no opener at all
+        /// (measured; see the module documentation).
+        opener: Option<String>,
+    },
     /// A target's url is now this.
     ///
     /// The event carries a title as well and it is deliberately not read: see
@@ -692,27 +844,28 @@ pub fn change(event: &Event) -> Option<Change> {
             if info.get("type").and_then(Json::as_str) != Some("page") {
                 return None;
             }
-            // Only a target with an opener. A target this program asked for
+            // Every page target, opener or not. One this program asked for
             // has none, and neither has the `about:blank` the engine started
-            // with — both are already tabs by the time the event arrives, and
-            // acting on it again would open the same page twice.
+            // with — but both are already tabs by the time the event is read,
+            // and [`Tabs::take`] knows them by id. A link opened with a
+            // modifier has none either, and is the reason this is not the
+            // rule it used to be: see the module documentation.
             //
-            // All five ways a page can ask for a window were checked against
-            // `chromium-shell` before this rule was trusted, because one of
-            // them not carrying an opener would be a click that does nothing:
-            // a `target=_blank` link, the same link with `rel=noopener`, a
-            // `window.open` from a click handler, the same with `noopener`, and
-            // a `window.open` from a script with no user gesture at all. Every
-            // one of them arrives with `openerId` set. What differs between
-            // them is `canAccessOpener`, which is about what the *page* may
-            // reach and is none of this program's business. The url, on the
-            // other hand, is empty in this event for all five: the target is
-            // announced before it has an address, and the address comes along
-            // afterwards as `Target.targetInfoChanged`.
-            let opener = info.get("openerId").and_then(Json::as_str)?;
-            if opener.is_empty() {
-                return None;
-            }
+            // All five ways a *page* can ask for a window were checked against
+            // `chromium-shell` — a `target=_blank` link, the same link with
+            // `rel=noopener`, a `window.open` from a click handler, the same
+            // with `noopener`, and a `window.open` from a script with no user
+            // gesture at all — and every one arrives with `openerId` set. What
+            // differs between them is `canAccessOpener`, which is about what
+            // the *page* may reach and is none of this program's business. The
+            // url, on the other hand, is empty in this event for all of them:
+            // the target is announced before it has an address, and the
+            // address comes along afterwards as `Target.targetInfoChanged`.
+            let opener = info
+                .get("openerId")
+                .and_then(Json::as_str)
+                .filter(|opener| !opener.is_empty())
+                .map(str::to_string);
             Some(Change::Opened {
                 target: info.get("targetId").and_then(Json::as_str)?.to_string(),
                 url: text::sanitize(
@@ -721,6 +874,7 @@ pub fn change(event: &Event) -> Option<Change> {
                         .unwrap_or("about:blank"),
                 )
                 .into_owned(),
+                opener,
             })
         }
         "Target.targetInfoChanged" => {
@@ -877,18 +1031,101 @@ mod tests {
     }
 
     #[test]
-    fn a_page_that_opens_a_page_becomes_a_tab_and_one_that_does_not_does_not() {
+    fn alt_9_goes_to_the_last_tab_however_many_there_are() {
+        let mut tabs = three();
+        assert!(tabs.select_last());
+        assert_eq!(tabs.active_index(), 2);
+        assert!(!tabs.select_last(), "already there");
+        for n in 3..12 {
+            tabs.open_behind(tab(&format!("t{n}"), "T"));
+        }
+        assert_eq!(tabs.len(), 12);
+        assert!(tabs.select_last());
+        assert_eq!(
+            tabs.active_index(),
+            11,
+            "the twelfth, which alt+9 used not to reach"
+        );
+    }
+
+    #[test]
+    fn a_tab_opened_behind_goes_to_the_end_and_the_one_in_front_stays() {
+        let mut tabs = three();
+        tabs.select(2);
+        assert_eq!(tabs.open_behind(tab("d", "D")), 3);
+        assert_eq!(tabs.active_index(), 1, "still the same page in front");
+        assert_eq!(titles(&tabs), ["A", "B", "C", "D"]);
+    }
+
+    #[test]
+    fn moving_the_active_tab_swaps_it_with_its_neighbour_and_stops_at_the_ends() {
+        let mut tabs = three();
+        tabs.select(2);
+        assert!(tabs.move_active(1));
+        assert_eq!(titles(&tabs), ["A", "C", "B"]);
+        assert_eq!(tabs.active_index(), 2, "the tab moved and stayed in front");
+        assert_eq!(tabs.active_target(), Some("b"));
+        assert!(!tabs.move_active(1), "the right-hand end does not wrap");
+        assert_eq!(titles(&tabs), ["A", "C", "B"]);
+        assert!(tabs.move_active(-1));
+        assert!(tabs.move_active(-1));
+        assert_eq!(titles(&tabs), ["B", "A", "C"]);
+        assert_eq!(tabs.active_index(), 0);
+        assert!(!tabs.move_active(-1), "nor the left-hand one");
+        assert_eq!(titles(&tabs), ["B", "A", "C"]);
+        assert!(!tabs.move_active(0), "and nowhere is not a move");
+    }
+
+    /// The `Target.targetCreated` the engine sent for a middle click on a
+    /// plain link, verbatim from the measurement: no `openerId` at all.
+    const MIDDLE_CLICKED: &str = r#"{"targetInfo":{"targetId":"BD60D04AA738978694171207AD9FFC0C","type":"page","title":"","url":"","attached":false,"canAccessOpener":false}}"#;
+
+    /// And the one for a `target=_blank` link, which names its opener.
+    const BLANK_TARGET: &str = r#"{"targetInfo":{"targetId":"1D99054AF031A8C7D61EFBD73659F428","type":"page","title":"","url":"","openerId":"32E59B2597C038E2553DB6525A75506C","canAccessOpener":false,"openerFrameId":"32E59B2597C038E2553DB6525A75506C","attached":false}}"#;
+
+    #[test]
+    fn a_link_the_person_opened_behind_is_a_tab_behind_and_a_page_that_asks_for_a_window_comes_in_front(
+    ) {
         let mut tabs = Tabs::new(tab("a", "A"));
 
-        // The engine announcing the target this program asked for: no opener,
-        // so it is already a tab and the event says nothing.
-        let mine = event(
-            "Target.targetCreated",
-            r#"{"targetInfo":{"targetId":"b","type":"page","url":"about:blank",
-                "title":"","attached":false}}"#,
+        let middle = event("Target.targetCreated", MIDDLE_CLICKED);
+        assert!(matches!(
+            tabs.take(&middle, |_| Ok(1)),
+            Outcome::OpenedBehind { index: 1 }
+        ));
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.active_index(), 0, "behind: the page in front stays");
+        assert_eq!(
+            tabs.iter().nth(1).map(|t| t.label().into_owned()),
+            Some("new tab".to_string())
         );
-        assert!(matches!(tabs.take(&mine, |_| Ok(1)), Outcome::Ignored));
-        assert_eq!(tabs.len(), 1);
+        // Its address comes a millisecond later, as for every new target.
+        let renamed = event(
+            "Target.targetInfoChanged",
+            r#"{"targetInfo":{"targetId":"BD60D04AA738978694171207AD9FFC0C","type":"page",
+                "title":"","url":"http://127.0.0.1:39453/plain","attached":false}}"#,
+        );
+        assert!(matches!(tabs.take(&renamed, |_| Ok(0)), Outcome::Renamed));
+        assert_eq!(
+            tabs.iter().nth(1).map(|t| t.url.as_str()),
+            Some("http://127.0.0.1:39453/plain")
+        );
+
+        let blank = event("Target.targetCreated", BLANK_TARGET);
+        assert!(matches!(
+            tabs.take(&blank, |_| Ok(3)),
+            Outcome::Opened { index: 2 }
+        ));
+        assert_eq!(
+            tabs.active_index(),
+            2,
+            "a page that asked for a window is in front"
+        );
+        assert_eq!(tabs.active().map(|t| t.connection), Some(3));
+
+        // The same target announced again is not a second tab.
+        assert!(matches!(tabs.take(&blank, |_| Ok(4)), Outcome::Ignored));
+        assert_eq!(tabs.len(), 3);
 
         // Something that is not a page: a service worker, an iframe with a
         // process of its own.
@@ -898,26 +1135,50 @@ mod tests {
                 "openerId":"a","title":""}}"#,
         );
         assert!(matches!(tabs.take(&worker, |_| Ok(2)), Outcome::Ignored));
-        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs.len(), 3);
 
-        // A link with target=_blank, which is the one that counts.
-        let opened = event(
+        // The engine announcing a target this program asked for, which is
+        // already in the list by then: no opener, and nothing to do.
+        let mine = event(
             "Target.targetCreated",
-            r#"{"targetInfo":{"targetId":"b","type":"page","openerId":"a",
-                "url":"https://example.com/second","title":""}}"#,
+            r#"{"targetInfo":{"targetId":"a","type":"page","url":"about:blank",
+                "title":"","attached":false}}"#,
         );
-        assert!(matches!(tabs.take(&opened, |_| Ok(3)), Outcome::Opened));
-        assert_eq!(tabs.len(), 2);
-        assert_eq!(tabs.active_target(), Some("b"), "and it is switched to");
-        assert_eq!(
-            tabs.active().map(|t| t.url.as_str()),
-            Some("https://example.com/second")
-        );
-        assert_eq!(tabs.active().map(|t| t.connection), Some(3));
+        assert!(matches!(tabs.take(&mine, |_| Ok(5)), Outcome::Ignored));
+        assert_eq!(tabs.len(), 3, "and still one tab of it");
+    }
 
-        // The same target announced again is not a second tab.
-        assert!(matches!(tabs.take(&opened, |_| Ok(4)), Outcome::Ignored));
-        assert_eq!(tabs.len(), 2);
+    #[test]
+    fn a_tab_this_program_opened_behind_is_not_pulled_forward_by_its_own_announcement() {
+        let mut tabs = three();
+        tabs.open_behind(tab("d", "D"));
+        let announced = event(
+            "Target.targetCreated",
+            r#"{"targetInfo":{"targetId":"d","type":"page","url":"","title":"","attached":true}}"#,
+        );
+        assert!(matches!(tabs.take(&announced, |_| Ok(9)), Outcome::Ignored));
+        assert_eq!(tabs.active_index(), 0, "the tab in front is still in front");
+        assert_eq!(tabs.len(), 4);
+    }
+
+    #[test]
+    fn change_reads_the_opener_when_there_is_one_and_says_so_when_there_is_not() {
+        assert_eq!(
+            change(&event("Target.targetCreated", MIDDLE_CLICKED)),
+            Some(Change::Opened {
+                target: "BD60D04AA738978694171207AD9FFC0C".to_string(),
+                url: String::new(),
+                opener: None,
+            })
+        );
+        assert_eq!(
+            change(&event("Target.targetCreated", BLANK_TARGET)),
+            Some(Change::Opened {
+                target: "1D99054AF031A8C7D61EFBD73659F428".to_string(),
+                url: String::new(),
+                opener: Some("32E59B2597C038E2553DB6525A75506C".to_string()),
+            })
+        );
     }
 
     #[test]
@@ -943,7 +1204,8 @@ mod tests {
             change(&opened),
             Some(Change::Opened {
                 target: "b".to_string(),
-                url: "https://evil.example/moc.knab".to_string()
+                url: "https://evil.example/moc.knab".to_string(),
+                opener: Some("a".to_string()),
             })
         );
     }
@@ -998,10 +1260,7 @@ mod tests {
         tabs.select(2);
         let destroyed = event("Target.targetDestroyed", r#"{"targetId":"b"}"#);
         match tabs.take(&destroyed, |_| Ok(0)) {
-            Outcome::Gone { tab, why } => {
-                assert_eq!(tab.target, "b");
-                assert_eq!(why, None, "window.close() needs no explanation");
-            }
+            Outcome::Gone { tab } => assert_eq!(tab.target, "b"),
             _ => panic!("the tab should be gone"),
         }
         assert_eq!(titles(&tabs), ["A", "C"]);
@@ -1015,16 +1274,73 @@ mod tests {
     #[test]
     fn a_renderer_that_dies_is_a_sentence_and_not_a_panic() {
         let mut tabs = three();
-        let crashed = event("Target.targetCrashed", r#"{"targetId":"a","errorCode":5}"#);
-        match tabs.take(&crashed, |_| Ok(0)) {
-            Outcome::Gone { tab, why } => {
-                assert_eq!(tab.target, "a");
-                let why = why.expect("a crash says why");
-                assert!(why.contains("tab"), "{why}");
-            }
-            _ => panic!("a crashed tab is gone"),
+        {
+            let a = tabs.get_mut(0).expect("a");
+            a.loading = true;
+            a.since = Some(Instant::now());
+            let opening = event(
+                "Page.javascriptDialogOpening",
+                r#"{"type":"alert","message":"hi","url":"https://a.example/"}"#,
+            );
+            assert!(a.dialog_event(&opening));
         }
-        assert_eq!(titles(&tabs), ["B", "C"]);
+        let crashed = event("Target.targetCrashed", r#"{"targetId":"a","errorCode":5}"#);
+        assert!(matches!(
+            tabs.take(&crashed, |_| Ok(0)),
+            Outcome::Crashed { index: 0 }
+        ));
+        assert_eq!(tabs.len(), 3, "the tab stays");
+        let a = tabs.get_mut(0).expect("a");
+        assert!(a.is_crashed());
+        let sentence = "this page crashed; ctrl+r reloads it";
+        assert_eq!(a.line(), sentence);
+        assert_eq!(a.label(), sentence);
+        assert!(!a.loading);
+        assert_eq!(a.since, None);
+        assert!(a.dialog.is_none(), "the alert went with its renderer");
+        assert!(!a.committed);
+
+        let stranger = event("Target.targetCrashed", r#"{"targetId":"zz","errorCode":5}"#);
+        assert!(matches!(tabs.take(&stranger, |_| Ok(0)), Outcome::Ignored));
+
+        // A landing from before the crash, read late, changes nothing; nor
+        // does the reload starting, or a navigation failing.
+        let a = tabs.get_mut(0).expect("a");
+        a.landed(Landing::Document("https://stale.example/".to_string()));
+        assert!(a.is_crashed(), "the old renderer's last word");
+        assert_eq!(a.url, "https://a.example");
+        a.started("https://a.example/".to_string(), Instant::now());
+        a.failed_to_reach("https://a.example/", "net::ERR_FAILED");
+        assert!(a.is_crashed());
+        // The engine says a new renderer is coming, and the landing after
+        // that is the page back.
+        a.reviving = true;
+        a.landed(Landing::Document("https://a.example/".to_string()));
+        assert!(!a.is_crashed(), "the reload's landing brings it back");
+        assert!(!a.reviving);
+        assert!(a.committed);
+    }
+
+    #[test]
+    fn a_dormant_tab_keeps_its_saved_name_until_it_is_woken() {
+        let mut tabs = Tabs::new(Tab::new("a", 0, "about:blank"));
+        {
+            let a = tabs.active_mut().expect("a");
+            a.url = "https://saved.example/".to_string();
+            a.title = "Saved".to_string();
+            a.dormant = true;
+        }
+        let renamed = event(
+            "Target.targetInfoChanged",
+            r#"{"targetInfo":{"targetId":"a","type":"page","url":"about:blank"}}"#,
+        );
+        assert!(matches!(tabs.take(&renamed, |_| Ok(0)), Outcome::Ignored));
+        let a = tabs.active_mut().expect("a");
+        assert_eq!(a.url, "https://saved.example/");
+        assert_eq!(a.title, "Saved");
+        a.dormant = false;
+        assert!(matches!(tabs.take(&renamed, |_| Ok(0)), Outcome::Renamed));
+        assert_eq!(tabs.active().expect("a").url, "about:blank");
     }
 
     #[test]
