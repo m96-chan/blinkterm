@@ -10,6 +10,11 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Changed
+
+- `brew install m96-chan/tap/blinkterm` installs the tagged release; `--HEAD`
+  is only needed for main.
+
 ## [0.1.0] - 2026-09-25
 
 The first tag.
