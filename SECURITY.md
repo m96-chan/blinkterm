@@ -75,7 +75,9 @@ machine. It prints a warning when it does. Do not browse as root.
   hand your clipboard back ([#9](https://github.com/m96-chan/blinkterm/issues/9)).
 
   The hover url is the page's string and goes through the same sanitizer as
-  the title (#28). The pointer shape sent to the terminal is one of a fixed
+  the title (#28). The tab list (`ctrl+shift+a`) is the one other text this
+  program writes, on the rows under the status row while it is open: its rows
+  are titles and urls and go through the same sanitizer as the row. The pointer shape sent to the terminal is one of a fixed
   table of names this program owns — the page's `cursor` value chooses among
   them and is never itself written
   ([#15](https://github.com/m96-chan/blinkterm/issues/15)).

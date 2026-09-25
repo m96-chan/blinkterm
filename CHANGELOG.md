@@ -10,10 +10,25 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Added
+
+- Tabs: `alt+9` is the last tab; the strip scrolls with `+N` markers when
+  the titles do not fit; `ctrl+shift+a`/`alt+a` lists every tab with a
+  filter; `ctrl+shift+pageup`/`pagedown` (`alt+shift+…`) move the current
+  tab; a middle click or `ctrl`+click on a link opens it in a tab behind
+  ([#19](https://github.com/m96-chan/blinkterm/issues/19)).
+
 ### Changed
 
 - `brew install m96-chan/tap/blinkterm` installs the tagged release; `--HEAD`
   is only needed for main.
+
+### Fixed
+
+- A middle click or `ctrl`+click on a link used to open a page the
+  program never attached to — a renderer running for nobody until the
+  engine exited — because the engine announces such a page with no opener
+  and the tab list required one.
 
 ## [0.1.0] - 2026-09-25
 
