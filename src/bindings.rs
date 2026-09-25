@@ -2,28 +2,43 @@
 //! spelled.
 //!
 //! The keys this program keeps for itself are a `match` in `app.rs`
-//! (`command`), and it stays one: two other changes in flight add commands
-//! and arms to it, and a table that replaced the function would collide with
-//! both. So what a config file says about keys is kept beside that function
-//! rather than instead of it — a list of rows, looked up first, whose answer
-//! is a command, "not a command even if the built-in table says so", or
-//! nothing said, in which case the built-in table answers as it always did.
-//! That is [`Lookup`], and wiring it in is one line at the one place a key
-//! becomes a command.
+//! (`command`), and it stays one: it reads shift only where shift matters and
+//! answers more spellings than anybody writes down, which a table of exact
+//! rows would have to list one by one. So what a config file says about keys
+//! is kept beside that function rather than instead of it — a list of rows,
+//! looked up first, whose answer is a command, "not a command even if the
+//! built-in table says so", or nothing said, in which case the built-in table
+//! answers as it always did. That is [`Lookup`], and `app::keyed` is where it
+//! is asked: every place a key becomes a command asks it there.
 //!
-//! That line is not in yet. Until it is, a `key.` line in the config file is
-//! read, checked with everything here — so a misspelt chord is still named
-//! with its line number — and then refused as not remappable yet, because a
-//! file that is read and quietly ignored is worse than one that says so.
+//! [`ACTIONS`] is the other half: every command with a name, the chords the
+//! built-in table answers it on, and a half-line of what it does. `--help`'s
+//! list of actions is made from it ([`help`]), and tests hold the README's
+//! rebinding table and `command` itself to it, so that a command added
+//! without a name, or a default key changed in one place only, fails `cargo
+//! test` rather than a person reading the help.
+//!
+//! # A chord needs ctrl, alt or super
+//!
+//! A bare letter, or a shifted one, is the page's by this program's first
+//! rule: every unmodified key goes to the page, so that a text field is a
+//! text field. A `key.` line must not be able to take `j` from every field by
+//! a typo, so [`Binding::parse`] refuses a chord without ctrl, alt or super —
+//! shift is not enough, `shift+a` is a capital A — unless its key is one of
+//! `f1`…`f24`, which no field types with and which is where `f5` for reload
+//! lives. [`Chord::parse`] itself stays the spelling parser, permissive, so
+//! that the rule is one sentence in one place.
 //!
 //! # A chord is exact
 //!
 //! [`Chord::matches`] wants the same key and the same four modifier bits,
-//! no more and no fewer. The built-in table reads shift only for `tab`, and
-//! a table of rows has to be either exact or a language; a row for `ctrl+tab`
-//! that also caught `ctrl+shift+tab` would take the previous-tab key away
-//! with the next-tab one. Caps lock and num lock, which the Kitty protocol
-//! reports as modifier bits too, are not part of any chord and are ignored.
+//! no more and no fewer. The built-in table reads shift only for `tab`, `t`,
+//! `a` and the page keys, and a table of rows has to be either exact or a
+//! language; a row for `ctrl+tab` that also caught `ctrl+shift+tab` would
+//! take the previous-tab key away with the next-tab one. So `key.ctrl+= =
+//! none` frees `ctrl+=` and leaves `ctrl+shift+=` zooming in, as the built-in
+//! table has it. Caps lock and num lock, which the Kitty protocol reports as
+//! modifier bits too, are not part of any chord and are ignored.
 //!
 //! `+` is the separator, so a chord that means the `+` key spells it `plus`;
 //! and a space cannot be written at the end of a line that is trimmed, so it
@@ -167,9 +182,9 @@ fn spell_key(key: Key) -> String {
     }
 }
 
-/// The commands that have names. One per command in `app.rs` that a person
-/// could want on a different key; `tab-1`…`tab-9` are one command with a
-/// number.
+/// The commands that have names: every one of the program's own, since the
+/// keys `command` answers are exactly the ones a person may move.
+/// `tab-1`…`tab-8` are one command with a number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Quit,
@@ -179,55 +194,218 @@ pub enum Action {
     Forward,
     NewTab,
     CloseTab,
+    ReopenTab,
+    Bookmark,
     NextTab,
     PreviousTab,
-    /// The nth tab, counted from one, one to nine.
+    /// The nth tab, counted from one, one to eight; `alt+9` is
+    /// [`Action::LastTab`], whatever the count.
     Tab(usize),
+    LastTab,
+    ListTabs,
+    MoveTabLeft,
+    MoveTabRight,
     ZoomIn,
     ZoomOut,
     ZoomReset,
     Find,
     Copy,
     CopyUrl,
+    ToggleNormal,
 }
 
-/// Every action with a fixed name, in the order `--help` lists them.
-const ACTIONS: [(&str, Action); 15] = [
-    ("quit", Action::Quit),
-    ("url", Action::EditUrl),
-    ("reload", Action::Reload),
-    ("back", Action::Back),
-    ("forward", Action::Forward),
-    ("new-tab", Action::NewTab),
-    ("close-tab", Action::CloseTab),
-    ("next-tab", Action::NextTab),
-    ("previous-tab", Action::PreviousTab),
-    ("zoom-in", Action::ZoomIn),
-    ("zoom-out", Action::ZoomOut),
-    ("zoom-reset", Action::ZoomReset),
-    ("find", Action::Find),
-    ("copy", Action::Copy),
-    ("copy-url", Action::CopyUrl),
+/// One row of [`ACTIONS`]: the name a `key.` line gives, the action, the
+/// chords the built-in table answers it on (comma-separated, as
+/// [`Chord::parse`] reads them), and the half-line the README's table says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Row {
+    pub name: &'static str,
+    pub action: Action,
+    pub keys: &'static str,
+    pub what: &'static str,
+}
+
+/// The name of the one row that stands for eight actions.
+const TAB_NAMES: &str = "tab-1 .. tab-8";
+
+/// Every action, in the order `--help` lists them. `tab-1`…`tab-8` are one
+/// row, `Action::Tab(1)`, whose name and keys are written as ranges;
+/// [`Action::every`] and [`defaults`] expand it.
+///
+/// The keys are the documented spellings, not every press the built-in table
+/// answers: it reads shift only for `tab`, `t`, `a` and the page keys, so
+/// `ctrl+shift+=` zooms in too, and a chord is exact.
+pub const ACTIONS: [Row; 23] = [
+    Row {
+        name: "quit",
+        action: Action::Quit,
+        keys: "ctrl+q",
+        what: "quit",
+    },
+    Row {
+        name: "url",
+        action: Action::EditUrl,
+        keys: "ctrl+l",
+        what: "type a url",
+    },
+    Row {
+        name: "reload",
+        action: Action::Reload,
+        keys: "ctrl+r",
+        what: "reload",
+    },
+    Row {
+        name: "back",
+        action: Action::Back,
+        keys: "alt+left",
+        what: "back",
+    },
+    Row {
+        name: "forward",
+        action: Action::Forward,
+        keys: "alt+right",
+        what: "forward",
+    },
+    Row {
+        name: "new-tab",
+        action: Action::NewTab,
+        keys: "ctrl+t",
+        what: "a new tab",
+    },
+    Row {
+        name: "close-tab",
+        action: Action::CloseTab,
+        keys: "ctrl+w",
+        what: "close this tab",
+    },
+    Row {
+        name: "reopen-tab",
+        action: Action::ReopenTab,
+        keys: "ctrl+shift+t, alt+t",
+        what: "reopen the tab closed last",
+    },
+    Row {
+        name: "bookmark",
+        action: Action::Bookmark,
+        keys: "ctrl+d",
+        what: "bookmark this page, or remove the bookmark",
+    },
+    Row {
+        name: "next-tab",
+        action: Action::NextTab,
+        keys: "ctrl+tab",
+        what: "the next tab",
+    },
+    Row {
+        name: "previous-tab",
+        action: Action::PreviousTab,
+        keys: "ctrl+shift+tab",
+        what: "the tab before",
+    },
+    Row {
+        name: TAB_NAMES,
+        action: Action::Tab(1),
+        keys: "alt+1 .. alt+8",
+        what: "the nth tab",
+    },
+    Row {
+        name: "last-tab",
+        action: Action::LastTab,
+        keys: "alt+9",
+        what: "the last tab",
+    },
+    Row {
+        name: "list-tabs",
+        action: Action::ListTabs,
+        keys: "ctrl+shift+a, alt+a",
+        what: "the tab list",
+    },
+    Row {
+        name: "move-tab-left",
+        action: Action::MoveTabLeft,
+        keys: "ctrl+shift+pageup, alt+shift+pageup",
+        what: "move this tab left",
+    },
+    Row {
+        name: "move-tab-right",
+        action: Action::MoveTabRight,
+        keys: "ctrl+shift+pagedown, alt+shift+pagedown",
+        what: "move this tab right",
+    },
+    Row {
+        name: "zoom-in",
+        action: Action::ZoomIn,
+        keys: "alt+=, ctrl+=",
+        what: "zoom in",
+    },
+    Row {
+        name: "zoom-out",
+        action: Action::ZoomOut,
+        keys: "alt+-, ctrl+-",
+        what: "zoom out",
+    },
+    Row {
+        name: "zoom-reset",
+        action: Action::ZoomReset,
+        keys: "alt+0, ctrl+0",
+        what: "back to 100%",
+    },
+    Row {
+        name: "find",
+        action: Action::Find,
+        keys: "ctrl+f",
+        what: "find in the page",
+    },
+    Row {
+        name: "copy",
+        action: Action::Copy,
+        keys: "alt+c",
+        what: "copy the selection, or the line being typed",
+    },
+    Row {
+        name: "copy-url",
+        action: Action::CopyUrl,
+        keys: "alt+u",
+        what: "copy the url",
+    },
+    Row {
+        name: "normal-mode",
+        action: Action::ToggleNormal,
+        keys: "ctrl+.",
+        what: "normal mode on or off",
+    },
 ];
 
+/// The rows with one name each: every row but `tab-1 .. tab-8`.
+fn named_rows() -> impl Iterator<Item = &'static Row> {
+    ACTIONS.iter().filter(|row| row.name != TAB_NAMES)
+}
+
 impl Action {
-    /// `quit`, `url`, `reload`, `back`, `forward`, `new-tab`, `close-tab`,
-    /// `next-tab`, `previous-tab`, `tab-1`…`tab-9`, `zoom-in`, `zoom-out`,
-    /// `zoom-reset`, `find`, `copy`, `copy-url`. Unknown: an error listing
-    /// them.
+    /// A name from [`ACTIONS`], or `tab-1`…`tab-8`. `tab-9` is refused with
+    /// the name of what `alt+9` does, since that is the one a person reaching
+    /// for it means; anything else unknown is an error listing them.
     pub fn parse(text: &str) -> Result<Action, String> {
         let lower = text.trim().to_ascii_lowercase();
-        if let Some((_, action)) = ACTIONS.iter().find(|(name, _)| *name == lower) {
-            return Ok(*action);
+        if let Some(row) = named_rows().find(|row| row.name == lower) {
+            return Ok(row.action);
         }
         if let Some(n) = lower.strip_prefix("tab-").and_then(|n| n.parse().ok()) {
-            if (1..=9).contains(&n) {
+            if (1..=8).contains(&n) {
                 return Ok(Action::Tab(n));
+            }
+            if n == 9 {
+                return Err(format!(
+                    "{text:?}: alt+9 is the last tab, whatever the count; that action is last-tab"
+                ));
             }
         }
         Err(format!(
-            "{text:?} is not an action; they are {}, tab-1..tab-9, or none",
-            ACTIONS.map(|(name, _)| name).join(", ")
+            "{text:?} is not an action; they are {}, tab-1..tab-8, or none",
+            named_rows()
+                .map(|row| row.name)
+                .collect::<Vec<_>>()
+                .join(", ")
         ))
     }
 
@@ -236,12 +414,61 @@ impl Action {
         if let Action::Tab(n) = self {
             return format!("tab-{n}");
         }
-        ACTIONS
-            .iter()
-            .find(|(_, action)| *action == self)
-            .map(|(name, _)| name.to_string())
+        named_rows()
+            .find(|row| row.action == self)
+            .map(|row| row.name.to_string())
             .unwrap_or_default()
     }
+
+    /// Every action, `tab-1 .. tab-8` expanded, in [`ACTIONS`]' order.
+    pub fn every() -> Vec<Action> {
+        ACTIONS
+            .iter()
+            .flat_map(|row| match row.action {
+                Action::Tab(_) => (1..=8).map(Action::Tab).collect(),
+                action => vec![action],
+            })
+            .collect()
+    }
+}
+
+/// The chords the built-in table answers `action` on, as [`ACTIONS`] lists
+/// them: its row's `keys` parsed, and `alt+n` for `tab-n`.
+///
+/// Nothing in the program asks this — the built-in table is `app::command`,
+/// which is a `match` — but the tests on both sides do, the README's table
+/// here and `command` itself in `app.rs`, and it is one function for both.
+pub fn defaults(action: Action) -> Vec<Chord> {
+    if let Action::Tab(n) = action {
+        return Chord::parse(&format!("alt+{n}")).into_iter().collect();
+    }
+    ACTIONS
+        .iter()
+        .filter(|row| row.action == action)
+        .flat_map(|row| row.keys.split(','))
+        .filter_map(|spelled| Chord::parse(spelled).ok())
+        .collect()
+}
+
+/// The `actions:` block `--help` prints after its `keys:`: a name and its
+/// default chords per row, and what a chord may be.
+///
+/// What each does is not printed: the `keys:` block above it has already
+/// said, in more words than half a line.
+pub fn help() -> String {
+    let width = ACTIONS.iter().map(|row| row.name.len()).max().unwrap_or(0);
+    let mut out =
+        String::from("\nactions (key.<chord> = <action> in the settings file; none unbinds):\n");
+    for row in &ACTIONS {
+        out.push_str(&format!("  {:<width$}  {}\n", row.name, row.keys));
+    }
+    out.push_str(
+        "A chord is ctrl, alt, shift or super joined with + to a key: a character,\n\
+         plus, space, tab, enter, esc, backspace, insert, delete, up, down, left,\n\
+         right, home, end, pageup, pagedown or f1..f24; it needs ctrl, alt or super\n\
+         unless it is an f-key.\n",
+    );
+    out
 }
 
 /// One line of the file: `None` is `= none`, the chord unbound.
@@ -253,8 +480,18 @@ pub struct Binding {
 
 impl Binding {
     /// `key.<chord> = <value>`'s two halves, `chord` without the `key.`.
+    /// Checked in the order they are written: the chord's spelling, then
+    /// that it has ctrl, alt or super or is an f-key (see the module's
+    /// section on it), then the action.
     pub fn parse(chord: &str, value: &str) -> Result<Binding, String> {
-        let chord = Chord::parse(chord).map_err(|why| format!("key.{why}"))?;
+        let written = chord.trim();
+        let chord = Chord::parse(written).map_err(|why| format!("key.{why}"))?;
+        let held = chord.mods.0 & (Mods::CTRL | Mods::ALT | Mods::SUPER) != 0;
+        if !held && !matches!(chord.key, Key::Function(_)) {
+            return Err(format!(
+                "key.{written}: a key with no ctrl, alt or super is the page's; add one, or use f1..f24"
+            ));
+        }
         let action = if value.trim().eq_ignore_ascii_case("none") {
             None
         } else {
@@ -330,33 +567,24 @@ mod tests {
     }
 
     #[test]
-    fn every_chord_the_defaults_use_parses_and_spells_back_the_same() {
-        for spelled in [
-            "ctrl+q",
-            "ctrl+l",
-            "ctrl+r",
-            "ctrl+t",
-            "ctrl+w",
-            "ctrl+f",
-            "ctrl+tab",
-            "ctrl+shift+tab",
-            "ctrl+=",
-            "ctrl+plus",
-            "ctrl+-",
-            "ctrl+_",
-            "ctrl+0",
-            "alt+left",
-            "alt+right",
-            "alt+1",
-            "alt+9",
-            "alt+c",
-            "alt+u",
-            "alt+=",
-            "alt+-",
-            "alt+0",
-        ] {
-            let chord = Chord::parse(spelled).expect(spelled);
-            assert_eq!(chord.spell(), spelled);
+    fn every_default_chord_in_the_table_parses_and_spells_back_the_same() {
+        for row in &ACTIONS {
+            if matches!(row.action, Action::Tab(_)) {
+                continue;
+            }
+            let spelled: Vec<&str> = row.keys.split(',').map(str::trim).collect();
+            let chords = defaults(row.action);
+            assert_eq!(chords.len(), spelled.len(), "{}: {}", row.name, row.keys);
+            for (chord, spelled) in chords.iter().zip(spelled) {
+                assert_eq!(chord.spell(), spelled, "{}", row.name);
+            }
+        }
+        for n in 1..=8 {
+            let spelled: Vec<String> = defaults(Action::Tab(n)).iter().map(Chord::spell).collect();
+            assert_eq!(spelled, [format!("alt+{n}")]);
+        }
+        for spelled in ["ctrl+plus", "ctrl+_"] {
+            assert_eq!(Chord::parse(spelled).expect(spelled).spell(), spelled);
         }
         assert_eq!(
             Chord::parse("ctrl+shift+tab"),
@@ -365,6 +593,74 @@ mod tests {
                 key: Key::Tab
             })
         );
+    }
+
+    #[test]
+    fn the_help_lists_every_action_once_with_its_default_chords() {
+        let help = help();
+        let lines: Vec<&str> = help
+            .lines()
+            .skip_while(|line| !line.starts_with("actions"))
+            .skip(1)
+            .take(ACTIONS.len())
+            .collect();
+        assert_eq!(lines.len(), ACTIONS.len());
+        for (line, row) in lines.iter().zip(&ACTIONS) {
+            let line = line.trim();
+            assert!(line.starts_with(row.name), "{line} for {}", row.name);
+            assert!(line.ends_with(row.keys), "{line} for {}", row.name);
+        }
+        for row in &ACTIONS {
+            let named = help
+                .lines()
+                .filter(|line| line.trim().split("  ").next() == Some(row.name))
+                .count();
+            assert_eq!(named, 1, "{}", row.name);
+        }
+        assert!(
+            help.trim_end()
+                .ends_with("it needs ctrl, alt or super\nunless it is an f-key."),
+            "{help}"
+        );
+    }
+
+    /// The rows of the README's `### Rebinding keys` table, each cell with
+    /// its backticks gone and `…` written `..`, as [`ACTIONS`] writes a range.
+    fn readme_rows() -> Vec<Vec<String>> {
+        include_str!("../README.md")
+            .lines()
+            .skip_while(|line| *line != "### Rebinding keys")
+            .skip(1)
+            .take_while(|line| !line.starts_with('#'))
+            .filter(|line| line.starts_with("| `"))
+            .map(|line| {
+                line.trim_matches('|')
+                    .split('|')
+                    .map(|cell| cell.replace('`', "").replace('…', "..").trim().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_readme_s_rebinding_table_is_the_action_table() {
+        let rows = readme_rows();
+        let names: Vec<&str> = rows.iter().map(|cells| cells[0].as_str()).collect();
+        let wanted: Vec<&str> = ACTIONS.iter().map(|row| row.name).collect();
+        assert_eq!(names, wanted);
+        for (cells, row) in rows.iter().zip(&ACTIONS) {
+            if matches!(row.action, Action::Tab(_)) {
+                assert_eq!(cells[1], row.keys);
+                continue;
+            }
+            let written: Vec<String> = cells[1]
+                .split(',')
+                .map(|chord| Chord::parse(chord).expect(chord).spell())
+                .collect();
+            let wanted: Vec<String> = defaults(row.action).iter().map(Chord::spell).collect();
+            assert_eq!(written, wanted, "{}", row.name);
+            assert_eq!(cells[2], row.what, "{}", row.name);
+        }
     }
 
     #[test]
@@ -436,21 +732,62 @@ mod tests {
 
     #[test]
     fn every_action_has_a_name_that_parses_back_to_it() {
-        let mut every: Vec<Action> = ACTIONS.iter().map(|(_, action)| *action).collect();
-        every.extend((1..=9).map(Action::Tab));
+        let every = Action::every();
+        assert_eq!(every.len(), ACTIONS.len() - 1 + 8);
         for action in every {
             assert_eq!(Action::parse(&action.name()), Ok(action), "{action:?}");
         }
         assert_eq!(Action::parse("url"), Ok(Action::EditUrl));
         assert_eq!(Action::parse("Tab-3"), Ok(Action::Tab(3)));
-        for wrong in ["tab-0", "tab-10", "bookmark"] {
+        assert_eq!(Action::parse("normal-mode"), Ok(Action::ToggleNormal));
+        for wrong in ["tab-0", "tab-10", "bookmarks", "tab-1 .. tab-8"] {
             let why = Action::parse(wrong).expect_err(wrong);
             assert!(why.contains("is not an action"), "{why}");
             assert!(
-                why.contains("copy-url"),
+                why.ends_with("copy-url, normal-mode, tab-1..tab-8, or none"),
                 "the list is in the sentence: {why}"
             );
         }
+        assert!(Action::parse("tab-9").is_err());
+    }
+
+    #[test]
+    fn tab_9_is_refused_and_told_that_the_last_tab_is_last_tab() {
+        assert_eq!(
+            Action::parse("tab-9"),
+            Err(
+                "\"tab-9\": alt+9 is the last tab, whatever the count; that action is last-tab"
+                    .to_string()
+            )
+        );
+        let why = Action::parse("tab-10").expect_err("tab-10");
+        assert!(why.starts_with("\"tab-10\" is not an action"), "{why}");
+    }
+
+    #[test]
+    fn a_chord_needs_ctrl_alt_or_super_unless_it_is_a_function_key() {
+        for bare in ["j", "shift+j", "space", "esc", "shift+pageup"] {
+            assert_eq!(
+                Binding::parse(bare, "back"),
+                Err(format!(
+                    "key.{bare}: a key with no ctrl, alt or super is the page's; add one, or use f1..f24"
+                )),
+                "{bare}"
+            );
+        }
+        for held in ["f5", "shift+f5", "super+j", "ctrl+j", "alt+enter"] {
+            assert!(Binding::parse(held, "back").is_ok(), "{held}");
+        }
+        // The spelling parser is not the rule.
+        assert!(Chord::parse("j").is_ok());
+        // Chord first, then modifiers, then the action.
+        assert_eq!(
+            Binding::parse("j", "nonsense")
+                .expect_err("bare")
+                .split(':')
+                .next(),
+            Some("key.j")
+        );
     }
 
     #[test]
@@ -529,7 +866,7 @@ mod tests {
             Binding::parse("ctrl+", "back"),
             Err("key.ctrl+: no key after the last +".to_string())
         );
-        let why = Binding::parse("ctrl+a", "bookmark").expect_err("not an action");
-        assert!(why.starts_with("\"bookmark\" is not an action"), "{why}");
+        let why = Binding::parse("ctrl+a", "bookmarks").expect_err("not an action");
+        assert!(why.starts_with("\"bookmarks\" is not an action"), "{why}");
     }
 }

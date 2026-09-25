@@ -32,6 +32,9 @@
 //! url has `%s`, `?` and `#` in it, a user agent has spaces and parentheses,
 //! a proxy has `://`, and nothing here needs a leading space. The keys are
 //! the option names without their `--`, so `--help` documents the file too.
+//! The one family that is not an option is `key.<chord> = <action>`
+//! (`key.f5 = reload`), which rebinds one of the program's keys and may be
+//! written as often as there are keys; see [`crate::bindings`].
 //!
 //! TOML was the alternative, and it is a dependency or a second parser the
 //! size of `json.rs` for a file of ten lines. `key value` without the `=`
@@ -58,12 +61,16 @@ use crate::zoom::Scale;
 /// produce a hundred line errors.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 
-/// What [`parse_config`] says about every `key.` line that is understood.
+/// What [`parse_config`] says about a `normal.` line.
 ///
-/// The bindings are parsed and checked (see [`crate::bindings`]) but not yet
-/// looked up by the loop, and a file that was read and quietly ignored would
-/// be worse than one that says so.
-pub const NOT_REMAPPABLE_YET: &str = "key bindings are not remappable yet (#17)";
+/// The letters of normal mode are a small language rather than a table — `gg`
+/// is two keys, and half of them are not commands but things the loop does
+/// to the page — so rebinding them is a design of its own. The shape is kept
+/// for it, `normal.<key> = <action>`, and refused with a sentence now, so
+/// that a file written ahead of it says what is wrong rather than "unknown
+/// setting".
+pub const NORMAL_NOT_REMAPPABLE_YET: &str =
+    "normal-mode letters are not remappable yet; key.<chord> is for the program's own keys";
 
 /// Everything `app::run` is told. Every field is concrete: the folding of the
 /// three sources has already happened.
@@ -98,8 +105,8 @@ pub struct Options {
     /// `--normal-mode`: start in normal mode rather than insert: the letters
     /// are the program's keys from the first one. See [`crate::normal`].
     pub normal_mode: bool,
-    /// `key.<chord> = <action>` lines from the file; see [`crate::bindings`].
-    /// Always empty until the loop looks them up: see [`NOT_REMAPPABLE_YET`].
+    /// `key.<chord> = <action>` lines from the file, in file order; the loop
+    /// asks them before its own table. See [`crate::bindings`].
     pub bindings: Bindings,
 }
 
@@ -534,11 +541,13 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             ));
         }
         if let Some(chord) = key.strip_prefix("key.") {
-            // Understood in full, so that a misspelt chord or action is named
-            // as precisely as it will be once bindings are looked up; then
-            // refused, because nothing looks them up yet.
-            let _binding = Binding::parse(chord, value).map_err(at)?;
-            return Err(at(format!("{key}: {NOT_REMAPPABLE_YET}")));
+            // Repeatable, like `engine-arg`: a later line for the same chord
+            // is the one that counts, which `Bindings::lookup` decides.
+            s.bindings.push(Binding::parse(chord, value).map_err(at)?);
+            continue;
+        }
+        if key == "normal" || key.starts_with("normal.") {
+            return Err(at(NORMAL_NOT_REMAPPABLE_YET.to_string()));
         }
         if key == "url" {
             return Err(at(
@@ -1315,19 +1324,37 @@ mod tests {
     }
 
     #[test]
-    fn a_key_line_is_understood_and_then_refused_as_not_remappable_yet() {
-        for line in [
-            "key.ctrl+b = back",
-            "key.alt+w = none",
-            "key.ctrl+= = zoom-in",
-        ] {
-            let why = file(line).expect_err(line);
-            assert!(why.starts_with("/c:1: key."), "{why}");
-            assert!(why.ends_with(NOT_REMAPPABLE_YET), "{why}");
+    fn a_key_line_becomes_a_binding_in_file_order() {
+        let s = file("key.ctrl+b = back\n# a comment\nkey.alt+w = none\nkey.ctrl+= = zoom-in")
+            .expect("three bindings");
+        assert_eq!(
+            s.bindings,
+            vec![
+                Binding::parse("ctrl+b", "back").expect("a row"),
+                Binding::parse("alt+w", "none").expect("a row"),
+                Binding::parse("ctrl+=", "zoom-in").expect("a row"),
+            ]
+        );
+        assert_eq!(s.bindings[2].action, Some(Action::ZoomIn));
+        assert_eq!(
+            s.bindings[2].chord,
+            Chord::parse("ctrl+=").expect("the chord that ends in =")
+        );
+    }
+
+    #[test]
+    fn a_normal_line_is_refused_with_the_sentence_that_says_it_is_not_yet() {
+        for line in ["normal.j = x", "normal = x"] {
+            assert_eq!(
+                file(line),
+                Err(format!("/c:1: {NORMAL_NOT_REMAPPABLE_YET}")),
+                "{line}"
+            );
         }
         assert_eq!(
-            file("key.ctrl+= = zoom-in"),
-            Err(format!("/c:1: key.ctrl+=: {NOT_REMAPPABLE_YET}"))
+            file("normal-mode = true").map(|s| s.normal_mode),
+            Ok(Some(true)),
+            "the setting is not the namespace"
         );
     }
 
@@ -1344,10 +1371,16 @@ mod tests {
                     .to_string()
             )
         );
-        let why = file("key.ctrl+a = bookmark").expect_err("refused");
+        let why = file("key.ctrl+a = bookmarks").expect_err("refused");
         assert!(
-            why.starts_with("/c:1: \"bookmark\" is not an action; they are quit, url, reload"),
+            why.starts_with("/c:1: \"bookmarks\" is not an action; they are quit, url, reload"),
             "{why}"
+        );
+        assert!(why.ends_with("normal-mode, tab-1..tab-8, or none"), "{why}");
+        assert_eq!(
+            file("# keys\n\nkey.j = back"),
+            Err("/c:3: key.j: a key with no ctrl, alt or super is the page's; add one, or use f1..f24"
+                .to_string())
         );
         assert_eq!(
             file("key = ctrl+a"),
