@@ -5693,3 +5693,202 @@ fn the_still_at_a_fractional_level_is_cut_to_the_pane() {
     client.close();
     engine.kill();
 }
+
+/// An engine started with extras, and a session on its first page: what
+/// `connect_in_with_target` is for `Engine::launch`, for
+/// `Engine::launch_with`. On a temporary profile, and skipping as the rest
+/// do.
+fn launched(launch: &engine::Launch) -> Option<(Engine, Client, Client)> {
+    if std::env::var_os(engine::ENGINE_ENV).is_none() {
+        eprintln!(
+            "skipped: {} is not set; name a Chromium to run this against",
+            engine::ENGINE_ENV
+        );
+        return None;
+    }
+    let profile = Profile::temporary().expect("a temporary profile");
+    let engine =
+        Engine::launch_with(profile, Duration::from_secs(30), launch).expect("the engine starts");
+    let mut browser = engine.browser().expect("the browser's client");
+    let target =
+        engine::first_page_target(&mut browser, Duration::from_secs(20)).expect("a first page");
+    let page = browser
+        .attach(&target, Duration::from_secs(10))
+        .expect("a session on the page");
+    Some((engine, browser, page))
+}
+
+/// `--user-agent` and `--proxy` are engine flags and nothing else, measured
+/// to cover the browser, the first page and a target made later; a proxy
+/// that refuses connections is the fastest proof the proxy took, and a
+/// `data:` url never goes through it.
+#[test]
+fn a_user_agent_and_a_proxy_reach_the_engine_and_the_agent_covers_a_later_tab() {
+    let launch = engine::Launch {
+        user_agent: Some("blinkterm-test/1".to_string()),
+        proxy: Some("127.0.0.1:1".to_string()),
+        ..engine::Launch::default()
+    };
+    let Some((mut engine, mut browser, mut page)) = launched(&launch) else {
+        return;
+    };
+    let version = browser
+        .call("Browser.getVersion", Json::empty())
+        .expect("a version");
+    assert_eq!(
+        version.get("userAgent").and_then(Json::as_str),
+        Some("blinkterm-test/1")
+    );
+    assert_eq!(
+        evaluate(&mut page, "navigator.userAgent").as_str(),
+        Some("blinkterm-test/1"),
+        "the first page"
+    );
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("a new target");
+    let later = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("the engine says which")
+        .to_string();
+    let mut later = browser
+        .attach(&later, Duration::from_secs(10))
+        .expect("a session on the later page");
+    assert_eq!(
+        evaluate(&mut later, "navigator.userAgent").as_str(),
+        Some("blinkterm-test/1"),
+        "a page made later"
+    );
+
+    let reply = page
+        .call_within(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string("http://example.test/"))]),
+            Duration::from_secs(20),
+        )
+        .expect("a reply");
+    let error = reply
+        .get("errorText")
+        .and_then(Json::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(error, "net::ERR_PROXY_CONNECTION_FAILED", "{reply:?}");
+    assert_eq!(load::reason(&error), "the proxy would not connect");
+
+    page.call(
+        "Page.navigate",
+        Json::object(vec![(
+            "url",
+            Json::string("data:text/html,<title>not proxied</title>"),
+        )]),
+    )
+    .expect("a data url loads");
+    assert_eq!(
+        wait_for_title(&mut page, "not proxied", Duration::from_secs(10)),
+        "not proxied"
+    );
+
+    later.close();
+    page.close();
+    browser.close();
+    engine.kill();
+}
+
+/// An `--engine-arg` goes to the engine as written: `--accept-lang=ja` is
+/// the language flag the headless shell was measured to honour.
+#[test]
+fn an_engine_arg_goes_through_as_written() {
+    let launch = engine::Launch {
+        args: vec!["--accept-lang=ja".to_string()],
+        ..engine::Launch::default()
+    };
+    let Some((mut engine, mut browser, mut page)) = launched(&launch) else {
+        return;
+    };
+    assert_eq!(
+        evaluate(&mut page, "navigator.language").as_str(),
+        Some("ja")
+    );
+    page.close();
+    browser.close();
+    engine.kill();
+}
+
+/// What `drive` does with three urls, without the pane: the first tab told
+/// to load, a tab each for the rest through `Target.createTarget`, the first
+/// put back in front. Three tabs, the first in front and still a visible
+/// page without being raised again, each at the url it was given, and none of the ones
+/// this program made counted twice when the engine announces them.
+#[test]
+fn several_urls_open_several_tabs_with_the_first_in_front() {
+    let Some((mut engine, page, target)) = connect_with_target() else {
+        return;
+    };
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+    let urls = [
+        "data:text/html,<title>one</title>",
+        "data:text/html,<title>two</title>",
+        "data:text/html,<title>three</title>",
+    ];
+    {
+        let first = tabs.active_mut().expect("the first tab");
+        first.url = urls[0].to_string();
+        first
+            .connection
+            .call(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(urls[0]))]),
+            )
+            .expect("the first page loads");
+    }
+    for &url in &urls[1..] {
+        let created = browser
+            .call(
+                "Target.createTarget",
+                Json::object(vec![("url", Json::string(url))]),
+            )
+            .expect("a new target");
+        let opened = created
+            .get("targetId")
+            .and_then(Json::as_str)
+            .expect("the engine says which")
+            .to_string();
+        let connection = browser
+            .attach(&opened, Duration::from_secs(10))
+            .expect("a session on it");
+        tabs.open(Tab::new(opened, connection, url));
+    }
+    assert!(tabs.select(1));
+
+    assert!(!pump(
+        &mut browser,
+        &mut tabs,
+        Duration::from_secs(2),
+        |tabs| tabs.len() > 3
+    ));
+    assert_eq!(tabs.len(), 3);
+    assert_eq!(tabs.active_index(), 0, "the first url is the tab in front");
+    for (index, (url, name)) in urls.iter().zip(["one", "two", "three"]).enumerate() {
+        let tab = tabs.get_mut(index).expect("a tab");
+        assert_eq!(tab.url, *url, "tab {index}");
+        assert_eq!(
+            wait_for_title(&mut tab.connection, name, Duration::from_secs(10)),
+            name,
+            "tab {index} loaded what it was given"
+        );
+    }
+    let front = tabs.active_mut().expect("the first tab");
+    assert_eq!(
+        evaluate(&mut front.connection, "document.visibilityState").as_str(),
+        Some("visible"),
+        "the tab in front is a page that paints"
+    );
+
+    drop(tabs);
+    browser.close();
+    engine.kill();
+}
