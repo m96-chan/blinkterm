@@ -98,7 +98,13 @@ keys:
   ctrl+t         a new tab, with the cursor in the url bar
   ctrl+w         close this tab; closing the last one quits
   ctrl+tab       the next tab, ctrl+shift+tab the one before
-  alt+1 .. alt+9 the nth tab
+  alt+1 .. alt+8 the nth tab; alt+9 the last tab
+  ctrl+shift+a   the tab list (alt+a too): type to filter, up/down to pick,
+                 enter to switch, esc to close
+  ctrl+shift+pageup/pagedown
+                 move this tab left, right (alt+shift+pageup/pagedown too)
+  middle click or ctrl+click on a link
+                 open it in a tab behind this one
   alt+= / alt+-  zoom in, out (ctrl+= / ctrl+- where the terminal lets them
                  through); alt+0 / ctrl+0 back to 100%
   ctrl+q         quit

@@ -732,6 +732,29 @@ style='position:absolute;left:0;top:0;width:240px;height:80px;background:#cc3'>o
 const SECOND_PAGE: &str = "<!doctype html><body style='margin:0;background:#39c'>\
 <script>document.title='second'</script></body>";
 
+/// A page of the ways a click can ask for another page, at known points: a
+/// plain link at (40, 30), something that is not a link at (340, 30), and a
+/// link with `target=_blank` at (40, 130). What the page's own listeners saw
+/// is kept in `window.log`, and a box moves every animation frame so that the
+/// screencast has something to send.
+const OPENS_PAGE: &str = "<!doctype html><title>opens</title>\
+<body style='margin:0;background:#fff'>\
+<a href='/plain' style='position:absolute;left:0;top:0;width:240px;height:60px;\
+background:#cc3'>plain</a>\
+<div style='position:absolute;left:300px;top:0;width:200px;height:60px;\
+background:#ccc'>not a link</div>\
+<a href='/plain' target=_blank style='position:absolute;left:0;top:100px;\
+width:240px;height:60px;background:#3c3'>blank</a>\
+<div id=box style='position:absolute;left:0;top:200px;width:40px;height:40px;\
+background:#c33'></div>\
+<script>window.log=[];\
+for(const t of ['click','auxclick'])addEventListener(t,e=>log.push(t+':'+e.button+':'+e.ctrlKey));\
+let x=0;(function f(){x=(x+4)%600;box.style.left=x+'px';requestAnimationFrame(f)})();\
+</script></body>";
+
+/// Where the links on [`OPENS_PAGE`] go.
+const PLAIN_PAGE: &str = "<!doctype html><title>plain</title><body>plain</body>";
+
 /// Serve those two pages on a port of the kernel's choosing, for as long as
 /// the test binary runs.
 fn serve() -> String {
@@ -745,6 +768,10 @@ fn serve() -> String {
             let request = String::from_utf8_lossy(&head[..read]).to_string();
             let body = if request.starts_with("GET /second") {
                 SECOND_PAGE
+            } else if request.starts_with("GET /opens") {
+                OPENS_PAGE
+            } else if request.starts_with("GET /plain") {
+                PLAIN_PAGE
             } else {
                 FIRST_PAGE
             };
@@ -948,6 +975,281 @@ fn a_link_that_wants_a_window_becomes_the_tab_in_front() {
     let png = wait_for_frame(&mut second.connection, Duration::from_secs(10))
         .expect("the tab in front paints");
     assert_eq!(&png[..4], b"\x89PNG");
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// A press and a release at `at`, as `send_mouse` sends them: `button` with
+/// its bit in `buttons` on the press and none on the release, and the
+/// modifiers as CDP counts them (Alt 1, Ctrl 2, Meta 4, Shift 8).
+fn click_with(client: &mut Client, at: (i32, i32), button: &str, bit: u32, modifiers: u32) {
+    for (kind, buttons) in [("mousePressed", bit), ("mouseReleased", 0)] {
+        client
+            .call(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(at.0)),
+                    ("y", Json::number(at.1)),
+                    ("button", Json::string(button)),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(modifiers)),
+                ]),
+            )
+            .expect("the click is dispatched");
+    }
+}
+
+/// Everything a page's session says for `within`, every screencast frame
+/// acknowledged as `handle_page_events` acknowledges them: how many frames
+/// came, and the other events.
+fn watch_page(client: &mut Client, within: Duration) -> (usize, Vec<blinkterm::cdp::Event>) {
+    let deadline = Instant::now() + within;
+    let mut frames = 0;
+    let mut others = Vec::new();
+    while Instant::now() < deadline {
+        for event in client.events() {
+            if event.method != "Page.screencastFrame" {
+                others.push(event);
+                continue;
+            }
+            frames += 1;
+            if let Some(session) = event.params.get("sessionId").and_then(Json::as_i64) {
+                let _ = client.notify(
+                    "Page.screencastFrameAck",
+                    Json::object(vec![("sessionId", Json::number(session as f64))]),
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    (frames, others)
+}
+
+/// What the page's own listeners saw, from [`OPENS_PAGE`]'s `window.log`.
+fn page_log(client: &mut Client) -> String {
+    match evaluate(client, "JSON.stringify(window.log)") {
+        Json::String(log) => log,
+        other => panic!("the page's log: {other:?}"),
+    }
+}
+
+/// A middle click and a ctrl+click on a link: the engine opens the page, the
+/// target it announces has no opener, and it becomes a tab *behind* the one
+/// in front — which goes on casting and is never switched from. Measured in
+/// `src/tabs.rs`; this is that measurement kept true. Before this, such a
+/// target was refused for having no opener, and the page loaded for nobody.
+#[test]
+fn a_middle_click_and_a_ctrl_click_on_a_link_open_a_tab_behind_the_one_in_front() {
+    let Some((mut engine, page, target)) = connect_with_target() else {
+        return;
+    };
+    let base = serve();
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+
+    {
+        let first = tabs.active_mut().expect("the first tab");
+        first
+            .connection
+            .call("Page.enable", Json::empty())
+            .expect("Page.enable");
+        viewport(&mut first.connection);
+        first
+            .connection
+            .call(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(format!("{base}opens")))]),
+            )
+            .expect("the page loads");
+        assert_eq!(
+            wait_for_title(&mut first.connection, "opens", Duration::from_secs(10)),
+            "opens"
+        );
+        cast(&mut first.connection, "jpeg", None, WIDTH, HEIGHT);
+        let (settling, _) = watch_page(&mut first.connection, Duration::from_millis(500));
+        assert!(settling > 0, "the page in front never cast a frame");
+
+        // The middle button on the plain link.
+        click_with(&mut first.connection, (40, 30), "middle", 4, 0);
+        let (frames, events) = watch_page(&mut first.connection, Duration::from_secs(1));
+        let dispositions: Vec<String> = events
+            .iter()
+            .filter(|event| event.method == "Page.frameRequestedNavigation")
+            .filter_map(|event| event.params.get("disposition").and_then(Json::as_str))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            dispositions.iter().any(|word| word == "newTab"),
+            "the engine did not say newTab for a middle click: {dispositions:?}"
+        );
+        assert!(
+            frames >= 10,
+            "the page in front stopped casting after a tab opened behind it: {frames} frames"
+        );
+    }
+
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            Duration::from_secs(15),
+            |tabs| tabs.len() == 2
+        ),
+        "a middle click on a link opened no tab"
+    );
+    assert_eq!(tabs.active_index(), 0, "the tab opened behind");
+    assert!(
+        pump(&mut browser, &mut tabs, Duration::from_secs(10), |tabs| {
+            tabs.iter()
+                .nth(1)
+                .is_some_and(|tab| tab.url.ends_with("/plain"))
+        }),
+        "the tab behind never said where it was: {:?}",
+        tabs.iter().map(|tab| tab.url.clone()).collect::<Vec<_>>()
+    );
+    let log = page_log(&mut tabs.active_mut().expect("a tab").connection);
+    assert!(log.contains("auxclick:1"), "{log}");
+
+    // It loads, and has its title, without ever being brought to the front.
+    {
+        let behind = tabs.get_mut(1).expect("the tab behind");
+        behind
+            .connection
+            .call("Page.enable", Json::empty())
+            .expect("Page.enable");
+        assert_eq!(
+            wait_for_title(&mut behind.connection, "plain", Duration::from_secs(10)),
+            "plain"
+        );
+    }
+
+    // The ctrl key on the left button: the same.
+    let first = &mut tabs.active_mut().expect("the first tab").connection;
+    click_with(first, (40, 30), "left", 1, 2);
+    let _ = watch_page(first, Duration::from_millis(200));
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            Duration::from_secs(15),
+            |tabs| tabs.len() == 3
+        ),
+        "a ctrl+click on a link opened no tab"
+    );
+    assert_eq!(tabs.active_index(), 0, "still behind");
+    let first = &mut tabs.active_mut().expect("the first tab").connection;
+    let log = page_log(first);
+    assert!(log.contains("click:0:true"), "{log}");
+
+    // A ctrl+click on something that is not a link is the page's, and opens
+    // nothing.
+    click_with(first, (340, 30), "left", 1, 2);
+    let _ = watch_page(first, Duration::from_millis(200));
+    assert!(
+        !pump(&mut browser, &mut tabs, Duration::from_secs(2), |tabs| tabs
+            .len()
+            > 3),
+        "a ctrl+click on nothing opened a tab"
+    );
+    let first = &mut tabs.active_mut().expect("the first tab").connection;
+    let clicks = |log: &str| log.matches("click:0:true").count();
+    let after = page_log(first);
+    assert_eq!(clicks(&after), clicks(&log) + 1, "{after}");
+
+    // And a link that asks for a window still comes to the front.
+    click_with(first, (40, 130), "left", 1, 0);
+    let _ = watch_page(first, Duration::from_millis(200));
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            Duration::from_secs(15),
+            |tabs| tabs.len() == 4
+        ),
+        "the target=_blank link opened no tab"
+    );
+    assert_eq!(
+        tabs.active_index(),
+        3,
+        "a page that asked for a window is in front"
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// [`blinkterm::app::open_behind`]: the program's own way to a tab behind,
+/// for a url rather than a click. The engine accepts `background: true`,
+/// which is documented as Chrome's only; the engine's announcement of the
+/// target is not a second tab; the page loads with nobody looking; and
+/// moving a tab in the strip is this program's order, not the engine's.
+#[test]
+fn a_tab_opened_behind_by_this_program_loads_without_being_looked_at() {
+    let Some((mut engine, page, target)) = connect_with_target() else {
+        return;
+    };
+    let base = serve();
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+    let appearance =
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+
+    let index = blinkterm::app::open_behind(
+        &mut tabs,
+        &mut browser,
+        &appearance,
+        &format!("{base}plain"),
+    )
+    .expect("the engine opens a page behind");
+    assert_eq!(index, 1);
+    assert_eq!(tabs.active_index(), 0, "the tab in front stays in front");
+    assert!(
+        !pump(&mut browser, &mut tabs, Duration::from_secs(3), |tabs| tabs
+            .len()
+            > 2),
+        "the tab this program opened behind was counted twice"
+    );
+    assert_eq!(tabs.active_index(), 0, "and was not pulled forward");
+    let behind = tabs.get_mut(1).expect("the tab behind");
+    assert_eq!(
+        wait_for_title(&mut behind.connection, "plain", Duration::from_secs(10)),
+        "plain"
+    );
+
+    // The engine's order of its targets, before and after the strip's
+    // changes: a future engine that reordered on activation would show up
+    // here as a mismatch nobody expected.
+    let order = |browser: &mut Client| -> Vec<String> {
+        let reply = browser
+            .call("Target.getTargets", Json::empty())
+            .expect("the targets");
+        reply
+            .get("targetInfos")
+            .and_then(Json::as_array)
+            .map(|infos| {
+                infos
+                    .iter()
+                    .filter(|info| info.get("type").and_then(Json::as_str) == Some("page"))
+                    .filter_map(|info| info.get("targetId").and_then(Json::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let before = order(&mut browser);
+    let targets: Vec<String> = tabs.iter().map(|tab| tab.target.clone()).collect();
+    assert!(tabs.move_active(1));
+    assert_eq!(tabs.active_index(), 1);
+    assert_eq!(
+        tabs.iter()
+            .map(|tab| tab.target.clone())
+            .collect::<Vec<_>>(),
+        [targets[1].clone(), targets[0].clone()]
+    );
+    assert_eq!(order(&mut browser), before, "the engine's order is its own");
 
     browser.close();
     drop(tabs);

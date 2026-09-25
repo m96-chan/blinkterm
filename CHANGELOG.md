@@ -25,6 +25,11 @@ flag, a different default, a raised Rust floor all do.
 - `--doctor` starts the engine and asks the terminal whether it speaks the
   Kitty graphics and keyboard protocols; `--print-engine` says which engine
   would run ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
+- Tabs: `alt+9` is the last tab; the strip scrolls with `+N` markers when
+  the titles do not fit; `ctrl+shift+a`/`alt+a` lists every tab with a
+  filter; `ctrl+shift+pageup`/`pagedown` (`alt+shift+…`) move the current
+  tab; a middle click or `ctrl`+click on a link opens it in a tab behind
+  ([#19](https://github.com/m96-chan/blinkterm/issues/19)).
 
 ### Changed
 
@@ -32,6 +37,13 @@ flag, a different default, a raised Rust floor all do.
   is only needed for main.
 - `blinkterm a b` opens two tabs rather than refusing with "one page at a
   time".
+
+### Fixed
+
+- A middle click or `ctrl`+click on a link used to open a page the
+  program never attached to — a renderer running for nobody until the
+  engine exited — because the engine announces such a page with no opener
+  and the tab list required one.
 
 ## [0.1.0] - 2026-09-25
 

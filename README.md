@@ -268,7 +268,10 @@ not a thing a terminal has.
 | `ctrl+t` | a new tab, with the cursor in the url bar |
 | `ctrl+w` | close this tab; closing the last one quits |
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
-| `alt+1` … `alt+9` | the nth tab |
+| `alt+1` … `alt+8`, `alt+9` | the nth tab, the last tab |
+| `ctrl+shift+a` (or `alt+a`) | the tab list: type to filter by title or url, `↑`/`↓` to pick, `enter` to switch, `esc` to close |
+| `ctrl+shift+pageup` / `pagedown` (or `alt+shift+pageup` / `pagedown`) | move this tab left or right |
+| middle click or `ctrl`+click on a link | open it in a tab behind this one |
 | `alt+=` / `alt+-` | zoom in and out (`ctrl+=` / `ctrl+-` where your terminal lets them through) |
 | `alt+0` / `ctrl+0` | back to 100% |
 | your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
@@ -282,6 +285,17 @@ not a thing a terminal has.
 Everything else goes to the page, including the mouse. A link that asks for a
 new window gets a new tab, and the tab is switched to.
 
+With more tabs than the row can name, the strip shows a run of them around
+the one in front and `+N` at either end for how many are past it; it scrolls
+when the tab in front reaches an edge. The list (`ctrl+shift+a`) shows all of
+them. Kitty and Ghostty keep `ctrl+shift+a` for themselves and every terminal
+keeps `ctrl+shift+pageup`/`pagedown` — Kitty and tOS for the scrollback,
+WezTerm and Ghostty for their own tabs — so each has an `alt` form that
+reaches the program everywhere. Ghostty also keeps `alt+1`..`alt+9` for its
+tabs; its `alt+9` is its last tab, as it is here. A middle or `ctrl` click
+opens a link behind the current tab, as a desktop browser does; a link that
+asks for a window (`target=_blank`) still comes to the front.
+
 `ctrl+c` and `ctrl+v` are the page's own: they copy and paste within the
 engine, not with your clipboard. Your terminal's paste key (`ctrl+shift+v`, a
 middle click) is how text gets in, and `alt+c` is how it gets out. A paste
@@ -292,7 +306,7 @@ OSC 52, which your terminal may need to be told to allow.
 The url bar is asked about every key first while it is open, so `alt+←`/`→`
 are back and forward only when it is closed — in the bar they move by a word —
 and `ctrl+w`, `ctrl+t` and the rest do nothing there; `esc` closes it. The
-find prompt is the same.
+find prompt and the tab list are the same.
 
 Find is case-insensitive, matches text as the page shows it — spaces
 collapsed, a word split across `<b>` still one word, never across a
