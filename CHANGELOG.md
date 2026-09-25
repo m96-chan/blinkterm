@@ -85,6 +85,11 @@ carry, and the list is kept as things land rather than written at the end.
 - Over ssh, or in a terminal whose `winsize` has no pixels, the cell size is
   asked with `CSI 16 t`, so the picture is the pane's size there too
   ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
+- A Homebrew tap: `brew install m96-chan/tap/blinkterm` on Linux builds the
+  same source `cargo install` does, with Homebrew's Rust; `--HEAD` until the
+  first tag. The formula is `packaging/homebrew/blinkterm.rb` here, built by
+  CI, and the tap carries a copy
+  ([#32](https://github.com/m96-chan/blinkterm/issues/32)).
 
 ### Changed
 

@@ -23,8 +23,11 @@ below.
 
 ## Before a release
 
-- CI green on `main`, all four jobs. The `engine` job is the one that matters
-  most and the one that cannot run on a laptop without a Chromium.
+- CI green on `main`, all four jobs in `CI`. The `engine` job is the one that
+  matters most and the one that cannot run on a laptop without a Chromium.
+- The `Homebrew` workflow is green too: it builds `packaging/homebrew/blinkterm.rb`
+  the way `brew install` would, and runs on pull requests that touch it, the
+  lock file, or the workflow.
 - `CHANGELOG.md` `Unreleased` section says what a person would notice.
 - The README's Rust floor still matches `Cargo.toml`; the `msrv` job checks
   this, so a green `main` has already confirmed it.
@@ -47,6 +50,51 @@ $EDITOR CHANGELOG.md
 git tag -a vX.Y.Z -m "blinkterm X.Y.Z"
 git push origin vX.Y.Z
 ```
+
+## Homebrew
+
+The formula is `packaging/homebrew/blinkterm.rb` here, and
+[m96-chan/homebrew-tap](https://github.com/m96-chan/homebrew-tap) carries a
+copy at `Formula/blinkterm.rb`; `brew install m96-chan/tap/blinkterm` reads
+the copy. The formula is edited here, where the `Homebrew` workflow builds it,
+and copied over once the tag exists, so the tap never holds a formula that was
+not built first.
+
+After step 3 above, with the tag pushed:
+
+```sh
+# 4. the stable block: GitHub's archive of the tag, and its checksum
+url=https://github.com/m96-chan/blinkterm/archive/refs/tags/vX.Y.Z.tar.gz
+curl -fsSL "$url" | sha256sum
+$EDITOR packaging/homebrew/blinkterm.rb
+#   above `license "MIT"`:
+#     url "https://github.com/m96-chan/blinkterm/archive/refs/tags/vX.Y.Z.tar.gz"
+#     sha256 "<the sum>"
+#   `head` stays. Land it through a pull request: the Homebrew workflow
+#   installs the stable spec now that there is one, then HEAD.
+
+# 5. copy it to the tap
+git clone https://github.com/m96-chan/homebrew-tap
+cp packaging/homebrew/blinkterm.rb homebrew-tap/Formula/blinkterm.rb
+(cd homebrew-tap && git commit -am "blinkterm X.Y.Z" && git push)
+```
+
+`brew bump-formula-pr --url "$url" --sha256 <sum> m96-chan/tap/blinkterm` does
+step 4's edit and step 5's commit against the tap in one go, but it edits the
+tap's copy rather than the canonical file and wants a GitHub token in
+`HOMEBREW_GITHUB_API_TOKEN`; it is the right tool once the tap has more than
+one formula and no canonical copy elsewhere, and not before.
+
+The archive url is what Homebrew expects for a GitHub tag, and GitHub keeps
+the checksum of a tag's archive stable. The build inside `brew` runs `cargo
+install --locked` against the `Cargo.lock` in the archive and fetches the tOS
+revisions from GitHub as it goes; Homebrew allows a build network access by
+default, on Linux (Landlock) as on macOS, and the formula does not opt out.
+Once the stable block is in, the README's `brew install` line drops `--HEAD`.
+
+Step 5 is what the release workflow will do once there is one (#22): a job
+after the tag that checks out the tap with a `HOMEBREW_TAP_TOKEN` secret,
+copies the formula, and pushes. Until then it is two commands.
 
 ## What goes in the release notes
 

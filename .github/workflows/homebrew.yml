@@ -1,0 +1,104 @@
+# The Homebrew formula, built the way a user builds it.
+#
+# A workflow of its own rather than a fifth job in ci.yml, for two reasons. It
+# needs Homebrew, which none of the other jobs do, and it is slow -- the
+# `rust` bottle and then a from-source build of this crate and the tOS crates
+# it pins, six to ten minutes -- for something that only changes when the
+# formula, the lock file or this file does. So it runs on those paths and on
+# demand, not on every push, and a `paths:` filter is workflow-level.
+#
+# What is under test is the formula, not the checkout: `head` in the formula
+# points at main on GitHub, so a pull request that edits the formula builds
+# it against main's tree, which is what a user would get. The crate under
+# review is ci.yml's business. A change to Cargo.toml or Cargo.lock that only
+# Homebrew would notice is caught on the push to main, which is the record.
+name: Homebrew
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - packaging/homebrew/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/homebrew.yml
+  pull_request:
+    paths:
+      - packaging/homebrew/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/homebrew.yml
+  workflow_dispatch:
+
+# Same reasoning as ci.yml: this reads the checkout and reports a status, and a
+# job that cannot push is a job that cannot be talked into pushing. The
+# audit's calls to GitHub's API are reads.
+permissions:
+  contents: read
+
+# As in ci.yml: a branch pushed twice in a minute does not need the first run
+# finished, and main's runs are the record, so they are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # Homebrew would otherwise `brew update` first, report usage, and print
+  # hints; none of that is the job.
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  # `brew audit --online` asks GitHub's API about the repository; without a
+  # token it is rate-limited by IP, which on a shared runner is already spent.
+  # The default token can read, and `bin/brew` passes HOMEBREW_* through its
+  # environment filter where a bare GITHUB_TOKEN would be dropped.
+  HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  formula:
+    name: brew audit, install, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # ubuntu-latest has a Homebrew at /home/linuxbrew/.linuxbrew already;
+      # this action puts a current one on PATH and taps homebrew/core, and it
+      # is what Homebrew's own `brew tap-new` scaffold uses, pinned to the same
+      # commit. Pinned by commit because Homebrew/actions has no major-version
+      # tag to follow, only a dated tag per release; Dependabot moves a commit
+      # pin with a version comment the way it moves a tag.
+      - uses: Homebrew/actions/setup-homebrew@1e34f2e2acaa766b7efacb8c26352e6abbb023f9 # 2026.09.13.1
+      # `brew audit` and `brew install` take formula names, not paths, so the
+      # formula is put in a local tap named as the real one. `brew --repository
+      # m96-chan/tap` is where that tap would live; making the directory is all
+      # tapping is. It is not a git repository, which only skips the audits
+      # that read a tap's history, and this formula has none yet.
+      - name: Put the formula in a local m96-chan/tap
+        run: |
+          tap=$(brew --repository m96-chan/tap)
+          mkdir -p "$tap/Formula"
+          cp packaging/homebrew/blinkterm.rb "$tap/Formula/blinkterm.rb"
+      # --strict --online is what a reviewer of the tap would run: style, the
+      # DSL rules (description length, licence, branch on the head url), and
+      # that the urls answer.
+      - run: brew audit --strict --online m96-chan/tap/blinkterm
+      # The stable spec, once there is one. Head-only until v0.1.0 is tagged,
+      # so this step looks for the sha256 line rather than assuming; when the
+      # stable block lands nothing here needs editing.
+      - name: brew install (stable), if there is a stable
+        run: |
+          if grep -q '^  sha256 ' packaging/homebrew/blinkterm.rb; then
+            brew install --build-from-source --verbose m96-chan/tap/blinkterm
+            brew test --verbose m96-chan/tap/blinkterm
+            brew uninstall m96-chan/tap/blinkterm
+          else
+            echo "no stable block yet; head only"
+          fi
+      # --build-from-source is redundant with --HEAD (there is no bottle for
+      # HEAD) and says what the job is about. --verbose so a failing cargo
+      # build shows its errors in the log rather than a path to one.
+      - run: brew install --HEAD --build-from-source --verbose m96-chan/tap/blinkterm
+      - run: brew test --verbose m96-chan/tap/blinkterm
+      # What was actually installed, in the log, the way the engine job prints
+      # its Chromium's --version.
+      - run: '"$(brew --prefix)/bin/blinkterm" --version'
