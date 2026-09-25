@@ -172,6 +172,10 @@ pub enum Problem {
     },
     /// The page came, and the server said it was an error while sending it.
     Status(u16),
+    /// The renderer behind the page died (`Target.targetCrashed`). The tab
+    /// stays and a reload brings a new renderer; until the page lands again
+    /// nothing is sent to it — see [`crate::tabs::Tab::crashed`].
+    Crashed,
 }
 
 /// The reason in a `Page.navigate` reply, if the navigation failed.
@@ -460,6 +464,7 @@ pub fn sentence(problem: &Problem) -> String {
             }
         }
         Problem::Status(status) => status_phrase(*status),
+        Problem::Crashed => "this page crashed; ctrl+r reloads it".to_string(),
     }
 }
 
@@ -891,5 +896,13 @@ mod tests {
         assert_eq!(status_phrase(500), "500 server error");
         assert_eq!(status_phrase(599), "599");
         assert_eq!(sentence(&Problem::Status(403)), "403 forbidden");
+    }
+
+    #[test]
+    fn a_crashed_page_says_what_to_press() {
+        assert_eq!(
+            sentence(&Problem::Crashed),
+            "this page crashed; ctrl+r reloads it"
+        );
     }
 }

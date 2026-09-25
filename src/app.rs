@@ -36,6 +36,7 @@ use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::{Cells, Metrics};
 
 use crate::appearance::Appearance;
+use crate::bookmarks::{Bookmarks, Toggled};
 use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::clipboard;
 use crate::dialog::{Answer, Dialog, Kind};
@@ -57,6 +58,7 @@ use crate::options::Options;
 use crate::profile::Profile;
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
+use crate::session::{self, Offer, Reply, Session, Snapshot};
 use crate::tablist::{self, TabList};
 use crate::tabs::{Outcome, Tab, Tabs};
 use crate::upload::{self, Upload};
@@ -207,6 +209,13 @@ extern "C" fn on_winch(_signal: libc::c_int) {
     RESIZED.store(true, Ordering::SeqCst);
 }
 
+/// How long a last tab that went by itself is given to turn out to be the
+/// engine going: a `SIGTERM` to the engine's group destroys every page 5 ms
+/// after it lands and closes the pipe 11 ms after that (measured against
+/// chrome-headless-shell 153, in the #18 design), so the list emptying is
+/// what an engine killed from outside says first.
+const ENGINE_GRACE: Duration = Duration::from_millis(50);
+
 /// Ask to be told about the three signals that matter, without `SA_RESTART`:
 /// a `poll` that is interrupted is a `poll` that comes back and looks at the
 /// flags, which is the whole point of setting them.
@@ -323,6 +332,14 @@ struct Chrome {
     hinting: Option<Hinting>,
     /// The question out after a click in normal mode.
     focus: Option<Focus>,
+    /// The person's bookmarks, one file for every profile; see
+    /// [`crate::bookmarks`].
+    bookmarks: Bookmarks,
+    /// The tabs as last written, the closed ones, and what the last run
+    /// left; see [`crate::session`].
+    session: Session,
+    /// The question after an unclean exit, while it is on the row.
+    offer: Option<Offer>,
 }
 
 impl Chrome {
@@ -592,6 +609,18 @@ pub fn run(options: Options) -> Result<(), String> {
                 mode: normal::Mode::starting(options.normal_mode),
                 hinting: None,
                 focus: None,
+                // The same file under every profile, a temporary one
+                // included: a bookmark is the person's, not the engine's.
+                bookmarks: match Profile::data_dir() {
+                    Ok(dir) => Bookmarks::load(&dir),
+                    Err(_) => Bookmarks::in_memory(),
+                },
+                session: if engine.profile().is_temporary() {
+                    Session::in_memory()
+                } else {
+                    Session::load(engine.profile().dir())
+                },
+                offer: None,
             };
             let outcome = drive(
                 &mut pane,
@@ -601,6 +630,10 @@ pub fn run(options: Options) -> Result<(), String> {
                 &mut chrome,
                 options,
             );
+            // A quit says the session is closed; anything else leaves it
+            // open, with what was still waiting to be written, so that the
+            // next start offers it back. See [`crate::session`].
+            chrome.session.finish(outcome.is_ok());
             (outcome, Some(chrome.downloads))
         }
         Err(e) => (Err(format!("cannot measure the pane: {e}")), None),
@@ -651,18 +684,50 @@ fn drive(
     chrome: &mut Chrome,
     options: Options,
 ) -> Result<(), String> {
+    // What the last run left, decided before anything is opened: its tabs,
+    // with `--restore`; a question on the row, after a run that did not quit.
+    let plan = session::plan(chrome.session.saved(), options.restore);
+    let mut restored = false;
+    if let Some(snapshot) = plan.restore {
+        chrome.session.take_saved();
+        restore_tabs(tabs, browser, chrome, snapshot);
+        restored = true;
+    }
+    if let Some(offer) = plan.offer {
+        chrome.offer = Some(offer);
+        chrome.session.hold(true);
+    }
+    // The first url on the command line, or the home page when there is none.
+    let url = normalise(options.urls.first().unwrap_or(&options.home));
+    // A url asked for on top of a restore is one more tab, in front — the
+    // rest of them go behind it, below; with nothing asked for, the restored
+    // tab in front is the page, and the home page is not opened.
+    if restored && !options.urls.is_empty() {
+        let appearance = chrome.appearance;
+        match open_tab(tabs, browser, &appearance, &url) {
+            Ok(()) => {
+                if let Some(tab) = tabs.active_mut() {
+                    tab.note = Some(format!("loading {url}"));
+                    tab.loading = true;
+                    tab.since = Some(Instant::now());
+                }
+            }
+            Err(why) => note(tabs, why),
+        }
+    }
     activate(tabs, browser, chrome)?;
 
-    let url = normalise(options.urls.first().unwrap_or(&options.home));
-    if let Some(tab) = tabs.active_mut() {
-        tab.url = url.clone();
-        tab.note = Some(format!("loading {url}"));
-        tab.loading = true;
-    }
-    redraw_row(pane, tabs, chrome)?;
-    if let Some(why) = navigate(tabs, chrome, &url) {
+    if !restored {
         if let Some(tab) = tabs.active_mut() {
-            tab.note = Some(why);
+            tab.url = url.clone();
+            tab.note = Some(format!("loading {url}"));
+            tab.loading = true;
+        }
+        redraw_row(pane, tabs, chrome)?;
+        if let Some(why) = navigate(tabs, chrome, &url) {
+            if let Some(tab) = tabs.active_mut() {
+                tab.note = Some(why);
+            }
         }
     }
     // Whether or not it was an error on the wire: a reply that says the page
@@ -680,8 +745,24 @@ fn drive(
     while !QUIT.load(Ordering::SeqCst) {
         if tabs.is_empty() {
             // The last tab closed itself, which is the page saying the browser
-            // is over — the same thing `ctrl+w` on the last tab means.
-            return Ok(());
+            // is over — the same thing `ctrl+w` on the last tab means. Or
+            // every page closing at once, which is also what an engine killed
+            // from outside says first ([`ENGINE_GRACE`]): the engine is asked
+            // before this is believed.
+            let deadline = Instant::now() + ENGINE_GRACE;
+            loop {
+                engine.check().map_err(|why| died(why, &chrome.session))?;
+                if let Some(ended) = browser.ended() {
+                    return Err(died(
+                        format!("the engine stopped talking: {ended}"),
+                        &chrome.session,
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         // A download's last word has been on the row long enough.
         if chrome.downloads.expire(Instant::now()) {
@@ -712,8 +793,12 @@ fn drive(
                 let stopped = tab.dialog.is_some();
                 let viewport = viewport(chrome, tab);
                 css = viewport.css;
-                emulate(&mut tab.connection, viewport, stopped)?;
-                restart_screencast(&mut tab.connection, metrics, stopped)?;
+                // Not a crashed page: the override takes the engine down
+                // ([`revive`]), and the landing that brings it back sizes it.
+                if !tab.is_crashed() {
+                    emulate(&mut tab.connection, viewport, stopped)?;
+                    restart_screencast(&mut tab.connection, metrics, stopped)?;
+                }
             }
             // The screen was cleared and the page is a different size, so
             // nothing that was captured before this is worth painting and the
@@ -740,10 +825,13 @@ fn drive(
         // later.
         if last_check.elapsed() > Duration::from_millis(500) {
             last_check = Instant::now();
-            engine.check()?;
+            engine.check().map_err(|why| died(why, &chrome.session))?;
         }
         if let Some(ended) = browser.ended() {
-            return Err(format!("the engine stopped talking: {ended}"));
+            return Err(died(
+                format!("the engine stopped talking: {ended}"),
+                &chrome.session,
+            ));
         }
         reap_dead_tabs(pane, tabs, browser, chrome)?;
 
@@ -836,8 +924,32 @@ fn drive(
         // And last, because it is the thing to do when nothing else happened:
         // a page that has stopped moving gets its lossless picture.
         rest_shot(pane, tabs, chrome)?;
+        // The tabs as they now are, for the session file: once a pass rather
+        // than at every place the list or a tab's url or title changes, of
+        // which there are many and a missed one is a session that lies. A
+        // few string clones; a write only when it differs from the last, at
+        // most once every [`session::WRITE_EVERY`].
+        chrome.session.record(Snapshot::of(tabs), Instant::now());
+        if let Err(why) = chrome.session.flush(Instant::now()) {
+            note(tabs, why);
+            redraw_row(pane, tabs, chrome)?;
+        }
     }
     Ok(())
+}
+
+/// The sentence for an engine that died, with what was not lost: the tabs
+/// the session file holds, which the next start offers back and
+/// `--restore` reopens. Just `why` when nothing was saved, or the session is
+/// kept nowhere — a temporary profile's.
+fn died(why: String, session: &Session) -> String {
+    match session.saved_tabs() {
+        Some(1) => format!("{why}; the tab you had is saved: blinkterm --restore reopens it"),
+        Some(tabs) => {
+            format!("{why}; the {tabs} tabs you had are saved: blinkterm --restore reopens them")
+        }
+        None => why,
+    }
 }
 
 /// Put a command to a page: waited for, unless the page is `stopped`.
@@ -857,6 +969,13 @@ fn drive(
 /// the pane is and already casting — rather than a loop that sat out a
 /// deadline per command before it could draw the question that is stopping
 /// the page.
+///
+/// A crashed page is neither told nor asked: it is not spoken to at all
+/// until it has landed again ([`Tab::is_crashed`]). Most of what would be
+/// sent to it is merely held, but `Emulation.setDeviceMetricsOverride` to a
+/// crashed renderer kills the whole browser process with `SIGSEGV`, as a
+/// call or a notification, measured every time against
+/// chrome-headless-shell 153 — see [`revive`].
 fn tell(
     client: &mut Client,
     stopped: bool,
@@ -1002,7 +1121,11 @@ pub fn page_title(client: &mut Client) -> Option<String> {
 /// and the engine's own word that it is leaving is three milliseconds behind.
 fn navigate(tabs: &mut Tabs<Client>, chrome: &mut Chrome, url: &str) -> Option<String> {
     let tab = tabs.active_mut()?;
-    tab.problem = None;
+    // A crash is the one problem that stays until the page lands: until then
+    // the renderer is dead, whatever has been asked of it ([`Tab::crashed`]).
+    if !tab.is_crashed() {
+        tab.problem = None;
+    }
     tab.since = Some(Instant::now());
     tab.committed = false;
     let sent = tab.connection.send(
@@ -1113,6 +1236,14 @@ fn activate(
     let Some(tab) = tabs.active_mut() else {
         return Ok(());
     };
+    // A page whose renderer died is raised and nothing more. `Page.enable`,
+    // the title and the screencast would all be held until it came back, and
+    // the size would take the engine down with it ([`revive`]); the landing
+    // that brings it back does all of it.
+    if tab.is_crashed() {
+        chrome.motion.reset(Instant::now());
+        return Ok(());
+    }
     // First, whether the page is stopped behind a dialog, because that
     // decides whether anything below can be waited for. See [`tell`].
     bin_events(tab, &base);
@@ -1160,8 +1291,11 @@ fn activate(
     // Except while a dialog is up, when the page cannot say what it is called
     // and a question would cost the two seconds of [`page_loaded`] for
     // nothing. The page is asked when the dialog closes instead.
+    //
+    // And not of a dormant tab, whose page is an `about:blank` that would
+    // answer with no title at all, over the one the session saved.
     bin_events(tab, &base);
-    if tab.dialog.is_none() {
+    if tab.dialog.is_none() && !tab.dormant {
         if let Some(loaded) = page_loaded(&mut tab.connection) {
             tab.loaded(loaded);
         }
@@ -1172,7 +1306,157 @@ fn activate(
     // already loaded and still gets its lossless picture a rest interval
     // from now rather than never.
     chrome.motion.reset(Instant::now());
+    // Last, so that everything above was asked of the blank page, which
+    // answers at once, and not of one with a navigation pending, which holds
+    // what is asked of it.
+    wake_dormant(tabs, chrome);
     Ok(())
+}
+
+/// A tab for a page that has not been asked for: an `about:blank` target
+/// carrying the url and title it will have, loaded the first time it is in
+/// front. See [`Tab::dormant`].
+///
+/// Why not the page itself, which `Target.createTarget` would load in one
+/// step: twenty tabs restored would be twenty pages fetched at once on start
+/// and twenty renderers' worth of memory for pages the person may never look
+/// at again. A blank target is the floor, 9.5 MB and 27 ms (measured), and
+/// the strip shows the saved titles at once. Chrome restores the same way.
+fn open_dormant(
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &Chrome,
+    entry: session::Entry,
+) -> Result<(), String> {
+    open_tab(tabs, browser, &chrome.appearance, "about:blank")?;
+    if let Some(tab) = tabs.active_mut() {
+        tab.url = entry.url;
+        tab.title = entry.title;
+        tab.dormant = true;
+    }
+    Ok(())
+}
+
+/// The tab in front, if dormant, asked for its page: called at the end of
+/// [`activate`], which is the one place a tab comes to the front.
+///
+/// The flag goes before the navigation does, so that the engine's rename of
+/// the target to the page's url is taken ([`Tabs::take`] passes over renames
+/// while a tab is dormant).
+fn wake_dormant(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(tab) = tabs.active_mut() else {
+        return;
+    };
+    if !tab.dormant {
+        return;
+    }
+    tab.dormant = false;
+    let url = tab.url.clone();
+    tab.note = Some(format!("loading {url}"));
+    tab.loading = true;
+    if let Some(why) = navigate(tabs, chrome, &url) {
+        note(tabs, why);
+    }
+}
+
+/// Open the tabs of a saved session, dormant, in order, and put the one
+/// that was in front in front — in the list; making it the engine's tab in
+/// front is the caller's, by [`activate`] or [`switched`].
+///
+/// The first adopts the tab this program started with when nobody has done
+/// anything with it yet — a lone, blank, untitled tab, which a restore
+/// should not leave behind as an empty one before the pages. A tab that
+/// will not open says why on the row and ends the restore there, with the
+/// tabs before it open. At most [`session::RESTORE_CAP`], which the file's
+/// reading has already held it to.
+fn restore_tabs(
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &Chrome,
+    snapshot: Snapshot,
+) {
+    let untouched = tabs.len() == 1
+        && tabs.active().is_some_and(|tab| {
+            tab.url == "about:blank" && tab.title.is_empty() && !tab.loading && !tab.dormant
+        });
+    let first = if untouched { 0 } else { tabs.len() };
+    for (index, entry) in snapshot
+        .tabs
+        .into_iter()
+        .take(session::RESTORE_CAP)
+        .enumerate()
+    {
+        if index == 0 && untouched {
+            if let Some(tab) = tabs.active_mut() {
+                tab.url = entry.url;
+                tab.title = entry.title;
+                tab.dormant = true;
+            }
+            continue;
+        }
+        if let Err(why) = open_dormant(tabs, browser, chrome, entry) {
+            note(tabs, format!("not every tab came back: {why}"));
+            return;
+        }
+    }
+    tabs.select(first + snapshot.active + 1);
+}
+
+/// The offer after an unclean exit, answered: taken off the row, the
+/// session let go to be written again, and on a yes the saved tabs opened
+/// and the one that was in front brought there.
+fn decline_or_restore(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &mut Chrome,
+    yes: bool,
+) -> Result<(), String> {
+    chrome.offer = None;
+    chrome.session.hold(false);
+    if yes {
+        if let Some(saved) = chrome.session.take_saved() {
+            let was = tabs.active_target().map(str::to_string);
+            restore_tabs(tabs, browser, chrome, saved.snapshot);
+            switched(pane, tabs, browser, chrome, was)?;
+            // The tab the program started with, adopted and still in front,
+            // was not switched to and is woken here.
+            wake_dormant(tabs, chrome);
+        }
+    }
+    redraw_row(pane, tabs, chrome)
+}
+
+/// Everything a crashed page's new renderer needs told again, once it has
+/// landed: the landing after `ctrl+r`, a history step or a typed url.
+///
+/// What the new renderer has is `Page` enabled and the size it was told
+/// before, both measured across a reload; what it has not is the
+/// screencast, which is dead with the old one (59 frames a second before the
+/// crash, none after the reload until it is started again, 59 once it is).
+/// So the cast is started again, and the rest of a session's setup — the
+/// file-chooser interception, [`prepare_session`], the size — is re-sent for
+/// the cost of a few notifications, since none of it was measured to survive
+/// and all of it is idempotent. Told, not asked, as after any landing: the
+/// page may already be busy.
+///
+/// Never called on a tab that is still crashed. An
+/// `Emulation.setDeviceMetricsOverride` to a crashed renderer takes the
+/// browser process down with `SIGSEGV` — chrome-headless-shell 153, as a call
+/// or a notification, first thing after the crash or after other commands,
+/// every time — which is why `activate` sends a crashed tab nothing and
+/// this waits for the landing that follows `Inspector.targetReloadedAfterCrash`
+/// ([`Tab::reviving`]).
+///
+/// Public so that the engine tests send what this program sends.
+pub fn revive(client: &mut Client, appearance: &Appearance, viewport: Viewport, metrics: Metrics) {
+    let _ = client.notify(
+        "Page.setInterceptFileChooserDialog",
+        Json::object(vec![("enabled", Json::Bool(true))]),
+    );
+    prepare_session(client, appearance);
+    let _ = emulate(client, viewport, true);
+    let _ = restart_screencast(client, metrics, true);
 }
 
 /// Throw away what a tab has queued, except what it says about a dialog or a
@@ -1204,7 +1488,8 @@ fn deactivate(tabs: &mut Tabs<Client>, target: &str) {
     let Some(index) = tabs.index_of(target) else {
         return;
     };
-    if let Some(tab) = tabs.get_mut(index) {
+    // A crashed page is casting nothing, and would hold the command.
+    if let Some(tab) = tabs.get_mut(index).filter(|tab| !tab.is_crashed()) {
         let stopped = tab.dialog.is_some();
         let _ = tell(
             &mut tab.connection,
@@ -1284,13 +1569,17 @@ fn switched(
 /// announcement, which has no opener, is ignored as already ours rather
 /// than made a second tab. Measured against `chrome-headless-shell` 153, the
 /// first stays a visible page while the others are made, so it needs no
-/// raising again. One that cannot be opened is a note on the first tab, and
-/// the rest still open: one bad url is no reason to open none.
+/// raising again. One that cannot be opened is a note on the first url's
+/// tab, the one in front, and the rest still open: one bad url is no reason
+/// to open none.
+///
+/// After a restore the first url's tab is in front of the restored ones, and
+/// these go at the end, after it.
 fn open_the_rest(tabs: &mut Tabs<Client>, browser: &mut Client, chrome: &Chrome, urls: &[String]) {
     for url in urls.iter().skip(1) {
         let url = normalise(url);
         if let Err(why) = open_behind(tabs, browser, &chrome.appearance, &url) {
-            if let Some(first) = tabs.get_mut(0) {
+            if let Some(first) = tabs.active_mut() {
                 first.note = Some(format!("couldn't open {url}: {why}"));
             }
         }
@@ -1458,16 +1747,31 @@ pub fn prepare_session(client: &mut Client, appearance: &Appearance) {
 /// makes `ctrl+w` the way out of a page that asks the same question forever,
 /// and it is why the README says so rather than leaving somebody to find out
 /// with their form.
-fn close_tab(tabs: &mut Tabs<Client>, browser: &mut Client, index: usize) {
-    let Some(mut tab) = tabs.close(index) else {
-        return;
-    };
+///
+/// What the tab was — its url and title — comes back, for `ctrl+shift+t`.
+/// A crashed tab closes the same way: `Target.closeTarget` is the browser's
+/// and answers at once on one (measured).
+fn close_tab(
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    index: usize,
+) -> Option<session::Entry> {
+    let mut tab = tabs.close(index)?;
     let _ = browser.call_within(
         "Target.closeTarget",
         Json::object(vec![("targetId", Json::string(&tab.target))]),
         SWITCH_TIMEOUT,
     );
     tab.connection.close();
+    Some(closed_entry(&tab))
+}
+
+/// A tab that went, as `ctrl+shift+t` will bring it back.
+fn closed_entry<C>(tab: &Tab<C>) -> session::Entry {
+    session::Entry {
+        url: tab.url.clone(),
+        title: tab.title.clone(),
+    }
 }
 
 /// Drop any tab whose session has gone.
@@ -1502,7 +1806,11 @@ fn reap_dead_tabs(
     }
     let was = tabs.active_target().map(str::to_string);
     for index in dead.into_iter().rev() {
-        tabs.close(index);
+        // A page that closed itself, heard here first rather than as
+        // `Target.targetDestroyed`: `ctrl+shift+t` brings it back either way.
+        if let Some(tab) = tabs.close(index) {
+            chrome.session.closed(closed_entry(&tab));
+        }
     }
     if tabs.is_empty() {
         // The loop's own check ends the program, cleanly.
@@ -1599,6 +1907,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         chrome.bar.as_ref(),
         chrome.find.as_ref(),
         chrome.list.as_ref(),
+        chrome.offer.as_ref(),
     );
     if let Some(RowOwner::List(list)) = &owner {
         // The rows under the row are the list's while it is open, and are
@@ -1724,6 +2033,8 @@ fn owned_row<C>(cols: u32, tabs: &Tabs<C>, owner: RowOwner<'_>) -> Vec<u8> {
             &screen::dialog_prompt(cols, &upload.prompt()),
             &upload.line,
         ),
+        // The same look as a `confirm()`: a question answered by a key.
+        RowOwner::Offer(offer) => screen::dialog_line(cols, &offer.caption(), offer.hint()),
     }
 }
 
@@ -1745,6 +2056,9 @@ enum RowOwner<'a> {
     /// question answered by a key.
     Dialog(&'a Dialog),
     Upload(&'a Upload),
+    /// The offer to restore the tabs a run that did not quit left: the
+    /// person's question, and not an urgent one.
+    Offer(&'a Offer),
 }
 
 /// Which line owns the row: the url bar, then the find prompt, then the tab
@@ -1761,8 +2075,10 @@ enum RowOwner<'a> {
 /// next, because the page is stopped behind it — even behind an upload
 /// prompt, since a chooser does not stop the page and a script can
 /// `alert()` while a path is half typed; the path waits underneath and comes
-/// back when the alert is answered. The upload prompt last, because it is
-/// the page's question and the page is not waiting on it.
+/// back when the alert is answered. The upload prompt next, because it is
+/// the page's question and the page is not waiting on it. And the offer to
+/// restore the last run's tabs last of all: nothing is waiting on it, so it
+/// waits under everything the page or the person is in the middle of.
 ///
 /// A line that joins them goes in here, in its place in that order, as one
 /// more arm of [`RowOwner`]; [`redraw_row`] and
@@ -1775,6 +2091,7 @@ fn row_owner<'a, C>(
     bar: Option<&'a UrlBar>,
     find: Option<&'a Find>,
     list: Option<&'a TabList>,
+    offer: Option<&'a Offer>,
 ) -> Option<RowOwner<'a>> {
     if let Some(bar) = bar {
         return Some(RowOwner::Bar(bar));
@@ -1789,7 +2106,10 @@ fn row_owner<'a, C>(
     if let Some(dialog) = &tab.dialog {
         return Some(RowOwner::Dialog(dialog));
     }
-    tab.upload.as_ref().map(RowOwner::Upload)
+    if let Some(upload) = &tab.upload {
+        return Some(RowOwner::Upload(upload));
+    }
+    offer.map(RowOwner::Offer)
 }
 
 /// The words that are there, two spaces apart, or `None` for none.
@@ -1825,6 +2145,8 @@ fn handle_target_events(
     let was = tabs.active_target().map(str::to_string);
     let mut redraw = false;
     let mut note: Option<String> = None;
+    // The tabs whose renderer died in this batch.
+    let mut crashed: Vec<String> = Vec::new();
 
     for event in &events {
         // A download's news comes on this connection and is nobody's tab's.
@@ -1854,10 +2176,16 @@ fn handle_target_events(
                 redraw = true;
             }
             Outcome::Renamed => redraw = true,
-            Outcome::Gone { mut tab, why } => {
+            Outcome::Gone { mut tab } => {
+                // A page that closed itself: `ctrl+shift+t` brings it back.
+                chrome.session.closed(closed_entry(&tab));
                 tab.connection.close();
                 redraw = true;
-                note = note.or(why);
+            }
+            Outcome::Crashed { index } => {
+                // The tab stays, saying so; see [`Tab::crashed`].
+                crashed.extend(tabs.iter().nth(index).map(|tab| tab.target.clone()));
+                redraw = true;
             }
             Outcome::Failed(why) => {
                 note = Some(why);
@@ -1879,10 +2207,67 @@ fn handle_target_events(
         tab.note = Some(note);
     }
     switched(pane, tabs, browser, chrome, was)?;
+    let front = tabs.active().filter(|tab| tab.is_crashed());
+    if let Some(target) = front.map(|tab| tab.target.clone()) {
+        if crashed.contains(&target) {
+            crashed_in_front(pane, tabs, chrome, &target)?;
+        }
+    }
     if redraw {
         redraw_row(pane, tabs, chrome)?;
     }
     Ok(())
+}
+
+/// The page in front has just crashed. The picture goes — a dead page that
+/// looks alive is a click that does nothing — and with it everything that
+/// was waiting on its renderer: the still, the hover's ask, the navigation
+/// if it was this page's, the find prompt if it was searching it, and the
+/// wheel. The row says the rest ([`crate::load::sentence`]).
+fn crashed_in_front(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    target: &str,
+) -> Result<(), String> {
+    pane.write(&crate::graphics::clear_command())
+        .map_err(|e| e.to_string())?;
+    pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())?;
+    chrome.motion.reset(Instant::now());
+    chrome.still = None;
+    chrome.wheel.forget();
+    if chrome
+        .navigation
+        .as_ref()
+        .is_some_and(|navigation| navigation.target == target)
+    {
+        chrome.navigation = None;
+    }
+    if chrome
+        .find
+        .as_ref()
+        .is_some_and(|find| find.target == target)
+    {
+        close_find(tabs, chrome);
+    }
+    // The labels and the focus question were the dead renderer's too. Only
+    // forgotten: the page they were on is gone, and a clear sent to it now
+    // would be sent before it has landed again.
+    if chrome
+        .hinting
+        .as_ref()
+        .is_some_and(|hinting| hinting.target == target)
+    {
+        chrome.hinting = None;
+    }
+    if chrome
+        .focus
+        .as_ref()
+        .is_some_and(|focus| focus.target == target)
+    {
+        chrome.focus = None;
+    }
+    forget_hover(pane, chrome)
 }
 
 /// Everything every tab said since the last look.
@@ -1923,7 +2308,14 @@ fn handle_page_events(
         if events.is_empty() {
             continue;
         }
+        // A dormant tab is an `about:blank` standing in for a page that has
+        // not been asked for, and nothing it says is about that page.
+        if tab.dormant {
+            continue;
+        }
         let mut ask_title = false;
+        // Whether this tab's renderer died and has now landed a page again.
+        let mut revived = false;
 
         for Event { method, params } in events {
             match method.as_str() {
@@ -1981,7 +2373,9 @@ fn handle_page_events(
                         if let Some(frame) = load::landed_frame(&params) {
                             tab.frame = Some(frame);
                         }
+                        let was_crashed = tab.is_crashed();
                         tab.landed(landing);
+                        revived |= was_crashed && !tab.is_crashed();
                         redraw = true;
                         // The matches, their highlights and the world they
                         // were found from went with the document. The prompt
@@ -2009,7 +2403,7 @@ fn handle_page_events(
                             zoom::host_key(&tab.url).map(|host| chrome.zooms.get(Some(&host)));
                         if let Some(wanted) = wanted.filter(|&wanted| wanted != tab.zoom) {
                             tab.zoom = wanted;
-                            if index == active {
+                            if index == active && !tab.is_crashed() {
                                 let viewport = viewport(chrome, tab);
                                 let _ = emulate(&mut tab.connection, viewport, true);
                                 chrome.motion.reset(Instant::now());
@@ -2100,11 +2494,46 @@ fn handle_page_events(
                         redraw = true;
                     }
                 }
+                // The page session's own word of a crash, which arrives
+                // without `Inspector.enable` in the same millisecond as the
+                // browser's `Target.targetCrashed`. That one is acted on,
+                // because it names the target and is what clears the screen;
+                // this one only makes sure the tab is marked, whichever of
+                // the two mailboxes is read first — marking twice is the
+                // same as once.
+                "Inspector.targetCrashed" => {
+                    tab.crashed();
+                    redraw = true;
+                }
+                // A new renderer is on its way, and the next landing is the
+                // page back: see [`Tab::reviving`].
+                "Inspector.targetReloadedAfterCrash" if tab.is_crashed() => {
+                    tab.reviving = true;
+                }
                 _ => {}
             }
         }
 
-        if ask_title && tab.dialog.is_none() {
+        // Told only now, after every event of the pass: a landing is a
+        // revival only if nothing after it said the renderer died again.
+        // Behind, nothing: [`activate`] does all of this when it comes to
+        // the front, as for any tab.
+        if revived && !tab.is_crashed() && index == active {
+            let viewport = viewport(chrome, tab);
+            revive(
+                &mut tab.connection,
+                &chrome.appearance,
+                viewport,
+                chrome.metrics,
+            );
+            chrome.motion.reset(Instant::now());
+            chrome.still = None;
+            chrome
+                .wheel
+                .resized((viewport.css.0 as i32, viewport.css.1 as i32));
+        }
+
+        if ask_title && tab.dialog.is_none() && !tab.is_crashed() {
             if let Some(loaded) = page_loaded(&mut tab.connection) {
                 tab.loaded(loaded);
                 // The one moment the page's final url, after its redirects,
@@ -2209,13 +2638,23 @@ fn typing_line(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<Typing> {
         chrome.bar.as_ref(),
         chrome.find.as_ref(),
         chrome.list.as_ref(),
+        chrome.offer.as_ref(),
     )? {
         RowOwner::Bar(_) => Some(Typing::Url),
         RowOwner::Find(_) => Some(Typing::Find),
         RowOwner::List(_) => Some(Typing::List),
         RowOwner::Dialog(dialog) => dialog.typing().then_some(Typing::Prompt),
         RowOwner::Upload(_) => Some(Typing::Upload),
+        RowOwner::Offer(_) => None,
     }
+}
+
+/// Whether keys, the mouse and a paste go to the page in front: not while
+/// its renderer is dead, where they would be held and land on the page that
+/// a reload brings back, and not while it is dormant, which it is only
+/// until [`activate`] wakes it.
+fn accepts_input<C>(tab: &Tab<C>) -> bool {
+    !tab.is_crashed() && !tab.dormant
 }
 
 /// Whether the page in front is stopped behind a dialog.
@@ -2324,6 +2763,10 @@ fn collect_still(
 /// motion clock, which is what asks for the still then.
 fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     if asking(tabs) || chrome.list.is_some() || !chrome.motion.wants_still(Instant::now()) {
+        return;
+    }
+    // A dead renderer draws nothing and would hold the question.
+    if tabs.active().is_some_and(Tab::is_crashed) {
         return;
     }
     let Some(target) = tabs.active_target().map(str::to_string) else {
@@ -2454,9 +2897,11 @@ fn tick_hover(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> 
         chrome.bar.as_ref(),
         chrome.find.as_ref(),
         chrome.list.as_ref(),
+        chrome.offer.as_ref(),
     )
     .is_some();
-    if owned || tabs.active().is_none() {
+    // Nor over a page that is dead, which has nothing under the pointer.
+    if owned || !tabs.active().is_some_and(accepts_input) {
         return forget_hover(pane, chrome);
     }
     let now = Instant::now();
@@ -2609,7 +3054,9 @@ fn handle_input(
         Input::Colour { slot: 11, rgb } => {
             if chrome.appearance.learned(rgb) {
                 for index in 0..tabs.len() {
-                    if let Some(tab) = tabs.get_mut(index) {
+                    // Not a crashed page, which is sent no `Emulation` at all
+                    // ([`revive`]); its landing tells it.
+                    if let Some(tab) = tabs.get_mut(index).filter(|tab| !tab.is_crashed()) {
                         prepare_session(&mut tab.connection, &chrome.appearance);
                     }
                 }
@@ -2664,6 +3111,35 @@ fn handle_input(
                 // after the program's own keys have had their say.
                 Some(Typing::Prompt | Typing::Upload) | None => {}
             }
+            // The offer to restore the last run's tabs, when it has the row:
+            // under an alert that arrived on top of it, the `y` is the
+            // alert's. Any key but its own declines it and goes on to
+            // whatever it was for — somebody who has started on something
+            // else has answered.
+            let offered = matches!(
+                row_owner(
+                    tabs,
+                    chrome.bar.as_ref(),
+                    chrome.find.as_ref(),
+                    chrome.list.as_ref(),
+                    chrome.offer.as_ref()
+                ),
+                Some(RowOwner::Offer(_))
+            );
+            if let Some(offer) = chrome.offer.filter(|_| offered) {
+                match offer.reply(&key) {
+                    Reply::Waiting => return Ok(true),
+                    Reply::Yes => {
+                        decline_or_restore(pane, tabs, browser, chrome, true)?;
+                        return Ok(true);
+                    }
+                    Reply::No => {
+                        decline_or_restore(pane, tabs, browser, chrome, false)?;
+                        return Ok(true);
+                    }
+                    Reply::Pass => decline_or_restore(pane, tabs, browser, chrome, false)?,
+                }
+            }
             // Hints showing take every key that is not one of the program's
             // own; one of those cancels them and runs. So does a question
             // that has come to the row since they went up, which the keys
@@ -2675,6 +3151,7 @@ fn handle_input(
                     chrome.bar.as_ref(),
                     chrome.find.as_ref(),
                     chrome.list.as_ref(),
+                    chrome.offer.as_ref(),
                 )
                 .is_some();
                 let own_key = command(&key).is_some();
@@ -2767,6 +3244,14 @@ fn handle_input(
                     chrome.mode.toggle();
                     redraw_row(pane, tabs, chrome)?;
                 }
+                Some(Command::CopySelection | Command::Find)
+                    if tabs.active().is_some_and(Tab::is_crashed) =>
+                {
+                    // Both ask the page, and a dead renderer would hold the
+                    // question until the deadline.
+                    note(tabs, load::sentence(&Problem::Crashed));
+                    redraw_row(pane, tabs, chrome)?;
+                }
                 Some(Command::EditUrl) => {
                     chrome.bar = tabs
                         .active()
@@ -2795,6 +3280,12 @@ fn handle_input(
                         Some(Problem::Unreachable { url, .. }) => Some(url.clone()),
                         _ => None,
                     };
+                    // A page whose renderer died is reloaded in place:
+                    // `Page.reload` is answered by the browser in 4 ms and
+                    // brings a new renderer, whose landing [`revive`]s it.
+                    if let Some(tab) = tabs.active_mut().filter(|tab| tab.is_crashed()) {
+                        tab.note = Some("reloading".to_string());
+                    }
                     match unreachable {
                         Some(url) => {
                             if let Some(tab) = tabs.active_mut() {
@@ -2843,8 +3334,33 @@ fn handle_input(
                     if tabs.len() < 2 {
                         return Ok(false);
                     }
-                    close_tab(tabs, browser, tabs.active_index());
+                    if let Some(entry) = close_tab(tabs, browser, tabs.active_index()) {
+                        chrome.session.closed(entry);
+                    }
                     switched(pane, tabs, browser, chrome, was)?;
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(Command::ReopenTab) => {
+                    match chrome.session.reopen() {
+                        Some(entry) => {
+                            // Dormant, and woken at once by being brought to
+                            // the front: the same road as a restored tab.
+                            if let Err(why) = open_dormant(tabs, browser, chrome, entry) {
+                                note(tabs, why);
+                            }
+                            switched(pane, tabs, browser, chrome, was)?;
+                        }
+                        None => note(tabs, "nothing to reopen"),
+                    }
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(Command::Bookmark) => {
+                    let (url, title) = tabs
+                        .active()
+                        .map(|tab| (tab.url.clone(), tab.title.clone()))
+                        .unwrap_or_default();
+                    let sentence = bookmarked(&mut chrome.bookmarks, &url, &title);
+                    note(tabs, sentence);
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(
@@ -2904,6 +3420,17 @@ fn handle_input(
                     redraw_row(pane, tabs, chrome)?;
                 }
                 None => match action {
+                    // Both send to the page, and a dead renderer is sent
+                    // nothing: a scroll or a script before it has landed
+                    // again can take the engine down with it.
+                    normal::Action::Scroll(_) | normal::Action::Hints { .. }
+                        if !tabs.active().is_some_and(accepts_input) =>
+                    {
+                        if tabs.active().is_some_and(Tab::is_crashed) {
+                            note(tabs, load::sentence(&Problem::Crashed));
+                            redraw_row(pane, tabs, chrome)?;
+                        }
+                    }
                     normal::Action::Scroll(scroll) => scroll_by_key(tabs, chrome, scroll),
                     normal::Action::Hints { new_tab } => {
                         open_hints(tabs, chrome, new_tab);
@@ -2917,7 +3444,12 @@ fn handle_input(
                     // already on the row.
                     normal::Action::Nothing => {}
                     _ => {
-                        let loading = tabs.active().is_some_and(|tab| tab.loading);
+                        // A crashed page coming back is loading too, and a
+                        // stop would ask its renderer for the title before it
+                        // has one.
+                        let loading = tabs
+                            .active()
+                            .is_some_and(|tab| tab.loading && accepts_input(tab));
                         let stops = key.key == Key::Escape
                             && key.action != KeyAction::Release
                             && escapes(
@@ -2926,6 +3458,7 @@ fn handle_input(
                                     chrome.bar.as_ref(),
                                     chrome.find.as_ref(),
                                     chrome.list.as_ref(),
+                                    chrome.offer.as_ref(),
                                 )
                                 .as_ref(),
                                 chrome.hinting.is_some(),
@@ -2933,7 +3466,8 @@ fn handle_input(
                             ) == Escapes::StopLoading;
                         if stops {
                             stop_loading(pane, tabs, chrome)?;
-                        } else if let Some(tab) = tabs.active_mut() {
+                        } else if let Some(tab) = tabs.active_mut().filter(|tab| accepts_input(tab))
+                        {
                             send_key(&mut tab.connection, &key);
                         }
                     }
@@ -2954,8 +3488,9 @@ fn handle_input(
             // A page with a question open is not a page to click on or
             // scroll. What was sent would not be lost — the engine queues it
             // behind the dialog — which is worse: a click meant for the
-            // question would land on the page the moment it was answered.
-            if asking(tabs) {
+            // question would land on the page the moment it was answered. A
+            // page whose renderer died is the same, until it is reloaded.
+            if asking(tabs) || !tabs.active().is_some_and(accepts_input) {
                 return Ok(true);
             }
             // A press or a notch leaves every label where the thing it named
@@ -3074,6 +3609,12 @@ enum Command {
     ZoomReset,
     /// `ctrl+.`: normal mode on or off. See [`crate::normal`].
     ToggleNormal,
+    /// `ctrl+d`: bookmark the page, or remove its bookmark. See
+    /// [`crate::bookmarks`].
+    Bookmark,
+    /// `ctrl+shift+t` or `alt+t`: reopen the tab closed last. See
+    /// [`crate::session`].
+    ReopenTab,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -3099,6 +3640,9 @@ enum Command {
 ///
 /// Normal mode's toggle survives: it touches no page, and a person can leave
 /// the mode while a question waits.
+/// Bookmarking survives, for the reason copying the url does: it reads the
+/// tab's url and title, which this program already has. So does reopening a
+/// closed tab, which opens another tab, as a new tab does.
 ///
 /// A zoom waits too. The page is stopped, so it would not lay itself out
 /// again or be photographed at the new level until it was answered, and the
@@ -3122,7 +3666,9 @@ fn survives_dialog(command: Command) -> bool {
         | Command::ListTabs
         | Command::MoveTab(_)
         | Command::CopyUrl
-        | Command::ToggleNormal => true,
+        | Command::ToggleNormal
+        | Command::Bookmark
+        | Command::ReopenTab => true,
         Command::EditUrl
         | Command::Reload
         | Command::Back
@@ -3308,6 +3854,9 @@ enum Escapes {
     /// The page in front is asking for a file input's path: nothing is sent,
     /// and the input is told `cancel` ([`cancel_chooser`]).
     Upload,
+    /// The offer to restore the last run's tabs is on the row: it is
+    /// declined ([`Reply::No`]).
+    Offer,
     /// Link hints are showing: they are taken away ([`cancel_hints`]).
     Hints,
     /// The page in front is loading: the load stops ([`stop_loading`]).
@@ -3323,7 +3872,7 @@ enum Escapes {
 /// how a question is said no to, and the row is where the person can see
 /// which of them it will be. Its order is [`row_owner`]'s and not one of its
 /// own — the url bar, the find prompt, the tab list, a dialog, a file
-/// input's path — so
+/// input's path, the offer to restore the last run's tabs — so
 /// that what Escape closes is always the thing on the screen, never one
 /// underneath it. That is why a dialog comes before a path here, which the
 /// design for this key had the other way round: an `alert()` opened while a
@@ -3357,6 +3906,7 @@ fn escapes(owner: Option<&RowOwner<'_>>, hinting: bool, loading: bool) -> Escape
         Some(RowOwner::List(_)) => Escapes::List,
         Some(RowOwner::Dialog(_)) => Escapes::Dialog,
         Some(RowOwner::Upload(_)) => Escapes::Upload,
+        Some(RowOwner::Offer(_)) => Escapes::Offer,
         None if hinting => Escapes::Hints,
         None if loading => Escapes::StopLoading,
         None => Escapes::Page,
@@ -3488,6 +4038,18 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// is nobody's. `alt+9` is the last tab rather than the ninth, as it is in
 /// Chrome, Firefox and Ghostty — whose own `alt+9` means the same, so the
 /// meaning agrees even where the key does not arrive.
+///
+/// `ctrl+d` is a browser's bookmark key, and what it shadows is a page's own
+/// `ctrl+d`, which in a headless engine did nothing anyway; inside a line
+/// being typed it is readline's delete-after, because the line is asked
+/// first. Reopening a closed tab is `ctrl+shift+t`, the reflex, which a
+/// terminal speaking the Kitty keyboard protocol sends as `ctrl+t` with
+/// shift — and which is also two things it cannot be: in a legacy terminal
+/// it is the byte `ctrl+t` sends, a new tab, and in a tOS pane it never
+/// arrives, because the compositor takes it for a workspace, as above. So it
+/// is `alt+t` as well, on the modifier the compositor leaves alone, which is
+/// the precedent the zoom keys set; what that shadows is an `accesskey` on
+/// `t`.
 fn command(key: &KeyInput) -> Option<Command> {
     if key.action == KeyAction::Release {
         return None;
@@ -3497,7 +4059,9 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('q') => Some(Command::Quit),
             Key::Char('l') => Some(Command::EditUrl),
             Key::Char('r') => Some(Command::Reload),
+            Key::Char('t' | 'T') if key.mods.shift() => Some(Command::ReopenTab),
             Key::Char('t') => Some(Command::NewTab),
+            Key::Char('d') => Some(Command::Bookmark),
             Key::Char('w') => Some(Command::CloseTab),
             Key::Char('f') => Some(Command::Find),
             Key::Char('a' | 'A') if key.mods.shift() => Some(Command::ListTabs),
@@ -3523,6 +4087,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Char('c') => Some(Command::CopySelection),
             Key::Char('u') => Some(Command::CopyUrl),
+            Key::Char('t') => Some(Command::ReopenTab),
             Key::Char('=' | '+') => Some(Command::ZoomIn),
             Key::Char('-' | '_') => Some(Command::ZoomOut),
             Key::Char('0') => Some(Command::ZoomReset),
@@ -3530,6 +4095,34 @@ fn command(key: &KeyInput) -> Option<Command> {
         };
     }
     None
+}
+
+/// `ctrl+d` on the page at `url`, titled `title`: the bookmark toggled, and
+/// the sentence the row says for it.
+///
+/// Added, the row says so with the title and the url, which is the whole of
+/// what was kept; removed, it says that. A page that is not a place — a new
+/// tab, a `data:` url — has nothing to keep. A bookmark that could not be
+/// written is still made for this run, and the row says why it will not
+/// outlive it.
+fn bookmarked(bookmarks: &mut Bookmarks, url: &str, title: &str) -> String {
+    if !Bookmarks::keeps(url) {
+        return "nothing to bookmark here".to_string();
+    }
+    let what = ["bookmarked", title, url]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("  —  ");
+    match bookmarks.toggle(url, title) {
+        Ok(Toggled::Added) if bookmarks.path().is_none() => {
+            "bookmarked for this run only: nowhere to keep it".to_string()
+        }
+        Ok(Toggled::Added) => what,
+        Ok(Toggled::Removed) => "bookmark removed".to_string(),
+        Err(why) if bookmarks.has(url) => format!("bookmarked, but not saved: {why}"),
+        Err(why) => format!("bookmark removed, but not saved: {why}"),
+    }
 }
 
 /// A new level for the tab in front: told to the engine, remembered for the
@@ -3558,6 +4151,12 @@ fn rezoom(
     };
     if tab.zoom == level {
         return Ok(());
+    }
+    // The size is the one thing a crashed page must never be told: it takes
+    // the engine down ([`revive`]).
+    if tab.is_crashed() {
+        tab.note = Some(load::sentence(&Problem::Crashed));
+        return redraw_row(pane, tabs, chrome);
     }
     tab.zoom = level;
     if let Some(host) = zoom::host_key(&tab.url) {
@@ -3605,7 +4204,7 @@ fn edit_url(
     let Some(bar) = chrome.bar.as_mut() else {
         return Ok(true);
     };
-    match bar_step(bar, &chrome.history, &key) {
+    match bar_step(bar, &chrome.history, &chrome.bookmarks, &key) {
         Edit::Typing | Edit::Inserted | Edit::Previous | Edit::Next => {}
         Edit::Quit => return Ok(false),
         Edit::Cancel => chrome.bar = None,
@@ -3691,7 +4290,8 @@ fn open_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
 /// The key press was already [`Motion::input`]; the thread's activity keeps
 /// the still away while the curve runs, as for the mouse.
 fn scroll_by_key(tabs: &Tabs<Client>, chrome: &mut Chrome, scroll: normal::Scroll) {
-    let Some(tab) = tabs.active() else {
+    // Nothing to a dead renderer or a dormant tab; see [`accepts_input`].
+    let Some(tab) = tabs.active().filter(|tab| accepts_input(tab)) else {
         return;
     };
     let viewport = viewport(chrome, tab);
@@ -3727,7 +4327,9 @@ fn open_hints(tabs: &mut Tabs<Client>, chrome: &mut Chrome, new_tab: bool) {
     let Some(px) = tabs.active().map(|tab| label_px(chrome, tab)) else {
         return;
     };
-    let Some(tab) = tabs.active_mut() else {
+    // Not a dead renderer or a dormant tab, which are sent nothing; the key
+    // that asks says why ([`handle_input`]).
+    let Some(tab) = tabs.active_mut().filter(|tab| accepts_input(tab)) else {
         return;
     };
     if tab.loading && !tab.committed {
@@ -3862,6 +4464,13 @@ fn pump_hints(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
         cancel_hints(tabs, chrome);
         return true;
     }
+    // A renderer that died under the labels is sent nothing more, a remade
+    // world or a `show` least of all; [`crashed_in_front`] has usually
+    // forgotten them already.
+    if tabs.active().is_some_and(Tab::is_crashed) {
+        chrome.hinting = None;
+        return true;
+    }
     let Some(px) = tabs.active().map(|tab| label_px(chrome, tab)) else {
         return false;
     };
@@ -3928,7 +4537,8 @@ fn cancel_hints(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     let (Some(context), Some(index)) = (hinting.context, tabs.index_of(&hinting.target)) else {
         return;
     };
-    if let Some(tab) = tabs.get_mut(index) {
+    // Nothing to a dead renderer: see [`Tab::is_crashed`].
+    if let Some(tab) = tabs.get_mut(index).filter(|tab| accepts_input(tab)) {
         let _ = tab
             .connection
             .notify("Runtime.callFunctionOn", hints::clear_params(context));
@@ -3939,7 +4549,8 @@ fn cancel_hints(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
 /// collected by [`pump_focus`]. Not while a navigation has not committed,
 /// when the engine would hold the question until it did.
 fn ask_focus(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
-    let Some(tab) = tabs.active_mut() else {
+    // Not a dead renderer or a dormant tab, which are sent nothing.
+    let Some(tab) = tabs.active_mut().filter(|tab| accepts_input(tab)) else {
         return;
     };
     if tab.loading && !tab.committed {
@@ -4129,7 +4740,9 @@ fn close_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     let (Some(context), Some(index)) = (find.context, tabs.index_of(&find.target)) else {
         return;
     };
-    if let Some(tab) = tabs.get_mut(index) {
+    // A crashed page has no highlights left to clear, and nothing renderer
+    // bound is sent to one.
+    if let Some(tab) = tabs.get_mut(index).filter(|tab| !tab.is_crashed()) {
         let _ = tab
             .connection
             .notify("Runtime.callFunctionOn", find::clear_params(context));
@@ -4296,7 +4909,13 @@ fn paste(
                     // As a typed character does: the walk through history
                     // ends, and what was there to take is asked for again.
                     bar.walk = None;
-                    bar.line.suggest(chrome.history.complete(bar.line.text()));
+                    let text = bar.line.text();
+                    bar.line.suggest(
+                        chrome
+                            .bookmarks
+                            .complete(text)
+                            .or_else(|| chrome.history.complete(text)),
+                    );
                 }
             }
             return redraw_row(pane, tabs, chrome);
@@ -4337,7 +4956,7 @@ fn paste(
         prompt.paste(&clipboard::one_line(text), &upload::Disk);
         return redraw_row(pane, tabs, chrome);
     }
-    if let Some(tab) = tabs.active_mut() {
+    if let Some(tab) = tabs.active_mut().filter(|tab| accepts_input(tab)) {
         let _ = tab
             .connection
             .notify("Input.insertText", keys::insert_text(text));
@@ -4426,27 +5045,31 @@ fn note(tabs: &mut Tabs<Client>, sentence: impl Into<String>) {
     }
 }
 
-/// What one key does to the url bar, given the pages visited: the part of
-/// [`edit_url`] that talks to nothing, so that it can be tested a key at a
-/// time.
+/// What one key does to the url bar, given the pages bookmarked and
+/// visited: the part of [`edit_url`] that talks to nothing, so that it can
+/// be tested a key at a time.
 ///
 /// A suggestion is asked for when text went in and at no other time — a
 /// suggestion made again after a backspace is one the backspace cannot
-/// delete. Up and Down walk the pages that match what was typed when the
-/// walk began; any edit that changes the text ends the walk, so that the
-/// next Up walks what is there now.
-fn bar_step(bar: &mut UrlBar, history: &History, key: &KeyInput) -> Edit {
+/// delete — and it is a bookmark's before it is a visited page's: a page
+/// somebody asked to keep is the better guess. Up and Down walk the
+/// bookmarks and then the pages that match what was typed when the walk
+/// began; any edit that changes the text ends the walk, so that the next Up
+/// walks what is there now.
+fn bar_step(bar: &mut UrlBar, history: &History, bookmarks: &Bookmarks, key: &KeyInput) -> Edit {
     let before = bar.line.text().len();
     let edit = bar.line.step(key);
     match edit {
         Edit::Inserted => {
             bar.walk = None;
-            bar.line.suggest(history.complete(bar.line.text()));
+            let text = bar.line.text();
+            bar.line
+                .suggest(bookmarks.complete(text).or_else(|| history.complete(text)));
         }
         Edit::Previous | Edit::Next => {
             let walk = bar
                 .walk
-                .get_or_insert_with(|| history::Walk::new(history, bar.line.text()));
+                .get_or_insert_with(|| history::Walk::new(history, bookmarks, bar.line.text()));
             let moved = if edit == Edit::Previous {
                 walk.up()
             } else {
@@ -4990,13 +5613,14 @@ mod tests {
     fn the_row_goes_to_the_url_bar_then_find_then_the_list_then_a_dialog_then_a_file_input() {
         let owner_with =
             |tabs: &Tabs<()>, bar: Option<&UrlBar>, list: Option<&TabList>| match row_owner(
-                tabs, bar, None, list,
+                tabs, bar, None, list, None,
             ) {
                 Some(RowOwner::Bar(_)) => "bar",
                 Some(RowOwner::Find(_)) => "find",
                 Some(RowOwner::List(_)) => "list",
                 Some(RowOwner::Dialog(_)) => "dialog",
                 Some(RowOwner::Upload(_)) => "upload",
+                Some(RowOwner::Offer(_)) => "offer",
                 None => "page",
             };
         let owner = |tabs: &Tabs<()>, bar: Option<&UrlBar>| owner_with(tabs, bar, None);
@@ -5034,6 +5658,186 @@ mod tests {
         // A tab behind with a prompt does not own the row in front.
         tabs.open(Tab::new("b", (), "https://b.example/"));
         assert_eq!(owner(&tabs, None), "page");
+    }
+
+    #[test]
+    fn the_offer_has_the_row_only_when_nothing_else_does() {
+        let offer = Offer { tabs: 2 };
+        let owner = |tabs: &Tabs<()>, bar: Option<&UrlBar>| match row_owner(
+            tabs,
+            bar,
+            None,
+            None,
+            Some(&offer),
+        ) {
+            Some(RowOwner::Offer(offer)) => format!("offer {}", offer.tabs),
+            Some(_) => "something else".to_string(),
+            None => "page".to_string(),
+        };
+        let mut tabs = Tabs::new(Tab::new("a", (), "https://a.example/"));
+        assert_eq!(owner(&tabs, None), "offer 2");
+        let bar = UrlBar::new(Line::empty());
+        assert_eq!(owner(&tabs, Some(&bar)), "something else");
+        let alert = Json::parse(r#"{"type":"alert","message":"m","url":"u"}"#).expect("JSON");
+        tabs.active_mut().expect("a tab").dialog = Dialog::opening(&alert);
+        assert_eq!(
+            owner(&tabs, None),
+            "something else",
+            "the alert takes the y"
+        );
+        tabs.active_mut().expect("a tab").dialog = None;
+        let chooser = upload::Chooser {
+            backend_node_id: 3,
+            multiple: false,
+            frame_id: "F".to_string(),
+        };
+        tabs.active_mut().expect("a tab").upload =
+            Some(Upload::new(chooser, PathBuf::from("/work"), None));
+        assert_eq!(owner(&tabs, None), "something else");
+        tabs.active_mut().expect("a tab").upload = None;
+        assert_eq!(owner(&tabs, None), "offer 2", "and back when they are gone");
+    }
+
+    #[test]
+    fn ctrl_d_bookmarks_and_ctrl_shift_t_reopens_and_plain_ctrl_t_still_opens() {
+        assert_eq!(
+            command(&key(Key::Char('t'), Mods::CTRL)),
+            Some(Command::NewTab)
+        );
+        assert_eq!(
+            command(&key(Key::Char('t'), Mods::CTRL | Mods::SHIFT)),
+            Some(Command::ReopenTab)
+        );
+        assert_eq!(
+            command(&key(Key::Char('T'), Mods::CTRL | Mods::SHIFT)),
+            Some(Command::ReopenTab),
+            "a terminal that reports the shifted key"
+        );
+        // The form a tOS pane and a legacy terminal can send.
+        assert_eq!(
+            command(&key(Key::Char('t'), Mods::ALT)),
+            Some(Command::ReopenTab)
+        );
+        assert_eq!(
+            command(&key(Key::Char('d'), Mods::CTRL)),
+            Some(Command::Bookmark)
+        );
+        assert_eq!(command(&key(Key::Char('d'), Mods::ALT)), None);
+        assert_eq!(command(&key(Key::Char('d'), 0)), None);
+    }
+
+    #[test]
+    fn bookmark_and_reopen_survive_a_dialog() {
+        assert!(survives_dialog(Command::Bookmark));
+        assert!(survives_dialog(Command::ReopenTab));
+    }
+
+    #[test]
+    fn the_row_says_what_ctrl_d_did() {
+        let mut marks = Bookmarks::in_memory();
+        assert_eq!(
+            bookmarked(&mut marks, "about:blank", ""),
+            "nothing to bookmark here"
+        );
+        assert_eq!(
+            bookmarked(&mut marks, "https://example.com/", "Example Domain"),
+            "bookmarked for this run only: nowhere to keep it"
+        );
+        assert_eq!(
+            bookmarked(&mut marks, "https://example.com/", "Example Domain"),
+            "bookmark removed"
+        );
+        let dir = std::env::temp_dir().join(format!("blinkterm-app-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut marks = Bookmarks::load(&dir);
+        assert_eq!(
+            bookmarked(&mut marks, "https://example.com/", "Example Domain"),
+            "bookmarked  —  Example Domain  —  https://example.com/"
+        );
+        assert_eq!(
+            bookmarked(&mut marks, "https://a.example/", ""),
+            "bookmarked  —  https://a.example/"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sentence_for_a_dead_engine_says_how_many_tabs_are_saved() {
+        let why = || "the browser engine exited (signal: 11 (SIGSEGV))".to_string();
+        let dir = std::env::temp_dir().join(format!("blinkterm-app-died-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let mut kept = Session::load(&dir);
+        assert_eq!(died(why(), &kept), why(), "nothing saved yet");
+        let tabs = |n: usize| Snapshot {
+            tabs: (0..n)
+                .map(|i| session::Entry {
+                    url: format!("https://example.com/{i}"),
+                    title: String::new(),
+                })
+                .collect(),
+            active: 0,
+        };
+        let now = Instant::now();
+        kept.record(tabs(3), now);
+        assert_eq!(
+            died(why(), &kept),
+            format!(
+                "{}; the 3 tabs you had are saved: blinkterm --restore reopens them",
+                why()
+            )
+        );
+        kept.record(tabs(1), now + Duration::from_secs(1));
+        assert_eq!(
+            died(why(), &kept),
+            format!(
+                "{}; the tab you had is saved: blinkterm --restore reopens it",
+                why()
+            )
+        );
+        let mut memory = Session::in_memory();
+        memory.record(tabs(3), now);
+        assert_eq!(
+            died(why(), &memory),
+            why(),
+            "a temporary profile keeps none"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dormant_or_crashed_tab_is_not_a_place_to_send_keys() {
+        let mut tab: Tab<()> = Tab::new("a", (), "https://a.example/");
+        assert!(accepts_input(&tab));
+        tab.dormant = true;
+        assert!(!accepts_input(&tab));
+        tab.dormant = false;
+        tab.crashed();
+        assert!(!accepts_input(&tab));
+        tab.reviving = true;
+        tab.landed(load::Landing::Document("https://a.example/".to_string()));
+        assert!(accepts_input(&tab), "back once it has landed");
+    }
+
+    #[test]
+    fn a_bookmark_is_offered_before_a_page_visited() {
+        let mut history = History::in_memory();
+        let _ = history.visited("https://example.com/visited", "", 1);
+        let _ = history.visited("https://example.com/visited", "", 2);
+        let mut marks = Bookmarks::in_memory();
+        marks
+            .toggle("https://example.com/kept", "Kept")
+            .expect("kept");
+        let mut bar = UrlBar::new(Line::empty());
+        for c in "exa".chars() {
+            bar_step(&mut bar, &history, &marks, &typed(c));
+        }
+        assert_eq!(bar.line.hint(), "mple.com/kept");
+        let mut bar = UrlBar::new(Line::empty());
+        bar_step(&mut bar, &history, &marks, &key(Key::Up, 0));
+        assert_eq!(bar.line.text(), "https://example.com/kept");
+        bar_step(&mut bar, &history, &marks, &key(Key::Up, 0));
+        assert_eq!(bar.line.text(), "https://example.com/visited");
     }
 
     #[test]
@@ -5333,6 +6137,7 @@ mod tests {
 
     #[test]
     fn the_url_bar_offers_what_was_visited_and_walks_it_with_up_and_down() {
+        let none = Bookmarks::in_memory();
         let mut history = History::in_memory();
         let _ = history.visited("https://example.com/docs", "Docs", 1);
         let _ = history.visited("https://rust-lang.org/", "Rust", 2);
@@ -5340,44 +6145,47 @@ mod tests {
 
         // Typing over the offered url asks for a suggestion.
         for c in "exa".chars() {
-            assert_eq!(bar_step(&mut bar, &history, &typed(c)), Edit::Inserted);
+            assert_eq!(
+                bar_step(&mut bar, &history, &none, &typed(c)),
+                Edit::Inserted
+            );
         }
         assert_eq!(bar.line.text(), "exa");
         assert_eq!(bar.line.hint(), "mple.com/docs");
         // A backspace takes it away and does not bring it back.
-        bar_step(&mut bar, &history, &key(Key::Backspace, 0));
+        bar_step(&mut bar, &history, &none, &key(Key::Backspace, 0));
         assert_eq!(bar.line.text(), "ex");
         assert_eq!(bar.line.hint(), "");
         // Typing again does, and Tab takes it.
-        bar_step(&mut bar, &history, &typed('a'));
-        bar_step(&mut bar, &history, &key(Key::Tab, 0));
+        bar_step(&mut bar, &history, &none, &typed('a'));
+        bar_step(&mut bar, &history, &none, &key(Key::Tab, 0));
         assert_eq!(bar.line.text(), "example.com/docs");
         assert_eq!(bar.line.hint(), "");
 
         // Up on an empty bar walks back through where you have been, and Down
         // comes back to what was typed.
         let mut bar = UrlBar::new(Line::empty());
-        bar_step(&mut bar, &history, &key(Key::Up, 0));
+        bar_step(&mut bar, &history, &none, &key(Key::Up, 0));
         assert_eq!(bar.line.text(), "https://rust-lang.org/");
         assert_eq!(bar.line.hint(), "", "no suggestion while walking");
-        bar_step(&mut bar, &history, &key(Key::Up, 0));
+        bar_step(&mut bar, &history, &none, &key(Key::Up, 0));
         assert_eq!(bar.line.text(), "https://example.com/docs");
-        bar_step(&mut bar, &history, &key(Key::Up, 0));
+        bar_step(&mut bar, &history, &none, &key(Key::Up, 0));
         assert_eq!(bar.line.text(), "https://example.com/docs", "the oldest");
-        bar_step(&mut bar, &history, &key(Key::Down, 0));
-        bar_step(&mut bar, &history, &key(Key::Down, 0));
+        bar_step(&mut bar, &history, &none, &key(Key::Down, 0));
+        bar_step(&mut bar, &history, &none, &key(Key::Down, 0));
         assert_eq!(bar.line.text(), "");
 
         // Up after typing walks what matches it.
         let mut bar = UrlBar::new(Line::empty());
         for c in "docs".chars() {
-            bar_step(&mut bar, &history, &typed(c));
+            bar_step(&mut bar, &history, &none, &typed(c));
         }
-        bar_step(&mut bar, &history, &key(Key::Up, 0));
+        bar_step(&mut bar, &history, &none, &key(Key::Up, 0));
         assert_eq!(bar.line.text(), "https://example.com/docs");
         assert!(bar.walk.is_some());
         // And an edit ends the walk, so the next Up walks what is there now.
-        bar_step(&mut bar, &history, &key(Key::Backspace, 0));
+        bar_step(&mut bar, &history, &none, &key(Key::Backspace, 0));
         assert!(bar.walk.is_none());
     }
 
@@ -5463,14 +6271,15 @@ mod tests {
             wanted: None,
             remade: false,
         };
-        // Every combination of the five things that can have the row, hints
+        let offer = Offer { tabs: 3 };
+        // Every combination of the six things that can have the row, hints
         // showing or not, and a load under them or not: the answer is the
         // first of them in `row_owner`'s order, then the hints, and the load
         // only when none of them is there.
         let list = TabList::open(0);
-        for mask in 0..128u32 {
-            let [open_bar, open_find, dialog, path, loading, open_list, hinting] =
-                [0, 1, 2, 3, 4, 5, 6].map(|bit| mask & (1 << bit) != 0);
+        for mask in 0..256u32 {
+            let [open_bar, open_find, dialog, path, loading, open_list, hinting, offered] =
+                [0, 1, 2, 3, 4, 5, 6, 7].map(|bit| mask & (1 << bit) != 0);
             let mut tab = Tab::new("a", (), "https://a.example/");
             tab.loading = loading;
             if dialog {
@@ -5490,6 +6299,8 @@ mod tests {
                 Escapes::Dialog
             } else if path {
                 Escapes::Upload
+            } else if offered {
+                Escapes::Offer
             } else if hinting {
                 Escapes::Hints
             } else if loading {
@@ -5502,12 +6313,13 @@ mod tests {
                 open_bar.then_some(&bar),
                 open_find.then_some(&find),
                 open_list.then_some(&list),
+                offered.then_some(&offer),
             );
             assert_eq!(
                 escapes(owner.as_ref(), hinting, loading),
                 wanted,
                 "bar {open_bar}, find {open_find}, list {open_list}, dialog {dialog}, \
-                 path {path}, hinting {hinting}, loading {loading}"
+                 path {path}, offer {offered}, hinting {hinting}, loading {loading}"
             );
         }
         // Escape is not one of the program's commands: when nothing wants

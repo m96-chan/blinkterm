@@ -51,7 +51,7 @@ options:
   --proxy <host:port|scheme://host:port|direct://>
                    send requests through a proxy (loopback never is)
   --home <url>     the page opened when no url is given (default: about:blank)
-  --restore        reopen the tabs the last run had (not yet: #18)
+  --restore        reopen the tabs the last run had
   --normal-mode    start in normal mode (ctrl+., below)
   --config <path>  read settings from <path> instead of
                    $XDG_CONFIG_HOME/blinkterm/config (~/.config/blinkterm/config)
@@ -78,7 +78,9 @@ one; install the one you want.
 
 A profile is made readable by you alone (0700), and one blinkterm uses it at a
 time: a second one started on the same profile is refused, and told which pid
-has it.
+has it. The open tabs are saved in the profile; --restore reopens them, and
+after a crash the next start offers to. Bookmarks are one file for every
+profile, $XDG_DATA_HOME/blinkterm/bookmarks, one url<TAB>title per line.
 
 A file a page offers — a link to a PDF, a Content-Disposition: attachment —
 is saved in the download directory under its own name, \"report (1).pdf\" if
@@ -97,6 +99,9 @@ keys:
   alt+left/right back and forward
   ctrl+t         a new tab, with the cursor in the url bar
   ctrl+w         close this tab; closing the last one quits
+  ctrl+shift+t   reopen the last tab closed (alt+t where the terminal or the
+                 compositor keeps ctrl+shift+t)
+  ctrl+d         bookmark this page, or remove the bookmark
   ctrl+tab       the next tab, ctrl+shift+tab the one before
   alt+1 .. alt+8 the nth tab; alt+9 the last tab
   ctrl+shift+a   the tab list (alt+a too): type to filter, up/down to pick,

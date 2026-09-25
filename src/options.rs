@@ -92,8 +92,8 @@ pub struct Options {
     pub force_dark: bool,
     /// How the engine is started; see [`crate::engine::Launch`].
     pub engine: engine::Launch,
-    /// `--restore`: reopen the last session's tabs (#18). Parsed here, acted
-    /// on there; nothing reads it until then.
+    /// `--restore`: reopen the last session's tabs at start. See
+    /// [`crate::session`].
     pub restore: bool,
     /// `--normal-mode`: start in normal mode rather than insert: the letters
     /// are the program's keys from the first one. See [`crate::normal`].

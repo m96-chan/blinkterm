@@ -125,7 +125,14 @@ machine. It prints a warning when it does. Do not browse as root.
   deleting the file forgets it. The zoom levels are kept beside it as
   `zoom`, which is a list of the hosts you zoomed — as private as the
   history, so 0600 too, and never written for a `--temp-profile`
-  ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
+  ([#16](https://github.com/m96-chan/blinkterm/issues/16)). The session
+  file, `session`, is the list of pages open, kept 0600 like the history and
+  never written for a `--temp-profile`; the bookmarks file is yours rather
+  than a profile's and lives beside the profiles, in
+  `$XDG_DATA_HOME/blinkterm/bookmarks`, 0600 — written under
+  `--temp-profile` too, but only when you press `ctrl+d`. Titles in both go
+  through the same plain-text filter as the row on the way in and on the way
+  out ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
 
 - **What the terminal answers.** `blinkterm` asks the terminal one question
   whose answer is not a key: its background colour (`OSC 11 ; ?`), for

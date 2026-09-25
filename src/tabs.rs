@@ -164,6 +164,20 @@ pub struct Tab<C> {
     /// A page with a host takes its host's level when it lands and when its
     /// tab comes to the front, so two tabs on one site zoom together.
     pub zoom: Zoom,
+    /// Whether the page is one that has not been asked for yet: a restored
+    /// tab, whose target is an `about:blank` carrying the url and title it
+    /// will have, loaded the first time the tab comes to the front (see
+    /// [`crate::session`]). While it is, the engine's renames of the blank
+    /// target it was made as are not taken — they would put `about:blank`
+    /// over the saved url.
+    pub dormant: bool,
+    /// Whether a crashed page has a new renderer on its way: the engine said
+    /// `Inspector.targetReloadedAfterCrash`, which comes first on every road
+    /// back — a reload, a history step, a typed url (measured) — so the next
+    /// landing is the page back. A landing read before it is one from before
+    /// the crash, which the same pass can still be holding, and does not
+    /// revive anything. See [`Tab::crashed`].
+    pub reviving: bool,
 }
 
 impl<C> Tab<C> {
@@ -183,7 +197,40 @@ impl<C> Tab<C> {
             committed: true,
             trust: Trust::Plain,
             zoom: Zoom::DEFAULT,
+            dormant: false,
+            reviving: false,
         }
+    }
+
+    /// `Target.targetCrashed`: the renderer behind this page died.
+    ///
+    /// The tab stays — the target is still there, and a reload brings a new
+    /// renderer (measured in the #18 design against chrome-headless-shell
+    /// 153) — with everything that was true of the old renderer taken off it:
+    /// nothing is loading, no dialog is open (its renderer went with the
+    /// alert), no file input is asking, and the page answers nothing until it
+    /// lands again — after [`Tab::reviving`], so that a landing from before
+    /// the crash read in the same pass is not taken for the page coming back
+    /// — which [`Tab::landed`] notices by clearing the problem. Nothing but
+    /// a landing clears it: a load starting or a `Page.navigate` failing is
+    /// still the dead renderer's tab until something has landed. A dormant
+    /// tab is left dormant: it has no page of its own to crash.
+    pub fn crashed(&mut self) {
+        self.problem = Some(Problem::Crashed);
+        self.reviving = false;
+        self.loading = false;
+        self.since = None;
+        self.note = None;
+        self.dialog = None;
+        self.upload = None;
+        self.committed = false;
+    }
+
+    /// Whether the renderer is dead: nothing renderer-bound may be sent to
+    /// it, and one command in particular takes the whole engine down (see
+    /// [`crate::app::revive`]).
+    pub fn is_crashed(&self) -> bool {
+        matches!(self.problem, Some(Problem::Crashed))
     }
 
     /// `Page.frameStartedNavigating` for the main frame: the page is leaving
@@ -206,7 +253,10 @@ impl<C> Tab<C> {
         }
         self.loading = true;
         self.committed = false;
-        self.problem = None;
+        // A crash stays said until the new renderer has landed something.
+        if !self.is_crashed() {
+            self.problem = None;
+        }
     }
 
     /// `Page.frameStoppedLoading` for the main frame: the load is over,
@@ -268,6 +318,13 @@ impl<C> Tab<C> {
     /// is what keeps "still loading" honest against a `Page.navigate` that
     /// timed out here and failed in the engine afterwards.
     pub fn landed(&mut self, landing: Landing) {
+        // A crashed page's landing that came before the engine said a new
+        // renderer was coming is the old renderer's last word, read late: the
+        // tab is still dead, and nothing about it changes.
+        if self.is_crashed() && !self.reviving {
+            return;
+        }
+        self.reviving = false;
         // Read before it is set below: it says whether a reason from
         // `failed_to_reach` belongs to this landing.
         let ours = self.loading;
@@ -321,6 +378,11 @@ impl<C> Tab<C> {
     /// been and gone. An unreachable problem on the tab can only be this
     /// navigation's, because `navigate` cleared it before sending.
     pub fn failed_to_reach(&mut self, url: &str, code: &str) {
+        // A crashed tab keeps saying so until something lands; the error
+        // page's landing says the rest.
+        if self.is_crashed() {
+            return;
+        }
         self.note = None;
         if let Some(Problem::Unreachable { reason, .. }) = &mut self.problem {
             reason.get_or_insert_with(|| code.to_string());
@@ -421,7 +483,9 @@ impl<C> Tab<C> {
         // of them: a 404 page has both, and the site's own words for what went
         // wrong are usually in the title.
         let status = match &self.problem {
-            Some(problem @ Problem::Unreachable { .. }) => return load::sentence(problem),
+            Some(problem @ (Problem::Unreachable { .. } | Problem::Crashed)) => {
+                return load::sentence(problem)
+            }
             Some(Problem::Status(status)) => Some(load::status_phrase(*status)),
             None => None,
         };
@@ -453,7 +517,7 @@ impl<C> Tab<C> {
         if let Some(note) = &self.note {
             return Cow::Borrowed(note);
         }
-        if let Some(problem @ Problem::Unreachable { .. }) = &self.problem {
+        if let Some(problem @ (Problem::Unreachable { .. } | Problem::Crashed)) = &self.problem {
             return Cow::Owned(load::sentence(problem));
         }
         if !self.title.is_empty() {
@@ -683,8 +747,11 @@ impl<C> Tabs<C> {
                 };
                 let tab = &mut self.tabs[index];
                 // An empty url in a target's information means the engine has
-                // not decided yet, not that the page has no address.
-                if url.is_empty() || tab.url == url {
+                // not decided yet, not that the page has no address. And a
+                // dormant tab is an `about:blank` wearing the name of the page
+                // it will load: the engine renaming the blank target is not
+                // news, and taking it would lose the saved url and title.
+                if url.is_empty() || tab.url == url || tab.dormant {
                     return Outcome::Ignored;
                 }
                 tab.url = url;
@@ -695,24 +762,22 @@ impl<C> Tabs<C> {
                 tab.note = None;
                 Outcome::Renamed
             }
-            Change::Closed { target } => self.gone(&target, None),
-            Change::Crashed { target } => self.gone(
-                &target,
-                Some("the page in that tab stopped answering, so the tab is gone".to_string()),
-            ),
-        }
-    }
-
-    fn gone(&mut self, target: &str, why: Option<String>) -> Outcome<C> {
-        match self.index_of(target) {
-            Some(index) => match self.close(index) {
-                Some(tab) => Outcome::Gone {
-                    tab: Box::new(tab),
-                    why,
+            Change::Closed { target } => match self.index_of(&target) {
+                Some(index) => match self.close(index) {
+                    Some(tab) => Outcome::Gone { tab: Box::new(tab) },
+                    None => Outcome::Ignored,
                 },
                 None => Outcome::Ignored,
             },
-            None => Outcome::Ignored,
+            // A crashed tab is not closed: the target is still there and a
+            // reload brings the page back, which is Chrome's own sad tab.
+            Change::Crashed { target } => match self.index_of(&target) {
+                Some(index) => {
+                    self.tabs[index].crashed();
+                    Outcome::Crashed { index }
+                }
+                None => Outcome::Ignored,
+            },
         }
     }
 }
@@ -729,12 +794,11 @@ pub enum Outcome<C> {
     /// A tab's title or url moved, so the row is out of date.
     Renamed,
     /// A tab is no longer in the list. Its connection comes back with it, to
-    /// be closed by the caller, and `why` is the sentence to put on the row
-    /// when the page did not simply close itself.
-    Gone {
-        tab: Box<Tab<C>>,
-        why: Option<String>,
-    },
+    /// be closed by the caller.
+    Gone { tab: Box<Tab<C>> },
+    /// The renderer behind the tab at `index` died. The tab stays, marked
+    /// [`Tab::is_crashed`], until a reload brings it back.
+    Crashed { index: usize },
     /// A target that should have become a tab could not be connected to.
     Failed(String),
 }
@@ -1196,10 +1260,7 @@ mod tests {
         tabs.select(2);
         let destroyed = event("Target.targetDestroyed", r#"{"targetId":"b"}"#);
         match tabs.take(&destroyed, |_| Ok(0)) {
-            Outcome::Gone { tab, why } => {
-                assert_eq!(tab.target, "b");
-                assert_eq!(why, None, "window.close() needs no explanation");
-            }
+            Outcome::Gone { tab } => assert_eq!(tab.target, "b"),
             _ => panic!("the tab should be gone"),
         }
         assert_eq!(titles(&tabs), ["A", "C"]);
@@ -1213,16 +1274,73 @@ mod tests {
     #[test]
     fn a_renderer_that_dies_is_a_sentence_and_not_a_panic() {
         let mut tabs = three();
-        let crashed = event("Target.targetCrashed", r#"{"targetId":"a","errorCode":5}"#);
-        match tabs.take(&crashed, |_| Ok(0)) {
-            Outcome::Gone { tab, why } => {
-                assert_eq!(tab.target, "a");
-                let why = why.expect("a crash says why");
-                assert!(why.contains("tab"), "{why}");
-            }
-            _ => panic!("a crashed tab is gone"),
+        {
+            let a = tabs.get_mut(0).expect("a");
+            a.loading = true;
+            a.since = Some(Instant::now());
+            let opening = event(
+                "Page.javascriptDialogOpening",
+                r#"{"type":"alert","message":"hi","url":"https://a.example/"}"#,
+            );
+            assert!(a.dialog_event(&opening));
         }
-        assert_eq!(titles(&tabs), ["B", "C"]);
+        let crashed = event("Target.targetCrashed", r#"{"targetId":"a","errorCode":5}"#);
+        assert!(matches!(
+            tabs.take(&crashed, |_| Ok(0)),
+            Outcome::Crashed { index: 0 }
+        ));
+        assert_eq!(tabs.len(), 3, "the tab stays");
+        let a = tabs.get_mut(0).expect("a");
+        assert!(a.is_crashed());
+        let sentence = "this page crashed; ctrl+r reloads it";
+        assert_eq!(a.line(), sentence);
+        assert_eq!(a.label(), sentence);
+        assert!(!a.loading);
+        assert_eq!(a.since, None);
+        assert!(a.dialog.is_none(), "the alert went with its renderer");
+        assert!(!a.committed);
+
+        let stranger = event("Target.targetCrashed", r#"{"targetId":"zz","errorCode":5}"#);
+        assert!(matches!(tabs.take(&stranger, |_| Ok(0)), Outcome::Ignored));
+
+        // A landing from before the crash, read late, changes nothing; nor
+        // does the reload starting, or a navigation failing.
+        let a = tabs.get_mut(0).expect("a");
+        a.landed(Landing::Document("https://stale.example/".to_string()));
+        assert!(a.is_crashed(), "the old renderer's last word");
+        assert_eq!(a.url, "https://a.example");
+        a.started("https://a.example/".to_string(), Instant::now());
+        a.failed_to_reach("https://a.example/", "net::ERR_FAILED");
+        assert!(a.is_crashed());
+        // The engine says a new renderer is coming, and the landing after
+        // that is the page back.
+        a.reviving = true;
+        a.landed(Landing::Document("https://a.example/".to_string()));
+        assert!(!a.is_crashed(), "the reload's landing brings it back");
+        assert!(!a.reviving);
+        assert!(a.committed);
+    }
+
+    #[test]
+    fn a_dormant_tab_keeps_its_saved_name_until_it_is_woken() {
+        let mut tabs = Tabs::new(Tab::new("a", 0, "about:blank"));
+        {
+            let a = tabs.active_mut().expect("a");
+            a.url = "https://saved.example/".to_string();
+            a.title = "Saved".to_string();
+            a.dormant = true;
+        }
+        let renamed = event(
+            "Target.targetInfoChanged",
+            r#"{"targetInfo":{"targetId":"a","type":"page","url":"about:blank"}}"#,
+        );
+        assert!(matches!(tabs.take(&renamed, |_| Ok(0)), Outcome::Ignored));
+        let a = tabs.active_mut().expect("a");
+        assert_eq!(a.url, "https://saved.example/");
+        assert_eq!(a.title, "Saved");
+        a.dormant = false;
+        assert!(matches!(tabs.take(&renamed, |_| Ok(0)), Outcome::Renamed));
+        assert_eq!(tabs.active().expect("a").url, "about:blank");
     }
 
     #[test]

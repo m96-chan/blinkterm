@@ -168,35 +168,18 @@ impl Profile {
         )
     }
 
-    /// Where the profile goes, given the two variables that decide it.
-    ///
-    /// The XDG base directory specification says a relative `$XDG_DATA_HOME`
-    /// is invalid and is to be ignored, and an empty one is the same as none;
-    /// both then fall back to `$HOME/.local/share`, which is the spec's
-    /// default. With neither there is no answer that is not a guess, and a
-    /// profile in a guessed place is a login kept somewhere nobody will look,
-    /// so it is an error that names the two ways round it.
+    /// Where the profile goes, given the two variables that decide it: the
+    /// `profile` directory inside [`data_dir`], whose doc has the rules.
     pub fn resolve(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf, String> {
-        let usable = |value: Option<&OsStr>| {
-            value
-                .map(Path::new)
-                .filter(|path| path.is_absolute())
-                .map(Path::to_path_buf)
-        };
-        if let Some(data) = usable(xdg) {
-            return Ok(data.join("blinkterm").join("profile"));
-        }
-        if let Some(home) = usable(home) {
-            return Ok(home
-                .join(".local")
-                .join("share")
-                .join("blinkterm")
-                .join("profile"));
-        }
-        Err(
-            "no $XDG_DATA_HOME and no $HOME, so nowhere to keep a profile; \
-             use --profile <dir> or --temp-profile"
-                .to_string(),
+        data_dir(xdg, home).map(|dir| dir.join("profile"))
+    }
+
+    /// The directory the default profile is in, from this process's
+    /// environment; see [`data_dir`].
+    pub fn data_dir() -> Result<PathBuf, String> {
+        data_dir(
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
         )
     }
 
@@ -276,6 +259,37 @@ impl Drop for Profile {
             self.remove();
         }
     }
+}
+
+/// The directory the default profile is in: `$XDG_DATA_HOME/blinkterm`, or
+/// `~/.local/share/blinkterm` without it. It is also where a file that is the
+/// person's rather than a profile's goes — the bookmarks, which every profile
+/// shares (see [`crate::bookmarks`]).
+///
+/// The XDG base directory specification says a relative `$XDG_DATA_HOME` is
+/// invalid and is to be ignored, and an empty one is the same as none; both
+/// then fall back to `$HOME/.local/share`, which is the spec's default. With
+/// neither there is no answer that is not a guess, and a profile in a guessed
+/// place is a login kept somewhere nobody will look, so it is an error that
+/// names the two ways round it.
+pub fn data_dir(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf, String> {
+    let usable = |value: Option<&OsStr>| {
+        value
+            .map(Path::new)
+            .filter(|path| path.is_absolute())
+            .map(Path::to_path_buf)
+    };
+    if let Some(data) = usable(xdg) {
+        return Ok(data.join("blinkterm"));
+    }
+    if let Some(home) = usable(home) {
+        return Ok(home.join(".local").join("share").join("blinkterm"));
+    }
+    Err(
+        "no $XDG_DATA_HOME and no $HOME, so nowhere to keep a profile; \
+         use --profile <dir> or --temp-profile"
+            .to_string(),
+    )
 }
 
 /// Remove this process's temporary profile, from a place that owns nothing.
@@ -399,10 +413,7 @@ fn lock(dir: &Path) -> Result<File, String> {
         .mode(0o600)
         .open(&path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    // SAFETY: `flock(2)` takes a descriptor and a flag word and reads no
-    // memory. The descriptor is `file`'s, which is open for the whole call.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
+    if let Err(error) = flock(&file, false) {
         if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(format!("cannot lock {}: {error}", path.display()));
         }
@@ -426,6 +437,53 @@ fn lock(dir: &Path) -> Result<File, String> {
         .and_then(|_| writeln!(file, "{}", std::process::id()))
         .and_then(|()| file.flush());
     Ok(file)
+}
+
+/// Take `path` for as long as the returned file is held: a blocking
+/// exclusive `flock`, the file made 0600 if it is not there, and its
+/// directory made 0700 with its parents if that is not there either.
+///
+/// For a file two runs may change at once — the bookmarks — where the answer
+/// to "somebody else has it" is to wait the tens of microseconds they need
+/// rather than to refuse, as [`Profile::take`] does. The lock goes with the
+/// file, however the process ends.
+pub fn hold(path: &Path) -> Result<File, String> {
+    if let Some(dir) = path.parent() {
+        make_private_dir(dir)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    flock(&file, true).map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+    Ok(file)
+}
+
+/// An exclusive `flock(2)` on `file`: waited for when `block`, refused at
+/// once with `EWOULDBLOCK` when not. The one `libc::flock` in the crate,
+/// shared by [`lock`] and [`hold`], so the unsafe count stays where it was.
+fn flock(file: &File, block: bool) -> std::io::Result<()> {
+    let flags = if block {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
+    loop {
+        // SAFETY: `flock(2)` takes a descriptor and a flag word and reads no
+        // memory. The descriptor is `file`'s, which is open for the whole call.
+        if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // A blocking wait that a signal interrupted is still a wait.
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -484,6 +542,54 @@ mod tests {
         assert!(why.contains("--temp-profile"), "{why}");
         let why = Profile::resolve(Some(OsStr::new("rel")), Some(OsStr::new(""))).unwrap_err();
         assert!(why.contains("$HOME"), "{why}");
+    }
+
+    #[test]
+    fn the_data_dir_is_the_profiles_parent() {
+        let cases: [(Option<&str>, Option<&str>); 3] = [
+            (Some("/data"), Some("/home/a")),
+            (Some("rel"), Some("/home/a")),
+            (None, Some("/home/a")),
+        ];
+        for (xdg, home) in cases {
+            let (xdg, home) = (xdg.map(OsStr::new), home.map(OsStr::new));
+            let data = data_dir(xdg, home).expect("a data dir");
+            assert_eq!(Profile::resolve(xdg, home), Ok(data.join("profile")));
+            assert_eq!(data.file_name(), Some(OsStr::new("blinkterm")));
+        }
+        assert!(data_dir(None, None).is_err());
+    }
+
+    #[test]
+    fn a_hold_waits_for_the_holder_and_a_lock_does_not() {
+        let dir = scratch("hold");
+        let path = dir.join("deeper").join("thing.lock");
+        let first = hold(&path).expect("the first hold");
+        assert_eq!(mode(&path), 0o600);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let second = hold(&path).expect("the second hold, eventually");
+                tx.send(Instant::now()).expect("the test is listening");
+                drop(second);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(rx.try_recv().is_err(), "the second hold did not wait");
+        // A non-blocking lock on the same file is refused at once while it
+        // is held, which is what the profile's own lock relies on.
+        let other = OpenOptions::new().read(true).open(&path).expect("open");
+        let refused = flock(&other, false).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EWOULDBLOCK));
+        let let_go = Instant::now();
+        drop(first);
+        let taken = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the second hold is taken once the first is let go");
+        assert!(taken >= let_go);
+        waiter.join().expect("the waiter finishes");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

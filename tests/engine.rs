@@ -831,12 +831,7 @@ fn pump(
             });
             match outcome {
                 Outcome::Failed(why) => panic!("a tab that would not open: {why}"),
-                Outcome::Gone { mut tab, why } => {
-                    if let Some(why) = why {
-                        eprintln!("a tab went: {why}");
-                    }
-                    tab.connection.close();
-                }
+                Outcome::Gone { mut tab } => tab.connection.close(),
                 _ => {}
             }
         }
@@ -3116,6 +3111,11 @@ fn follow(tab: &mut Tab<Client>, timeout: Duration) -> Vec<Landing> {
                         tab.landed(landing);
                         loaded = false;
                     }
+                }
+                // A crashed page's new renderer, which is what makes the
+                // landing after it the page back (`Tab::reviving`).
+                "Inspector.targetReloadedAfterCrash" if tab.is_crashed() => {
+                    tab.reviving = true;
                 }
                 "Page.loadEventFired" if !landings.is_empty() => {
                     tab.loading = false;
@@ -6914,5 +6914,495 @@ fn hints_on_about_blank_and_the_error_page_are_none_and_no_exception() {
     );
 
     client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Crashed pages, the session, and dormant tabs (#18)
+// ---------------------------------------------------------------------------
+
+use blinkterm::session::{self, Session, Snapshot, State};
+use tos_preview::fit::Metrics;
+
+/// A page that paints every frame, so that a screencast of it is a count.
+/// No `%` and no `#` in it: this is a url, and `#` would start its fragment.
+const ANIMATED: &str = "data:text/html,<title>anim</title>\
+<div id=b style='position:absolute;width:40px;height:40px;background:red'></div>\
+<script>var n=0,b=document.getElementById('b');\
+function f(){n=n>400?0:n+3;b.style.left=n+'px';requestAnimationFrame(f)}f()</script>";
+
+/// How many screencast frames arrive in `window`, acknowledged as they come.
+fn frames_in(client: &mut Client, window: Duration) -> usize {
+    let deadline = Instant::now() + window;
+    let mut count = 0;
+    while Instant::now() < deadline {
+        count += take_frames(client).len();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    count
+}
+
+/// The browser's events until one is `method` about `target`, or the time is
+/// up; everything read on the way is handed to `seen` as well.
+fn browser_event(
+    browser: &mut Client,
+    method: &str,
+    target: &str,
+    timeout: Duration,
+    mut seen: impl FnMut(&blinkterm::cdp::Event),
+) -> Option<blinkterm::cdp::Event> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for event in browser.events() {
+            seen(&event);
+            let about = event
+                .params
+                .get("targetId")
+                .and_then(Json::as_str)
+                .map(str::to_string);
+            if event.method == method && about.as_deref() == Some(target) {
+                return Some(event);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+/// The page session's events for `window`, by method.
+fn page_events(client: &mut Client, window: Duration) -> Vec<blinkterm::cdp::Event> {
+    let deadline = Instant::now() + window;
+    let mut events = Vec::new();
+    while Instant::now() < deadline {
+        events.extend(client.events());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    events
+}
+
+/// A renderer that dies leaves its tab, as a sad tab does in Chrome, and
+/// `ctrl+r` brings the page back: at the size it was, and — once the
+/// screencast is started again, which is `app::revive` — painting.
+///
+/// Not done here, and documented instead: sending
+/// `Emulation.setDeviceMetricsOverride` to the crashed tab. Measured in the
+/// #18 design, it takes the whole browser down with SIGSEGV every time,
+/// which is why the program never does; proving it again on every run would
+/// prove only that the engine still has the bug.
+#[test]
+fn a_crashed_page_keeps_its_tab_and_a_reload_brings_it_back_casting() {
+    let Some((mut engine, mut page, target)) = connect_with_target() else {
+        return;
+    };
+    page.call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    let (mut browser, mut tabs) = tabbed(&engine, page, target.clone());
+    browser
+        .call(
+            "Target.activateTarget",
+            Json::object(vec![("targetId", Json::string(&target))]),
+        )
+        .expect("the tab in front");
+    {
+        let tab = tabs.active_mut().expect("the tab");
+        viewport(&mut tab.connection);
+        navigate_tab(tab, ANIMATED);
+        follow(tab, Duration::from_secs(5));
+        cast(&mut tab.connection, "jpeg", Some(85), WIDTH, HEIGHT);
+        let before = frames_in(&mut tab.connection, Duration::from_secs(1));
+        eprintln!("frames in a second before the crash: {before}");
+        assert!(before >= 10, "{before} frames before the crash");
+    }
+
+    let _crash = tabs
+        .active_mut()
+        .expect("the tab")
+        .connection
+        .send("Page.crash", Json::empty())
+        .expect("Page.crash sent");
+    let crashed = browser_event(
+        &mut browser,
+        "Target.targetCrashed",
+        &target,
+        Duration::from_secs(1),
+        |_| {},
+    )
+    .expect("Target.targetCrashed within a second");
+    eprintln!("crashed: {}", crashed.params);
+    assert_eq!(
+        crashed.params.get("status").and_then(Json::as_str),
+        Some("crashed")
+    );
+    assert!(
+        crashed.params.get("errorCode").is_some(),
+        "{}",
+        crashed.params
+    );
+    assert!(matches!(
+        tabs.take(&crashed, |_| Err("no new tab".to_string())),
+        Outcome::Crashed { index: 0 }
+    ));
+    let tab = tabs.active_mut().expect("the tab stays");
+    assert!(tab.is_crashed());
+    assert_eq!(tab.line(), "this page crashed; ctrl+r reloads it");
+    assert!(tab.connection.ended().is_none(), "the session goes on");
+
+    let events = page_events(&mut tab.connection, Duration::from_millis(300));
+    let inspector = events
+        .iter()
+        .find(|event| event.method == "Inspector.targetCrashed")
+        .expect("the page session's own word of it, without Inspector.enable");
+    assert_eq!(inspector.params, Json::empty());
+
+    // What the program no longer asks a crashed page: it would wait.
+    let held = tab
+        .connection
+        .send(
+            "Runtime.evaluate",
+            Json::object(vec![("expression", Json::string("1"))]),
+        )
+        .expect("sent");
+    std::thread::sleep(Duration::from_millis(500));
+    let answer = tab.connection.take_reply(&held);
+    eprintln!("Runtime.evaluate on the crashed page after 500 ms: {answer:?}");
+    assert!(answer.is_none(), "a dead renderer answered: {answer:?}");
+    drop(held);
+    let dead = frames_in(&mut tab.connection, Duration::from_secs(1));
+    assert_eq!(dead, 0, "frames from a dead renderer");
+
+    // What `ctrl+r` does.
+    let started = Instant::now();
+    tab.connection
+        .call_within("Page.reload", Json::empty(), Duration::from_secs(1))
+        .expect("Page.reload answers on a crashed page");
+    eprintln!("Page.reload answered in {:?}", started.elapsed());
+    follow(tab, Duration::from_secs(2));
+    assert_eq!(tab.problem, None, "the landing brought it back");
+    assert!(!tab.is_crashed());
+    assert_eq!(tab.title, "anim");
+    let width = evaluate(&mut tab.connection, "innerWidth");
+    assert_eq!(
+        width.as_f64(),
+        Some(WIDTH as f64),
+        "the size told before the crash is kept across the reload: {width}"
+    );
+
+    // Whether the screencast survives is not something to lean on either way. The
+    // design's probe saw none until it was started again; here, with every
+    // frame acknowledged as it came, the cast carried on across the reload
+    // (61 frames in the second). An acknowledgement owed when the renderer
+    // died is the likely difference. So it is printed, not asserted, and
+    // `revive` starts the cast again whatever happened, which is idempotent.
+    let unstarted = frames_in(&mut tab.connection, Duration::from_secs(1));
+    eprintln!("frames in a second after the reload, the cast untouched: {unstarted}");
+    blinkterm::app::revive(
+        &mut tab.connection,
+        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+        blinkterm::zoom::Viewport::fit((WIDTH, HEIGHT), 1.0),
+        Metrics {
+            cols: WIDTH / CELL.0,
+            rows: HEIGHT / CELL.1 + 1,
+            cell: CELL,
+        },
+    );
+    let after = frames_in(&mut tab.connection, Duration::from_secs(1));
+    eprintln!("frames in a second after revive: {after}");
+    assert!(after >= 10, "{after} frames after revive");
+    engine.check().expect("the engine lived through all of it");
+
+    drop(tabs);
+    browser.close();
+    engine.kill();
+}
+
+/// `chrome://crash` is the same crash by navigation: the navigation's reply
+/// is `net::ERR_ABORTED`, which is not a failure to report, and the crash
+/// follows. What `alt+left` does on the crashed tab — the browser's history
+/// and a step through it — answers and lands, and closing a crashed tab is
+/// what closing any tab is.
+#[test]
+fn chrome_crash_is_the_same_crash_with_its_navigation_aborted() {
+    let Some((mut engine, mut page, target)) = connect_with_target() else {
+        return;
+    };
+    page.call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    let (mut browser, mut tabs) = tabbed(&engine, page, target.clone());
+    let tab = tabs.active_mut().expect("the tab");
+    viewport(&mut tab.connection);
+    navigate_tab(tab, "data:text/html,<title>one</title>one");
+    follow(tab, Duration::from_secs(5));
+    navigate_tab(tab, "data:text/html,<title>two</title>two");
+    follow(tab, Duration::from_secs(5));
+
+    let reply = navigate_tab(tab, "chrome://crash");
+    eprintln!("chrome://crash: {reply}");
+    assert_eq!(
+        reply.get("errorText").and_then(Json::as_str),
+        Some("net::ERR_ABORTED")
+    );
+    assert_eq!(load::failed(&reply), None, "not a failure to report");
+
+    let crashed = browser_event(
+        &mut browser,
+        "Target.targetCrashed",
+        &target,
+        Duration::from_secs(1),
+        |_| {},
+    )
+    .expect("Target.targetCrashed within a second");
+    assert!(
+        crashed.params.get("errorCode").is_some(),
+        "{}",
+        crashed.params
+    );
+    assert!(matches!(
+        tabs.take(&crashed, |_| Err("no new tab".to_string())),
+        Outcome::Crashed { index: 0 }
+    ));
+    let tab = tabs.active_mut().expect("the tab stays");
+    let events = page_events(&mut tab.connection, Duration::from_millis(300));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.method == "Page.frameStoppedLoading"),
+        "the aborted load stops"
+    );
+    assert!(tab.is_crashed());
+
+    // Back: the browser's history answers on a crashed tab, and a step
+    // through it is a new renderer landing.
+    let started = Instant::now();
+    let history = tab
+        .connection
+        .call_within(
+            "Page.getNavigationHistory",
+            Json::empty(),
+            Duration::from_secs(1),
+        )
+        .expect("the history, from the browser side");
+    let index = history
+        .get("currentIndex")
+        .and_then(Json::as_i64)
+        .expect("an index");
+    let entries = history
+        .get("entries")
+        .and_then(Json::as_array)
+        .expect("entries");
+    assert!(index >= 1, "somewhere to go back to: {history}");
+    let id = entries[index as usize - 1]
+        .get("id")
+        .and_then(Json::as_i64)
+        .expect("an entry id");
+    tab.connection
+        .call_within(
+            "Page.navigateToHistoryEntry",
+            Json::object(vec![("entryId", Json::number(id as f64))]),
+            Duration::from_secs(1),
+        )
+        .expect("the step answers on a crashed page");
+    eprintln!("history and the step in {:?}", started.elapsed());
+    follow(tab, Duration::from_secs(5));
+    assert_eq!(tab.problem, None, "the entry landed");
+    assert!(!tab.is_crashed());
+
+    // Crash once more, and close it the way `ctrl+w` does.
+    let _crash = tab
+        .connection
+        .send("Page.crash", Json::empty())
+        .expect("Page.crash sent");
+    browser_event(
+        &mut browser,
+        "Target.targetCrashed",
+        &target,
+        Duration::from_secs(1),
+        |_| {},
+    )
+    .expect("crashed again");
+    let started = Instant::now();
+    let closed = browser
+        .call_within(
+            "Target.closeTarget",
+            Json::object(vec![("targetId", Json::string(&target))]),
+            Duration::from_secs(1),
+        )
+        .expect("closeTarget answers on a crashed tab");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(closed.get("success").and_then(Json::as_bool), Some(true));
+    let tab = tabs.active_mut().expect("the tab, until the list hears");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while tab.connection.ended().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ended = tab.connection.ended().expect("the session ends");
+    assert!(ended.contains("detached"), "{ended}");
+
+    drop(tabs);
+    browser.close();
+    engine.kill();
+}
+
+/// The engine dying outright ends every session on the pipe at once, and the
+/// session file it leaves says the run did not quit — which is what the next
+/// start reads to offer the tabs back.
+#[test]
+fn an_engine_that_dies_ends_every_session_at_once_and_leaves_the_session_file_open() {
+    let root = temp_dir("session-died");
+    let dir = root.join("profile");
+    let profile = Profile::take(Choice::At(dir.clone())).expect("a kept profile");
+    let Some((mut engine, page)) = connect_in(profile) else {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let browser = engine.browser().expect("the browser's client");
+
+    let mut kept = Session::load(&dir);
+    let two = Snapshot {
+        tabs: vec![
+            session::Entry {
+                url: "https://a.example/".to_string(),
+                title: "A".to_string(),
+            },
+            session::Entry {
+                url: "https://b.example/".to_string(),
+                title: String::new(),
+            },
+        ],
+        active: 1,
+    };
+    let now = Instant::now();
+    kept.record(two.clone(), now);
+    kept.flush(now).expect("written");
+
+    let group = engine.group().expect("a group of its own");
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{group}")])
+        .status()
+        .expect("kill runs");
+    assert!(killed.success());
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while (browser.ended().is_none() || page.ended().is_none()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let ended = browser.ended().expect("the browser's client ends");
+    assert!(ended.contains("closed its end"), "{ended}");
+    let ended = page.ended().expect("the page's session ends");
+    assert!(ended.contains("closed its end"), "{ended}");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while engine.check().is_ok() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let why = engine.check().unwrap_err();
+    eprintln!("{why}");
+
+    let saved = Session::load(&dir).saved().cloned().expect("a session");
+    assert_eq!(saved.state, State::Open, "the run did not quit");
+    assert_eq!(saved.snapshot, two);
+    kept.finish(false);
+    assert_eq!(
+        Session::load(&dir).saved().map(|saved| saved.state),
+        Some(State::Open)
+    );
+    kept.finish(true);
+    assert_eq!(
+        Session::load(&dir).saved().map(|saved| saved.state),
+        Some(State::Closed)
+    );
+
+    drop(page);
+    drop(browser);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A restored tab is a blank target wearing the saved url and title: the
+/// engine's own news about the blank page does not change them, nothing is
+/// loaded until it is asked for, and once asked for it lands like any page.
+#[test]
+fn a_dormant_tab_is_a_blank_target_that_keeps_its_name_and_loads_when_asked() {
+    let Some((mut engine, mut page, target)) = connect_with_target() else {
+        return;
+    };
+    page.call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+    let saved = session::Entry {
+        url: "data:text/html,<title>saved</title>saved".to_string(),
+        title: "Saved".to_string(),
+    };
+
+    // As `open_dormant` does it.
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("a target");
+    let id = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("its id")
+        .to_string();
+    let mut connection = browser
+        .attach(&id, Duration::from_secs(5))
+        .expect("a session on it");
+    connection
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    let mut tab = Tab::new(id.clone(), connection, "about:blank");
+    tab.url = saved.url.clone();
+    tab.title = saved.title.clone();
+    tab.dormant = true;
+    tabs.open(tab);
+
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let mut about_it = 0;
+    let mut started = 0;
+    while Instant::now() < deadline {
+        for event in browser.events() {
+            let ours = event
+                .params
+                .path(&["targetInfo", "targetId"])
+                .and_then(Json::as_str)
+                == Some(id.as_str());
+            let outcome = tabs.take(&event, |_| Err("no new tab".to_string()));
+            if ours {
+                about_it += 1;
+                assert!(
+                    matches!(outcome, Outcome::Ignored),
+                    "{}: {}",
+                    event.method,
+                    event.params
+                );
+            }
+        }
+        let tab = tabs.active_mut().expect("the dormant tab");
+        started += tab
+            .connection
+            .events()
+            .iter()
+            .filter(|event| event.method == "Page.frameStartedNavigating")
+            .count();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!("{about_it} events about the blank target while it slept");
+    let tab = tabs.active_mut().expect("the dormant tab");
+    assert_eq!(tab.url, saved.url, "the saved url stands");
+    assert_eq!(tab.title, saved.title, "and the saved title");
+    assert_eq!(started, 0, "nothing was loaded");
+
+    // Woken: the flag first, then the page.
+    tab.dormant = false;
+    navigate_tab(tab, &saved.url);
+    let landings = follow(tab, Duration::from_secs(2));
+    assert!(
+        matches!(landings.as_slice(), [Landing::Document(_)]),
+        "{landings:?}"
+    );
+    assert_eq!(tab.title, "saved");
+    assert!(!tab.dormant);
+
+    drop(tabs);
+    browser.close();
     engine.kill();
 }

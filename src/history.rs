@@ -32,6 +32,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::bookmarks::Bookmarks;
 use crate::text;
 
 /// Entries kept: a year of somebody's browsing is more than the url bar will
@@ -264,28 +265,8 @@ impl History {
     /// every page, newest first: Up on an empty bar walks back through where
     /// you have been.
     pub fn matches(&self, typed: &str) -> Vec<&Entry> {
-        let typed = typed.trim();
-        if typed.is_empty() {
-            return self.entries.iter().collect();
-        }
-        let wanted = key(typed);
-        let words = typed.to_lowercase();
-        let tiers: [&dyn Fn(&Entry) -> bool; 3] = [
-            &|entry| key(&entry.url).starts_with(&wanted),
-            &|entry| key(&entry.url).contains(&wanted),
-            &|entry| entry.title.to_lowercase().contains(&words),
-        ];
-        let mut taken = vec![false; self.entries.len()];
-        let mut out = Vec::new();
-        for tier in tiers {
-            for (index, entry) in self.entries.iter().enumerate() {
-                if !taken[index] && tier(entry) {
-                    taken[index] = true;
-                    out.push(entry);
-                }
-            }
-        }
-        out
+        let entries: Vec<&Entry> = self.entries.iter().collect();
+        tiers(&entries, |e| &e.url, |e| &e.title, typed)
     }
 
     /// Whether a url is one to remember at all: a web page or a file, and
@@ -305,8 +286,46 @@ impl History {
     }
 }
 
-/// Up and Down through [`History::matches`], remembering what was typed so
-/// that Down past the newest puts it back.
+/// The three tiers of [`History::matches`] — url starts with what was typed,
+/// url has it, title has it — over anything with a url and a title, in the
+/// order given within a tier; nothing typed is everything, in that order.
+///
+/// Shared with [`Bookmarks::matches`], so that a bookmark and a page visited
+/// are ranked by one rule and the url bar's walk through both reads as one
+/// list.
+pub fn tiers<'a, T>(
+    items: &[&'a T],
+    url: impl Fn(&T) -> &str,
+    title: impl Fn(&T) -> &str,
+    typed: &str,
+) -> Vec<&'a T> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return items.to_vec();
+    }
+    let wanted = key(typed);
+    let words = typed.to_lowercase();
+    let tiers: [&dyn Fn(&T) -> bool; 3] = [
+        &|item| key(url(item)).starts_with(&wanted),
+        &|item| key(url(item)).contains(&wanted),
+        &|item| title(item).to_lowercase().contains(&words),
+    ];
+    let mut taken = vec![false; items.len()];
+    let mut out = Vec::new();
+    for tier in tiers {
+        for (index, item) in items.iter().enumerate() {
+            if !taken[index] && tier(item) {
+                taken[index] = true;
+                out.push(*item);
+            }
+        }
+    }
+    out
+}
+
+/// Up and Down through the bookmarks that match and then
+/// [`History::matches`], remembering what was typed so that Down past the
+/// newest puts it back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Walk {
     typed: String,
@@ -319,15 +338,25 @@ impl Walk {
     /// A walk through what matches `typed`, standing on `typed` itself.
     ///
     /// The matches are taken now and kept, so that the list does not change
-    /// under the walk as the line it is walking changes the text.
-    pub fn new(history: &History, typed: &str) -> Walk {
+    /// under the walk as the line it is walking changes the text. Bookmarks
+    /// come first — a page somebody asked to keep is a better guess than one
+    /// they merely passed through — and a url in both is walked once, in the
+    /// bookmark's place.
+    pub fn new(history: &History, bookmarks: &Bookmarks, typed: &str) -> Walk {
+        let mut urls: Vec<String> = Vec::new();
+        let found = bookmarks
+            .matches(typed)
+            .into_iter()
+            .map(|mark| mark.url.as_str())
+            .chain(history.matches(typed).into_iter().map(|e| e.url.as_str()));
+        for url in found {
+            if !urls.iter().any(|known| known == url) {
+                urls.push(url.to_string());
+            }
+        }
         Walk {
             typed: typed.to_string(),
-            urls: history
-                .matches(typed)
-                .into_iter()
-                .map(|entry| entry.url.clone())
-                .collect(),
+            urls,
             index: None,
         }
     }
@@ -373,7 +402,7 @@ pub fn key(url: &str) -> String {
 }
 
 /// How many bytes of `url` [`key`] leaves off the front.
-fn prefix_len(url: &str) -> usize {
+pub(crate) fn prefix_len(url: &str) -> usize {
     let starts = |at: usize, prefix: &str| {
         url.get(at..at + prefix.len())
             .is_some_and(|there| there.eq_ignore_ascii_case(prefix))
@@ -654,7 +683,8 @@ mod tests {
         let mut history = History::in_memory();
         visit(&mut history, "https://a.example/", "", 1);
         visit(&mut history, "https://b.example/", "", 2);
-        let mut walk = Walk::new(&history, "");
+        let none = Bookmarks::in_memory();
+        let mut walk = Walk::new(&history, &none, "");
         assert_eq!(walk.down(), None, "nothing newer than what was typed");
         assert_eq!(walk.up(), Some("https://b.example/"));
         assert_eq!(walk.up(), Some("https://a.example/"));
@@ -663,10 +693,50 @@ mod tests {
         assert_eq!(walk.down(), Some(""), "what was typed, which was nothing");
         assert_eq!(walk.down(), None);
 
-        let mut walk = Walk::new(&history, "a.ex");
+        let mut walk = Walk::new(&history, &none, "a.ex");
         assert_eq!(walk.up(), Some("https://a.example/"));
         assert_eq!(walk.up(), None);
         assert_eq!(walk.down(), Some("a.ex"));
+    }
+
+    #[test]
+    fn tiers_work_over_anything_with_a_url_and_a_title() {
+        let items = [
+            ("https://docs.example/", "Home"),
+            ("https://example.com/rust", "Guide"),
+            ("https://example.org/", "The Rust book"),
+            ("https://rust.example/", ""),
+            ("https://unrelated.example/", "Nothing"),
+        ];
+        let refs: Vec<&(&str, &str)> = items.iter().rev().collect();
+        let found: Vec<&str> = tiers(&refs, |item| item.0, |item| item.1, "rust")
+            .into_iter()
+            .map(|item| item.0)
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "https://rust.example/",
+                "https://example.com/rust",
+                "https://example.org/",
+            ]
+        );
+        assert_eq!(tiers(&refs, |i| i.0, |i| i.1, " ").len(), items.len());
+    }
+
+    #[test]
+    fn a_walk_offers_bookmarks_before_history_and_a_url_once() {
+        let mut history = History::in_memory();
+        visit(&mut history, "https://a.example/", "", 1);
+        visit(&mut history, "https://b.example/", "", 2);
+        let mut bookmarks = Bookmarks::in_memory();
+        bookmarks
+            .toggle("https://a.example/", "A")
+            .expect("kept in memory");
+        let mut walk = Walk::new(&history, &bookmarks, "");
+        assert_eq!(walk.up(), Some("https://a.example/"), "the bookmark first");
+        assert_eq!(walk.up(), Some("https://b.example/"));
+        assert_eq!(walk.up(), None, "a.example is not walked twice");
     }
 
     #[test]
