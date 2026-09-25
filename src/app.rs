@@ -1604,10 +1604,13 @@ fn handle_target_events(
         });
         match outcome {
             Outcome::Ignored => {}
-            Outcome::Opened => {
-                // An opened tab is the one in front; one that was already
-                // ours and was only switched to keeps the frame it had.
-                if let (Some(frame), Some(tab)) = (frame, tabs.active_mut()) {
+            // In front or behind, the tab is told its main frame by index,
+            // since a tab opened behind is not the active one. Nothing else
+            // differs: `switched` below is a no-op for a tab behind, because
+            // the target in front did not change, which is the whole of
+            // "behind".
+            Outcome::Opened { index } | Outcome::OpenedBehind { index } => {
+                if let (Some(frame), Some(tab)) = (frame, tabs.get_mut(index)) {
                     tab.frame = Some(frame);
                 }
                 redraw = true;
