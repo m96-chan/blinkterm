@@ -10,10 +10,27 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Added
+
+- Bookmarks: `ctrl+d` bookmarks the page (again removes it) to
+  `$XDG_DATA_HOME/blinkterm/bookmarks`, one `url<TAB>title` per line,
+  hand-editable, shared by every profile; the url bar offers them before the
+  history ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
+- The open tabs are saved in the profile (`session`) as they change;
+  `--restore` reopens them, loading each when it is first looked at, and
+  after a crash the next start offers to. `ctrl+shift+t` — or `alt+t`, which
+  reaches a tOS pane and a legacy terminal — reopens the last closed tab
+  ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
+
 ### Changed
 
 - `brew install m96-chan/tap/blinkterm` installs the tagged release; `--HEAD`
   is only needed for main.
+- A page whose renderer crashes keeps its tab, with `this page crashed;
+  ctrl+r reloads it` on the row, rather than the tab closing
+  ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
+- When the engine dies the exit message says the tabs are saved and how to
+  get them back ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
 
 ## [0.1.0] - 2026-09-25
 

@@ -155,6 +155,57 @@ you alone (0600) too, and keeps the last 500. `--temp-profile` keeps the
 levels in memory for the run and writes none; deleting the file forgets
 every level.
 
+### Bookmarks
+
+`ctrl+d` bookmarks the page in front, and `ctrl+d` again removes the
+bookmark; the row says which. They are kept in one file for every profile,
+`$XDG_DATA_HOME/blinkterm/bookmarks` (or `~/.local/share/blinkterm/bookmarks`),
+beside the default profile rather than in any of them — the same file under
+`--profile` and under `--temp-profile`, because a profile is the engine's data
+and a bookmark is yours: pressing `ctrl+d` in a throwaway profile is asking
+for that one page to outlive it. The file is readable by you alone (0600), one
+bookmark a line:
+
+```text
+https://example.com/<TAB>Example Domain
+# a comment
+https://a.example/notitle
+```
+
+A url and its title, separated by a tab; a line that is only a url is a
+bookmark with no title, and anything else — a `#` comment, a blank, a
+mistake — is left exactly where it is when `blinkterm` changes the file. Edit
+it with anything; `grep` it to see what is kept. A url is matched exactly, so
+`https://example.com/` and `https://example.com` are two bookmarks. The url
+bar offers bookmarks before the pages you visited: the dim suggestion is a
+bookmark's when one starts with what you typed, and `↑` walks the bookmarks
+that match before the history. Two `blinkterm`s can share the file: every
+change takes a lock on `bookmarks.lock` and reads the file again first, so
+neither loses the other's bookmark; what one adds shows up in the other after
+its next `ctrl+d` or its next start.
+
+### The session
+
+The tabs you have open — their urls, their titles and which one is in front —
+are kept in the profile, in a file called `session`, readable by you alone
+(0600) and written within half a second of any change. Nothing else of a tab
+is: not how far down a page you were, not what you had typed into a form.
+`blinkterm --restore` (or `restore = true` in the configuration file) reopens
+them at start, in order, with the one that was in front in front; a url on
+the command line as well opens in one more tab, in front of them. A restored
+tab loads its page the first time you look at it, not all at once: the strip
+shows the saved titles straight away, and twenty tabs cost half a second of
+start rather than twenty pages fetched. At most 100 tabs are restored.
+
+After a run that did not end with a quit — a crash, a `kill -9`, the engine
+dying — the next start asks on the row: `restore 3 tabs from last time?
+y/n`. `y` or `enter` restores them; `n`, `esc`, or simply getting on with
+something else declines, and the question waits under anything else that
+wants the row. How a run that did not quit is known is the file's first line,
+`# blinkterm session: open` until the run quits and writes `closed`.
+`--temp-profile` keeps the session in memory, for `ctrl+shift+t`, and writes
+nothing.
+
 ## Downloads
 
 A file a page offers — a link to a PDF, anything served as
@@ -212,10 +263,12 @@ not a thing a terminal has.
 | --- | --- |
 | `ctrl+l` | type a url. In the url bar, `←`/`→`, `home`/`end`, `ctrl+a`/`ctrl+e` and `alt+b`/`alt+f` (or `ctrl+←`/`ctrl+→`) move; `ctrl+w`/`alt+backspace` and `alt+d` delete a word; `ctrl+u`/`ctrl+k` delete to either end; `↑`/`↓` walk the pages visited; a dim suggestion after what you typed is taken with `tab` or `→` |
 | `ctrl+f` | find in the page. Type and the matches are highlighted as you go, the current one in orange and scrolled into view; the row says `3/17`. `enter`/`ctrl+g`/`↓` next, `shift+enter`/`ctrl+shift+g`/`↑` previous; the same editing keys as the url bar; `esc` closes and clears. The next `ctrl+f` offers the last needle again |
-| `ctrl+r` | reload |
+| `ctrl+r` | reload; a page whose renderer crashed comes back with it |
 | `alt+left` / `alt+right` | back and forward |
 | `ctrl+t` | a new tab, with the cursor in the url bar |
 | `ctrl+w` | close this tab; closing the last one quits |
+| `ctrl+shift+t` / `alt+t` | reopen the tab closed last, and the one before it on the next press (up to twenty, this run). `alt+t` is there because `ctrl+shift+t` is `ctrl+t` in a terminal without the Kitty keyboard protocol, and never reaches a tOS pane, whose compositor takes it for a workspace |
+| `ctrl+d` | bookmark this page; again to remove the bookmark |
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
 | `alt+1` … `alt+9` | the nth tab |
 | `alt+=` / `alt+-` | zoom in and out (`ctrl+=` / `ctrl+-` where your terminal lets them through) |
@@ -329,7 +382,16 @@ link and an I-beam over a text field; the rest ignore it. A zoom that is not
 
 The url bar, the find prompt, a page's dialog and a file input's path take
 the whole row while they are open, and `esc` goes to whichever of them has it
-before it stops a load; no link is shown while one of them is there.
+before it stops a load; no link is shown while one of them is there. The
+offer to restore the last run's tabs takes it too, after all of them.
+
+A page whose renderer crashes stays in its tab: the picture goes, and the row
+says `this page crashed; ctrl+r reloads it` — a tab behind that crashed says
+the same in the strip. `ctrl+r` brings it back, painting, at the size it was;
+`ctrl+w` closes it; keys and the mouse do nothing to it until then. When the
+engine itself dies `blinkterm` exits, and the message says how many tabs were
+saved and that `blinkterm --restore` reopens them; the next plain start
+offers to.
 
 To know what is under the pointer the terminal is asked to report every
 mouse movement, not only presses (`?1003h`), so the page now sees the
