@@ -10,10 +10,28 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Added
+
+- A settings file, `$XDG_CONFIG_HOME/blinkterm/config`: every option as
+  `name = value`, `engine-arg` repeatable. The command line wins over the
+  file; `$BLINKTERM_ENGINE` sits between. `--config <path>`, `--no-config`
+  ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
+- `--engine <path>`, `--engine-arg <flag>` (repeatable; four that would
+  reopen the DevTools port or move the profile are refused),
+  `--user-agent <text>`, `--proxy <host:port>`, `--home <url>`
+  ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
+- Several urls on the command line open one tab each, the first in front
+  ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
+- `--doctor` starts the engine and asks the terminal whether it speaks the
+  Kitty graphics and keyboard protocols; `--print-engine` says which engine
+  would run ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
+
 ### Changed
 
 - `brew install m96-chan/tap/blinkterm` installs the tagged release; `--HEAD`
   is only needed for main.
+- `blinkterm a b` opens two tabs rather than refusing with "one page at a
+  time".
 
 ## [0.1.0] - 2026-09-25
 

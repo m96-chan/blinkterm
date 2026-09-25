@@ -95,7 +95,8 @@ It wants the usual Chromium libraries (its `deb.deps` lists them) and, if you
 read any CJK, `fonts-noto-cjk`: without it every Japanese glyph is a box.
 
 Anything Chromium-shaped will do, with one caution. `blinkterm` looks at
-`$BLINKTERM_ENGINE` first, then on `PATH` for `chrome-headless-shell`,
+`--engine <path>` first, then `$BLINKTERM_ENGINE`, then `engine = <path>` in
+the [settings](#settings), then on `PATH` for `chrome-headless-shell`,
 `chromium`, `chromium-browser`, `google-chrome` and `chromium-shell`, in that
 order. Debian's `chromium-shell` is last because it is Chromium's
 `content_shell`, not a headless shell: it keeps a DevTools port open beside
@@ -154,6 +155,56 @@ site at 100%. It is a list of sites you have visited, so it is readable by
 you alone (0600) too, and keeps the last 500. `--temp-profile` keeps the
 levels in memory for the run and writes none; deleting the file forgets
 every level.
+
+## Settings
+
+Everything on the command line can also be kept in
+`$XDG_CONFIG_HOME/blinkterm/config` — `~/.config/blinkterm/config` when
+`XDG_CONFIG_HOME` is not set — one setting per line, named as the option is
+without its `--`:
+
+    # what a page is told about you
+    color-scheme = dark
+    scale = 2
+    user-agent = Mozilla/5.0 (X11; Linux x86_64) blinkterm
+    # the engine
+    engine = /opt/chrome-headless-shell-linux64/chrome-headless-shell
+    engine-arg = --accept-lang=ja
+    engine-arg = --disable-features=Translate
+    proxy = socks5://127.0.0.1:1080
+
+The command line wins over the file, and `$BLINKTERM_ENGINE` sits between
+the two for `engine`. `--config <path>` reads another file, `--no-config`
+none. A line the program does not understand stops it with the file and
+line number; a missing file is nothing. A flag is `true` or `false`
+(`force-dark = true`), and a path may start with `~/`. There is no `url`
+setting: the page to open is what the command line is for, and
+`home = <url>` is the page opened when none is given. `restore` and
+`normal-mode` are read and do nothing yet.
+
+`--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
+repeatable. Four are refused because they would undo something this
+program set on purpose: `--remote-debugging-port` and
+`--remote-allow-origins` would open the DevTools port the pipe replaced
+([#5](https://github.com/m96-chan/blinkterm/issues/5)), `--user-data-dir`
+is `--profile`, and `--remote-debugging-pipe` is already there. Everything
+else goes through as written, and where it repeats a flag the program set,
+Chromium takes the last. `--user-agent` and `--proxy` are the two everybody
+wants and have names of their own; loopback never goes through the proxy.
+(`--lang=ja` does nothing in the headless shell; `--accept-lang=ja` is the
+one that changes what pages are told.)
+
+Several urls open several tabs, the first in front:
+
+    blinkterm https://example.com https://example.org
+
+`--doctor` is the first thing to run in a new terminal: it starts the engine
+on a throwaway profile, asks the terminal whether it speaks the Kitty
+graphics and keyboard protocols, and prints one line per answer, exiting 1
+when the engine did not answer or the terminal answered neither. In tmux
+without `allow-passthrough` it will tell you the terminal did not answer,
+which is the truth. `--print-engine` prints the path the search finds and
+nothing else, for scripts.
 
 ## Downloads
 
