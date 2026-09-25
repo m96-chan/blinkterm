@@ -1061,7 +1061,7 @@ fn a_middle_click_and_a_ctrl_click_on_a_link_open_a_tab_behind_the_one_in_front(
             .connection
             .call(
                 "Page.navigate",
-                Json::object(vec![("url", Json::string(&format!("{base}opens")))]),
+                Json::object(vec![("url", Json::string(format!("{base}opens")))]),
             )
             .expect("the page loads");
         assert_eq!(
