@@ -179,12 +179,30 @@ pub fn dispatch(input: &KeyInput) -> Option<Json> {
     // terminal has already decided the second question — it reports no
     // associated text for `ctrl+l` — so this only has to hold the first.
     if input.action != KeyAction::Release {
-        if let Some(text) = input.text {
+        if let Some(text) = input.text.or_else(|| enter_text(input)) {
             fields.push(("text", Json::string(text.to_string())));
             fields.push(("unmodifiedText", Json::string(text.to_string())));
         }
     }
     Some(Json::object(fields))
+}
+
+/// The text Enter carries, which the terminal does not send.
+///
+/// A terminal reports Enter as `\r` or `CSI 13 u` and calls it a key with no
+/// text, which is right for a terminal and wrong for a page: Chromium makes a
+/// `keypress` — and from it the default actions, a form's submit and a
+/// textarea's new line — only out of a `keyDown` that carries text. Sent
+/// without it, a page's own `keydown` listener fires and nothing else does;
+/// the engine test `enter_submits_a_form_and_breaks_a_line_in_a_textarea`
+/// failed on exactly that before this. So Enter goes as `"\r"`, which is what
+/// a keyboard's Enter types. Not with ctrl, alt or meta held: those are
+/// shortcuts, and a shortcut is not typing, the rule the terminal applies to
+/// every other key. Shift is typing — shift+Enter is how a line is broken in
+/// a field where Enter sends.
+fn enter_text(input: &KeyInput) -> Option<char> {
+    let shortcut = input.mods.ctrl() || input.mods.alt() || input.mods.meta();
+    (input.key == Key::Enter && !shortcut).then_some('\r')
 }
 
 /// The parameters of an `Input.insertText`.
@@ -208,6 +226,27 @@ mod tests {
 
     fn named_for(input: &KeyInput) -> Named {
         name(input).expect("a name")
+    }
+
+    #[test]
+    fn enter_types_a_return_unless_it_is_a_shortcut() {
+        let sent = |mods: u32, action: KeyAction| {
+            let mut input = key(Key::Enter, None, mods);
+            input.action = action;
+            dispatch(&input).expect("params").to_string()
+        };
+        let plain = sent(0, KeyAction::Press);
+        assert!(plain.contains(r#""text":"\r""#), "{plain}");
+        let shifted = sent(Mods::SHIFT, KeyAction::Press);
+        assert!(shifted.contains(r#""text":"\r""#), "{shifted}");
+        let repeated = sent(0, KeyAction::Repeat);
+        assert!(repeated.contains(r#""text":"\r""#), "{repeated}");
+        for mods in [Mods::CTRL, Mods::ALT, Mods::SUPER] {
+            let shortcut = sent(mods, KeyAction::Press);
+            assert!(!shortcut.contains("text"), "{shortcut}");
+        }
+        let up = sent(0, KeyAction::Release);
+        assert!(!up.contains("text"), "a release never types: {up}");
     }
 
     #[test]

@@ -3975,3 +3975,86 @@ fn quitting_with_a_download_coming_leaves_no_partial_file() {
     assert_eq!(names_in(&dir), Vec::<String>::new());
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ---------------------------------------------------------------------------
+// Enter
+// ---------------------------------------------------------------------------
+
+/// Enter does what Enter does on a page: it submits the form a text field is
+/// in, and it starts a new line in a textarea.
+///
+/// Both are the engine's default actions for a `keypress` of `"\r"`, not for
+/// the `keydown` a page's own listener sees, and Chromium only makes the one
+/// out of the other when the key comes with text. The terminal reports Enter
+/// with none — it is `Key::Enter`, `text: None`, as `\r` or `CSI 13 u` — so
+/// this is sent exactly the way the program sends it, press and release.
+#[test]
+fn enter_submits_a_form_and_breaks_a_line_in_a_textarea() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let page = "data:text/html,<title>ready</title><form onsubmit=\"document.title='submitted';return false\">\
+<input id=i autofocus></form><textarea id=t></textarea>";
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(page))]),
+        )
+        .expect("the page loads");
+    wait_for_title(&mut client, "ready", Duration::from_secs(10));
+
+    let press = |action| KeyInput {
+        key: Key::Enter,
+        mods: Mods::default(),
+        action,
+        text: None,
+    };
+    let enter = |client: &mut Client| {
+        for action in [KeyAction::Press, KeyAction::Release] {
+            let params = keys::dispatch(&press(action)).expect("Enter has a name");
+            client
+                .call("Input.dispatchKeyEvent", params)
+                .expect("the key is dispatched");
+        }
+    };
+    let evaluate = |client: &mut Client, expression: &str| {
+        client
+            .call(
+                "Runtime.evaluate",
+                Json::object(vec![
+                    ("expression", Json::string(expression)),
+                    ("returnByValue", Json::Bool(true)),
+                ]),
+            )
+            .expect("the page answers")
+    };
+
+    evaluate(&mut client, "document.getElementById('i').focus()");
+    enter(&mut client);
+    assert_eq!(
+        wait_for_title(&mut client, "submitted", Duration::from_secs(5)),
+        "submitted",
+        "Enter in a text field submits its form"
+    );
+
+    evaluate(
+        &mut client,
+        "var t=document.getElementById('t');t.focus();t.value='a';t.setSelectionRange(1,1)",
+    );
+    enter(&mut client);
+    let value = evaluate(&mut client, "document.getElementById('t').value");
+    assert_eq!(
+        value
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(Json::as_str),
+        Some("a\n"),
+        "Enter in a textarea starts a new line"
+    );
+
+    client.close();
+    engine.kill();
+}
