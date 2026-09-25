@@ -36,6 +36,7 @@ use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::{Cells, Metrics};
 
 use crate::appearance::Appearance;
+use crate::bindings::{Action, Bindings, Lookup};
 use crate::bookmarks::{Bookmarks, Toggled};
 use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::clipboard;
@@ -328,6 +329,9 @@ struct Chrome {
     /// Insert or normal: whether an unmodified letter is the page's or the
     /// program's. See [`crate::normal`].
     mode: normal::Mode,
+    /// The settings file's `key.` lines, asked before the built-in table
+    /// wherever a key becomes a command: see [`keyed`].
+    bindings: Bindings,
     /// The link hints showing, or being collected, on the page in front.
     hinting: Option<Hinting>,
     /// The question out after a click in normal mode.
@@ -607,6 +611,7 @@ pub fn run(options: Options) -> Result<(), String> {
                 list_first: Cell::new(0),
                 strip_first: Cell::new(0),
                 mode: normal::Mode::starting(options.normal_mode),
+                bindings: options.bindings.clone(),
                 hinting: None,
                 focus: None,
                 // The same file under every profile, a temporary one
@@ -3154,7 +3159,7 @@ fn handle_input(
                     chrome.offer.as_ref(),
                 )
                 .is_some();
-                let own_key = command(&key).is_some();
+                let own_key = keyed(&chrome.bindings, &key).is_some();
                 if !own_key && !owned {
                     return hint_key(pane, tabs, browser, chrome, key);
                 }
@@ -3165,7 +3170,7 @@ fn handle_input(
                 }
             }
             let was = tabs.active_target().map(str::to_string);
-            let command = command(&key);
+            let command = keyed(&chrome.bindings, &key);
             if asking(tabs) {
                 // The page is waiting on an answer. The tab keys still work,
                 // because leaving the question where it is — or closing the
@@ -3705,7 +3710,8 @@ fn answer_dialog(
     };
     match dialog.step(&key) {
         Answer::Waiting => {}
-        Answer::Quit => return Ok(false),
+        Answer::Quit if quits(&chrome.bindings, &key) => return Ok(false),
+        Answer::Quit => {}
         answer => {
             let params = dialog.reply(answer);
             let stay = dialog.kind == Kind::BeforeUnload && answer == Answer::Dismiss;
@@ -3745,7 +3751,8 @@ fn answer_upload(
     };
     match prompt.step(&key, &upload::Disk) {
         upload::Outcome::Waiting => {}
-        upload::Outcome::Quit => return Ok(false),
+        upload::Outcome::Quit if quits(&chrome.bindings, &key) => return Ok(false),
+        upload::Outcome::Quit => {}
         upload::Outcome::Send => {
             let params = prompt.reply();
             tab.note = Some(prompt.sentence());
@@ -4050,6 +4057,11 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// is `alt+t` as well, on the modifier the compositor leaves alone, which is
 /// the precedent the zoom keys set; what that shadows is an `accesskey` on
 /// `t`.
+///
+/// This is the built-in table, and the one the README documents; the settings
+/// file's `key.` lines are asked before it, by [`keyed`], and every caller
+/// goes through that. What the file may name is [`crate::bindings::ACTIONS`],
+/// which the tests hold to this `match` in both directions.
 fn command(key: &KeyInput) -> Option<Command> {
     if key.action == KeyAction::Release {
         return None;
@@ -4095,6 +4107,71 @@ fn command(key: &KeyInput) -> Option<Command> {
         };
     }
     None
+}
+
+/// What `key` is, with the person's `key.` lines asked first: a chord they
+/// bound is that command, one they unbound is nothing, and the rest is the
+/// built-in table's answer as it always was.
+///
+/// Nothing, from an unbound chord, means what it means for a key the table
+/// never had: the key goes on to a dialog, to normal mode, or to the page.
+/// With no `key.` lines every key is `Lookup::Default`, and this is
+/// [`command`].
+fn keyed(bindings: &Bindings, key: &KeyInput) -> Option<Command> {
+    match bindings.lookup(key) {
+        Lookup::Bound(action) => Some(command_of(action)),
+        Lookup::Unbound => None,
+        Lookup::Default => command(key),
+    }
+}
+
+/// The one place the file's names and the loop's commands meet. Exhaustive,
+/// so an action without a command does not compile; the other direction, a
+/// command without a name, is a test.
+fn command_of(action: Action) -> Command {
+    match action {
+        Action::Quit => Command::Quit,
+        Action::EditUrl => Command::EditUrl,
+        Action::Reload => Command::Reload,
+        Action::Back => Command::Back,
+        Action::Forward => Command::Forward,
+        Action::NewTab => Command::NewTab,
+        Action::CloseTab => Command::CloseTab,
+        Action::ReopenTab => Command::ReopenTab,
+        Action::Bookmark => Command::Bookmark,
+        Action::NextTab => Command::NextTab,
+        Action::PreviousTab => Command::PreviousTab,
+        Action::Tab(n) => Command::SelectTab(n),
+        Action::LastTab => Command::LastTab,
+        Action::ListTabs => Command::ListTabs,
+        Action::MoveTabLeft => Command::MoveTab(-1),
+        Action::MoveTabRight => Command::MoveTab(1),
+        Action::ZoomIn => Command::ZoomIn,
+        Action::ZoomOut => Command::ZoomOut,
+        Action::ZoomReset => Command::ZoomReset,
+        Action::Find => Command::Find,
+        Action::Copy => Command::CopySelection,
+        Action::CopyUrl => Command::CopyUrl,
+        Action::ToggleNormal => Command::ToggleNormal,
+    }
+}
+
+/// Whether the editors' own `ctrl+q` still quits: it does unless the file
+/// took the chord from quit, by unbinding it or by binding it to something
+/// else.
+///
+/// The line editor, a dialog and a file input's path each answer `ctrl+q`
+/// with a quit of their own, below the loop, and with `key.ctrl+q = none`
+/// that would be the one way `none` could be a lie. So the owner asks here,
+/// with the key the editor was given. A chord bound to another action has to
+/// be asked about too: in a dialog the `match` on the command takes it first,
+/// but on the row [`row_command`] passes everything but the copy keys and
+/// quit to the line, and `key.ctrl+q = back` must not quit from the url bar.
+fn quits(bindings: &Bindings, key: &KeyInput) -> bool {
+    matches!(
+        bindings.lookup(key),
+        Lookup::Default | Lookup::Bound(Action::Quit)
+    )
 }
 
 /// `ctrl+d` on the page at `url`, titled `title`: the bookmark toggled, and
@@ -4198,15 +4275,16 @@ fn edit_url(
         .as_ref()
         .map(|bar| bar.line.text().to_string())
         .unwrap_or_default();
-    if copy_from_row(pane, tabs, &key, &typed)? {
-        return Ok(true);
+    if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed)? {
+        return Ok(going);
     }
     let Some(bar) = chrome.bar.as_mut() else {
         return Ok(true);
     };
     match bar_step(bar, &chrome.history, &chrome.bookmarks, &key) {
         Edit::Typing | Edit::Inserted | Edit::Previous | Edit::Next => {}
-        Edit::Quit => return Ok(false),
+        Edit::Quit if quits(&chrome.bindings, &key) => return Ok(false),
+        Edit::Quit => {}
         Edit::Cancel => chrome.bar = None,
         Edit::Go => {
             let url = destination(bar.line.text(), chrome.search_url.as_deref());
@@ -4227,30 +4305,44 @@ fn edit_url(
     Ok(true)
 }
 
-/// The copy keys, while a line is being typed on the row: `true` if `key`
-/// was one of them and has been done.
+/// A program key that reaches through a line being typed on the row: the
+/// copy keys and quit, on whatever chords the file put them. The rest are the
+/// line's — `ctrl+w` deletes a word there, it does not close the tab — and
+/// `Quit` is answered by the caller, since it is the caller that returns
+/// `Ok(false)`.
+fn row_command(bindings: &Bindings, key: &KeyInput) -> Option<Command> {
+    match keyed(bindings, key) {
+        found @ Some(Command::CopySelection | Command::CopyUrl | Command::Quit) => found,
+        _ => None,
+    }
+}
+
+/// What [`row_command`] found, before the editor sees the key: `Some(false)`
+/// to quit, `Some(true)` if it was a copy and has been done, `None` if the
+/// key is the line's.
 ///
-/// Before the editor sees the key: they leave the line as it is, the
-/// selection included. What is on the row while the line is open is the
-/// line, so that is what `alt+c` copies, as `typed`; `alt+u` is still the
-/// page's url.
-fn copy_from_row(
+/// The copy keys leave the line as it is, the selection included. What is
+/// on the row while the line is open is the line, so that is what `copy`
+/// copies, as `typed`; `copy-url` is still the page's url.
+fn through_row(
     pane: &mut Pane,
     tabs: &mut Tabs<Client>,
+    bindings: &Bindings,
     key: &KeyInput,
     typed: &str,
-) -> Result<bool, String> {
-    match command(key) {
+) -> Result<Option<bool>, String> {
+    match row_command(bindings, key) {
+        Some(Command::Quit) => Ok(Some(false)),
         Some(Command::CopySelection) => {
             copy_out(pane, tabs, typed, Copied::Text)?;
-            Ok(true)
+            Ok(Some(true))
         }
         Some(Command::CopyUrl) => {
             let url = tabs.active().map(|tab| tab.url.clone()).unwrap_or_default();
             copy_out(pane, tabs, &url, Copied::Url)?;
-            Ok(true)
+            Ok(Some(true))
         }
-        _ => Ok(false),
+        _ => Ok(None),
     }
 }
 
@@ -4634,8 +4726,8 @@ fn edit_find(
         .as_ref()
         .map(|find| find.finder.line.text().to_string())
         .unwrap_or_default();
-    if copy_from_row(pane, tabs, &key, &typed)? {
-        return Ok(true);
+    if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed)? {
+        return Ok(going);
     }
     let Some(find) = chrome.find.as_mut() else {
         return Ok(true);
@@ -4644,7 +4736,8 @@ fn edit_find(
         find::Step::Typing(None) => {}
         find::Step::Typing(Some(ask)) => find.want(ask),
         find::Step::Close => close_find(tabs, chrome),
-        find::Step::Quit => return Ok(false),
+        find::Step::Quit if quits(&chrome.bindings, &key) => return Ok(false),
+        find::Step::Quit => {}
     }
     pump_find(tabs, chrome);
     redraw_row(pane, tabs, chrome)?;
@@ -4805,15 +4898,18 @@ fn edit_list(
         .as_ref()
         .map(|list| list.line.text().to_string())
         .unwrap_or_default();
-    if copy_from_row(pane, tabs, &key, &typed)? {
-        return Ok(true);
+    if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed)? {
+        return Ok(going);
     }
     let page = chrome.metrics.usable_rows() as usize;
     let Some(list) = chrome.list.as_mut() else {
         return Ok(true);
     };
     let matched: Vec<usize> = list.matches(tabs).iter().map(|entry| entry.index).collect();
-    let step = list.step(&key, &matched, page);
+    let step = match list.step(&key, &matched, page) {
+        tablist::Step::Quit if !quits(&chrome.bindings, &key) => tablist::Step::Typing,
+        step => step,
+    };
     list_step(pane, tabs, browser, chrome, step)
 }
 
@@ -5413,6 +5509,158 @@ mod tests {
             action: KeyAction::Press,
             text: None,
         }
+    }
+
+    /// A table of `key.` lines, as the settings file would give it.
+    fn bound(lines: &[(&str, &str)]) -> Bindings {
+        Bindings::from_rows(
+            lines
+                .iter()
+                .map(|(chord, action)| crate::bindings::Binding::parse(chord, action).expect(chord))
+                .collect(),
+        )
+    }
+
+    /// Every press worth asking the built-in table about: each printable
+    /// character, each named key and each function key, under every subset
+    /// of ctrl, alt, shift and super.
+    fn every_press() -> Vec<KeyInput> {
+        let mut keys: Vec<Key> = (' '..='~').map(Key::Char).collect();
+        keys.extend([
+            Key::Enter,
+            Key::Tab,
+            Key::Backspace,
+            Key::Escape,
+            Key::Insert,
+            Key::Delete,
+            Key::Up,
+            Key::Down,
+            Key::Left,
+            Key::Right,
+            Key::Home,
+            Key::End,
+            Key::PageUp,
+            Key::PageDown,
+        ]);
+        keys.extend((1..=24).map(Key::Function));
+        let mut presses = Vec::new();
+        for k in keys {
+            for mods in 0..16 {
+                presses.push(key(k, mods));
+            }
+        }
+        presses
+    }
+
+    #[test]
+    fn a_bound_key_is_the_command_it_names_an_unbound_one_is_nothing_and_the_rest_is_the_table() {
+        let table = bound(&[
+            ("alt+b", "back"),
+            ("ctrl+q", "none"),
+            ("f5", "reload"),
+            ("ctrl+t", "quit"),
+        ]);
+        assert_eq!(
+            keyed(&table, &key(Key::Char('b'), Mods::ALT)),
+            Some(Command::Back)
+        );
+        assert_eq!(keyed(&table, &key(Key::Char('q'), Mods::CTRL)), None);
+        assert_eq!(
+            keyed(&table, &key(Key::Function(5), 0)),
+            Some(Command::Reload)
+        );
+        assert_eq!(
+            keyed(&table, &key(Key::Char('t'), Mods::CTRL)),
+            Some(Command::Quit),
+            "a shadowed built-in"
+        );
+        assert_eq!(
+            keyed(&table, &key(Key::Char('w'), Mods::CTRL)),
+            Some(Command::CloseTab),
+            "the rest is the built-in table's"
+        );
+        let mut released = key(Key::Char('b'), Mods::ALT);
+        released.action = KeyAction::Release;
+        assert_eq!(keyed(&table, &released), None);
+    }
+
+    #[test]
+    fn an_empty_table_leaves_every_key_the_built_in_table_s() {
+        let empty = Bindings::default();
+        for press in every_press() {
+            assert_eq!(keyed(&empty, &press), command(&press), "{press:?}");
+        }
+    }
+
+    #[test]
+    fn every_chord_the_built_in_table_answers_has_a_name_and_the_name_answers_it() {
+        let every = Action::every();
+        for press in every_press() {
+            let Some(wanted) = command(&press) else {
+                continue;
+            };
+            let named = every.iter().find(|action| command_of(**action) == wanted);
+            let Some(action) = named else {
+                panic!("{wanted:?}, on {press:?}, has no name in bindings::ACTIONS");
+            };
+            assert_eq!(
+                Action::parse(&action.name()).map(command_of),
+                Ok(wanted),
+                "{press:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_action_s_default_chords_are_the_ones_the_built_in_table_answers() {
+        for action in Action::every() {
+            let chords = crate::bindings::defaults(action);
+            assert!(!chords.is_empty(), "{action:?} has a default key");
+            for chord in chords {
+                let press = KeyInput {
+                    key: chord.key,
+                    mods: chord.mods,
+                    action: KeyAction::Press,
+                    text: None,
+                };
+                assert_eq!(
+                    command(&press),
+                    Some(command_of(action)),
+                    "{} for {action:?}",
+                    chord.spell()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copy_copy_url_and_quit_reach_through_a_line_on_whatever_chords_they_are() {
+        let table = bound(&[("alt+x", "copy"), ("ctrl+x", "quit"), ("alt+b", "back")]);
+        assert_eq!(
+            row_command(&table, &key(Key::Char('x'), Mods::ALT)),
+            Some(Command::CopySelection)
+        );
+        assert_eq!(
+            row_command(&table, &key(Key::Char('x'), Mods::CTRL)),
+            Some(Command::Quit)
+        );
+        assert_eq!(
+            row_command(&table, &key(Key::Char('u'), Mods::ALT)),
+            Some(Command::CopyUrl)
+        );
+        assert_eq!(row_command(&table, &key(Key::Char('b'), Mods::ALT)), None);
+        assert_eq!(row_command(&table, &key(Key::Char('w'), Mods::CTRL)), None);
+    }
+
+    #[test]
+    fn an_unbound_ctrl_q_no_longer_quits_from_a_line_or_a_dialog() {
+        let ctrl_q = key(Key::Char('q'), Mods::CTRL);
+        assert!(!quits(&bound(&[("ctrl+q", "none")]), &ctrl_q));
+        assert!(quits(&Bindings::default(), &ctrl_q));
+        assert!(quits(&bound(&[("ctrl+q", "quit")]), &ctrl_q));
+        // Taken for something else, it is not quit on the row either, where
+        // only the copy keys and quit reach past the line.
+        assert!(!quits(&bound(&[("ctrl+q", "back")]), &ctrl_q));
     }
 
     #[test]

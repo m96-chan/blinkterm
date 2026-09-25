@@ -68,7 +68,9 @@ Settings can be kept in $XDG_CONFIG_HOME/blinkterm/config, one per line as
 \"name = value\", where the names are the options above without their --
 (scale = 2, color-scheme = dark, engine-arg = --accept-lang=ja, which may
 be repeated; a line starting with # is a comment). The command line
-overrides the file; $BLINKTERM_ENGINE sits between them.
+overrides the file; $BLINKTERM_ENGINE sits between them. key.<chord> =
+<action> rebinds a key, and key.<chord> = none gives it to the page; the
+actions are listed after the keys.
 
 The page is rendered by a headless Chromium, which this program starts and
 stops. It is looked for in --engine, then $BLINKTERM_ENGINE, then the
@@ -138,7 +140,7 @@ fn main() -> ExitCode {
     };
     let options = match invocation {
         Invocation::Help => {
-            print!("{USAGE}");
+            print!("{USAGE}{}", blinkterm::bindings::help());
             return ExitCode::SUCCESS;
         }
         Invocation::Version => {

@@ -12,6 +12,11 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- `key.<chord> = <action>` in the settings file rebinds any of the
+  program's keys (`key.f5 = reload`), and `key.<chord> = none` gives one
+  back to the page; the actions are listed by `--help`. A chord needs
+  `ctrl`, `alt` or `super` unless it is an f-key
+  ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
 - A settings file, `$XDG_CONFIG_HOME/blinkterm/config`: every option as
   `name = value`, `engine-arg` repeatable. The command line wins over the
   file; `$BLINKTERM_ENGINE` sits between. `--config <path>`, `--no-config`
