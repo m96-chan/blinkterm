@@ -3515,6 +3515,187 @@ fn a_dialog_on_a_tab_that_is_not_in_front_is_still_heard() {
     engine.kill();
 }
 
+// ---------------------------------------------------------------------------
+// File inputs
+// ---------------------------------------------------------------------------
+
+use blinkterm::upload::{Chooser, Disk, Outcome as Typed, Upload};
+
+/// A page whose file input sits in the first pixels of the page, and which
+/// writes into its title what it was given — each file's name and size, as a
+/// page reads them — or that it heard `cancel`.
+fn upload_page(multiple: bool) -> String {
+    format!(
+        "data:text/html,<title>ready</title><body style='margin:0'>\
+<input id=f type=file {} style='position:absolute;left:0;top:0;width:200px;height:32px'>\
+<script>f.addEventListener('change',function(){{var a=[];\
+for(var x of f.files)a.push(x.name+' '+x.size);document.title='files '+a.join(', ')}});\
+f.addEventListener('cancel',function(){{document.title='cancelled'}});</script></body>",
+        if multiple { "multiple" } else { "" }
+    )
+}
+
+/// What `/report.pdf` holds for these tests, and so what size the page says.
+const UPLOADED: &[u8] = b"%PDF-1.4 a small report";
+
+/// A page with its file inputs asked about, as `app::connect_tab` sets one
+/// up, and a directory with two files in it to choose from.
+fn an_upload_page(client: &mut Client, multiple: bool) -> std::path::PathBuf {
+    a_page_that_asks(client, &upload_page(multiple), "ready");
+    client
+        .call(
+            "Page.setInterceptFileChooserDialog",
+            Json::object(vec![("enabled", Json::Bool(true))]),
+        )
+        .expect("interception");
+    let dir = temp_dir(if multiple { "uploads" } else { "upload" });
+    std::fs::write(dir.join("report.pdf"), UPLOADED).expect("a file");
+    std::fs::write(dir.join("notes.txt"), b"one line\n").expect("a file");
+    dir
+}
+
+/// A left click at a point of the page, pressed and let go, as `send_mouse`
+/// sends one. The click is what gives the page the activation a chooser
+/// needs: from a script with none, the engine refuses to open one.
+fn click_at(client: &mut Client, x: u32, y: u32) {
+    for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+        client
+            .call(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(x)),
+                    ("y", Json::number(y)),
+                    ("button", Json::string("left")),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(0)),
+                ]),
+            )
+            .expect("the click is dispatched");
+    }
+}
+
+/// The next file input the page asks about, read the way the program reads
+/// it.
+fn wait_for_chooser(client: &Client, timeout: Duration) -> Chooser {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for event in client.events() {
+            if event.method == "Page.fileChooserOpened" {
+                return Chooser::opening(&event.params)
+                    .unwrap_or_else(|| panic!("a chooser with no input: {}", event.params));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("no file chooser opened in {timeout:?}");
+}
+
+/// Keys at an upload prompt, until one of them ends it.
+fn type_path(upload: &mut Upload, keys: &[KeyInput]) -> Typed {
+    let mut outcome = Typed::Waiting;
+    for key in keys {
+        outcome = upload.step(key, &Disk);
+        if outcome != Typed::Waiting {
+            break;
+        }
+    }
+    outcome
+}
+
+fn letters(text: &str) -> Vec<KeyInput> {
+    text.chars().map(letter).collect()
+}
+
+/// A `<input type=file>` used to be a click that did nothing — headless has
+/// no picker, and the engine told the page `cancel` at once. Now the click
+/// is a path on the row, and what is typed and confirmed reaches the page as
+/// the file: its name and its size, read the way the page reads them. And
+/// Escape sends nothing, and the page hears `cancel` as it would from a real
+/// chooser.
+#[test]
+fn a_file_typed_on_the_row_reaches_the_pages_file_input() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let dir = an_upload_page(&mut client, false);
+
+    click_at(&mut client, 8, 8);
+    let chooser = wait_for_chooser(&client, Duration::from_secs(5));
+    assert!(!chooser.multiple);
+
+    // `rep`, Tab completes to `report.pdf`, Enter sends.
+    let mut upload = Upload::new(chooser, dir.clone(), None);
+    let mut keys = letters("rep");
+    keys.extend([press(Key::Tab), press(Key::Enter)]);
+    assert_eq!(type_path(&mut upload, &keys), Typed::Send);
+    assert_eq!(upload.line.text(), format!("{}/report.pdf", dir.display()));
+    client
+        .call("DOM.setFileInputFiles", upload.reply())
+        .expect("the engine takes the file");
+    let wanted = format!("files report.pdf {}", UPLOADED.len());
+    assert_eq!(
+        wait_for_title(&mut client, &wanted, Duration::from_secs(5)),
+        wanted
+    );
+
+    // Escape: nothing sent, and the page hears cancel.
+    click_at(&mut client, 8, 8);
+    let chooser = wait_for_chooser(&client, Duration::from_secs(5));
+    let mut upload = Upload::new(chooser, dir.clone(), None);
+    let keys = [letter('n'), press(Key::Escape)];
+    assert_eq!(type_path(&mut upload, &keys), Typed::Cancel);
+    blinkterm::app::cancel_chooser(&mut client, upload.chooser.backend_node_id);
+    assert_eq!(
+        wait_for_title(&mut client, "cancelled", Duration::from_secs(5)),
+        "cancelled"
+    );
+    assert_eq!(
+        evaluate(&mut client, "f.files.length"),
+        Json::number(1),
+        "the file sent before is untouched"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
+/// A `multiple` input is asked once per file, and an Enter with nothing
+/// typed sends what was entered, in the order it was.
+#[test]
+fn a_multiple_input_takes_every_path_entered_until_an_empty_enter() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let dir = an_upload_page(&mut client, true);
+
+    click_at(&mut client, 8, 8);
+    let chooser = wait_for_chooser(&client, Duration::from_secs(5));
+    assert!(chooser.multiple);
+
+    let mut upload = Upload::new(chooser, dir.clone(), None);
+    let mut keys = letters("report.pdf");
+    keys.push(press(Key::Enter));
+    keys.extend(letters("notes.txt"));
+    keys.extend([press(Key::Enter), press(Key::Enter)]);
+    assert_eq!(type_path(&mut upload, &keys), Typed::Send);
+    assert_eq!(upload.taken.len(), 2);
+    client
+        .call("DOM.setFileInputFiles", upload.reply())
+        .expect("the engine takes the files");
+    let wanted = format!("files report.pdf {}, notes.txt 9", UPLOADED.len());
+    assert_eq!(
+        wait_for_title(&mut client, &wanted, Duration::from_secs(5)),
+        wanted
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
 use blinkterm::download::{self, Downloads};
 
 /// What `/report.pdf` sends, which is what the saved file must hold.

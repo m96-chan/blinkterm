@@ -136,6 +136,7 @@ pub mod screen;
 pub mod scroll;
 pub mod tabs;
 pub mod text;
+pub mod upload;
 
 pub use app::Options;
 pub use json::Json;

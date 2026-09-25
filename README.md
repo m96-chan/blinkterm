@@ -156,6 +156,32 @@ Quitting cancels anything still coming and leaves no partial file. A
 `blinkterm` that is killed outright can leave `<guid>.crdownload` in the
 directory, which is the engine's partial file and is safe to delete.
 
+## Uploading a file
+
+A click on a page's file input — an "attach", a "choose file" — takes the
+status row for a path:
+
+    upload: ~/work/report/rep▌ort.pdf
+
+It starts in the directory the last file was uploaded from, or the one
+`blinkterm` was started in. `tab` completes a name (a second `tab` lists what
+it could be), `~` is your home, and the line is edited with the url bar's
+keys; `enter` sends the file. A page that takes several files asks once per
+file — `upload (2 added, enter to send):` — and an `enter` with nothing typed
+sends them. `esc` sends nothing, and the page is told the picker was
+dismissed, as a browser would tell it.
+
+What `enter` sends is checked here, because the engine checks nothing: the
+path is made absolute, and it must be a file that exists and can be read.
+Directories are refused. The page then gets what any browser gives it — the
+file's name, size and contents — and nothing is sent before `enter`: what
+`tab` reads of your disk to complete a name stays on this side.
+
+Two things a browser has that this does not: a page that uses the newer
+file-picker API (`showOpenFilePicker()`) is told no, and the row says "this
+page's file picker isn't supported"; and there is no drag and drop, which is
+not a thing a terminal has.
+
 ## Keys
 
 | | |
@@ -167,11 +193,12 @@ directory, which is the engine's partial file and is safe to delete.
 | `ctrl+w` | close this tab; closing the last one quits |
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
 | `alt+1` … `alt+9` | the nth tab |
-| your terminal's paste key | pastes into the page, the url bar, or a `prompt()` — whichever has the cursor |
-| `alt+c` | copy the page's selection to your clipboard; with the url bar or a `prompt()` open, copy that line |
+| your terminal's paste key | pastes into the page, the url bar, a `prompt()` or a file input's path — whichever has the cursor |
+| `alt+c` | copy the page's selection to your clipboard; with the url bar, a `prompt()` or a file input's path open, copy that line |
 | `alt+u` | copy the page's url to your clipboard |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
+| a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
 
 Everything else goes to the page, including the mouse. A link that asks for a
 new window gets a new tab, and the tab is switched to.
@@ -209,6 +236,13 @@ work, and the page gets no keys or mouse until it has its answer. A tab behind
 that opens one is marked `!` in the strip — `2! Title` — and keeps its question
 until you go to it. `ctrl+w` closes a tab without asking the page, so a tab
 with something unsaved in it is closed without a "leave this page?".
+
+A file input's path keeps the same keys — the tab keys and `ctrl+q` work,
+`ctrl+l`, reload, back and forward wait for `enter` or `esc` — but it does not
+stop the page, and the mouse still reaches it. A tab behind with a path
+waiting is marked `!` as one with a dialog is. A dialog the page opens while a
+path is half typed takes the row first; the path is there again once it is
+answered.
 
 ## Tests
 

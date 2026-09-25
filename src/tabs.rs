@@ -46,12 +46,14 @@
 //! loads anything costs nothing at all.
 
 use std::borrow::Cow;
+use std::path::Path;
 
 use crate::cdp::Event;
 use crate::dialog::Dialog;
 use crate::json::Json;
 use crate::load::{self, Landing, Loaded, Problem};
 use crate::text;
+use crate::upload::{Chooser, Upload};
 
 /// One page target, and what the row says about it.
 pub struct Tab<C> {
@@ -95,6 +97,17 @@ pub struct Tab<C> {
     /// because a tab that is not in front can open one too, and it has to be
     /// there — marked in the strip — when the person goes to look.
     pub dialog: Option<Dialog>,
+    /// The file input this page asked about and nobody has answered: a path
+    /// being typed on the row. See [`crate::upload`].
+    ///
+    /// Beside [`Tab::dialog`] rather than in the same slot, because the two
+    /// are not exclusive. A chooser does not stop the page, so a script can
+    /// open an `alert()` while the path is half typed; the alert has the row
+    /// then, since the page is stopped behind it, and the path is still here
+    /// when it has been answered. Per tab, like a dialog, because a tab that
+    /// is not in front gets the event too (measured), and the answer goes to
+    /// that page's input.
+    pub upload: Option<Upload>,
 }
 
 impl<C> Tab<C> {
@@ -108,6 +121,7 @@ impl<C> Tab<C> {
             note: None,
             problem: None,
             dialog: None,
+            upload: None,
         }
     }
 
@@ -140,6 +154,10 @@ impl<C> Tab<C> {
         self.title.clear();
         self.note = None;
         self.loading = true;
+        // The input a path was being typed for has gone with its document. An
+        // answer sent to it now would be taken and do nothing (measured), but
+        // a question about an input that is not there is a lie on the row.
+        self.upload = None;
         match landing {
             Landing::Document(url) => {
                 self.url = url;
@@ -223,6 +241,44 @@ impl<C> Tab<C> {
             "Page.javascriptDialogClosed" => self.dialog.take().is_some(),
             _ => false,
         }
+    }
+
+    /// What a `Page.fileChooserOpened` does to this tab: a prompt for a path,
+    /// starting in `base`. True when the row is now out of date.
+    ///
+    /// A second click on the input a prompt is already up for comes with the
+    /// same `backendNodeId` (measured), and it is the person clicking again,
+    /// not a new question: the half-typed path is kept. A different input
+    /// replaces it, since that is the one the person clicked last. An event
+    /// with no input to give files to — `showOpenFilePicker()` — is said once
+    /// on the note, so that the click did not silently do nothing.
+    pub fn chooser_event(&mut self, event: &Event, base: &Path, home: Option<&Path>) -> bool {
+        if event.method != "Page.fileChooserOpened" {
+            return false;
+        }
+        let Some(chooser) = Chooser::opening(&event.params) else {
+            self.note = Some("this page's file picker isn't supported".to_string());
+            return true;
+        };
+        let same = self
+            .upload
+            .as_ref()
+            .is_some_and(|upload| upload.chooser.backend_node_id == chooser.backend_node_id);
+        if same {
+            return false;
+        }
+        self.upload = Some(Upload::new(
+            chooser,
+            base.to_path_buf(),
+            home.map(Path::to_path_buf),
+        ));
+        true
+    }
+
+    /// Whether the page is waiting on the person — a dialog, or a file
+    /// input's path — which is what the strip marks with a `!`.
+    pub fn asks(&self) -> bool {
+        self.dialog.is_some() || self.upload.is_some()
     }
 
     /// The whole row, when this is the only tab there is.
@@ -902,6 +958,58 @@ mod tests {
         let gone = tabs.close(1).expect("b");
         assert!(gone.dialog.is_some());
         assert!(tabs.iter().all(|tab| tab.dialog.is_none()));
+    }
+
+    #[test]
+    fn a_file_input_waits_on_its_tab_and_goes_with_its_page() {
+        let mut tabs = three();
+        let base = Path::new("/work");
+        let opened = |node: u32| {
+            event(
+                "Page.fileChooserOpened",
+                &format!(r#"{{"frameId":"F","mode":"selectSingle","backendNodeId":{node}}}"#),
+            )
+        };
+        // The third tab asks while the first is in front.
+        let tab = tabs.get_mut(2).expect("c");
+        assert!(tab.chooser_event(&opened(3), base, None));
+        assert!(tab.asks(), "marked in the strip");
+        assert_eq!(tab.upload.as_ref().expect("a prompt").line.text(), "/work/");
+        assert!(tabs.active().expect("a").upload.is_none());
+
+        // The same input clicked again keeps what was typed.
+        let tab = tabs.get_mut(2).expect("c");
+        tab.upload
+            .as_mut()
+            .expect("a prompt")
+            .line
+            .insert_str("rep");
+        assert!(!tab.chooser_event(&opened(3), base, None));
+        assert_eq!(tab.upload.as_ref().expect("kept").line.text(), "/work/rep");
+        // Another input is another question.
+        assert!(tab.chooser_event(&opened(7), base, None));
+        assert_eq!(tab.upload.as_ref().expect("new").chooser.backend_node_id, 7);
+        // Something else about the page is not about the input.
+        let loaded = event("Page.loadEventFired", r#"{"timestamp":1}"#);
+        assert!(!tab.chooser_event(&loaded, base, None));
+        assert!(tab.upload.is_some());
+
+        // The page going somewhere takes the input, and the prompt, with it.
+        tab.landed(Landing::Document("https://c.example/next".to_string()));
+        assert!(tab.upload.is_none());
+        assert!(!tab.asks());
+
+        // A picker with no input to fill is said, not asked.
+        let picker = event(
+            "Page.fileChooserOpened",
+            r#"{"frameId":"F","mode":"selectSingle"}"#,
+        );
+        assert!(tab.chooser_event(&picker, base, None));
+        assert!(tab.upload.is_none());
+        assert_eq!(
+            tab.note.as_deref(),
+            Some("this page's file picker isn't supported")
+        );
     }
 
     #[test]

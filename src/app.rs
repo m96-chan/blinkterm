@@ -26,6 +26,7 @@
 //! side is a notch handed over as it is read and a timestamp read back once a
 //! pass.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,6 +51,7 @@ use crate::profile::{Choice, Profile};
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::tabs::{Outcome, Tab, Tabs};
+use crate::upload::{self, Upload};
 
 /// How long the engine gets to answer on its pipe.
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -233,6 +235,21 @@ struct Chrome {
     /// the tab it started in, and its events come on the browser's
     /// connection. See [`crate::download`].
     downloads: Downloads,
+    /// The directory the last file was uploaded from, this run: where the
+    /// next file input's prompt starts. See [`upload::start_dir`].
+    upload_dir: Option<PathBuf>,
+}
+
+impl Chrome {
+    /// Where a file input's prompt starts, read now: see
+    /// [`upload::start_dir`].
+    fn upload_base(&self) -> PathBuf {
+        upload::start_dir(
+            self.upload_dir.as_deref(),
+            std::env::current_dir().ok(),
+            upload::home().as_deref(),
+        )
+    }
 }
 
 /// The url bar while it is open.
@@ -344,7 +361,9 @@ pub fn run(options: Options) -> Result<(), String> {
             format!("{why}; the engine said: {}", tail.join(" / "))
         }
     })?;
-    let client = browser.attach(&first, CONNECT_TIMEOUT)?;
+    // Set up as every other tab is, so that the page most uploads happen in
+    // is one whose file inputs are asked on the row: see [`connect_tab`].
+    let client = connect_tab(&mut browser, &first)?;
     let mut tabs = Tabs::new(Tab::new(first, client, "about:blank"));
 
     let mut pane = Pane::enter(0, 1).map_err(|e| format!("cannot take the terminal: {e}"))?;
@@ -372,6 +391,7 @@ pub fn run(options: Options) -> Result<(), String> {
                 search_url: options.search_url.clone(),
                 navigation: None,
                 downloads: Downloads::new(downloads_dir),
+                upload_dir: None,
             };
             let outcome = drive(
                 &mut pane,
@@ -820,12 +840,13 @@ fn activate(
         SWITCH_TIMEOUT,
     );
     let metrics = chrome.metrics;
+    let base = chrome.upload_base();
     let Some(tab) = tabs.active_mut() else {
         return Ok(());
     };
     // First, whether the page is stopped behind a dialog, because that
     // decides whether anything below can be waited for. See [`tell`].
-    bin_events(tab);
+    bin_events(tab, &base);
     let mut stopped = tab.dialog.is_some();
     if let Err(why) = tell(
         &mut tab.connection,
@@ -838,7 +859,7 @@ fn activate(
         // is the one way to get here with a page that is fine. The command is
         // queued behind the dialog like everything else, so the rest is told
         // rather than asked; anything else is a page that is not answering.
-        bin_events(tab);
+        bin_events(tab, &base);
         if tab.dialog.is_none() {
             return Err(why);
         }
@@ -863,7 +884,7 @@ fn activate(
     // Except while a dialog is up, when the page cannot say what it is called
     // and a question would cost the two seconds of [`page_loaded`] for
     // nothing. The page is asked when the dialog closes instead.
-    bin_events(tab);
+    bin_events(tab, &base);
     if tab.dialog.is_none() {
         if let Some(loaded) = page_loaded(&mut tab.connection) {
             tab.loaded(loaded);
@@ -878,16 +899,23 @@ fn activate(
     Ok(())
 }
 
-/// Throw away what a tab has queued, except what it says about a dialog.
+/// Throw away what a tab has queued, except what it says about a dialog or a
+/// file input.
 ///
 /// A queue that is binned is binned for its frames, which are older than the
 /// moment they would be painted in. A dialog is not like that: the page opened
 /// it and is stopped until it is answered, however long ago that was, and a
 /// `Page.javascriptDialogOpening` that went in the bin would be a tab that
-/// had stopped with nothing on the row to say why and nothing to answer.
-fn bin_events(tab: &mut Tab<Client>) {
+/// had stopped with nothing on the row to say why and nothing to answer. A
+/// `Page.fileChooserOpened` is the same question without the stopping: the
+/// person clicked an input, and a prompt that went in the bin would be a
+/// click that did nothing — which is what issue #11 was. `base` is where a
+/// prompt opened here starts.
+fn bin_events(tab: &mut Tab<Client>, base: &Path) {
+    let home = upload::home();
     for event in tab.connection.events() {
         tab.dialog_event(&event);
+        tab.chooser_event(&event, base, home.as_deref());
     }
 }
 
@@ -978,9 +1006,23 @@ fn open_tab(tabs: &mut Tabs<Client>, browser: &mut Client, url: &str) -> Result<
 /// is looked at: a tab that is loading in the background still has to tell the
 /// strip when it has a name, and the events it sends before anybody asks are
 /// the only notice there is.
+///
+/// And a page's file inputs are asked about on the row from then on:
+/// `Page.setInterceptFileChooserDialog`, which turns a click on one into a
+/// `Page.fileChooserOpened` rather than the engine's own at-once `cancel`.
+/// Here and not in [`activate`], because it is per session and a tab behind
+/// gets the event too; and after `Page.enable`, because before it the command
+/// is accepted and does nothing — both measured against
+/// `chrome-headless-shell` 153. It survives the page navigating. See
+/// [`crate::upload`].
 fn connect_tab(browser: &mut Client, target: &str) -> Result<Client, String> {
     let mut connection = browser.attach(target, CONNECT_TIMEOUT)?;
     connection.call_within("Page.enable", Json::empty(), SWITCH_TIMEOUT)?;
+    connection.call_within(
+        "Page.setInterceptFileChooserDialog",
+        Json::object(vec![("enabled", Json::Bool(true))]),
+        SWITCH_TIMEOUT,
+    )?;
     Ok(connection)
 }
 
@@ -1091,24 +1133,17 @@ fn page_cells(metrics: Metrics) -> Cells {
 /// place after the strip with more — and never instead of it, because the
 /// tab's line is what a person navigates by and a download is news, not a
 /// place. Behind the url bar and a dialog, like the tab's line itself.
+///
+/// A file input's path, being typed, is the sixth, and takes the whole row
+/// after the url bar and a dialog: see [`row_owner`] for the order and why.
 fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(), String> {
     let cols = chrome.metrics.cols;
     let Some(active) = tabs.active() else {
         return Ok(());
     };
     let downloading = chrome.downloads.line(Instant::now());
-    let bytes = if let Some(bar) = &chrome.bar {
-        typing_row(cols, "url: ", &bar.line)
-    } else if let Some(dialog) = &active.dialog {
-        if dialog.typing() {
-            typing_row(
-                cols,
-                &screen::dialog_prompt(cols, &dialog.caption()),
-                &dialog.line,
-            )
-        } else {
-            screen::dialog_line(cols, &dialog.caption(), dialog.hint())
-        }
+    let bytes = if let Some(owner) = row_owner(tabs, chrome.bar.as_ref()) {
+        owned_row(cols, owner)
     } else if tabs.len() < 2 {
         match &downloading {
             Some(words) => screen::split_line(cols, &active.line(), words),
@@ -1125,13 +1160,76 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
             .map(|(index, (name, tab))| screen::TabLabel {
                 title: name,
                 active: index == tabs.active_index(),
-                dialog: tab.dialog.is_some(),
+                // A dialog or a file input's path: the page is waiting on
+                // the person either way.
+                dialog: tab.asks(),
             })
             .collect();
         let right = downloading.as_deref().unwrap_or(&active.url);
         screen::tab_line(cols, &labels, right)
     };
     pane.write(&bytes).map_err(|e| e.to_string())
+}
+
+/// The row as whichever of them owns it draws it.
+fn owned_row(cols: u32, owner: RowOwner<'_>) -> Vec<u8> {
+    match owner {
+        RowOwner::Bar(bar) => typing_row(cols, "url: ", &bar.line),
+        RowOwner::Dialog(dialog) if dialog.typing() => typing_row(
+            cols,
+            &screen::dialog_prompt(cols, &dialog.caption()),
+            &dialog.line,
+        ),
+        RowOwner::Dialog(dialog) => screen::dialog_line(cols, &dialog.caption(), dialog.hint()),
+        RowOwner::Upload(upload) => typing_row(
+            cols,
+            &screen::dialog_prompt(cols, &upload.prompt()),
+            &upload.line,
+        ),
+    }
+}
+
+/// What has the whole row, when something does: something being typed, or
+/// a question the page is stopped on.
+///
+/// Each of these is kept where it belongs — the url bar on [`Chrome`],
+/// because it is the person's and `ctrl+l` opens the same bar on any tab; the
+/// rest on the tab in front, because each is that page's — and what is
+/// shared is the one rule for which of them has the row and the cursor.
+enum RowOwner<'a> {
+    Bar(&'a UrlBar),
+    /// Any dialog: a `prompt()` is a line with the cursor, the others are a
+    /// question answered by a key.
+    Dialog(&'a Dialog),
+    Upload(&'a Upload),
+}
+
+/// Which line owns the row: the url bar, then a dialog, then a file input's
+/// path — or nothing, and the row is the page's own.
+///
+/// The url bar first, because it was opened by the person, and a question
+/// that arrived while they were typing is there when they finish. A dialog
+/// next, because the page is stopped behind it — even behind an upload
+/// prompt, since a chooser does not stop the page and a script can
+/// `alert()` while a path is half typed; the path waits underneath and comes
+/// back when the alert is answered. The upload prompt last, because it is
+/// the page's question and the page is not waiting on it.
+///
+/// A line that joins them — find in the page, say — goes in here, in its
+/// place in that order, as one more arm of [`RowOwner`]; [`redraw_row`] and
+/// [`row_owns_cursor`] follow from it. What does not follow from it is which
+/// keys reach each one, which is [`handle_input`]'s, in the same order but
+/// with a rule of its own for each about which of the program's keys survive
+/// it; and [`paste`], which goes to the same place by the same order.
+fn row_owner<'a, C>(tabs: &'a Tabs<C>, bar: Option<&'a UrlBar>) -> Option<RowOwner<'a>> {
+    if let Some(bar) = bar {
+        return Some(RowOwner::Bar(bar));
+    }
+    let tab = tabs.active()?;
+    if let Some(dialog) = &tab.dialog {
+        return Some(RowOwner::Dialog(dialog));
+    }
+    tab.upload.as_ref().map(RowOwner::Upload)
 }
 
 /// The row as `line` being typed after `prompt`: as much of it as fits, with
@@ -1318,6 +1416,16 @@ fn handle_page_events(
                         redraw = true;
                     }
                 }
+                "Page.fileChooserOpened" => {
+                    // A click on a file input, on this tab, in front or not:
+                    // a path to type on the row, answered by a key in
+                    // `answer_upload`. The page is not stopped.
+                    let base = chrome.upload_base();
+                    let event = Event { method, params };
+                    if tab.chooser_event(&event, &base, upload::home().as_deref()) {
+                        redraw = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1379,14 +1487,15 @@ fn paint(
     Ok(())
 }
 
-/// Whether the row is a line being typed into: the url bar, or the answer to
-/// a `prompt()` on the page in front.
+/// Whether the row is a line being typed into: the url bar, the answer to a
+/// `prompt()` on the page in front, or a path for its file input — whichever
+/// [`row_owner`] says has the row.
 fn row_owns_cursor(tabs: &Tabs<Client>, chrome: &Chrome) -> bool {
-    chrome.bar.is_some()
-        || tabs
-            .active()
-            .and_then(|tab| tab.dialog.as_ref())
-            .is_some_and(|dialog| dialog.typing())
+    match row_owner(tabs, chrome.bar.as_ref()) {
+        Some(RowOwner::Bar(_) | RowOwner::Upload(_)) => true,
+        Some(RowOwner::Dialog(dialog)) => dialog.typing(),
+        None => false,
+    }
 }
 
 /// Whether the page in front is stopped behind a dialog.
@@ -1648,6 +1757,28 @@ fn handle_input(
                     None => return answer_dialog(pane, tabs, chrome, key),
                 }
             }
+            if tabs.active().is_some_and(|tab| tab.upload.is_some()) {
+                // A file input's path is being typed. The page is not
+                // stopped, but the keys are the path's, by the same rule as a
+                // dialog's: the tab keys and quit work, and `ctrl+l`, reload,
+                // back and forward wait — a half-typed path is not something
+                // to navigate away from by reflex, and Escape is one key.
+                match command {
+                    Some(Command::CopySelection) => {
+                        let typed = tabs
+                            .active()
+                            .and_then(|tab| tab.upload.as_ref())
+                            .map(|upload| upload.line.text().to_string())
+                            .unwrap_or_default();
+                        copy_out(pane, tabs, &typed, Copied::Text)?;
+                        redraw_row(pane, tabs, chrome)?;
+                        return Ok(true);
+                    }
+                    Some(command) if survives_dialog(command) => {}
+                    Some(_) => return Ok(true),
+                    None => return answer_upload(pane, tabs, chrome, key),
+                }
+            }
             match command {
                 Some(Command::Quit) => return Ok(false),
                 Some(Command::EditUrl) => {
@@ -1813,7 +1944,7 @@ enum Command {
     /// The nth tab, counted from one.
     SelectTab(usize),
     /// `alt+c`: the page's selection to the host's clipboard — or, with the
-    /// url bar or a `prompt()`'s line open, that line.
+    /// url bar, a `prompt()`'s line or a file input's path open, that line.
     CopySelection,
     /// `alt+u`: the current url to the host's clipboard.
     CopyUrl,
@@ -1836,6 +1967,10 @@ enum Command {
 /// asks the page, and a page stopped behind a dialog answers nothing until the
 /// deadline — except on a `prompt()`, where it copies the line being typed,
 /// which [`handle_input`] does before it gets here.
+///
+/// The same keys survive a file input's prompt, and the same wait, although
+/// that page is not stopped: what waits is still what would do something to
+/// the page the path is being typed for, and the copy is still of the line.
 fn survives_dialog(command: Command) -> bool {
     match command {
         Command::Quit
@@ -1890,6 +2025,94 @@ fn answer_dialog(
     }
     redraw_row(pane, tabs, chrome)?;
     Ok(true)
+}
+
+/// A key, as typing into the path for the file input on the page in front.
+///
+/// Sent, the prompt comes off the tab at once and the files go as
+/// `DOM.setFileInputFiles` — a notification, because the reply is `{}` and the
+/// engine reading the file is not this loop's business. The row says what
+/// went, on the tab's note, until the page says something else: there is no
+/// event for the page having read it, so there is no progress to show. The
+/// directory it came from is where the next prompt starts.
+///
+/// Escaped, nothing is sent, and the page is told `cancel` the way a real
+/// chooser would tell it: [`cancel_chooser`].
+fn answer_upload(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    key: KeyInput,
+) -> Result<bool, String> {
+    let Some(tab) = tabs.active_mut() else {
+        return Ok(true);
+    };
+    let Some(prompt) = tab.upload.as_mut() else {
+        return Ok(true);
+    };
+    match prompt.step(&key, &upload::Disk) {
+        upload::Outcome::Waiting => {}
+        upload::Outcome::Quit => return Ok(false),
+        upload::Outcome::Send => {
+            let params = prompt.reply();
+            tab.note = Some(prompt.sentence());
+            chrome.upload_dir = prompt.last_dir();
+            tab.upload = None;
+            let _ = tab.connection.notify("DOM.setFileInputFiles", params);
+        }
+        upload::Outcome::Cancel => {
+            let node = prompt.chooser.backend_node_id;
+            tab.upload = None;
+            cancel_chooser(&mut tab.connection, node);
+        }
+    }
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
+/// Tell a page its file input was dismissed: `cancel`, dispatched on the
+/// input itself, which is what Chromium's own chooser fires on a dismiss
+/// since 113.
+///
+/// There is no cancel in the protocol — `DOM.setFileInputFiles` with no
+/// files is answered and does nothing at all, measured — so the input is
+/// found by the node the event named (`DOM.resolveNode`, which answers at once
+/// on a live page, and needs no `DOM.enable`), the event is fired on it
+/// ([`Upload::CANCEL_FUNCTION`]), and the handle is let go. The first is a
+/// call, briefly, because the next two need what it answers; they are
+/// notifications. A page that does not answer in time does not hear its
+/// `cancel`, which is the one thing here this program can afford to lose.
+///
+/// Public so that the engine tests send what this program sends.
+pub fn cancel_chooser(client: &mut Client, backend_node_id: i64) {
+    let Ok(node) = client.call_within(
+        "DOM.resolveNode",
+        Json::object(vec![(
+            "backendNodeId",
+            Json::number(backend_node_id as f64),
+        )]),
+        SWITCH_TIMEOUT,
+    ) else {
+        return;
+    };
+    let Some(object) = node
+        .path(&["object", "objectId"])
+        .and_then(Json::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let _ = client.notify(
+        "Runtime.callFunctionOn",
+        Json::object(vec![
+            ("objectId", Json::string(&object)),
+            ("functionDeclaration", Json::string(Upload::CANCEL_FUNCTION)),
+        ]),
+    );
+    let _ = client.notify(
+        "Runtime.releaseObject",
+        Json::object(vec![("objectId", Json::string(object))]),
+    );
 }
 
 /// A page that asked before it was left and was told no.
@@ -2045,7 +2268,7 @@ fn edit_url(
 ///
 /// The url bar if it is open, because the person pressed `ctrl+l` and that
 /// is where they are typing; then a `prompt()`'s line on the page in front;
-/// then the page. A paste on an alert, a confirm or a "leave this page?" is
+/// then the path for its file input; then the page. A paste on an alert, a confirm or a "leave this page?" is
 /// dropped: a paste is not "any key", and answering "delete these files?"
 /// with the clipboard's contents would be worse than not pasting at all.
 ///
@@ -2085,6 +2308,13 @@ fn paste(
             redraw_row(pane, tabs, chrome)?;
         }
         return Ok(());
+    }
+    // A file input's path, which is where a long path most often comes from:
+    // the same order as [`row_owner`]'s, and the same one-line rule as the
+    // lines above.
+    if let Some(prompt) = tabs.active_mut().and_then(|tab| tab.upload.as_mut()) {
+        prompt.paste(&clipboard::one_line(text), &upload::Disk);
+        return redraw_row(pane, tabs, chrome);
     }
     if let Some(tab) = tabs.active_mut() {
         let _ = tab
@@ -2619,6 +2849,74 @@ mod tests {
         assert_eq!(survives(Key::Char('y'), 0), None);
         assert_eq!(survives(Key::Enter, 0), None);
         assert_eq!(survives(Key::Escape, 0), None);
+    }
+
+    #[test]
+    fn the_tab_keys_and_quit_survive_an_upload_prompt_and_the_rest_wait() {
+        // The same set as a dialog's, and the same reasons: see
+        // `survives_dialog`. Checked here from the upload's side so that a
+        // change to one is a decision about both.
+        let survives = |k: Key, mods: u32| command(&key(k, mods)).map(survives_dialog);
+        for (k, mods) in [
+            (Key::Char('q'), Mods::CTRL),
+            (Key::Char('t'), Mods::CTRL),
+            (Key::Char('w'), Mods::CTRL),
+            (Key::Tab, Mods::CTRL),
+            (Key::Char('2'), Mods::ALT),
+            (Key::Char('u'), Mods::ALT),
+        ] {
+            assert_eq!(survives(k, mods), Some(true), "{k:?}");
+        }
+        for (k, mods) in [
+            (Key::Char('l'), Mods::CTRL),
+            (Key::Char('r'), Mods::CTRL),
+            (Key::Left, Mods::ALT),
+            (Key::Right, Mods::ALT),
+        ] {
+            assert_eq!(survives(k, mods), Some(false), "{k:?}");
+        }
+        // Tab, Enter and Escape are the path's.
+        assert_eq!(survives(Key::Tab, 0), None);
+        assert_eq!(survives(Key::Enter, 0), None);
+        assert_eq!(survives(Key::Escape, 0), None);
+    }
+
+    #[test]
+    fn the_row_goes_to_the_url_bar_then_a_dialog_then_a_file_input() {
+        let owner = |tabs: &Tabs<()>, bar: Option<&UrlBar>| match row_owner(tabs, bar) {
+            Some(RowOwner::Bar(_)) => "bar",
+            Some(RowOwner::Dialog(_)) => "dialog",
+            Some(RowOwner::Upload(_)) => "upload",
+            None => "page",
+        };
+        let mut tabs = Tabs::new(Tab::new("a", (), "https://a.example/"));
+        let bar = UrlBar::new(Line::empty());
+        assert_eq!(owner(&tabs, None), "page");
+
+        let chooser = upload::Chooser {
+            backend_node_id: 3,
+            multiple: false,
+            frame_id: "F".to_string(),
+        };
+        let tab = tabs.active_mut().expect("a tab");
+        tab.upload = Some(Upload::new(chooser, PathBuf::from("/work"), None));
+        assert_eq!(owner(&tabs, None), "upload");
+        assert_eq!(owner(&tabs, Some(&bar)), "bar", "the person's typing first");
+
+        // An alert while the path is half typed: the page is stopped, so the
+        // alert has the row, and the path is underneath it.
+        let alert = Json::parse(r#"{"type":"alert","message":"m","url":"u"}"#).expect("JSON");
+        let tab = tabs.active_mut().expect("a tab");
+        tab.dialog = Dialog::opening(&alert);
+        assert_eq!(owner(&tabs, None), "dialog");
+        assert_eq!(owner(&tabs, Some(&bar)), "bar");
+        let tab = tabs.active_mut().expect("a tab");
+        tab.dialog = None;
+        assert_eq!(owner(&tabs, None), "upload", "and back when it is answered");
+
+        // A tab behind with a prompt does not own the row in front.
+        tabs.open(Tab::new("b", (), "https://b.example/"));
+        assert_eq!(owner(&tabs, None), "page");
     }
 
     #[test]

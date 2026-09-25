@@ -56,6 +56,10 @@ carry, and the list is kept as things land rather than written at the end.
   disk.
 - `--search-url <url with %s>`: words typed in the url bar go to that search.
   Off by default; without it nothing typed is sent anywhere it does not name.
+- A page's `<input type=file>` asks for a path on the status row, with tab
+  completion; several files for a `multiple` input, one per `enter` and an
+  empty `enter` to send them; `esc` sends nothing
+  ([#11](https://github.com/m96-chan/blinkterm/issues/11)).
 
 ### Changed
 
