@@ -7,11 +7,15 @@
 # formula, the lock file or this file does. So it runs on those paths and on
 # demand, not on every push, and a `paths:` filter is workflow-level.
 #
-# What is under test is the formula, not the checkout: `head` in the formula
-# points at main on GitHub, so a pull request that edits the formula builds
-# it against main's tree, which is what a user would get. The crate under
-# review is ci.yml's business. A change to Cargo.toml or Cargo.lock that only
-# Homebrew would notice is caught on the push to main, which is the record.
+# The formula is audited as it will be published, with `head` pointing at main
+# on GitHub, but it is built from this checkout: the install step points the
+# local copy's `head` at the tree under test. Two reasons. A pull request that
+# changes Cargo.toml or Cargo.lock should be built with that change, not with
+# main's; and while this repository is private, an anonymous `git clone` of
+# github.com/m96-chan/blinkterm -- which is what the published url asks Homebrew
+# to do -- is refused ("could not read Username"), so the published head could
+# not be built here at all. On a push to main the checkout is main, and the
+# two are the same build.
 name: Homebrew
 
 on:
@@ -60,7 +64,12 @@ jobs:
     name: brew audit, install, test
     runs-on: ubuntu-latest
     steps:
+      # The whole history, because Homebrew clones the head from this checkout
+      # and a clone of a one-commit shallow repository is a thing git has only
+      # sometimes been willing to do.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       # ubuntu-latest has a Homebrew at /home/linuxbrew/.linuxbrew already;
       # this action puts a current one on PATH and taps homebrew/core, and it
       # is what Homebrew's own `brew tap-new` scaffold uses, pinned to the same
@@ -94,6 +103,17 @@ jobs:
           else
             echo "no stable block yet; head only"
           fi
+      # After the audit, which saw the published url: the copy in the local tap
+      # builds this checkout instead. The checkout is a detached head (a pull
+      # request's merge commit), and `head` wants a branch, so it gets one.
+      - name: Point the formula's head at this checkout
+        run: |
+          git switch -c brew-under-test
+          tap=$(brew --repository m96-chan/tap)
+          sed -i "s|^  head \".*\", branch: \"main\"$|  head \"file://$GITHUB_WORKSPACE\", branch: \"brew-under-test\"|" \
+            "$tap/Formula/blinkterm.rb"
+          grep -n '^  head ' "$tap/Formula/blinkterm.rb"
+          grep -q "file://$GITHUB_WORKSPACE" "$tap/Formula/blinkterm.rb"
       # --build-from-source is redundant with --HEAD (there is no bottle for
       # HEAD) and says what the job is about. --verbose so a failing cargo
       # build shows its errors in the log rather than a path to one.
