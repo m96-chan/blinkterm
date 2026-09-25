@@ -108,9 +108,14 @@ impl Mode {
         self.pending_g = false;
     }
 
-    /// What `key` means now. Always [`Action::Page`] in insert mode; a
-    /// release is [`Action::Nothing`] in normal mode, since the press already
-    /// acted; a repeat is a press, so a held `j` keeps scrolling.
+    /// What `key` means now. Always [`Action::Page`] in insert mode; a repeat
+    /// is a press, so a held `j` keeps scrolling.
+    ///
+    /// A release goes where its press went: the page's keys are released on
+    /// the page, which saw them go down, and a letter's release is
+    /// [`Action::Nothing`], since the press already acted and the page never
+    /// saw it. A release forgets nothing, so the `g` of a `gg` typed quickly
+    /// is still waiting when the first one comes up.
     ///
     /// A shifted letter is told by the text the terminal reported, then by
     /// shift on the lower-case key — the rule [`crate::keys`] follows too.
@@ -120,10 +125,12 @@ impl Mode {
         if !self.normal {
             return Action::Page;
         }
-        if key.action == KeyAction::Release {
-            return Action::Nothing;
-        }
-        let pending_g = std::mem::take(&mut self.pending_g);
+        let release = key.action == KeyAction::Release;
+        let pending_g = if release {
+            false
+        } else {
+            std::mem::take(&mut self.pending_g)
+        };
         if key.mods.ctrl() || key.mods.alt() || key.mods.meta() {
             return Action::Page;
         }
@@ -135,6 +142,13 @@ impl Mode {
             None if key.mods.shift() => c.to_ascii_uppercase(),
             None => c,
         };
+        if release {
+            return if c == ' ' {
+                Action::Page
+            } else {
+                Action::Nothing
+            };
+        }
         match c {
             // Space is a named key as far as a page is concerned: it pages
             // down, or presses the button that has focus.
@@ -285,6 +299,10 @@ mod tests {
             key(Key::Other(57441), 0),
         ] {
             assert_eq!(mode.step(&input), Action::Page, "{input:?}");
+            // And comes up where it went down.
+            let mut released = input.clone();
+            released.action = KeyAction::Release;
+            assert_eq!(mode.step(&released), Action::Page, "{released:?}");
         }
         for c in ['x', '1', ';', '日'] {
             assert_eq!(mode.step(&typed(c)), Action::Nothing, "{c}");

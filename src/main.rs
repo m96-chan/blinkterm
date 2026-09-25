@@ -236,6 +236,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         scale: scale.unwrap_or(Scale::Auto),
         scheme: scheme.unwrap_or_default(),
         force_dark,
+        normal_mode: false,
     })
 }
 
