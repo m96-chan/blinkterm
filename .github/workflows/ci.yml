@@ -170,8 +170,15 @@ jobs:
       # "what changed", which is unanswerable if the version was never recorded.
       # It goes in the log rather than into a pin because pinning it would mean
       # testing against an engine nobody is running.
+      #
+      # --no-sandbox even here. This job is root in a container, and Chromium
+      # refuses to start as root without it for *any* invocation, `--version`
+      # included -- which tools/run.sh has said in a comment since it was
+      # written. Doubling as a smoke test: if the binary will not report its
+      # own version, the two and a half minutes of tests below are not going
+      # to tell anybody anything they do not already know.
       - name: Say which engine this is
-        run: chromium-shell --version
+        run: chromium-shell --no-sandbox --version
       - uses: Swatinem/rust-cache@v2
       # --release because several of these tests assert on timings: the rest
       # interval before a still, the frame rate under a steady wheel, the cost
