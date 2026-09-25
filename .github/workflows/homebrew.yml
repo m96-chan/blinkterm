@@ -106,11 +106,15 @@ jobs:
       # After the audit, which saw the published url: the copy in the local tap
       # builds this checkout instead. The checkout is a detached head (a pull
       # request's merge commit), and `head` wants a branch, so it gets one.
+      # `using: :git` because Homebrew picks a download strategy from the url,
+      # and a file:// url that does not end in .git is fetched with curl as one
+      # file -- the first run of this step handed cargo a build directory
+      # holding that one downloaded file and no Cargo.toml.
       - name: Point the formula's head at this checkout
         run: |
           git switch -c brew-under-test
           tap=$(brew --repository m96-chan/tap)
-          sed -i "s|^  head \".*\", branch: \"main\"$|  head \"file://$GITHUB_WORKSPACE\", branch: \"brew-under-test\"|" \
+          sed -i "s|^  head \".*\", branch: \"main\"$|  head \"file://$GITHUB_WORKSPACE\", branch: \"brew-under-test\", using: :git|" \
             "$tap/Formula/blinkterm.rb"
           grep -n '^  head ' "$tap/Formula/blinkterm.rb"
           grep -q "file://$GITHUB_WORKSPACE" "$tap/Formula/blinkterm.rb"
