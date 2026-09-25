@@ -67,7 +67,7 @@ cargo install --git https://github.com/m96-chan/blinkterm
 Or, on Linux, with [Homebrew](https://brew.sh):
 
 ```sh
-brew install --HEAD m96-chan/tap/blinkterm    # --HEAD until the first tag
+brew install m96-chan/tap/blinkterm
 ```
 
 That builds from source too — the tap's formula asks Homebrew for a Rust and

@@ -5,11 +5,12 @@
 class Blinkterm < Formula
   desc "Real browser in a terminal: headless Chromium over the Kitty graphics protocol"
   homepage "https://github.com/m96-chan/blinkterm"
+  # GitHub's archive of the tag; RELEASING.md ("Homebrew") says how both lines
+  # are made on each release. `head` stays below, so `--HEAD` keeps installing
+  # main.
+  url "https://github.com/m96-chan/blinkterm/archive/refs/tags/v0.1.0.tar.gz"
+  sha256 "84cbea74248e2ec64ae57b8c06f181032c8528ea87c166ee6167b4236b64feef"
   license "MIT"
-  # Head-only until the first tag: RELEASING.md says how one is cut, and none
-  # has been. The stable block -- `url` to GitHub's archive of the tag and its
-  # `sha256` -- goes above `license` when it exists; `head` stays, so `--HEAD`
-  # keeps installing main.
   head "https://github.com/m96-chan/blinkterm.git", branch: "main"
 
   # Build dependencies before platform requirements: that is the order

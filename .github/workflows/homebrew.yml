@@ -91,9 +91,8 @@ jobs:
       # DSL rules (description length, licence, branch on the head url), and
       # that the urls answer.
       - run: brew audit --strict --online m96-chan/tap/blinkterm
-      # The stable spec, once there is one. Head-only until v0.1.0 is tagged,
-      # so this step looks for the sha256 line rather than assuming; when the
-      # stable block lands nothing here needs editing.
+      # The stable spec. The step looks for the sha256 line rather than
+      # assuming one, so a formula that goes back to head-only still passes.
       - name: brew install (stable), if there is a stable
         run: |
           if grep -q '^  sha256 ' packaging/homebrew/blinkterm.rb; then
