@@ -121,7 +121,7 @@ impl History {
             newest.insert(entry.url.clone(), (lines, entry));
         }
         let mut entries: Vec<(usize, Entry)> = newest.into_values().collect();
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         entries.truncate(CAP);
         let history = History {
             entries: entries.into_iter().map(|(_, entry)| entry).collect(),
