@@ -27,6 +27,7 @@
 use crate::input::{Key, KeyAction, KeyInput};
 use crate::json::Json;
 use crate::line::{Edit, Line};
+use crate::text;
 
 /// Which of the four questions a page can ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +46,9 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dialog {
     pub kind: Kind,
-    /// What the page asked, exactly as it asked it — newlines and all. What is
-    /// drawn is [`Dialog::caption`], which is this made to fit on one row.
+    /// What the page asked, as it asked it, less anything a terminal would
+    /// execute ([`crate::text::sanitize`]); its newlines are kept as spaces
+    /// and made one line by [`Dialog::caption`], which is what is drawn.
     pub message: String,
     /// The page that asked, which is not always the page in front of it: an
     /// iframe can call `alert()` too.
@@ -89,19 +91,18 @@ impl Dialog {
             "beforeunload" => Kind::BeforeUnload,
             _ => return None,
         };
+        // Every field is the page's, so every field is plain text before it
+        // is anything else — the url too, which is not drawn today and may be
+        // one day. The default of a prompt most of all: it is what is edited
+        // on the row and what goes back as `promptText`, so what is seen is
+        // what is sent, and a default that carried a zero-width joiner
+        // arrives without it.
         let text = |key: &str| {
-            params
-                .get(key)
-                .and_then(Json::as_str)
-                .unwrap_or_default()
-                .to_string()
+            text::sanitize(params.get(key).and_then(Json::as_str).unwrap_or_default()).into_owned()
         };
         let line = match kind {
             Kind::Prompt => Line::selected(text("defaultPrompt")),
-            _ => Line {
-                text: String::new(),
-                whole: false,
-            },
+            _ => Line::empty(),
         };
         Some(Dialog {
             kind,
@@ -146,7 +147,7 @@ impl Dialog {
                 }
             }
             Kind::Prompt => match self.line.step(key) {
-                Edit::Typing => Answer::Waiting,
+                Edit::Typing | Edit::Inserted | Edit::Previous | Edit::Next => Answer::Waiting,
                 Edit::Go => Answer::Accept,
                 Edit::Cancel => Answer::Dismiss,
                 Edit::Quit => Answer::Quit,
@@ -164,7 +165,7 @@ impl Dialog {
         let accept = answer == Answer::Accept;
         let mut fields = vec![("accept", Json::Bool(accept))];
         if accept && self.kind == Kind::Prompt {
-            fields.push(("promptText", Json::string(&self.line.text)));
+            fields.push(("promptText", Json::string(self.line.text())));
         }
         Json::object(fields)
     }
@@ -289,8 +290,8 @@ mod tests {
         assert_eq!(of("beforeunload").kind, Kind::BeforeUnload);
         // Only a prompt has a line; the others' is empty and not selected, so
         // nothing about them looks like typing.
-        assert_eq!(of("confirm").line.text, "");
-        assert!(!of("confirm").line.whole);
+        assert_eq!(of("confirm").line.text(), "");
+        assert!(!of("confirm").line.whole());
 
         // A kind nobody has keys for is not a dialog this program shows.
         let odd = Json::parse(r#"{"type":"payment","message":"x","url":"y"}"#).expect("JSON");
@@ -372,14 +373,14 @@ mod tests {
             prompt.step(&key(Key::Other(LEFT_SHIFT), Mods::SHIFT)),
             Answer::Waiting
         );
-        assert!(prompt.line.whole);
+        assert!(prompt.line.whole());
         for c in ['X', 'y'] {
             assert_eq!(prompt.step(&typed(c)), Answer::Waiting);
         }
-        assert_eq!(prompt.line.text, "Xy");
+        assert_eq!(prompt.line.text(), "Xy");
         // A y in a prompt is a letter, not a yes.
         assert_eq!(prompt.step(&key(Key::Backspace, 0)), Answer::Waiting);
-        assert_eq!(prompt.line.text, "X");
+        assert_eq!(prompt.line.text(), "X");
         assert_eq!(prompt.step(&key(Key::Enter, 0)), Answer::Accept);
         assert_eq!(
             prompt.reply(Answer::Accept).to_string(),
@@ -441,6 +442,41 @@ mod tests {
         assert_eq!(of("prompt").hint(), "enter/esc");
         assert!(of("prompt").typing());
         assert!(!of("confirm").typing());
+    }
+
+    #[test]
+    fn a_dialogs_words_are_plain_text_before_they_are_one_line() {
+        let confirm = opening(
+            r#"{"url":"https://example.com/\u001b]2;x\u0007","type":"confirm",
+                "message":"\u001b]0;x\u0007 Delete\u202e?","defaultPrompt":""}"#,
+        );
+        assert_eq!(confirm.caption(), "]0;x Delete?");
+        assert_eq!(confirm.url, "https://example.com/]2;x");
+
+        // A prompt's default is what is edited and what is sent back, so it
+        // is the same plain text both times.
+        let prompt = opening(
+            r#"{"url":"u","type":"prompt","message":"name?",
+                "defaultPrompt":"\u001b[2Jdefault"}"#,
+        );
+        assert_eq!(prompt.line.text(), "[2Jdefault");
+        assert_eq!(
+            prompt.reply(Answer::Accept).to_string(),
+            r#"{"accept":true,"promptText":"[2Jdefault"}"#
+        );
+
+        // And what a page writes for a box that wraps still reads: the line
+        // breaks are spaces by the time the event has been read, and the
+        // caption makes the runs of them one.
+        let wrapped = opening(
+            r#"{"url":"u","type":"confirm",
+                "message":"  Delete\n\n3 files?\r\n\tThis cannot be undone.  "}"#,
+        );
+        assert_eq!(
+            wrapped.message,
+            "  Delete  3 files?   This cannot be undone.  "
+        );
+        assert_eq!(wrapped.caption(), "Delete 3 files? This cannot be undone.");
     }
 
     #[test]

@@ -44,12 +44,47 @@ machine. It prints a warning when it does. Do not browse as root.
 
 - **What gets written to your terminal.** A terminal executes the bytes it is
   sent, so anything page-derived that reaches the status row is a place where a
-  page could try to speak to your terminal instead of to you. `blinkterm` puts
-  the page's **title** (`document.title`, which the page sets to whatever it
-  likes) and its **url** on that row, and **does not currently strip control
-  or escape bytes from either**. Treat that as an open hole, not a solved
-  problem. The page *body* is safe in this respect by construction: it arrives
-  as decoded pixels and is written as a graphics payload, never as text.
+  page could try to speak to your terminal instead of to you. The row is the
+  only text this program writes, and everything on it that a page or the
+  engine can put words into — `document.title`, the url, a dialog's message
+  and a `prompt()`'s default, the engine's error text, and the last lines of
+  its stderr quoted in an error after the terminal has been given back — goes
+  through `text::sanitize` where it is read off the pipe, and once more as the
+  row is built. C0 and C1 control characters and DEL are dropped (a line break
+  becomes a space); so are Unicode's bidi controls, which could make one url
+  read as another, and the invisible format characters that make two
+  different strings look the same. A title that is `\x1b]0;x\x07` is shown as
+  `]0;x`; the engine tests set one against a real Chromium and parse the row
+  with the compositor's own terminal
+  ([#28](https://github.com/m96-chan/blinkterm/issues/28)). What is
+  deliberately not filtered is visible text: a title in Cyrillic that looks
+  like Latin is the page's to write and yours to read, as in any browser's tab
+  strip, and a character the row measures wrongly — a keycap sequence, a
+  Hangul jamo — is a row one cell short, not an escape. The page *body* is safe in this respect
+  by construction: it arrives as decoded pixels and is written as a graphics
+  payload, never as text.
+
+  A paste is page-adjacent in the same sense — a page's "copy" button may be
+  what put it on your clipboard — so pasted text shown on the row, in the url
+  bar or a `prompt()`'s line, is kept to one line of plain text as it is
+  pasted and goes through the same `text::sanitize` as the title as the row is
+  built. Nothing on the row is ever the text of a copy: `alt+c` says how many
+  characters it copied, not which. The copy itself is written as OSC 52 with
+  a base64 payload, an alphabet a terminal cannot be spoken to in, and
+  `blinkterm` never sends the OSC 52 query that would ask your terminal to
+  hand your clipboard back ([#9](https://github.com/m96-chan/blinkterm/issues/9)).
+
+- **Files a page hands over.** A download's name is the page's
+  (`Content-Disposition`, the `download` attribute, the url). The engine
+  sanitizes it once and `blinkterm` again: one path component, control and
+  bidi characters replaced, no leading dot, at most 255 bytes, and the file
+  it renames is `<dir>/<guid>` with the guid checked, never a path the page
+  spelled. Nothing outside the download directory is ever written, and
+  nothing in it is removed except this run's own `<guid>.crdownload`
+  partials. What is *not* done: no prompt before saving, so a page can put a
+  file into that directory without a click, as it can in any browser; and
+  nothing is opened or run — the row says a file arrived and that is all
+  ([#10](https://github.com/m96-chan/blinkterm/issues/10)).
 
 - **`/dev/shm`.** Frames go through POSIX shared memory objects named
   `blinkterm-<pid>-...`, created with your umask and unlinked by the terminal
@@ -57,6 +92,12 @@ machine. It prints a warning when it does. Do not browse as root.
   the window between write and unlink — that is a picture of whatever you are
   looking at. `Painter` falls back to inline base64 when `/dev/shm` is not
   usable, but it does not currently tighten the mode.
+
+- **The history.** The url bar's history is a record of the pages you
+  visited — url, title, how often, when — kept in the profile as `history`,
+  made readable by you alone (0600) like the cookies beside it, and never
+  written for a `--temp-profile`. It is read by nothing but the url bar, and
+  deleting the file forgets it.
 
 - **The engine's lifetime.** `blinkterm` starts Chromium in a process group of
   its own and kills the group on exit, on a signal, and from a panic hook.

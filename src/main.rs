@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use blinkterm::app::{self, Options};
+use blinkterm::download;
 use blinkterm::engine;
 use blinkterm::profile::Choice;
 
@@ -19,6 +20,13 @@ options:
                    (default: $XDG_DATA_HOME/blinkterm/profile, or
                    ~/.local/share/blinkterm/profile)
   --temp-profile   a profile that is thrown away when this program exits
+  --download-dir <dir>  save files a page offers in <dir>
+                   (default: $XDG_DOWNLOAD_DIR, the XDG_DOWNLOAD_DIR of
+                   ~/.config/user-dirs.dirs, or ~/Downloads)
+  --search-url <url>
+                   send what is typed in the url bar and is not a url to
+                   <url>, with %s where the words go (off by default: nothing
+                   typed leaves the machine unless you say so)
 
 The page is rendered by a headless Chromium, which this program starts and
 stops. It is looked for in $BLINKTERM_ENGINE first, then on PATH as
@@ -29,11 +37,19 @@ A profile is made readable by you alone (0700), and one blinkterm uses it at a
 time: a second one started on the same profile is refused, and told which pid
 has it.
 
+A file a page offers — a link to a PDF, a Content-Disposition: attachment —
+is saved in the download directory under its own name, \"report (1).pdf\" if
+that name is taken, and the status row says so; the page stays where it was.
+Quitting cancels a download that is still coming.
+
 The terminal has to speak the Kitty graphics protocol, the Kitty keyboard
 protocol and SGR mouse reporting: a tOS pane, Kitty, WezTerm or Ghostty.
 
 keys:
-  ctrl+l         type a url
+  ctrl+l         type a url; in the url bar, left/right, home/end, ctrl+a/e
+                 and alt+b/f move, ctrl+w and alt+d delete a word, ctrl+u/k
+                 to either end, up/down walk the pages visited, and tab takes
+                 the suggestion
   ctrl+r         reload
   alt+left/right back and forward
   ctrl+t         a new tab, with the cursor in the url bar
@@ -70,7 +86,10 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             // The terminal has already been put back by the time this runs, so
-            // the sentence lands in a shell the person can read it in.
+            // the sentence lands in a shell the person can read it in. A shell
+            // is still a terminal, and the sentence can quote the engine, so it
+            // is plain text first, whatever made it.
+            let message = blinkterm::text::sanitize(&message);
             eprintln!("blinkterm: {message}");
             if message.contains(engine::ENGINE_ENV) || message.contains("PATH") {
                 eprintln!(
@@ -90,12 +109,57 @@ fn main() -> ExitCode {
 /// `--profile=DIR` — because both are what people type. `--profile` and
 /// `--temp-profile` together is a contradiction rather than a preference, so it
 /// is refused instead of one of them quietly winning, and so is either one
-/// twice.
+/// twice. `--download-dir` is taken the same two ways and refused twice for
+/// the same reason.
+///
+/// `--search-url` is taken the same two ways, and refused without a `%s`,
+/// which is where the words go: a search url without one would send every
+/// search to the same page, and the person would find that out by searching.
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut url = None;
     let mut profile = None;
+    let mut downloads = None;
+    let mut search_url = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
+        let dir = if arg == "--download-dir" {
+            Some(
+                args.next()
+                    .filter(|dir| !dir.is_empty())
+                    .ok_or(DOWNLOAD_DIR_NEEDED)?
+                    .as_str(),
+            )
+        } else if let Some(dir) = arg.strip_prefix("--download-dir=") {
+            if dir.is_empty() {
+                return Err(DOWNLOAD_DIR_NEEDED.to_string());
+            }
+            Some(dir)
+        } else {
+            None
+        };
+        if let Some(dir) = dir {
+            if downloads.replace(PathBuf::from(dir)).is_some() {
+                return Err("one download directory at a time".to_string());
+            }
+            continue;
+        }
+        let search = if arg == "--search-url" {
+            Some(args.next().map(String::as_str).unwrap_or_default())
+        } else {
+            arg.strip_prefix("--search-url=")
+        };
+        if let Some(search) = search {
+            if search.is_empty() {
+                return Err("--search-url needs a url: --search-url <url with %s>".to_string());
+            }
+            if !search.contains("%s") {
+                return Err("--search-url needs a %s where the words go".to_string());
+            }
+            if search_url.replace(search.to_string()).is_some() {
+                return Err("one search url at a time".to_string());
+            }
+            continue;
+        }
         let chosen = if arg == "--temp-profile" {
             Some(Choice::Temporary)
         } else if arg == "--profile" {
@@ -127,8 +191,12 @@ fn parse(args: &[String]) -> Result<Options, String> {
     Ok(Options {
         url: url.unwrap_or_else(|| "about:blank".to_string()),
         profile: profile.unwrap_or(Choice::Default),
+        download: downloads.map_or(download::Choice::Default, download::Choice::At),
+        search_url,
     })
 }
+
+const DOWNLOAD_DIR_NEEDED: &str = "--download-dir needs a directory: --download-dir <dir>";
 
 #[cfg(test)]
 mod tests {
@@ -143,7 +211,43 @@ mod tests {
     fn with_no_flags_the_profile_is_the_default_one() {
         let options = parsed(&[]).expect("nothing is fine");
         assert_eq!(options.profile, Choice::Default);
+        assert_eq!(options.download, download::Choice::Default);
         assert_eq!(options.url, "about:blank");
+        assert_eq!(options.search_url, None, "nothing typed is searched");
+    }
+
+    #[test]
+    fn a_search_url_can_be_named_either_way_round_the_equals_sign() {
+        let search = "https://duckduckgo.com/?q=%s";
+        for args in [
+            &["--search-url", search, "example.com"][..],
+            &["--search-url=https://duckduckgo.com/?q=%s", "example.com"][..],
+            &["example.com", "--search-url", search][..],
+        ] {
+            let options = parsed(args).expect("a search url");
+            assert_eq!(options.search_url.as_deref(), Some(search), "{args:?}");
+            assert_eq!(options.url, "example.com", "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_search_url_needs_a_percent_s() {
+        let why = parsed(&["--search-url", "https://duckduckgo.com/"])
+            .err()
+            .expect("refused");
+        assert!(why.contains("%s"), "{why}");
+        for args in [&["--search-url"][..], &["--search-url="][..]] {
+            let why = parsed(args).err().expect("refused");
+            assert!(why.contains("--search-url"), "{args:?}: {why}");
+        }
+    }
+
+    #[test]
+    fn two_search_urls_are_one_too_many() {
+        let why = parsed(&["--search-url=a%s", "--search-url", "b%s"])
+            .err()
+            .expect("refused");
+        assert_eq!(why, "one search url at a time");
     }
 
     #[test]
@@ -182,6 +286,46 @@ mod tests {
         for args in [&["--profile"][..], &["--profile="][..]] {
             let why = parsed(args).err().expect("refused");
             assert!(why.contains("--profile"), "{args:?}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_download_directory_can_be_named_either_way_round_the_equals_sign() {
+        for args in [
+            &["--download-dir", "x", "example.com"][..],
+            &["--download-dir=x", "example.com"][..],
+            &["example.com", "--download-dir", "x", "--temp-profile"][..],
+        ] {
+            let options = parsed(args).expect("a download directory");
+            assert_eq!(
+                options.download,
+                download::Choice::At(PathBuf::from("x")),
+                "{args:?}"
+            );
+            assert_eq!(options.url, "example.com", "{args:?}");
+        }
+    }
+
+    #[test]
+    fn two_download_directories_are_one_too_many() {
+        for args in [
+            &["--download-dir", "x", "--download-dir", "y"][..],
+            &["--download-dir=x", "--download-dir=x"][..],
+        ] {
+            let why = parsed(args).err().expect("refused");
+            assert_eq!(why, "one download directory at a time", "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_download_directory_with_no_directory_is_an_error_that_names_the_option() {
+        for args in [
+            &["--download-dir"][..],
+            &["--download-dir="][..],
+            &["--download-dir", ""][..],
+        ] {
+            let why = parsed(args).err().expect("refused");
+            assert!(why.contains("--download-dir"), "{args:?}: {why}");
         }
     }
 

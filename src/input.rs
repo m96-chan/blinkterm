@@ -31,6 +31,55 @@
 //! press when the caller has waited long enough that no more is coming. The
 //! caller already has a poll loop with a timeout, so the wait costs nothing
 //! and the ambiguity is resolved where the clock is.
+//!
+//! # Pastes
+//!
+//! [`crate::screen`] turns on bracketed paste, so a paste arrives as
+//! `CSI 200 ~`, the text, `CSI 201 ~`, and comes out of here as one
+//! [`Input::Paste`] rather than as the keystrokes it would otherwise have
+//! been — where every `\r` in it was an Enter, which in a form's `<input>` is
+//! one submission per line. Everything between the markers is the paste's,
+//! bytes and all: an ESC in it is a byte of the text and not the start of a
+//! key, and a `CSI 200 ~` in it is six more bytes of text. Only `CSI 201 ~`
+//! ends it. tOS's own encoder (`tos_input::encode_paste`) strips escapes out
+//! of a paste before it wraps it and Kitty does too, but a terminal behind an
+//! ssh hop, or an older one, may not, and a clipboard can legitimately hold
+//! an escape sequence somebody copied out of a document. What a paste may
+//! then do is decided where it goes: the page takes it as text, and the row
+//! only ever shows it through [`crate::text::sanitize`].
+//!
+//! The end marker can arrive split across two reads, so the last five bytes
+//! of an unfinished paste are kept back until the next read says whether they
+//! were the start of it. And the lone-escape rule does not apply while a
+//! paste is open: a 64 KiB paste over ssh comes in many reads, sometimes more
+//! than a poll interval apart, and it must not be cut where the pipe paused.
+//! A terminal that opens a paste and never closes it is the caller's to give
+//! up on, with [`Parser::abandon_paste`], because the caller is where the
+//! clock is.
+//!
+//! A paste is at most [`PASTE_LIMIT`] bytes, and one over it is refused
+//! whole — [`Input::PasteRefused`] — and never cut to fit, because half of a
+//! pasted command is exactly the kind of text that does damage. The limit is
+//! the engine's, measured against `chrome-headless-shell` 153: what
+//! `Input.insertText` costs is not bytes but paragraphs, and it is
+//! superlinear in them.
+//!
+//! | a paste into a `<textarea>`, as one `Input.insertText` | took |
+//! | --- | --- |
+//! | 16 KiB, one line | 8 ms |
+//! | 64 KiB, one line | 23 ms |
+//! | 256 KiB, one line | 93 ms |
+//! | 16 KiB as 368 forty-byte lines | 295 ms |
+//! | 64 KiB as 1474 forty-byte lines | 4.8 s |
+//! | 256 KiB as forty-byte lines | over a minute, and abandoned |
+//! | 64 KiB of short lines as sixteen 4 KiB pieces | 4.5 s |
+//!
+//! So 64 KiB of short lines is five seconds of a renderer that draws nothing
+//! else meanwhile, which is the price of the limit, and four times that is a
+//! page that does not come back. Sending it in pieces changes nothing: the
+//! cost is the engine's, per paragraph. 64 KiB is also tOS's
+//! `MAX_CLIPBOARD_BYTES`, the most its compositor will hold, so the most it
+//! will ever send.
 
 /// Modifiers, in the protocol's own bitfield: the CSI parameter minus one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -175,7 +224,28 @@ pub enum Input {
         mode: u16,
         state: u8,
     },
+    /// A bracketed paste, whole: everything between `CSI 200 ~` and
+    /// `CSI 201 ~`, as text, with bytes that are not UTF-8 as U+FFFD. Never
+    /// empty — a terminal that sends the two markers around nothing has
+    /// pasted nothing, and nothing is produced.
+    Paste(String),
+    /// A paste longer than [`PASTE_LIMIT`], thrown away whole. `bytes` is how
+    /// long it was, for the sentence that says so.
+    PasteRefused {
+        bytes: usize,
+    },
 }
+
+/// The most a paste may be, in bytes of text.
+///
+/// See the module's own section on pastes for the measurements: 64 KiB of
+/// forty-byte lines is 4.8 s of the engine's renderer, and 256 KiB of them is
+/// a page that does not come back. It is also tOS's `MAX_CLIPBOARD_BYTES`,
+/// the most its compositor will ever send.
+pub const PASTE_LIMIT: usize = 64 * 1024;
+
+/// What ends a paste.
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// The incremental parser.
 #[derive(Debug, Default)]
@@ -183,6 +253,12 @@ pub struct Parser {
     buf: Vec<u8>,
     /// Set once a DECRPM answer says mouse reports are in pixels.
     pixels: bool,
+    /// `Some` between the two paste markers: what has arrived of the text.
+    /// Emptied, and left empty, once the paste has passed [`PASTE_LIMIT`].
+    paste: Option<Vec<u8>>,
+    /// How many bytes of the open paste have arrived, kept or not, which is
+    /// what says a paste is over the limit and by how much.
+    pasted: usize,
 }
 
 impl Parser {
@@ -215,15 +291,47 @@ impl Parser {
     }
 
     /// Give up on a held `ESC` and call it the Escape key.
+    ///
+    /// Never while a paste is open: an ESC there is a byte of the text, and
+    /// the wait that makes it a key is a pause in a paste arriving over a slow
+    /// line.
     pub fn flush(&mut self) -> Option<Input> {
-        if self.buf == [0x1b] {
+        if self.paste.is_none() && self.buf == [0x1b] {
             self.buf.clear();
             return Some(Input::Key(KeyInput::press(Key::Escape)));
         }
         None
     }
 
+    /// Whether a paste is open: its start marker has been read and its end
+    /// marker has not.
+    pub fn pasting(&self) -> bool {
+        self.paste.is_some()
+    }
+
+    /// Drop an open paste, text and all; `false` if there was none.
+    ///
+    /// For a terminal that opened a paste and has gone quiet without closing
+    /// it, which is a terminal that never will: without this, everything typed
+    /// afterwards would be more of a paste that never ends. What was collected
+    /// is thrown away rather than delivered, because half a paste is the thing
+    /// bracketed paste exists to prevent. The caller decides how quiet is
+    /// quiet, because the caller has the clock.
+    pub fn abandon_paste(&mut self) -> bool {
+        let open = self.paste.take().is_some();
+        if open {
+            self.pasted = 0;
+            // What was held back in case it was the start of the end marker
+            // is the paste's too.
+            self.buf.clear();
+        }
+        open
+    }
+
     fn step(&mut self) -> Step {
+        if self.paste.is_some() {
+            return self.paste_step();
+        }
         let Some(&first) = self.buf.first() else {
             return Step::NeedMore;
         };
@@ -282,11 +390,15 @@ impl Parser {
             .ok()
             .and_then(|s| s.chars().next())
         {
+            // A C1 control in UTF-8 — `C2 9B`, a CSI, from a paste or a
+            // terminal that sent one — is still a key, which nothing binds,
+            // but it types nothing: the same rule the `CSI u` form keeps, and
+            // the reason it cannot end up in the url bar and back on the row.
             Some(c) => Step::Produced(Input::Key(KeyInput {
                 key: Key::Char(c),
                 mods: Mods::default(),
                 action: KeyAction::Press,
-                text: Some(c),
+                text: Some(c).filter(|c| !c.is_control()),
             })),
             None => Step::Consumed,
         }
@@ -333,6 +445,13 @@ impl Parser {
         self.buf.drain(..at + 1);
 
         match (prefix, intermediate, final_byte) {
+            // The start of a paste. A `CSI 201 ~` with no paste open is not a
+            // key either, and falls through to be dropped as one.
+            (None, None, b'~') if params == [vec![200]] => {
+                self.paste = Some(Vec::new());
+                self.pasted = 0;
+                Step::Consumed
+            }
             (Some(b'<'), _, b'M') | (Some(b'<'), _, b'm') => {
                 match mouse(&params, final_byte == b'm') {
                     Some(report) => Step::Produced(Input::Mouse(report)),
@@ -356,6 +475,57 @@ impl Parser {
             _ => Step::Consumed,
         }
     }
+
+    /// The inside of a paste: everything up to the end marker is text.
+    fn paste_step(&mut self) -> Step {
+        match find(&self.buf, PASTE_END) {
+            Some(at) => {
+                self.collect(at);
+                self.buf.drain(..PASTE_END.len());
+                let text = self.paste.take().unwrap_or_default();
+                let bytes = std::mem::take(&mut self.pasted);
+                if bytes > PASTE_LIMIT {
+                    Step::Produced(Input::PasteRefused { bytes })
+                } else if text.is_empty() {
+                    Step::Consumed
+                } else {
+                    Step::Produced(Input::Paste(String::from_utf8_lossy(&text).into_owned()))
+                }
+            }
+            None => {
+                // The last few bytes may be the start of the end marker, cut
+                // by a read; they wait for the next one. Everything before
+                // them is text.
+                let keep = PASTE_END.len() - 1;
+                self.collect(self.buf.len().saturating_sub(keep));
+                Step::NeedMore
+            }
+        }
+    }
+
+    /// Move the first `n` bytes of the buffer into the open paste, or only
+    /// count them once it is over the limit.
+    fn collect(&mut self, n: usize) {
+        self.pasted += n;
+        let over = self.pasted > PASTE_LIMIT;
+        let Some(text) = self.paste.as_mut() else {
+            return;
+        };
+        if over {
+            // Refused whole when it ends, so none of it is worth holding.
+            *text = Vec::new();
+            self.buf.drain(..n);
+        } else {
+            text.extend(self.buf.drain(..n));
+        }
+    }
+}
+
+/// Where `needle` first starts in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 enum Step {
@@ -688,6 +858,15 @@ mod tests {
     }
 
     #[test]
+    fn a_c1_control_typed_as_a_character_is_a_key_with_no_text() {
+        let key = one_key(b"\xc2\x9b");
+        assert_eq!(key.key, Key::Char('\u{9b}'));
+        assert_eq!(key.text, None);
+        // Which is what the Kitty form of the same key already said.
+        assert_eq!(one_key(b"\x1b[155u").text, None);
+    }
+
+    #[test]
     fn the_kitty_form_carries_modifiers_events_and_text() {
         // ctrl+l press, which is this program's own key for the url bar.
         let key = one_key(b"\x1b[108;5u");
@@ -860,7 +1039,7 @@ mod tests {
 
     #[test]
     fn a_stream_that_arrives_a_byte_at_a_time_parses_the_same() {
-        let stream = b"a\x1b[<0;3;4M\x1b[108;5u\x1b[?1016;1$y\x1b[3~";
+        let stream = b"a\x1b[<0;3;4M\x1b[108;5u\x1b[?1016;1$y\x1b[200~pasted\r\x1b[201~\x1b[3~";
         let whole = feed(stream);
         let mut parser = Parser::new();
         let mut piecemeal = Vec::new();
@@ -868,7 +1047,128 @@ mod tests {
             piecemeal.extend(parser.feed(&[*byte]));
         }
         assert_eq!(whole, piecemeal);
-        assert_eq!(whole.len(), 5);
+        assert_eq!(whole.len(), 6);
+        assert_eq!(whole[4], Input::Paste("pasted\r".to_string()));
+    }
+
+    fn typed(c: char) -> Input {
+        Input::Key(KeyInput {
+            key: Key::Char(c),
+            mods: Mods::default(),
+            action: KeyAction::Press,
+            text: Some(c),
+        })
+    }
+
+    #[test]
+    fn a_paste_arrives_whole_and_never_as_keys() {
+        assert_eq!(
+            feed(b"\x1b[200~hello\r\nworld\x1b[201~"),
+            vec![Input::Paste("hello\r\nworld".to_string())]
+        );
+        // Bytes that are not UTF-8 are a character that says so, not a
+        // paste thrown away.
+        assert_eq!(
+            feed(b"\x1b[200~caf\xe9\x1b[201~"),
+            vec![Input::Paste("caf\u{fffd}".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_paste_split_across_reads_is_the_same_paste() {
+        let stream = b"\x1b[200~one\rtwo\x1b[201~";
+        let wanted = vec![Input::Paste("one\rtwo".to_string())];
+        // Every place the stream can be cut in two, the five inside the end
+        // marker among them.
+        for cut in 0..=stream.len() {
+            let mut parser = Parser::new();
+            let mut got = parser.feed(&stream[..cut]);
+            got.extend(parser.feed(&stream[cut..]));
+            assert_eq!(got, wanted, "cut at {cut}");
+            assert!(!parser.pasting());
+        }
+        // And in pieces of every size.
+        for size in 1..=stream.len() {
+            let mut parser = Parser::new();
+            let got: Vec<Input> = stream
+                .chunks(size)
+                .flat_map(|chunk| parser.feed(chunk))
+                .collect();
+            assert_eq!(got, wanted, "pieces of {size}");
+        }
+    }
+
+    #[test]
+    fn an_escape_inside_a_paste_is_text() {
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1b[200~a\x1b[200~b\x1b[Cc\x1b").is_empty());
+        // The pause that would make a held ESC the Escape key is a pause in
+        // the paste.
+        assert_eq!(parser.flush(), None);
+        assert!(parser.pasting());
+        assert_eq!(
+            parser.feed(b"\x1b[201~"),
+            vec![Input::Paste("a\x1b[200~b\x1b[Cc\x1b".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_empty_paste_is_nothing() {
+        assert_eq!(feed(b"\x1b[200~\x1b[201~x"), vec![typed('x')]);
+        // And an end marker with no paste open is not a key.
+        assert_eq!(feed(b"\x1b[201~x"), vec![typed('x')]);
+    }
+
+    #[test]
+    fn a_paste_over_the_limit_is_refused_whole() {
+        let mut stream = b"\x1b[200~".to_vec();
+        stream.extend(std::iter::repeat_n(b'a', PASTE_LIMIT + 1));
+        stream.extend_from_slice(b"\x1b[201~x");
+        assert_eq!(
+            feed(&stream),
+            vec![
+                Input::PasteRefused {
+                    bytes: PASTE_LIMIT + 1
+                },
+                typed('x')
+            ]
+        );
+        // The same in reads the size this program makes them.
+        let mut parser = Parser::new();
+        let got: Vec<Input> = stream
+            .chunks(8192)
+            .flat_map(|chunk| parser.feed(chunk))
+            .collect();
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got[0], Input::PasteRefused { .. }));
+
+        // Exactly the limit is a paste.
+        let mut stream = b"\x1b[200~".to_vec();
+        stream.extend(std::iter::repeat_n(b'a', PASTE_LIMIT));
+        stream.extend_from_slice(b"\x1b[201~");
+        match feed(&stream).as_slice() {
+            [Input::Paste(text)] => assert_eq!(text.len(), PASTE_LIMIT),
+            other => panic!("{:?}", other.len()),
+        }
+    }
+
+    #[test]
+    fn an_unterminated_paste_is_abandoned_where_the_clock_is() {
+        let mut parser = Parser::new();
+        assert!(!parser.abandon_paste(), "there was nothing to abandon");
+        assert!(parser.feed(b"\x1b[200~half a comm").is_empty());
+        assert!(parser.pasting());
+        assert!(parser.abandon_paste());
+        assert!(!parser.pasting());
+        assert_eq!(parser.feed(b"a"), vec![typed('a')]);
+    }
+
+    #[test]
+    fn keys_before_and_after_a_paste_are_keys() {
+        assert_eq!(
+            feed(b"a\x1b[200~b\x1b[201~c"),
+            vec![typed('a'), Input::Paste("b".to_string()), typed('c')]
+        );
     }
 
     #[test]
@@ -903,6 +1203,12 @@ mod tests {
         assert_eq!(one_key(b"\x1b[27;1:2u").key, Key::Escape);
         assert_eq!(one_key(b"\x1b[57414;1u").key, Key::Enter, "keypad enter");
         assert_eq!(one_key(b"\x1b[57399;1u").key, Key::Char('0'), "keypad 0");
+        // `tos_input::encode_paste("hi\nthere", true)`: control characters but
+        // newline and tab stripped, each newline sent as `\r`, and wrapped.
+        assert_eq!(
+            feed(b"\x1b[200~hi\rthere\x1b[201~"),
+            vec![Input::Paste("hi\rthere".to_string())]
+        );
     }
 
     #[test]

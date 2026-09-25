@@ -519,6 +519,198 @@ fn a_click_lands_where_the_cell_was() {
 }
 
 // ---------------------------------------------------------------------------
+// The clipboard
+// ---------------------------------------------------------------------------
+
+/// A form with a textarea and a one-line input, a paragraph to select, and a
+/// log of every key and every submission, which is what a paste must not
+/// cause.
+const FORM: &str = "data:text/html,<body style='margin:0'>\
+<form id=f><textarea id=t></textarea><input id=i></form>\
+<p id=p style='font:16px monospace'>Some paragraph text to select, and more after it.</p>\
+<script>window.log=[];\
+f.addEventListener('submit',function(e){e.preventDefault();log.push('submit')});\
+document.addEventListener('keydown',function(){log.push('keydown')});\
+document.title='ready';</script></body>";
+
+/// Evaluate an expression in the page and hand back its value.
+fn evaluate(client: &mut Client, expression: &str) -> Json {
+    client
+        .call_within(
+            "Runtime.evaluate",
+            Json::object(vec![
+                ("expression", Json::string(expression)),
+                ("returnByValue", Json::Bool(true)),
+            ]),
+            Duration::from_secs(5),
+        )
+        .ok()
+        .and_then(|reply| reply.path(&["result", "value"]).cloned())
+        .unwrap_or(Json::Null)
+}
+
+fn form(client: &mut Client) {
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(FORM))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+}
+
+/// A paste is one `Input.insertText`, exactly as the loop sends it, and the
+/// engine takes it as text: kept whole in a textarea, one line in an input,
+/// and not a key or a submission in either.
+#[test]
+fn a_multi_line_paste_lands_in_a_textarea_and_submits_nothing() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    form(&mut client);
+
+    let pasted = "line one\nline two\n\nline four\ttabbed";
+    evaluate(&mut client, "t.focus()");
+    client
+        .call("Input.insertText", keys::insert_text(pasted))
+        .expect("the paste is sent");
+    assert_eq!(evaluate(&mut client, "t.value").as_str(), Some(pasted));
+
+    // tOS sends every newline as `\r`, and Kitty what the clipboard held; the
+    // engine makes them all `\n`.
+    evaluate(&mut client, "t.value=''");
+    client
+        .call("Input.insertText", keys::insert_text("a\r\nb\rc"))
+        .expect("the paste is sent");
+    assert_eq!(evaluate(&mut client, "t.value").as_str(), Some("a\nb\nc"));
+
+    evaluate(&mut client, "i.focus()");
+    client
+        .call("Input.insertText", keys::insert_text("first\nsecond\n"))
+        .expect("the paste is sent");
+    // The input's value is read after whatever the paste might have queued.
+    assert_eq!(
+        evaluate(&mut client, "i.value").as_str(),
+        Some("first second")
+    );
+    assert_eq!(
+        evaluate(&mut client, "log.join(',')").as_str(),
+        Some(""),
+        "a paste fired no key and submitted nothing"
+    );
+
+    // The control: an Enter key into the same input does both, so the log
+    // was listening. With its `\r`, which is what makes the engine run the
+    // form's implicit submission; a `keyDown` without text is only a keydown.
+    let enter = KeyInput {
+        key: Key::Enter,
+        mods: Mods::default(),
+        action: KeyAction::Press,
+        text: Some('\r'),
+    };
+    client
+        .call(
+            "Input.dispatchKeyEvent",
+            keys::dispatch(&enter).expect("enter has a name"),
+        )
+        .expect("the key is sent");
+    assert_eq!(
+        evaluate(&mut client, "log.join(',')").as_str(),
+        Some("keydown,submit")
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// What the person dragged over is what `alt+c` asks the page for, and the
+/// bytes it becomes are read by a terminal as that text on its clipboard.
+#[test]
+fn a_selection_copies_out_as_the_bytes_a_terminal_reads_as_a_clipboard() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    form(&mut client);
+
+    let number = |json: Json| json.as_f64().expect("a number");
+    let top = number(evaluate(&mut client, "p.getBoundingClientRect().top"));
+    let left = number(evaluate(&mut client, "p.getBoundingClientRect().left"));
+    let (y, from) = (top + 8.0, left + 1.0);
+    for (kind, x, buttons) in [
+        ("mousePressed", from, 1),
+        ("mouseMoved", from + 60.0, 1),
+        ("mouseMoved", from + 120.0, 1),
+        ("mouseReleased", from + 120.0, 0),
+    ] {
+        client
+            .call(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(x)),
+                    ("y", Json::number(y)),
+                    ("button", Json::string("left")),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(0)),
+                ]),
+            )
+            .expect("the drag is sent");
+    }
+    let reply = client
+        .call_within(
+            "Runtime.evaluate",
+            blinkterm::clipboard::selection_params(),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers");
+    let selected = blinkterm::clipboard::selection(&reply).expect("a string");
+    assert!(
+        selected.starts_with("Some para") && selected.len() < 30,
+        "{selected:?}"
+    );
+
+    let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+    terminal.advance(&blinkterm::clipboard::osc52(&selected).expect("under the limit"));
+    let stored: Vec<_> = terminal
+        .take_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            tos_term::TermEvent::ClipboardStore { selection, data } => Some((selection, data)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stored, vec![('c', selected.into_bytes())]);
+
+    // A range selected inside a textarea is the same question's answer.
+    evaluate(
+        &mut client,
+        "getSelection().removeAllRanges();t.value='alpha beta gamma';t.focus();\
+         t.setSelectionRange(6,10)",
+    );
+    let reply = client
+        .call_within(
+            "Runtime.evaluate",
+            blinkterm::clipboard::selection_params(),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers");
+    assert_eq!(
+        blinkterm::clipboard::selection(&reply).as_deref(),
+        Some("beta")
+    );
+
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
 // Tabs
 // ---------------------------------------------------------------------------
 
@@ -2845,6 +3037,102 @@ fn the_status_of_the_document_comes_with_its_title() {
     engine.kill();
 }
 
+/// Whether a row, fed to the compositor's own terminal, only ever wrote text:
+/// no title set, no question answered, and nothing below a space between the
+/// row's own escapes. Returns what the top row reads as.
+fn a_terminal_reads_only_text_in(row: &[u8]) -> String {
+    let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+    terminal.advance(&blinkterm::screen::enter_sequence());
+    let _ = terminal.take_output();
+    terminal.advance(row);
+    assert_eq!(
+        terminal.title(),
+        "",
+        "the row set the window title: {row:?}"
+    );
+    assert!(
+        terminal.take_output().is_empty(),
+        "the row asked the terminal something: {row:?}"
+    );
+    // And byte for byte: nothing below a space between the framing.
+    let body = String::from_utf8_lossy(row);
+    let body = body
+        .trim_start_matches("\x1b[1;1H\x1b[K\x1b[7m")
+        .trim_end_matches("\x1b[0m\x1b[?25l")
+        .replace("\x1b[27m", "")
+        .replace("\x1b[7m", "");
+    assert!(body.bytes().all(|b| b >= 0x20 && b != 0x7f), "{body:?}");
+    terminal.grid().row(0).to_text()
+}
+
+/// A page whose title is an OSC sequence, and whose dialog is one too. What
+/// is checked is not the title the engine reports — it reports what the
+/// script set, escape and all, as `\u001b` in its JSON — but that nothing of
+/// it survives into the row, measured the way the frame tests measure: the
+/// bytes this program would write, parsed by the compositor's own terminal.
+#[test]
+fn a_page_that_titles_itself_with_an_escape_sequence_cannot_reach_the_terminal() {
+    use blinkterm::screen::{self, TabLabel};
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    // Set from a script rather than in the url, so that the url's own
+    // canonicalisation is not what is being tested.
+    const HOSTILE: &str = "data:text/html,<title>plain</title><script>\
+document.title=String.fromCharCode(27)+']0;pwned'+String.fromCharCode(7)\
++' a'+String.fromCharCode(13)+'b '+String.fromCharCode(0x202e)+'moc.elpmaxe';\
+</script>";
+    navigate_tab(&mut tab, HOSTILE);
+    follow(&mut tab, Duration::from_secs(10));
+    // `document.title`'s getter collapses ASCII whitespace itself, so the
+    // `\r` is a space before this program sees it; ESC, BEL and the override
+    // are not whitespace and arrive whole, as `\u001b`, `\u0007`, `\u202e`.
+    // The expected string is the same whichever does the collapsing, on
+    // purpose.
+    let loaded = blinkterm::app::page_loaded(&mut tab.connection).expect("the page answers");
+    assert_eq!(loaded.title, "]0;pwned a b moc.elpmaxe");
+    assert_eq!(tab.title, loaded.title, "and that is what the tab holds");
+
+    let status = screen::status_line(80, &tab.line());
+    let text = a_terminal_reads_only_text_in(&status);
+    assert!(text.starts_with("]0;pwned a b moc.elpmaxe"), "{text:?}");
+
+    let label = tab.label();
+    let strip = screen::tab_line(
+        80,
+        &[
+            TabLabel {
+                title: &label,
+                active: true,
+                dialog: false,
+            },
+            TabLabel {
+                title: "\x1b]2;x\x07",
+                active: false,
+                dialog: true,
+            },
+        ],
+        &tab.url,
+    );
+    let text = a_terminal_reads_only_text_in(&strip);
+    assert!(text.starts_with("1 ]0;pwned"), "{text:?}");
+
+    // The same through a dialog, which is the other thing a page writes.
+    raise(
+        &mut tab.connection,
+        "alert(String.fromCharCode(27)+']0;pwned'+String.fromCharCode(7))",
+    );
+    let dialog = wait_for_dialog(&tab.connection, Duration::from_secs(5));
+    assert_eq!(dialog.caption(), "alert: ]0;pwned");
+    let row = screen::dialog_line(80, &dialog.caption(), dialog.hint());
+    let text = a_terminal_reads_only_text_in(&row);
+    assert!(text.starts_with("alert: ]0;pwned"), "{text:?}");
+    answer(&mut tab.connection, dialog, &[press(Key::Enter)]);
+
+    tab.connection.close();
+    engine.kill();
+}
+
 // ---------------------------------------------------------------------------
 // Dialogs
 // ---------------------------------------------------------------------------
@@ -2980,7 +3268,9 @@ fn an_alert_is_seen_and_any_key_lets_the_page_carry_on() {
     );
     let dialog = wait_for_dialog(&client, Duration::from_secs(5));
     assert_eq!(dialog.kind, blinkterm::dialog::Kind::Alert);
-    assert_eq!(dialog.message, "saved\nthree files");
+    // The newline the page wrote is a space once the event has been read:
+    // the message is plain text before it is anything else.
+    assert_eq!(dialog.message, "saved three files");
     assert_eq!(dialog.caption(), "alert: saved three files");
     assert!(dialog.url.starts_with("data:text/html"), "{}", dialog.url);
 
@@ -3060,8 +3350,12 @@ fn a_prompt_sends_back_what_was_typed_or_nothing() {
         );
         let dialog = wait_for_dialog(&client, Duration::from_secs(5));
         assert_eq!(dialog.kind, blinkterm::dialog::Kind::Prompt);
-        assert_eq!(dialog.line.text, "default", "the page's default is offered");
-        assert!(dialog.line.whole, "and selected");
+        assert_eq!(
+            dialog.line.text(),
+            "default",
+            "the page's default is offered"
+        );
+        assert!(dialog.line.whole(), "and selected");
         answer(&mut client, dialog, &keys);
         assert_eq!(
             wait_for_title(&mut client, returned, Duration::from_secs(5)),
@@ -3218,5 +3512,553 @@ fn a_dialog_on_a_tab_that_is_not_in_front_is_still_heard() {
 
     browser.close();
     drop(tabs);
+    engine.kill();
+}
+
+use blinkterm::download::{self, Downloads};
+
+/// What `/report.pdf` sends, which is what the saved file must hold.
+const REPORT: &[u8] = b"%PDF-1.4 hello report\n";
+
+/// How big `/big` is, and how it is paced: 128 kB every 100 ms, so that the
+/// whole takes about a second and a half and the engine's half-second
+/// progress events land in the middle of it.
+const BIG: usize = 2 * 1024 * 1024;
+const BIG_STEP: usize = 128 * 1024;
+
+/// A server with files to offer: a page with a link to one, the file, a big
+/// one that comes slowly, and one that breaks off. Every connection has a
+/// thread of its own, because the slow one would otherwise hold up the engine
+/// asking for anything else. The base comes back without a trailing slash.
+fn serve_files() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
+    let address = listener.local_addr().expect("an address");
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut head = [0u8; 2048];
+                let read = stream.read(&mut head).unwrap_or(0);
+                let request = String::from_utf8_lossy(&head[..read]).to_string();
+                let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+                let attachment = |name: &str, kind: &str, length: usize| {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\n\
+                         Content-Disposition: attachment; filename=\"{name}\"\r\n\
+                         Content-Length: {length}\r\nConnection: close\r\n\r\n"
+                    )
+                };
+                match path.as_str() {
+                    "/report.pdf" => {
+                        let head = attachment("report.pdf", "application/pdf", REPORT.len());
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(REPORT);
+                    }
+                    "/big" => {
+                        let head = attachment("big.bin", "application/octet-stream", BIG);
+                        let _ = stream.write_all(head.as_bytes());
+                        let chunk = vec![b'b'; BIG_STEP];
+                        for _ in 0..BIG / BIG_STEP {
+                            if stream.write_all(&chunk).is_err() {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                    "/broken" => {
+                        let head =
+                            attachment("broken.bin", "application/octet-stream", 4 * 1024 * 1024);
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&vec![b'x'; 100_000]);
+                        // And the socket closes with four megabytes promised.
+                    }
+                    _ => {
+                        let body = "<!doctype html><title>page</title>\
+                             <body style='margin:0'><a href='/report.pdf' \
+                             style='display:block;position:absolute;left:0;top:0;\
+                             width:240px;height:80px;background:#cc3'>report</a>";
+                        let answer = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(answer.as_bytes());
+                    }
+                }
+            });
+        }
+    });
+    format!("http://{address}")
+}
+
+/// A directory for downloads to go to that does not exist yet, under one
+/// that does and that the test removes: never the person's `~/Downloads`.
+fn download_dir(what: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!(
+        "blinkterm-it-download-{what}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("a directory");
+    let dir = base.join("Downloads");
+    (base, dir)
+}
+
+/// An engine told to save into `dir`, as `app::run` tells it, with its tab
+/// ready the way the program has one: enabled and sized.
+fn downloading(dir: &std::path::Path) -> Option<(Engine, Client, Tabs<Client>, Downloads)> {
+    let (engine, page, target) = connect_with_target()?;
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+    download::enable(&mut browser, dir).expect("the engine is told where");
+    let tab = tabs.active_mut().expect("the tab");
+    tab.connection
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut tab.connection);
+    Some((engine, browser, tabs, Downloads::new(dir.to_path_buf())))
+}
+
+/// [`pump`], with what `app::handle_target_events` does with a download's
+/// events first: every event the browser connection has is handed to the
+/// downloads, and `seen` is told what the row says each time the downloads
+/// say it changed. Until `done` or the time is up.
+fn pump_downloads(
+    browser: &mut Client,
+    tabs: &mut Tabs<Client>,
+    downloads: &mut Downloads,
+    timeout: Duration,
+    mut seen: impl FnMut(Option<String>),
+    done: impl Fn(&Downloads) -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        for event in browser.events() {
+            if downloads.take(&event, Instant::now()) {
+                seen(downloads.line(Instant::now()));
+            }
+            let outcome = tabs.take(&event, |target| {
+                browser.attach(target, Duration::from_secs(5))
+            });
+            if let Outcome::Gone { mut tab, .. } = outcome {
+                tab.connection.close();
+            }
+        }
+        if done(downloads) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The names in a directory, sorted; none for one that is not there.
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// The names in a directory once it has emptied, or when the time is up.
+///
+/// The engine removes a cancelled download's partial file itself, but after
+/// it has sent `canceled` rather than before — measured, the file is still
+/// there when the event is read — so an empty directory is waited for.
+fn emptied(dir: &std::path::Path, timeout: Duration) -> Vec<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let names = names_in(dir);
+        if names.is_empty() || Instant::now() >= deadline {
+            return names;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn saved(downloads: &Downloads) -> bool {
+    downloads
+        .line(Instant::now())
+        .is_some_and(|line| line.starts_with("saved "))
+}
+
+/// The acceptance test for #10: a url that is a file is saved, under its own
+/// name, with what the server sent, and the page it was asked for from stays
+/// where it was — typed, typed again, and clicked.
+#[test]
+fn an_attachment_is_saved_under_its_own_name_with_its_contents() {
+    use std::os::unix::fs::PermissionsExt;
+    let (base, dir) = download_dir("attachment");
+    let Some((mut engine, mut browser, mut tabs, mut downloads)) = downloading(&dir) else {
+        return;
+    };
+    let server = serve_files();
+    let page = format!("{server}/page");
+    {
+        let tab = tabs.active_mut().expect("the tab");
+        navigate_tab(tab, &page);
+        follow(tab, Duration::from_secs(10));
+        assert_eq!(tab.url, page);
+    }
+
+    for (round, wanted) in ["report.pdf", "report (1).pdf"].into_iter().enumerate() {
+        let tab = tabs.active_mut().expect("the tab");
+        let reply = navigate_tab(tab, &format!("{server}/report.pdf"));
+        assert!(download::became_download(&reply), "{reply:?}");
+        // What `app::navigated` did with that reply: the page stayed, so the
+        // loading note is off and the url is the page's again.
+        assert_eq!(tab.note, None);
+        assert!(!tab.loading);
+        assert_eq!(tab.url, page);
+        assert_eq!(tab.problem, None);
+
+        assert!(
+            pump_downloads(
+                &mut browser,
+                &mut tabs,
+                &mut downloads,
+                Duration::from_secs(10),
+                |_| {},
+                saved
+            ),
+            "round {round}: never saved: {:?}",
+            downloads.line(Instant::now())
+        );
+        assert_eq!(
+            std::fs::read(dir.join(wanted)).expect(wanted),
+            REPORT,
+            "{wanted}"
+        );
+        // So that the next round's `saved` is its own.
+        downloads.expire(Instant::now() + download::NOTICE_FOR);
+    }
+    let mode = std::fs::metadata(&dir)
+        .expect("the directory")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+
+    // A click on the link: the way most files are asked for.
+    {
+        let tab = tabs.active_mut().expect("the tab");
+        let _ = tab.connection.events();
+        for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+            tab.connection
+                .call(
+                    "Input.dispatchMouseEvent",
+                    Json::object(vec![
+                        ("type", Json::string(kind)),
+                        ("x", Json::number(40)),
+                        ("y", Json::number(20)),
+                        ("button", Json::string("left")),
+                        ("buttons", Json::number(buttons)),
+                        ("clickCount", Json::number(1)),
+                        ("modifiers", Json::number(0)),
+                    ]),
+                )
+                .expect("the click is dispatched");
+        }
+    }
+    assert!(
+        pump_downloads(
+            &mut browser,
+            &mut tabs,
+            &mut downloads,
+            Duration::from_secs(10),
+            |_| {},
+            saved
+        ),
+        "the click saved nothing: {:?}",
+        downloads.line(Instant::now())
+    );
+    assert_eq!(
+        std::fs::read(dir.join("report (2).pdf")).expect("the third"),
+        REPORT
+    );
+    let tab = tabs.active_mut().expect("the tab");
+    let navigated: Vec<_> = tab
+        .connection
+        .events()
+        .into_iter()
+        .filter(|event| event.method == "Page.frameNavigated")
+        .collect();
+    assert!(
+        navigated.is_empty(),
+        "the page went somewhere: {navigated:?}"
+    );
+    assert_eq!(tab.url, page);
+
+    // Only the three, under their names: no guid left over, no partial.
+    assert_eq!(
+        names_in(&dir),
+        ["report (1).pdf", "report (2).pdf", "report.pdf"]
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A download that takes a while says so while it does, and the row is only
+/// redrawn when what it says has changed.
+#[test]
+fn a_download_says_how_far_it_has_come_and_then_where_it_went() {
+    let (base, dir) = download_dir("progress");
+    let Some((mut engine, mut browser, mut tabs, mut downloads)) = downloading(&dir) else {
+        return;
+    };
+    let server = serve_files();
+    let tab = tabs.active_mut().expect("the tab");
+    let reply = navigate_tab(tab, &format!("{server}/big"));
+    assert!(download::became_download(&reply), "{reply:?}");
+
+    let mut lines: Vec<Option<String>> = Vec::new();
+    assert!(
+        pump_downloads(
+            &mut browser,
+            &mut tabs,
+            &mut downloads,
+            Duration::from_secs(15),
+            |line| lines.push(line),
+            saved
+        ),
+        "never saved: {lines:?}"
+    );
+    let percents: Vec<u64> = lines
+        .iter()
+        .flatten()
+        .filter_map(|line| {
+            line.strip_prefix("downloading big.bin ")?
+                .strip_suffix('%')?
+                .parse()
+                .ok()
+        })
+        .collect();
+    assert!(
+        percents.iter().any(|&n| n > 0 && n < 100),
+        "nothing between the start and the end: {lines:?}"
+    );
+    assert!(
+        percents.windows(2).all(|pair| pair[0] <= pair[1]),
+        "went backwards: {lines:?}"
+    );
+    assert!(
+        lines.windows(2).all(|pair| pair[0] != pair[1]),
+        "redrawn with nothing new to say: {lines:?}"
+    );
+    let last = lines.last().cloned().flatten().expect("a last word");
+    assert!(
+        last.starts_with("saved ") && last.ends_with("/big.bin"),
+        "{last}"
+    );
+    assert_eq!(
+        std::fs::metadata(dir.join("big.bin"))
+            .expect("the file")
+            .len(),
+        BIG as u64
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A server that stops sending halfway: the engine tries again, gives up,
+/// and says `canceled`; the row says the file did not arrive and nothing of
+/// it is left.
+#[test]
+fn a_download_that_breaks_off_is_reported_and_leaves_nothing() {
+    let (base, dir) = download_dir("broken");
+    let Some((mut engine, mut browser, mut tabs, mut downloads)) = downloading(&dir) else {
+        return;
+    };
+    let server = serve_files();
+    let tab = tabs.active_mut().expect("the tab");
+    navigate_tab(tab, &format!("{server}/broken"));
+    assert!(
+        pump_downloads(
+            &mut browser,
+            &mut tabs,
+            &mut downloads,
+            Duration::from_secs(10),
+            |_| {},
+            |downloads| !downloads.all().is_empty() && downloads.in_flight().next().is_none()
+        ),
+        "never ended: {:?}",
+        downloads.line(Instant::now())
+    );
+    assert_eq!(
+        downloads.line(Instant::now()).as_deref(),
+        Some("couldn't save broken.bin")
+    );
+    assert_eq!(
+        emptied(&dir, Duration::from_secs(2)),
+        Vec::<String>::new(),
+        "the engine left its partial file"
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// What the way out does: cancelled, the engine removes its own partial and
+/// the row does not call that a failure; killed without a cancel — the
+/// temporary profile's way out, or an engine that stopped answering — the
+/// partials this run saw begin are removed by name afterwards.
+#[test]
+fn quitting_with_a_download_coming_leaves_no_partial_file() {
+    let (base, dir) = download_dir("quit");
+    let Some((mut engine, mut browser, mut tabs, mut downloads)) = downloading(&dir) else {
+        return;
+    };
+    let server = serve_files();
+    let start = |tabs: &mut Tabs<Client>, browser: &mut Client, downloads: &mut Downloads| {
+        let tab = tabs.active_mut().expect("the tab");
+        navigate_tab(tab, &format!("{server}/big"));
+        assert!(
+            pump_downloads(
+                browser,
+                tabs,
+                downloads,
+                Duration::from_secs(10),
+                |_| {},
+                |downloads| downloads.in_flight().any(|download| download.received > 0)
+            ),
+            "the download never started"
+        );
+    };
+
+    start(&mut tabs, &mut browser, &mut downloads);
+    downloads.cancel_all(&mut browser);
+    pump_downloads(
+        &mut browser,
+        &mut tabs,
+        &mut downloads,
+        Duration::from_secs(2),
+        |_| {},
+        |downloads| downloads.in_flight().next().is_none(),
+    );
+    assert_eq!(downloads.line(Instant::now()), None, "not a failure");
+    assert_eq!(
+        emptied(&dir, Duration::from_secs(2)),
+        Vec::<String>::new(),
+        "the engine left its partial file"
+    );
+    assert_eq!(
+        downloads.partials().len(),
+        1,
+        "still named, for an engine killed before it got round to it"
+    );
+    browser.close();
+    drop(tabs);
+    engine.kill();
+
+    let Some((mut engine, mut browser, mut tabs, mut downloads)) = downloading(&dir) else {
+        return;
+    };
+    start(&mut tabs, &mut browser, &mut downloads);
+    let partials = downloads.partials();
+    assert_eq!(partials.len(), 1, "{partials:?}");
+    browser.close();
+    drop(tabs);
+    engine.kill();
+    for partial in partials {
+        let _ = std::fs::remove_file(partial);
+    }
+    assert_eq!(names_in(&dir), Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// Enter
+// ---------------------------------------------------------------------------
+
+/// Enter does what Enter does on a page: it submits the form a text field is
+/// in, and it starts a new line in a textarea.
+///
+/// Both are the engine's default actions for a `keypress` of `"\r"`, not for
+/// the `keydown` a page's own listener sees, and Chromium only makes the one
+/// out of the other when the key comes with text. The terminal reports Enter
+/// with none — it is `Key::Enter`, `text: None`, as `\r` or `CSI 13 u` — so
+/// this is sent exactly the way the program sends it, press and release.
+#[test]
+fn enter_submits_a_form_and_breaks_a_line_in_a_textarea() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let page = "data:text/html,<title>ready</title><form onsubmit=\"document.title='submitted';return false\">\
+<input id=i autofocus></form><textarea id=t></textarea>";
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(page))]),
+        )
+        .expect("the page loads");
+    wait_for_title(&mut client, "ready", Duration::from_secs(10));
+
+    let press = |action| KeyInput {
+        key: Key::Enter,
+        mods: Mods::default(),
+        action,
+        text: None,
+    };
+    let enter = |client: &mut Client| {
+        for action in [KeyAction::Press, KeyAction::Release] {
+            let params = keys::dispatch(&press(action)).expect("Enter has a name");
+            client
+                .call("Input.dispatchKeyEvent", params)
+                .expect("the key is dispatched");
+        }
+    };
+    let evaluate = |client: &mut Client, expression: &str| {
+        client
+            .call(
+                "Runtime.evaluate",
+                Json::object(vec![
+                    ("expression", Json::string(expression)),
+                    ("returnByValue", Json::Bool(true)),
+                ]),
+            )
+            .expect("the page answers")
+    };
+
+    evaluate(&mut client, "document.getElementById('i').focus()");
+    enter(&mut client);
+    assert_eq!(
+        wait_for_title(&mut client, "submitted", Duration::from_secs(5)),
+        "submitted",
+        "Enter in a text field submits its form"
+    );
+
+    evaluate(
+        &mut client,
+        "var t=document.getElementById('t');t.focus();t.value='a';t.setSelectionRange(1,1)",
+    );
+    enter(&mut client);
+    let value = evaluate(&mut client, "document.getElementById('t').value");
+    assert_eq!(
+        value
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(Json::as_str),
+        Some("a\n"),
+        "Enter in a textarea starts a new line"
+    );
+
+    client.close();
     engine.kill();
 }

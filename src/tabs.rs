@@ -51,6 +51,7 @@ use crate::cdp::Event;
 use crate::dialog::Dialog;
 use crate::json::Json;
 use crate::load::{self, Landing, Loaded, Problem};
+use crate::text;
 
 /// One page target, and what the row says about it.
 pub struct Tab<C> {
@@ -60,7 +61,13 @@ pub struct Tab<C> {
     /// The connection to that target: in the program a [`crate::cdp::Client`],
     /// in the tests whatever is cheap.
     pub connection: C,
+    /// Plain text; see [`crate::text`]. Set from the parsers in
+    /// [`crate::load`], which sanitize; a test that writes it directly is
+    /// still caught by the row.
     pub title: String,
+    /// Plain text; see [`crate::text`]. Set from the parsers in
+    /// [`crate::load`] and [`change`], which sanitize; a test that writes it
+    /// directly is still caught by the row.
     pub url: String,
     /// Whether the page is between a navigation and its load event.
     pub loading: bool,
@@ -509,6 +516,10 @@ pub enum Change {
 }
 
 /// Read one event, or decide it says nothing about the tabs.
+///
+/// A url comes out as plain text ([`crate::text::sanitize`]): it is the
+/// engine's spelling of wherever the page went, the page chose where that
+/// was, and it is about to be on the row.
 pub fn change(event: &Event) -> Option<Change> {
     match event.method.as_str() {
         "Target.targetCreated" => {
@@ -539,11 +550,12 @@ pub fn change(event: &Event) -> Option<Change> {
             }
             Some(Change::Opened {
                 target: info.get("targetId").and_then(Json::as_str)?.to_string(),
-                url: info
-                    .get("url")
-                    .and_then(Json::as_str)
-                    .unwrap_or("about:blank")
-                    .to_string(),
+                url: text::sanitize(
+                    info.get("url")
+                        .and_then(Json::as_str)
+                        .unwrap_or("about:blank"),
+                )
+                .into_owned(),
             })
         }
         "Target.targetInfoChanged" => {
@@ -553,11 +565,8 @@ pub fn change(event: &Event) -> Option<Change> {
             }
             Some(Change::Renamed {
                 target: info.get("targetId").and_then(Json::as_str)?.to_string(),
-                url: info
-                    .get("url")
-                    .and_then(Json::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                url: text::sanitize(info.get("url").and_then(Json::as_str).unwrap_or_default())
+                    .into_owned(),
             })
         }
         "Target.targetDestroyed" => Some(Change::Closed {
@@ -744,6 +753,34 @@ mod tests {
         // The same target announced again is not a second tab.
         assert!(matches!(tabs.take(&opened, |_| Ok(4)), Outcome::Ignored));
         assert_eq!(tabs.len(), 2);
+    }
+
+    #[test]
+    fn a_url_from_the_browser_connection_is_plain_text() {
+        let renamed = event(
+            "Target.targetInfoChanged",
+            r#"{"targetInfo":{"targetId":"a","type":"page","title":"",
+                "url":"https://example.com/\u001b]0;x\u0007"}}"#,
+        );
+        assert_eq!(
+            change(&renamed),
+            Some(Change::Renamed {
+                target: "a".to_string(),
+                url: "https://example.com/]0;x".to_string()
+            })
+        );
+        let opened = event(
+            "Target.targetCreated",
+            r#"{"targetInfo":{"targetId":"b","type":"page","openerId":"a","title":"",
+                "url":"https://evil.example/\u202emoc.knab"}}"#,
+        );
+        assert_eq!(
+            change(&opened),
+            Some(Change::Opened {
+                target: "b".to_string(),
+                url: "https://evil.example/moc.knab".to_string()
+            })
+        );
     }
 
     #[test]

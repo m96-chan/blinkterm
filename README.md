@@ -7,6 +7,7 @@ JavaScript, the lot, in a terminal.
 
 ```sh
 blinkterm https://example.com
+blinkterm localhost:3000       # this machine gets http://, everything else https://
 ```
 
 `blinkterm` starts a Chromium as a child process, drives it over the Chrome
@@ -117,26 +118,91 @@ other way of stopping it — `SIGTERM` included — loses what was not yet
 written. So a `blinkterm` that is itself `SIGKILL`ed can lose the last thirty
 seconds or so of cookies, which is Chromium's own flush interval.
 
+### History
+
+The pages you visit are remembered in the profile, in a file called
+`history`: each page's url, its title, how many times you have been there and
+when last — a page that loaded, not one that failed, and not `about:` or
+`data:`. It is readable by you alone (0600), like the cookies beside it, and
+keeps the last 2000 pages. `--temp-profile` keeps it in memory for the run and
+writes none. Deleting the file is how to forget it; nothing else reads it.
+
 A full `chromium` rather than the headless shell still writes
 `~/.config/chromium/Crash Reports` whatever profile it is given; that
 directory is Chromium's, not `blinkterm`'s.
+
+## Downloads
+
+A file a page offers — a link to a PDF, anything served as
+`Content-Disposition: attachment`, an `<a download>` — is saved, under the
+name the page suggested, and the status row says so:
+
+    downloading report.pdf 42%        →        saved ~/Downloads/report.pdf
+
+The page stays where it was: a link to a file is not a place to go. A name
+that is already taken becomes `report (1).pdf`, the way a browser's shelf
+does it, rather than overwriting. What the row says when a download did not
+finish is `couldn't save report.pdf`; the engine gives no reason, and this
+program adds one when it has it.
+
+Files go to `$XDG_DOWNLOAD_DIR` when that is set, else to the
+`XDG_DOWNLOAD_DIR` in `~/.config/user-dirs.dirs` — the file every desktop
+reads — else to `~/Downloads`; `--download-dir <dir>` for somewhere else.
+The directory is made, 0700, the first time something is saved into it.
+The name a page suggests is checked here: one path component, no control
+characters, no leading dot, at most 255 bytes.
+
+Quitting cancels anything still coming and leaves no partial file. A
+`blinkterm` that is killed outright can leave `<guid>.crdownload` in the
+directory, which is the engine's partial file and is safe to delete.
 
 ## Keys
 
 | | |
 | --- | --- |
-| `ctrl+l` | type a url |
+| `ctrl+l` | type a url. In the url bar, `←`/`→`, `home`/`end`, `ctrl+a`/`ctrl+e` and `alt+b`/`alt+f` (or `ctrl+←`/`ctrl+→`) move; `ctrl+w`/`alt+backspace` and `alt+d` delete a word; `ctrl+u`/`ctrl+k` delete to either end; `↑`/`↓` walk the pages visited; a dim suggestion after what you typed is taken with `tab` or `→` |
 | `ctrl+r` | reload |
 | `alt+left` / `alt+right` | back and forward |
 | `ctrl+t` | a new tab, with the cursor in the url bar |
 | `ctrl+w` | close this tab; closing the last one quits |
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
 | `alt+1` … `alt+9` | the nth tab |
+| your terminal's paste key | pastes into the page, the url bar, or a `prompt()` — whichever has the cursor |
+| `alt+c` | copy the page's selection to your clipboard; with the url bar or a `prompt()` open, copy that line |
+| `alt+u` | copy the page's url to your clipboard |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 
 Everything else goes to the page, including the mouse. A link that asks for a
 new window gets a new tab, and the tab is switched to.
+
+`ctrl+c` and `ctrl+v` are the page's own: they copy and paste within the
+engine, not with your clipboard. Your terminal's paste key (`ctrl+shift+v`, a
+middle click) is how text gets in, and `alt+c` is how it gets out. A paste
+reaches the page as text, never as keys, so the newlines in it do not submit
+a form; one over 64 KiB is refused whole rather than cut. Copying goes out as
+OSC 52, which your terminal may need to be told to allow.
+
+The url bar is asked about every key first while it is open, so `alt+←`/`→`
+are back and forward only when it is closed — in the bar they move by a word —
+and `ctrl+w`, `ctrl+t` and the rest do nothing there; `esc` closes it.
+
+### Searching
+
+Nothing you type in the url bar is sent anywhere but where it names. With
+`--search-url`, words are sent to the search you choose:
+
+```sh
+blinkterm --search-url 'https://duckduckgo.com/?q=%s'
+```
+
+What counts as words: anything with a space in it, or a single word with no
+dot that is not `localhost` and has no port (`rust`, `what?`), or a number
+that is not an address (`3.14`). `example.com`, `localhost:3000`, `myhost:8080`,
+`192.168.1.1` and anything with a scheme or starting with `/` are still places.
+Without the flag, `rust` goes to `https://rust`, and that is the point: a
+mistyped intranet name or a half-pasted token is not handed to a third party
+unless you said so, once, on the command line.
 
 While a page is waiting on its dialog, only the tab keys and `ctrl+q` still
 work, and the page gets no keys or mouse until it has its answer. A tab behind

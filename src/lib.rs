@@ -119,9 +119,12 @@
 pub mod app;
 pub mod base64;
 pub mod cdp;
+pub mod clipboard;
 pub mod dialog;
+pub mod download;
 pub mod engine;
 pub mod graphics;
+pub mod history;
 pub mod input;
 pub mod json;
 pub mod keys;
@@ -132,6 +135,7 @@ pub mod profile;
 pub mod screen;
 pub mod scroll;
 pub mod tabs;
+pub mod text;
 
 pub use app::Options;
 pub use json::Json;
