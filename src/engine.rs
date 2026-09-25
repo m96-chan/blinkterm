@@ -40,7 +40,9 @@
 //! WebSocket handshake without an `Origin` is checked against a list that is
 //! empty by default. `--no-sandbox` only when this program is root, because
 //! Chromium refuses to start as root without it and adding it as anyone else
-//! would be turning off a protection that was working.
+//! would be turning off a protection that was working. Root also gets a
+//! sentence on stderr about it: it is the one flag here that takes a defence
+//! away, and it should not be added on the person's behalf in silence.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
@@ -280,6 +282,22 @@ impl Engine {
         let path = locate()?;
         // SAFETY: `geteuid(2)` takes nothing, reads no memory and cannot fail.
         let as_root = unsafe { libc::geteuid() } == 0;
+        if as_root {
+            // Said out loud, because `--no-sandbox` is added silently below and
+            // it is the one flag here that takes a protection away rather than
+            // adding one. The renderer is the part of Chromium that parses
+            // what a page sends; the sandbox is what stops a bug in it from
+            // being the machine. This runs before `Pane::enter`, so it lands
+            // on the ordinary screen rather than under the alternate one.
+            eprintln!(
+                "blinkterm: running as root, so the engine gets --no-sandbox: \
+                 Chromium will not start as root without it."
+            );
+            eprintln!(
+                "blinkterm: that is the sandbox off, on the program that renders \
+                 untrusted pages. Run as an ordinary user if you can."
+            );
+        }
         let mut command = Command::new(&path);
         command
             .args(flags(as_root))

@@ -55,7 +55,8 @@ has no Chromium to test against and this program is nothing without one.
 
 ## Installing
 
-Rust 1.75 or newer:
+Rust 1.87 or newer — the floor comes from the dependency closure, not from
+anything in `src/`; see [Checks](#checks):
 
 ```sh
 cargo install --git https://github.com/m96-chan/blinkterm
@@ -146,6 +147,19 @@ against exactly the `rust-version` in `Cargo.toml`, so the number stays true.
 `ruff check --select E9,F tools/` — syntax and pyflakes, not style, since
 those scripts are stdlib-only by design and some of what a style rule would
 object to is deliberate.
+
+## Contributing, releases, security
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the checks, how to run the engine tests,
+and how the tOS revision is moved. [RELEASING.md](RELEASING.md) says what the
+version number promises — SemVer on the command-line surface, and `lib.rs` is
+not a stable API — and how a tag is cut. [CHANGELOG.md](CHANGELOG.md) is what
+changed.
+
+[SECURITY.md](SECURITY.md) has the threat model and how to report something
+privately. Worth reading before pointing this at a page you do not trust: it
+says which parts are Chromium's problem, which are this program's, and which
+are currently open holes.
 
 ## Licence
 

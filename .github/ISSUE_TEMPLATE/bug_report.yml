@@ -1,0 +1,88 @@
+name: Bug report
+description: Something renders wrong, does not respond, or does not start
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This program sits between two things it does not control — a terminal
+        and a browser engine — so most of what makes a report actionable is
+        *which two*. The boxes below are that.
+
+        Something that lets a page reach outside the page belongs in a private
+        report instead: the **Security** tab → **Report a vulnerability**. See
+        [SECURITY.md](https://github.com/m96-chan/blinkterm/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: And what you expected instead. A photograph of the pane is fine and often quicker than describing it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to get there
+      description: The page, and what you did. A url anybody can reach is worth more than a description of one.
+      placeholder: |
+        1. blinkterm https://…
+        2. scroll / click / press …
+        3. …
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: blinkterm version
+      description: "`blinkterm --version`. If you built it yourself, the commit."
+      placeholder: blinkterm 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: engine
+    attributes:
+      label: The engine
+      description: "Which binary and which version — `chromium-shell --version`, or whatever `$BLINKTERM_ENGINE` points at."
+      placeholder: /usr/bin/chromium-shell — Chromium 120.0.6099.224
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: The terminal
+      description: Name and version. A tOS pane, Kitty, WezTerm, Ghostty, or something else you expected to work.
+      placeholder: kitty 0.32.2
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: Debian bookworm / Arch / macOS 14
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: layers
+    attributes:
+      label: Anything between you and the terminal
+      description: Each of these changes what reaches the program, and each has its own way of breaking graphics or keys.
+      options:
+        - label: tmux
+        - label: GNU screen
+        - label: over SSH
+        - label: inside a container
+        - label: running as root
+
+  - type: textarea
+    id: engine_said
+    attributes:
+      label: Anything it printed
+      description: "Errors on exit, or the engine's own complaints. If it would not start, this is usually the whole answer."
+      render: text

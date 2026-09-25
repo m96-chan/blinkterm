@@ -100,6 +100,22 @@ jobs:
       # tree, and whether the program works is `check`'s and `engine`'s
       # business on a toolchain that can run them faster.
       - run: cargo check --all-targets --locked
+      # The README tells people which Rust to install, and it said 1.75 for as
+      # long as Cargo.toml did. Fixing one and not the other is the same bug
+      # again, so every "Rust <x>.<y>" in the README has to be this job's
+      # version. Cheap, and it runs next to the thing it is comparing against.
+      - name: The README agrees about the floor
+        run: |
+          version=${{ steps.msrv.outputs.version }}
+          bad=0
+          for found in $(grep -oE 'Rust \*{0,2}[0-9]+\.[0-9]+' README.md \
+                         | grep -oE '[0-9]+\.[0-9]+' | sort -u); do
+            if [ "$found" != "$version" ]; then
+              echo "README.md says Rust $found; Cargo.toml says $version" >&2
+              bad=1
+            fi
+          done
+          exit $bad
 
   tools:
     name: shell and python tools
@@ -159,6 +175,25 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends chromium-shell fonts-noto-cjk
           rm -rf /var/lib/apt/lists/*
+      # Which engine this run actually tested against. bookworm ships whatever
+      # chromium-shell it has that day, so a Debian security update can turn
+      # this job red with no commit to blame -- and the first question then is
+      # "what changed", which is unanswerable if the version was never recorded.
+      # It goes in the log rather than into a pin because pinning it would mean
+      # testing against an engine nobody is running.
+      #
+      # Asked of dpkg rather than of the binary. `chromium-shell --version`
+      # looks like the obvious way to do this and is not: Chromium refuses to
+      # run as root without --no-sandbox even to print its version, and then
+      # still initialises Ozone, picks X11 and dies on "Missing X server or
+      # $DISPLAY" unless --ozone-platform=headless is there too. Both of those
+      # are written down in tools/run.sh, and both were rediscovered here the
+      # expensive way. The package version is what apt installed, which is the
+      # thing that changes underneath this job anyway, and dpkg cannot fail to
+      # report it -- a line that exists to say what happened should not be
+      # able to decide whether the job passes.
+      - name: Say which engine this is
+        run: dpkg-query -W -f='chromium-shell ${Version}\n' chromium-shell
       - uses: Swatinem/rust-cache@v2
       # --release because several of these tests assert on timings: the rest
       # interval before a still, the frame rate under a steady wheel, the cost
