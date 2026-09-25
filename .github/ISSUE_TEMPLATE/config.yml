@@ -1,0 +1,8 @@
+# A bug report has a form because the answers are always the same five
+# questions. Everything else -- a feature, a terminal that does not work, a
+# question -- is better as prose, so the blank issue stays available.
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/m96-chan/blinkterm/security/advisories/new
+    about: Anything that lets a page reach outside the page. Private, not a public issue.
