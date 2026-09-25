@@ -45,7 +45,9 @@ chromium-shell. blinkterm does not ship one; install the one you want.
 
 A profile is made readable by you alone (0700), and one blinkterm uses it at a
 time: a second one started on the same profile is refused, and told which pid
-has it.
+has it. The open tabs are saved in the profile; --restore reopens them, and
+after a crash the next start offers to. Bookmarks are one file for every
+profile, $XDG_DATA_HOME/blinkterm/bookmarks, one url<TAB>title per line.
 
 A file a page offers — a link to a PDF, a Content-Disposition: attachment —
 is saved in the download directory under its own name, \"report (1).pdf\" if
@@ -64,6 +66,9 @@ keys:
   alt+left/right back and forward
   ctrl+t         a new tab, with the cursor in the url bar
   ctrl+w         close this tab; closing the last one quits
+  ctrl+shift+t   reopen the last tab closed (alt+t where the terminal or the
+                 compositor keeps ctrl+shift+t)
+  ctrl+d         bookmark this page, or remove the bookmark
   ctrl+tab       the next tab, ctrl+shift+tab the one before
   alt+1 .. alt+9 the nth tab
   alt+= / alt+-  zoom in, out (ctrl+= / ctrl+- where the terminal lets them
@@ -236,6 +241,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         scale: scale.unwrap_or(Scale::Auto),
         scheme: scheme.unwrap_or_default(),
         force_dark,
+        // `--restore` is parsed with the rest of the configuration (#17).
+        restore: false,
     })
 }
 

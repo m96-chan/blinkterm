@@ -119,6 +119,7 @@
 pub mod app;
 pub mod appearance;
 pub mod base64;
+pub mod bookmarks;
 pub mod cdp;
 pub mod clipboard;
 pub mod dialog;
@@ -137,6 +138,7 @@ pub mod motion;
 pub mod profile;
 pub mod screen;
 pub mod scroll;
+pub mod session;
 pub mod tabs;
 pub mod text;
 pub mod upload;
