@@ -6942,6 +6942,14 @@ fn frames_in(client: &mut Client, window: Duration) -> usize {
     count
 }
 
+/// How long a renderer's death may take to reach the browser. On a
+/// workstation it is about 20 ms; on the CI runner it took more than the
+/// second these tests first allowed, probably because the kernel pipes the
+/// dead renderer's core to the host's crash collector before the process is
+/// gone. The program reads the event whenever it comes, so only the tests
+/// wait on it, and they print how long it took.
+const CRASH_NOTICE: Duration = Duration::from_secs(20);
+
 /// The browser's events until one is `method` about `target`, or the time is
 /// up; everything read on the way is handed to `seen` as well.
 fn browser_event(
@@ -7020,14 +7028,16 @@ fn a_crashed_page_keeps_its_tab_and_a_reload_brings_it_back_casting() {
         .connection
         .send("Page.crash", Json::empty())
         .expect("Page.crash sent");
+    let asked = Instant::now();
     let crashed = browser_event(
         &mut browser,
         "Target.targetCrashed",
         &target,
-        Duration::from_secs(1),
+        CRASH_NOTICE,
         |_| {},
     )
-    .expect("Target.targetCrashed within a second");
+    .expect("Target.targetCrashed");
+    eprintln!("Target.targetCrashed after {:?}", asked.elapsed());
     eprintln!("crashed: {}", crashed.params);
     assert_eq!(
         crashed.params.get("status").and_then(Json::as_str),
@@ -7143,14 +7153,16 @@ fn chrome_crash_is_the_same_crash_with_its_navigation_aborted() {
     );
     assert_eq!(load::failed(&reply), None, "not a failure to report");
 
+    let asked = Instant::now();
     let crashed = browser_event(
         &mut browser,
         "Target.targetCrashed",
         &target,
-        Duration::from_secs(1),
+        CRASH_NOTICE,
         |_| {},
     )
-    .expect("Target.targetCrashed within a second");
+    .expect("Target.targetCrashed");
+    eprintln!("Target.targetCrashed after {:?}", asked.elapsed());
     assert!(
         crashed.params.get("errorCode").is_some(),
         "{}",
