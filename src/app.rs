@@ -39,6 +39,7 @@ use crate::graphics::{Painter, Raw};
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
 use crate::json::Json;
 use crate::keys;
+use crate::load::{self, Loaded, Problem};
 use crate::motion::{self, Motion};
 use crate::profile::{Choice, Profile};
 use crate::screen::{self, Pane};
@@ -329,8 +330,10 @@ fn drive(
         if let Some(tab) = tabs.active_mut() {
             tab.note = Some(why);
         }
-        redraw_row(pane, tabs, &chrome)?;
     }
+    // Whether or not it was an error on the wire: a reply that says the page
+    // did not come has replaced the loading note with why.
+    redraw_row(pane, tabs, &chrome)?;
 
     let mut last_check = Instant::now();
     let mut buf = [0u8; 8192];
@@ -474,40 +477,81 @@ fn restart_screencast(client: &mut Client, metrics: Metrics) -> Result<(), Strin
     start_screencast(client, metrics)
 }
 
-/// What a page calls itself, asked of the page.
+/// What a page calls itself, and the status its document came with, asked of
+/// the page.
 ///
 /// Deliberately not `Target.targetInfoChanged`'s `title`, which would cost
 /// nothing and be wrong: against `chromium-shell` that field is derived from
 /// the url and a `document.title` set by a script never changes it. See
-/// [`crate::tabs`] for the measurement. `None` means the page did not answer
-/// in time, and a tab keeps the name it had rather than losing it to a page
-/// that is busy.
-pub fn page_title(client: &mut Client) -> Option<String> {
+/// [`crate::tabs`] for the measurement. The status rides in the same
+/// evaluation, which is how a 404 is known without the `Network` domain — see
+/// [`crate::load`] for why that domain is not paid for. `None` means the page
+/// did not answer in time, and a tab keeps the name it had rather than losing
+/// it to a page that is busy.
+pub fn page_loaded(client: &mut Client) -> Option<Loaded> {
     let answer = client
         .call_within(
             "Runtime.evaluate",
             Json::object(vec![
-                ("expression", Json::string("document.title")),
+                ("expression", Json::string(load::LOADED)),
+                // Without it the array comes back as a handle to an object in
+                // the page rather than as the array.
                 ("returnByValue", Json::Bool(true)),
             ]),
             Duration::from_secs(2),
         )
         .ok()?;
-    answer
-        .path(&["result", "value"])
-        .and_then(Json::as_str)
-        .map(str::to_string)
+    load::loaded(&answer)
+}
+
+/// Just the title: [`page_loaded`] with the status left out.
+pub fn page_title(client: &mut Client) -> Option<String> {
+    page_loaded(client).map(|loaded| loaded.title)
 }
 
 /// Send the active tab somewhere. The sentence, if it would not go.
+///
+/// A navigation fails in one of two ways, and only one of them comes back as
+/// an error here. A url the engine cannot parse is refused outright, and that
+/// is the `Err`. A url it can parse but not reach — a host that does not
+/// resolve, a port nobody listens on — is a command that *succeeded*: the
+/// engine navigated, to its own error page, and the reply carries the reason
+/// as `errorText`. That is what [`navigated`] reads. It is quick, too: a
+/// `.invalid` host answers in 10 ms, because the resolver refuses the name
+/// without asking anyone. The error page's own events follow the reply, and
+/// [`Tab::landed`] takes the url from them.
+///
+/// The problem the tab had is cleared before anything is sent, so that a
+/// reason from an earlier navigation — one whose reply timed out here and
+/// whose failure landed afterwards — cannot be pinned on this one.
+///
+/// This blocks the loop until the engine answers, as it always has; a host
+/// that takes its time to refuse is a loop that takes its time too.
 fn navigate(tabs: &mut Tabs<Client>, url: &str) -> Option<String> {
     let tab = tabs.active_mut()?;
-    tab.connection
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(url))]),
-        )
-        .err()
+    tab.problem = None;
+    match tab.connection.call(
+        "Page.navigate",
+        Json::object(vec![("url", Json::string(url))]),
+    ) {
+        Ok(reply) => {
+            navigated(tab, url, &reply);
+            None
+        }
+        Err(why) => Some(why),
+    }
+}
+
+/// What a `Page.navigate` reply says about the tab it was sent to.
+///
+/// Only anything when the navigation failed: then the reason is recorded
+/// against the url that was asked for, and the error page's landing, which is
+/// ten to sixty milliseconds behind, keeps it. A reply without an
+/// `errorText` says nothing the page's own events will not say better.
+pub fn navigated(tab: &mut Tab<Client>, url: &str, reply: &Json) {
+    if let Some(code) = load::failed(reply) {
+        tab.failed_to_reach(url, &code);
+    }
 }
 
 /// Start the active tab painting: sized, told it is in front, and casting.
@@ -547,9 +591,16 @@ fn activate(
     // afterwards is what makes that safe: the only thing worth having in that
     // queue was the news that the page had finished loading, and this is that
     // news asked for directly.
+    //
+    // What is not safe is a `Page.frameNavigated` in there: a tab that landed
+    // somewhere between the last pass and this one loses the landing, and
+    // with it the url and whether the page came at all. It is a gap of one
+    // pass, known and left, because the frames in the same queue are the
+    // greater harm; the load event after it still asks the page, below and
+    // then again when it fires.
     let _ = tab.connection.events();
-    if let Some(title) = page_title(&mut tab.connection) {
-        tab.title = title;
+    if let Some(loaded) = page_loaded(&mut tab.connection) {
+        tab.loaded(loaded);
     }
     start_screencast(&mut tab.connection, metrics)?;
     // A different page, so a different clock: nothing this tab sends can be
@@ -743,11 +794,14 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
     let bytes = if chrome.editing.is_some() || tabs.len() < 2 {
         screen::status_line(cols, &active.line(), chrome.editing.as_deref())
     } else {
-        let labels: Vec<screen::TabLabel> = tabs
+        // Held here first, because a label can be a sentence made on the spot
+        // — a tab whose page did not come — and the strip only borrows.
+        let names: Vec<_> = tabs.iter().map(|tab| tab.label()).collect();
+        let labels: Vec<screen::TabLabel> = names
             .iter()
             .enumerate()
-            .map(|(index, tab)| screen::TabLabel {
-                title: tab.label(),
+            .map(|(index, name)| screen::TabLabel {
+                title: name,
                 active: index == tabs.active_index(),
             })
             .collect();
@@ -885,17 +939,12 @@ fn handle_page_events(
                 }
                 "Page.frameNavigated" => {
                     // Only the main frame, which is the one whose url is the
-                    // page's: an advert in an iframe navigating is not.
-                    let frame = params.get("frame");
-                    let is_main = frame.and_then(|f| f.get("parentId")).is_none();
-                    if let (true, Some(url)) = (
-                        is_main,
-                        frame.and_then(|f| f.get("url")).and_then(Json::as_str),
-                    ) {
-                        tab.url = url.to_string();
-                        tab.title.clear();
-                        tab.note = None;
-                        tab.loading = true;
+                    // page's: an advert in an iframe navigating is not. And
+                    // for the engine's error page, the url that did not come
+                    // rather than `chrome-error://chromewebdata/` — see
+                    // [`crate::load`].
+                    if let Some(landing) = load::landing(&params) {
+                        tab.landed(landing);
                         redraw = true;
                     }
                 }
@@ -917,8 +966,8 @@ fn handle_page_events(
         }
 
         if ask_title {
-            if let Some(title) = page_title(&mut tab.connection) {
-                tab.title = title;
+            if let Some(loaded) = page_loaded(&mut tab.connection) {
+                tab.loaded(loaded);
             }
         }
     }
@@ -1178,8 +1227,36 @@ fn handle_input(
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(Command::Reload) => {
-                    if let Some(tab) = tabs.active_mut() {
-                        let _ = tab.connection.call("Page.reload", Json::empty());
+                    // A page that did not come has no document to reload, and
+                    // `Page.reload` of the error page says nothing about why it
+                    // failed again. Going to the same url once more does: it is
+                    // a `Page.navigate`, whose reply carries the reason. The
+                    // engine takes a navigation to the url it is already on as
+                    // a reload, so no second history entry is made — checked
+                    // against the engine, in the engine tests.
+                    let unreachable = match tabs.active().and_then(|tab| tab.problem.as_ref()) {
+                        Some(Problem::Unreachable { url, .. }) => Some(url.clone()),
+                        _ => None,
+                    };
+                    match unreachable {
+                        Some(url) => {
+                            if let Some(tab) = tabs.active_mut() {
+                                tab.note = Some(format!("loading {url}"));
+                                tab.loading = true;
+                            }
+                            redraw_row(pane, tabs, chrome)?;
+                            if let Some(why) = navigate(tabs, &url) {
+                                if let Some(tab) = tabs.active_mut() {
+                                    tab.note = Some(why);
+                                }
+                            }
+                            redraw_row(pane, tabs, chrome)?;
+                        }
+                        None => {
+                            if let Some(tab) = tabs.active_mut() {
+                                let _ = tab.connection.call("Page.reload", Json::empty());
+                            }
+                        }
                     }
                 }
                 Some(Command::Back) => go(tabs, -1),

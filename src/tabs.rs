@@ -41,8 +41,11 @@
 //! tab — event-driven rather than polled, and a background tab that never
 //! loads anything costs nothing at all.
 
+use std::borrow::Cow;
+
 use crate::cdp::Event;
 use crate::json::Json;
+use crate::load::{self, Landing, Loaded, Problem};
 
 /// One page target, and what the row says about it.
 pub struct Tab<C> {
@@ -60,6 +63,18 @@ pub struct Tab<C> {
     /// else: what it is loading, why a navigation failed, what happened to the
     /// tab that is no longer here.
     pub note: Option<String>,
+    /// What is wrong with the page, when something is: it did not come, or it
+    /// came with an error status.
+    ///
+    /// Not a [`Tab::note`], for two reasons. A 404 page has a title and a url
+    /// that are both worth keeping on the row, and a note stands in for the
+    /// title rather than beside it. And a note is wiped by the browser
+    /// connection's rename of the tab, which arrives a millisecond after a
+    /// failed page lands and, for a url the engine spells differently from the
+    /// one that was typed — a trailing slash is enough — would clear the
+    /// failure the moment it was said. [`Tabs::take`] does not touch this;
+    /// only the tab's own `Page` events do. See [`crate::load`].
+    pub problem: Option<Problem>,
 }
 
 impl<C> Tab<C> {
@@ -71,6 +86,85 @@ impl<C> Tab<C> {
             url: url.into(),
             loading: false,
             note: None,
+            problem: None,
+        }
+    }
+
+    /// The main frame committed: a document, or the error page for one.
+    ///
+    /// This is `Page.frameNavigated`, and it is the one signal of a failure
+    /// that arrives however the navigation started — typed, clicked, reloaded
+    /// or walked to through history. What it does not carry is why, which
+    /// only a `Page.navigate` reply says, and that arrives first, through
+    /// [`Tab::failed_to_reach`]. So the question here is whether a reason
+    /// already on the tab belongs to this landing.
+    ///
+    /// The reason names the url that was asked for and the landing names where
+    /// the engine ended up — the same place in the engine's spelling, or the
+    /// end of a redirect — so the two cannot simply be compared. What can be
+    /// relied on instead is that between the reply and the landing nothing
+    /// else happens to this tab: a reason recorded while the tab is still
+    /// loading is this landing's. A reason for the very url that has landed
+    /// again is kept too, which is what reloading an error page looks like.
+    /// Anything else is dropped, because a wrong reason is worse than none.
+    /// [`crate::app`]'s `navigate` clears the problem before it sends, which
+    /// is what keeps "still loading" honest against a `Page.navigate` that
+    /// timed out here and failed in the engine afterwards.
+    pub fn landed(&mut self, landing: Landing) {
+        // Read before it is set below: it says whether a reason from
+        // `failed_to_reach` belongs to this landing.
+        let ours = self.loading;
+        // A page that has gone somewhere has not got there yet, and the title
+        // it had was the last page's.
+        self.title.clear();
+        self.note = None;
+        self.loading = true;
+        match landing {
+            Landing::Document(url) => {
+                self.url = url;
+                self.problem = None;
+            }
+            Landing::Unreachable(url) => {
+                let reason = match &self.problem {
+                    Some(Problem::Unreachable { url: was, reason }) if ours || *was == url => {
+                        reason.clone()
+                    }
+                    _ => None,
+                };
+                // The url that did not come, and never the error page's own
+                // `chrome-error://chromewebdata/`: that is where the engine
+                // put the page, not where anybody was going.
+                self.url = url.clone();
+                self.problem = Some(Problem::Unreachable { url, reason });
+            }
+        }
+    }
+
+    /// `Page.navigate` answered with an `errorText`: the landing is on its way,
+    /// ten to sixty milliseconds behind, and this is why.
+    pub fn failed_to_reach(&mut self, url: &str, code: &str) {
+        self.note = None;
+        self.loading = true;
+        self.problem = Some(Problem::Unreachable {
+            url: url.to_string(),
+            reason: Some(code.to_string()),
+        });
+    }
+
+    /// The page said it has loaded, and this is what it answered.
+    ///
+    /// An error status replaces a status and nothing else: a page that did not
+    /// come keeps saying so, because the error page it is showing has a status
+    /// of 0 and no title, and that is not the news that the problem is over.
+    pub fn loaded(&mut self, loaded: Loaded) {
+        self.title = loaded.title;
+        match loaded.status {
+            Some(status) => self.problem = Some(Problem::Status(status)),
+            None => {
+                if matches!(self.problem, Some(Problem::Status(_))) {
+                    self.problem = None;
+                }
+            }
         }
     }
 
@@ -82,28 +176,46 @@ impl<C> Tab<C> {
         if let Some(note) = &self.note {
             return note.clone();
         }
-        match (self.title.is_empty(), self.url.is_empty()) {
-            (true, true) => "blinkterm".to_string(),
-            (true, false) => self.url.clone(),
-            (false, true) => self.title.clone(),
-            (false, false) => format!("{}  —  {}", self.title, self.url),
+        // A status is said beside the title and the url rather than instead
+        // of them: a 404 page has both, and the site's own words for what went
+        // wrong are usually in the title.
+        let status = match &self.problem {
+            Some(problem @ Problem::Unreachable { .. }) => return load::sentence(problem),
+            Some(Problem::Status(status)) => Some(load::status_phrase(*status)),
+            None => None,
+        };
+        let parts: Vec<&str> = [status.as_deref(), Some(&self.title), Some(&self.url)]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return "blinkterm".to_string();
         }
+        parts.join("  —  ")
     }
 
     /// The name this tab goes by in the strip, before it is clipped.
-    pub fn label(&self) -> &str {
+    ///
+    /// A page that did not come is named for that, since the host and the
+    /// reason are all there is to know about it. A status is not: a strip is
+    /// narrow, and the title of a 404 page is usually the site saying so.
+    pub fn label(&self) -> Cow<'_, str> {
         if let Some(note) = &self.note {
-            return note;
+            return Cow::Borrowed(note);
+        }
+        if let Some(problem @ Problem::Unreachable { .. }) = &self.problem {
+            return Cow::Owned(load::sentence(problem));
         }
         if !self.title.is_empty() {
-            return &self.title;
+            return Cow::Borrowed(&self.title);
         }
         // A tab that was just opened has the url it was opened with and no
         // title yet, and "about:blank" is not a name for anything.
         if self.url.is_empty() || self.url == "about:blank" {
-            return "new tab";
+            return Cow::Borrowed("new tab");
         }
-        &self.url
+        Cow::Borrowed(&self.url)
     }
 }
 
@@ -663,5 +775,131 @@ mod tests {
         assert_eq!(change(&frame), None);
         let empty = event("Target.targetCreated", r#"{}"#);
         assert_eq!(change(&empty), None);
+    }
+
+    /// What `app::handle_page_events` does with a load event, which is not a
+    /// method of the tab's because the title is asked of the page in between.
+    fn load_finished(tab: &mut Tab<u32>, title: &str, status: Option<u16>) {
+        tab.loading = false;
+        tab.loaded(Loaded {
+            title: title.to_string(),
+            status,
+        });
+    }
+
+    #[test]
+    fn a_failed_navigation_is_a_sentence_until_the_page_goes_somewhere_else() {
+        let mut tab: Tab<u32> = Tab::new("a", 0, "about:blank");
+        // What `navigate` does: the url typed, a note while it goes, and then
+        // a reply with an `errorText` in it.
+        tab.url = "https://example.cmo".to_string();
+        tab.note = Some("loading https://example.cmo".to_string());
+        tab.loading = true;
+        tab.failed_to_reach("https://example.cmo", "net::ERR_NAME_NOT_RESOLVED");
+        assert_eq!(tab.line(), "can't reach example.cmo: name not resolved");
+
+        // The error page lands under the url in the engine's spelling, and
+        // the reason stays with it.
+        tab.landed(Landing::Unreachable("https://example.cmo/".to_string()));
+        assert_eq!(tab.url, "https://example.cmo/", "never chrome-error://");
+        assert_eq!(tab.line(), "can't reach example.cmo: name not resolved");
+        // The error page loads like any page, with no title and no status,
+        // and that is not the news that the problem is over.
+        load_finished(&mut tab, "", None);
+        assert_eq!(tab.line(), "can't reach example.cmo: name not resolved");
+        assert_eq!(tab.label(), "can't reach example.cmo: name not resolved");
+
+        // Going somewhere that works is.
+        tab.landed(Landing::Document("https://example.com/".to_string()));
+        load_finished(&mut tab, "Example", None);
+        assert_eq!(tab.problem, None);
+        assert_eq!(tab.line(), "Example  —  https://example.com/");
+    }
+
+    #[test]
+    fn a_failure_the_page_found_on_its_own_names_the_host() {
+        // A link clicked on a loaded page: no `Page.navigate`, so no reason,
+        // only the landing.
+        let mut tab = tab("a", "A");
+        tab.landed(Landing::Unreachable("http://127.0.0.1:9/x".to_string()));
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:9");
+        assert_eq!(tab.label(), "can't reach 127.0.0.1:9");
+        assert_eq!(tab.title, "", "the last page's title went with it");
+
+        // And reloading it lands at the same url again, still with nothing
+        // to say why.
+        load_finished(&mut tab, "", None);
+        tab.landed(Landing::Unreachable("http://127.0.0.1:9/x".to_string()));
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:9");
+    }
+
+    #[test]
+    fn a_reason_that_timed_out_is_not_pinned_on_the_next_failure() {
+        let mut tab: Tab<u32> = Tab::new("a", 0, "about:blank");
+        tab.failed_to_reach("https://first.invalid/", "net::ERR_NAME_NOT_RESOLVED");
+        tab.landed(Landing::Unreachable("https://first.invalid/".to_string()));
+        load_finished(&mut tab, "", None);
+
+        // Reloading the same failure keeps its reason: nothing else could
+        // have happened to the same url.
+        tab.landed(Landing::Unreachable("https://first.invalid/".to_string()));
+        assert_eq!(tab.line(), "can't reach first.invalid: name not resolved");
+        load_finished(&mut tab, "", None);
+
+        // A different url failing from a page at rest is not the first one's
+        // reason again: nothing has said why this one failed.
+        tab.landed(Landing::Unreachable("http://127.0.0.1:9/".to_string()));
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:9");
+    }
+
+    #[test]
+    fn a_rename_from_the_browser_leaves_the_failure_alone() {
+        let mut tabs = Tabs::new(Tab::new("a", 0u32, "about:blank"));
+        let tab = tabs.active_mut().expect("a tab");
+        tab.url = "http://127.0.0.1:9".to_string();
+        tab.loading = true;
+        tab.failed_to_reach("http://127.0.0.1:9", "net::ERR_CONNECTION_REFUSED");
+
+        // A millisecond later the browser connection renames the tab, in the
+        // engine's spelling — which is a different url, so the rename is
+        // taken, and a note would have gone with it.
+        let renamed = event(
+            "Target.targetInfoChanged",
+            r#"{"targetInfo":{"targetId":"a","type":"page","title":"127.0.0.1:9/",
+                "url":"http://127.0.0.1:9/"}}"#,
+        );
+        assert!(matches!(tabs.take(&renamed, |_| Ok(0)), Outcome::Renamed));
+        let tab = tabs.active_mut().expect("a tab");
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:9: connection refused");
+
+        tab.landed(Landing::Unreachable("http://127.0.0.1:9/".to_string()));
+        assert_eq!(tab.line(), "can't reach 127.0.0.1:9: connection refused");
+    }
+
+    #[test]
+    fn an_error_status_is_said_beside_the_title_and_not_instead_of_it() {
+        let mut tab: Tab<u32> = Tab::new("a", 0, "about:blank");
+        tab.landed(Landing::Document("http://127.0.0.1:1/404".to_string()));
+        load_finished(&mut tab, "nope", Some(404));
+        assert_eq!(
+            tab.line(),
+            "404 not found  —  nope  —  http://127.0.0.1:1/404"
+        );
+        assert_eq!(tab.label(), "nope", "the strip keeps the page's own name");
+
+        // No title: the status and the url.
+        tab.title.clear();
+        assert_eq!(tab.line(), "404 not found  —  http://127.0.0.1:1/404");
+
+        // A note still stands in for the lot while something is loading.
+        tab.note = Some("loading".to_string());
+        assert_eq!(tab.line(), "loading");
+        tab.note = None;
+
+        // The next page is fine, and says nothing about a status.
+        tab.landed(Landing::Document("http://127.0.0.1:1/".to_string()));
+        load_finished(&mut tab, "fine", None);
+        assert_eq!(tab.problem, None);
+        assert_eq!(tab.line(), "fine  —  http://127.0.0.1:1/");
     }
 }

@@ -117,6 +117,7 @@ pub mod http;
 pub mod input;
 pub mod json;
 pub mod keys;
+pub mod load;
 pub mod motion;
 pub mod profile;
 pub mod screen;

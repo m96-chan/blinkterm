@@ -2394,3 +2394,378 @@ fn a_temporary_profile_leaves_nothing_on_disk() {
     drop(engine);
     assert!(!dir.exists(), "{} is still there", dir.display());
 }
+
+// ---------------------------------------------------------------------------
+// Failed loads
+// ---------------------------------------------------------------------------
+
+use blinkterm::load::{self, Landing, Loaded, Problem};
+
+/// A server with the troubles a page can have, and a port that has none of
+/// anything.
+///
+/// `/404` and `/500` are error statuses with bodies of their own — a body is
+/// what makes the engine show the site's page rather than its own — `/redir`
+/// is a 302 into the closed port, `/link` is a page whose top-left corner is
+/// a link into it, and anything else is a page that is fine. The closed port
+/// is one the kernel handed out and this test gave back, so nothing is on it
+/// and nothing will be while the test runs. The base comes back without a
+/// trailing slash, so that `base + "/404"` is the url.
+fn serve_troubles() -> (String, u16) {
+    use std::io::{Read, Write};
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to close");
+        listener.local_addr().expect("an address").port()
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
+    let address = listener.local_addr().expect("an address");
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = [0u8; 2048];
+            let read = stream.read(&mut head).unwrap_or(0);
+            let request = String::from_utf8_lossy(&head[..read]).to_string();
+            let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+            let dead = format!("http://127.0.0.1:{closed}/");
+            let (status, extra, body) = match path.as_str() {
+                "/404" => (
+                    "404 Not Found",
+                    String::new(),
+                    "<!doctype html><title>nope</title><p>not here".to_string(),
+                ),
+                "/500" => (
+                    "500 Internal Server Error",
+                    String::new(),
+                    "<!doctype html><title>broken</title><p>broken".to_string(),
+                ),
+                "/redir" => ("302 Found", format!("Location: {dead}\r\n"), String::new()),
+                "/link" => (
+                    "200 OK",
+                    String::new(),
+                    format!(
+                        "<!doctype html><title>link</title><body style='margin:0'>\
+                         <a href='{dead}' style='display:block;position:absolute;\
+                         left:0;top:0;width:240px;height:80px;background:#cc3'>dead</a>"
+                    ),
+                ),
+                _ => (
+                    "200 OK",
+                    String::new(),
+                    "<!doctype html><title>fine</title><p>fine".to_string(),
+                ),
+            };
+            let answer = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{extra}\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(answer.as_bytes());
+        }
+    });
+    (format!("http://{address}"), closed)
+}
+
+/// A page connection with `Page.enable` and nothing else, which is all the
+/// program has on a tab either — no `Network`, no `Log` — held in a tab the
+/// way the program holds it.
+fn failing_tab() -> Option<(Engine, Tab<Client>)> {
+    let (engine, mut client) = connect()?;
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    Some((engine, Tab::new("t", client, "about:blank")))
+}
+
+/// Navigate as `app::navigate` does — the problem cleared, the call made, the
+/// reply handed to `app::navigated` — and hand the reply back to be looked at.
+fn navigate_tab(tab: &mut Tab<Client>, url: &str) -> Json {
+    let _ = tab.connection.events();
+    tab.url = url.to_string();
+    tab.note = Some(format!("loading {url}"));
+    tab.loading = true;
+    tab.problem = None;
+    let reply = tab
+        .connection
+        .call_within(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+            Duration::from_secs(20),
+        )
+        .expect("the engine answers the navigation");
+    blinkterm::app::navigated(tab, url, &reply);
+    reply
+}
+
+/// What `app::handle_page_events` does with a tab's events, until a main
+/// frame has landed and the load event after it has fired: the landings seen,
+/// in order.
+fn follow(tab: &mut Tab<Client>, timeout: Duration) -> Vec<Landing> {
+    let deadline = Instant::now() + timeout;
+    let mut landings = Vec::new();
+    let mut loaded = false;
+    // `loaded` is only ever set once something has landed, and a landing
+    // after it sets it back.
+    while !loaded && Instant::now() < deadline {
+        for event in tab.connection.events() {
+            match event.method.as_str() {
+                "Page.frameNavigated" => {
+                    if let Some(landing) = load::landing(&event.params) {
+                        landings.push(landing.clone());
+                        tab.landed(landing);
+                        loaded = false;
+                    }
+                }
+                "Page.loadEventFired" if !landings.is_empty() => {
+                    tab.loading = false;
+                    if let Some(answer) = blinkterm::app::page_loaded(&mut tab.connection) {
+                        tab.loaded(answer);
+                    }
+                    loaded = true;
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        loaded,
+        "no load event after the landing within {timeout:?}: {landings:?}"
+    );
+    landings
+}
+
+/// How many entries the tab's history has.
+fn history_length(client: &mut Client) -> usize {
+    client
+        .call("Page.getNavigationHistory", Json::empty())
+        .expect("the history")
+        .get("entries")
+        .and_then(Json::as_array)
+        .map_or(0, <[Json]>::len)
+}
+
+/// The quickest failure there is, and the one the resolver would otherwise
+/// be asked about: `.invalid` is reserved never to resolve, and the engine
+/// knows it without asking anyone. What matters is that the reason is in the
+/// reply to `Page.navigate`, which is the only place it is, and that the
+/// error page's landing afterwards keeps it.
+#[test]
+fn a_host_that_does_not_exist_is_explained_before_the_resolver_gives_up() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let url = "https://nonexistent.invalid/";
+    let started = Instant::now();
+    let reply = navigate_tab(&mut tab, url);
+    let elapsed = started.elapsed();
+    let code = load::failed(&reply).expect("a reply with an errorText in it");
+    eprintln!("{url}: {code} in {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "{elapsed:?} to say a reserved name does not exist"
+    );
+    assert_eq!(
+        tab.line(),
+        format!("can't reach nonexistent.invalid: {}", load::reason(&code))
+    );
+
+    let landings = follow(&mut tab, Duration::from_secs(5));
+    assert_eq!(landings, [Landing::Unreachable(url.to_string())]);
+    assert_eq!(tab.url, url, "the address, never chrome-error://");
+    // Behind a proxy the engine never asks a resolver and the code is the
+    // proxy's; the sentence still names the host, and the words are checked
+    // exactly only for the code this was measured with.
+    if code == "net::ERR_NAME_NOT_RESOLVED" {
+        assert_eq!(
+            tab.line(),
+            "can't reach nonexistent.invalid: name not resolved"
+        );
+    } else {
+        eprintln!(
+            "not the resolver's answer, so probably a proxy's: {}",
+            tab.line()
+        );
+        assert!(tab.line().starts_with("can't reach nonexistent.invalid: "));
+    }
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// A closed port is refused, and a redirect into one fails where it ended:
+/// the reply's reason is the last hop's, and the landing is at the last hop's
+/// url, which is what the row names. Going to the failed url again — which is
+/// what `ctrl+r` does on an error page — is checked here not to add a history
+/// entry.
+#[test]
+fn a_port_nobody_listens_on_is_refused_and_a_redirect_into_it_names_where_it_ended() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, closed) = serve_troubles();
+    let dead = format!("http://127.0.0.1:{closed}/");
+    let refused = format!("can't reach 127.0.0.1:{closed}: connection refused");
+
+    // Somewhere to have been, so that the history has a before.
+    navigate_tab(&mut tab, &format!("{base}/"));
+    follow(&mut tab, Duration::from_secs(10));
+
+    let reply = navigate_tab(&mut tab, &dead);
+    assert_eq!(
+        load::failed(&reply).as_deref(),
+        Some("net::ERR_CONNECTION_REFUSED")
+    );
+    assert_eq!(
+        follow(&mut tab, Duration::from_secs(5)),
+        [Landing::Unreachable(dead.clone())]
+    );
+    assert_eq!(tab.line(), refused);
+    let before = history_length(&mut tab.connection);
+
+    // `ctrl+r` on the error page: the same url again, through `Page.navigate`.
+    let again = navigate_tab(&mut tab, &dead);
+    assert_eq!(
+        load::failed(&again).as_deref(),
+        Some("net::ERR_CONNECTION_REFUSED")
+    );
+    follow(&mut tab, Duration::from_secs(5));
+    assert_eq!(tab.line(), refused);
+    let after = history_length(&mut tab.connection);
+    eprintln!("history: {before} entries before going again, {after} after");
+    assert_eq!(
+        after, before,
+        "going to the same failed url again is a reload"
+    );
+
+    // Through a redirect.
+    let reply = navigate_tab(&mut tab, &format!("{base}/redir"));
+    assert_eq!(
+        load::failed(&reply).as_deref(),
+        Some("net::ERR_CONNECTION_REFUSED"),
+        "the last hop's reason"
+    );
+    assert_eq!(
+        follow(&mut tab, Duration::from_secs(5)),
+        [Landing::Unreachable(dead.clone())],
+        "and the last hop's url"
+    );
+    assert_eq!(tab.url, dead);
+    assert_eq!(tab.line(), refused);
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// A link is not a `Page.navigate`, so there is no reply and no reason — and
+/// the landing still says the page did not come, which is the half that used
+/// to show `chrome-error://`. A reload of the error page lands again.
+#[test]
+fn a_link_into_a_dead_host_is_a_failure_the_page_reports_by_itself() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, closed) = serve_troubles();
+    let dead = format!("http://127.0.0.1:{closed}/");
+
+    navigate_tab(&mut tab, &format!("{base}/link"));
+    follow(&mut tab, Duration::from_secs(10));
+    assert_eq!(tab.title, "link");
+    assert_eq!(tab.problem, None);
+
+    let clicked = Instant::now();
+    for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+        tab.connection
+            .call(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(20)),
+                    ("y", Json::number(20)),
+                    ("button", Json::string("left")),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(0)),
+                ]),
+            )
+            .expect("the click is dispatched");
+    }
+    let landings = follow(&mut tab, Duration::from_secs(5));
+    eprintln!("the link's failure landed within {:?}", clicked.elapsed());
+    assert_eq!(landings, [Landing::Unreachable(dead.clone())]);
+    assert_eq!(tab.url, dead);
+    assert_eq!(tab.line(), format!("can't reach 127.0.0.1:{closed}"));
+
+    let _ = tab.connection.events();
+    tab.connection
+        .call("Page.reload", Json::empty())
+        .expect("the reload is taken");
+    assert_eq!(
+        follow(&mut tab, Duration::from_secs(5)),
+        [Landing::Unreachable(dead.clone())],
+        "a reload of an error page is a second landing"
+    );
+    assert_eq!(tab.line(), format!("can't reach 127.0.0.1:{closed}"));
+
+    tab.connection.close();
+    engine.kill();
+}
+
+/// The status comes out of the same evaluation as the title, from the
+/// navigation timing entry, with no `Network` domain enabled.
+#[test]
+fn the_status_of_the_document_comes_with_its_title() {
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    let (base, closed) = serve_troubles();
+
+    let reply = navigate_tab(&mut tab, &format!("{base}/404"));
+    assert_eq!(
+        load::failed(&reply),
+        None,
+        "a 404 is not a failure to the engine"
+    );
+    follow(&mut tab, Duration::from_secs(10));
+    assert_eq!(
+        blinkterm::app::page_loaded(&mut tab.connection),
+        Some(Loaded {
+            title: "nope".to_string(),
+            status: Some(404)
+        })
+    );
+    assert_eq!(tab.problem, Some(Problem::Status(404)));
+    assert_eq!(tab.line(), format!("404 not found  —  nope  —  {base}/404"));
+
+    navigate_tab(&mut tab, &format!("{base}/500"));
+    follow(&mut tab, Duration::from_secs(10));
+    assert_eq!(
+        blinkterm::app::page_loaded(&mut tab.connection).and_then(|loaded| loaded.status),
+        Some(500)
+    );
+    assert_eq!(tab.problem, Some(Problem::Status(500)));
+
+    navigate_tab(&mut tab, &format!("{base}/"));
+    follow(&mut tab, Duration::from_secs(10));
+    assert_eq!(
+        blinkterm::app::page_loaded(&mut tab.connection),
+        Some(Loaded {
+            title: "fine".to_string(),
+            status: None
+        })
+    );
+    assert_eq!(tab.problem, None);
+
+    navigate_tab(&mut tab, &format!("http://127.0.0.1:{closed}/"));
+    follow(&mut tab, Duration::from_secs(5));
+    assert_eq!(
+        blinkterm::app::page_loaded(&mut tab.connection),
+        Some(Loaded {
+            title: String::new(),
+            status: None
+        }),
+        "an error page has no title and no status"
+    );
+
+    tab.connection.close();
+    engine.kill();
+}
