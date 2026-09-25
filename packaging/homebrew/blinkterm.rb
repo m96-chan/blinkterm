@@ -12,12 +12,15 @@ class Blinkterm < Formula
   # keeps installing main.
   head "https://github.com/m96-chan/blinkterm.git", branch: "main"
 
+  # Build dependencies before platform requirements: that is the order
+  # `brew audit --strict` checks components in, and it refuses the other.
+  depends_on "rust" => :build
+
   # It compiles for macOS (`cargo check --target x86_64-apple-darwin` is
   # clean) but has never run there, and a formula that installs is a promise
   # that it works. This line comes out when #21 has run the engine tests on a
   # Mac; a macOS line in the caveats below goes in at the same time.
   depends_on :linux
-  depends_on "rust" => :build
 
   def install
     # std_cargo_args is `--jobs N --locked --root=#{prefix} --path=.`.
