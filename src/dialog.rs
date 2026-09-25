@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn the_opening_event_says_which_kind_it_is_and_what_it_asked() {
-        // As `chromium-shell` sends it.
+        // As `headless_shell` sends it.
         let dialog = opening(
             r#"{"url":"https://example.com/form","frameId":"F","message":"Your name?",
                 "type":"prompt","hasBrowserHandler":false,"defaultPrompt":"someone"}"#,

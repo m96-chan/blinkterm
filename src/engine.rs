@@ -82,13 +82,24 @@ use crate::profile::Profile;
 
 /// The engines that are looked for, in the order they are looked for.
 ///
-/// `chromium-shell` first: it is Debian's `headless_shell`, the one this was
-/// measured against, and the one with no window system code in it at all.
-pub const CANDIDATES: [&str; 4] = [
-    "chromium-shell",
+/// `chrome-headless-shell` first: Chrome for Testing's `headless_shell`, the
+/// one the engine tests run against, and the one with no window system code
+/// in it at all.
+///
+/// `chromium-shell` last. It was first, on the belief that it was Debian's
+/// `headless_shell`, and it is not: it is Chromium's `content_shell`, and it
+/// differs where this program cares most. It opens its DevTools port whether
+/// or not it is asked to, so the pipe stops being the only way in; it answers
+/// a page's `alert`, `confirm` and `prompt` itself, before the person can; and
+/// it does not exit on `Browser.close`, so a kept profile is never flushed.
+/// Measured against a `content_shell` build and against Debian's 153 in CI.
+/// It still renders a page, so it stays on the list, behind anything better.
+pub const CANDIDATES: [&str; 5] = [
+    "chrome-headless-shell",
     "chromium",
     "chromium-browser",
     "google-chrome",
+    "chromium-shell",
 ];
 
 /// The environment variable that overrides the search.

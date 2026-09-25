@@ -478,7 +478,7 @@ fn drive(
 ///
 /// A page with a dialog open answers nothing that has to reach its renderer,
 /// and that is more than `Runtime.evaluate` and the still. Measured against
-/// `chromium-shell` with an `alert()` up, `Page.enable`,
+/// `headless_shell` 141 with an `alert()` up, `Page.enable`,
 /// `Emulation.setDeviceMetricsOverride`, `Page.startScreencast` and
 /// `Page.stopScreencast` all went three seconds without a word — which is
 /// every command a switch to or from that tab sends, and every one a resize
@@ -669,7 +669,7 @@ fn collect_navigation(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
         // host, a refused connection. [`navigated`] reads it. One that is not
         // a failure to report is `net::ERR_ABORTED` after a "leave this
         // page?" was answered no — the page stayed, the note was already
-        // cleared by `stayed`, and measured against `chromium-shell` that is
+        // cleared by `stayed`, and measured against `headless_shell` 141 that is
         // exactly what this reply carries then; `load::failed` passes over it.
         Ok(reply) => navigated(tab, &url, &reply),
     }

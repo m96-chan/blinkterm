@@ -64,24 +64,28 @@ cargo install --git https://github.com/m96-chan/blinkterm
 ```
 
 Then a browser engine, which `blinkterm` does not ship — a Chromium is 482 MB
-installed, twice a tOS ISO, and a choice about which browser somebody runs. On
-Debian or Ubuntu:
+installed, twice a tOS ISO, and a choice about which browser somebody runs.
+The one it is tested against is `chrome-headless-shell` from
+[Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/):
+the same Chromium with no desktop browser UI compiled in. On x86-64 Linux:
 
 ```sh
-apt-get install -y --no-install-recommends chromium-shell fonts-noto-cjk
+curl -fsSLO https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.52/linux64/chrome-headless-shell-linux64.zip
+unzip chrome-headless-shell-linux64.zip -d /opt
+BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell blinkterm
 ```
 
-`chromium-shell` is Debian's `headless_shell`: the same Chromium with no
-desktop browser UI compiled in, 76 packages against 112. The CJK fonts are not
-optional if you read any; without them every Japanese glyph is a box.
+It wants the usual Chromium libraries (its `deb.deps` lists them) and, if you
+read any CJK, `fonts-noto-cjk`: without it every Japanese glyph is a box.
 
-Anything Chromium-shaped will do. `blinkterm` looks at `$BLINKTERM_ENGINE`
-first, then on `PATH` for `chromium-shell`, `chromium`, `chromium-browser` and
-`google-chrome`, in that order.
-
-```sh
-BLINKTERM_ENGINE=/opt/chrome/chrome-headless-shell blinkterm
-```
+Anything Chromium-shaped will do, with one caution. `blinkterm` looks at
+`$BLINKTERM_ENGINE` first, then on `PATH` for `chrome-headless-shell`,
+`chromium`, `chromium-browser`, `google-chrome` and `chromium-shell`, in that
+order. Debian's `chromium-shell` is last because it is Chromium's
+`content_shell`, not a headless shell: it keeps a DevTools port open beside
+the pipe whatever it is told, answers a page's dialogs itself, and does not
+close when asked, so a kept profile is not flushed. It renders pages; it does
+not keep the promises below.
 
 ## Profiles
 
@@ -151,7 +155,8 @@ when they skip — naming the engine is the consent, because a machine with a
 Chromium on it did not thereby agree to have it started.
 
 ```sh
-BLINKTERM_ENGINE=chromium-shell cargo test --release -- --test-threads=1
+BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
+  cargo test --release -- --test-threads=1
 ```
 
 `--release` because several of them assert on timings, and one at a time

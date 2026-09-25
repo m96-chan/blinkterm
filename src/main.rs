@@ -22,8 +22,8 @@ options:
 
 The page is rendered by a headless Chromium, which this program starts and
 stops. It is looked for in $BLINKTERM_ENGINE first, then on PATH as
-chromium-shell, chromium, chromium-browser or google-chrome. blinkterm does
-not ship one; install the one you want.
+chrome-headless-shell, chromium, chromium-browser, google-chrome or
+chromium-shell. blinkterm does not ship one; install the one you want.
 
 A profile is made readable by you alone (0700), and one blinkterm uses it at a
 time: a second one started on the same profile is refused, and told which pid

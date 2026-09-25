@@ -96,8 +96,9 @@
 //! Debian packages, one upstream binary, and everything else is the person's
 //! (`docs/design/applications.md`), and that is this program's rule too: it is
 //! one small binary, and the engine it drives is installed by the person who
-//! wants one — `$BLINKTERM_ENGINE`, or whichever of `chromium-shell`,
-//! `chromium`, `chromium-browser` or `google-chrome` is on the path.
+//! wants one — `$BLINKTERM_ENGINE`, or whichever of `chrome-headless-shell`,
+//! `chromium`, `chromium-browser`, `google-chrome` or `chromium-shell` is on
+//! the path. See [`engine::CANDIDATES`] for why in that order.
 //!
 //! **No dependencies to speak of.** The pipe's framing and its session
 //! router, the JSON and the base64 are all in this crate, each in its own
