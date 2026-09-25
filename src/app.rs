@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::{Cells, Metrics};
 
-use crate::appearance::{self, Appearance};
+use crate::appearance::Appearance;
 use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::clipboard;
 use crate::dialog::{Answer, Dialog, Kind};
@@ -50,15 +50,17 @@ use crate::keys;
 use crate::line::{Edit, Line};
 use crate::load::{self, Loaded, Problem};
 use crate::motion::{self, Motion};
-use crate::profile::{Choice, Profile};
+use crate::options::Options;
+use crate::profile::Profile;
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::tabs::{Outcome, Tab, Tabs};
 use crate::upload::{self, Upload};
 use crate::zoom::{self, Scale, Viewport, Zoom, Zooms};
 
-/// How long the engine gets to answer on its pipe.
-const ENGINE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the engine gets to answer on its pipe; `--doctor` gives it the
+/// same.
+pub const ENGINE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long it then gets to offer a page to drive.
 const TARGET_TIMEOUT: Duration = Duration::from_secs(15);
@@ -214,27 +216,6 @@ fn install_signals() {
         // it is `EPIPE`, which `cdp` turns into a sentence.
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
-}
-
-/// What the person asked for on the command line.
-pub struct Options {
-    pub url: String,
-    /// Where cookies, logins and site data are kept; see [`crate::profile`].
-    pub profile: Choice,
-    /// Where a file a page offers is saved; see [`crate::download`].
-    pub download: download::Choice,
-    /// `--search-url`: where words typed into the url bar are sent, with `%s`
-    /// where they go; or none, in which case what is typed is always a url.
-    /// See [`destination`].
-    pub search_url: Option<String>,
-    /// `--scale`: terminal pixels per CSS pixel before any zoom, or `Auto`
-    /// to guess it from the cell. See [`crate::zoom::Scale`].
-    pub scale: Scale,
-    /// `--color-scheme`: what a page is told it prefers, or `Auto` for what
-    /// the terminal's background says. See [`crate::appearance`].
-    pub scheme: appearance::Choice,
-    /// `--force-dark`: every page painted dark, dark style or none.
-    pub force_dark: bool,
 }
 
 /// Everything the loop owns that is not the terminal, the tabs or the engine.
@@ -455,7 +436,7 @@ pub fn run(options: Options) -> Result<(), String> {
     // Taken before the engine is started, so that a profile another blinkterm
     // is using is refused before anything has written to it.
     let profile = Profile::take(options.profile.clone())?;
-    let mut engine = Engine::launch(profile, ENGINE_TIMEOUT)?;
+    let mut engine = Engine::launch_with(profile, ENGINE_TIMEOUT, &options.engine)?;
     // The browser's own client, rather than a page's. It is the only one that
     // can hear about a target this program did not open — a `target=_blank`,
     // a `window.open` — and the only one that can open, close, raise or
@@ -595,7 +576,7 @@ fn drive(
 ) -> Result<(), String> {
     activate(tabs, browser, chrome)?;
 
-    let url = normalise(&options.url);
+    let url = normalise(options.urls.first().unwrap_or(&options.home));
     if let Some(tab) = tabs.active_mut() {
         tab.url = url.clone();
         tab.note = Some(format!("loading {url}"));
@@ -609,6 +590,8 @@ fn drive(
     }
     // Whether or not it was an error on the wire: a reply that says the page
     // did not come has replaced the loading note with why.
+    redraw_row(pane, tabs, chrome)?;
+    open_the_rest(tabs, browser, chrome, &options.urls);
     redraw_row(pane, tabs, chrome)?;
 
     let mut last_check = Instant::now();
@@ -1197,6 +1180,31 @@ fn switched(
         }
     }
     Ok(())
+}
+
+/// Every url on the command line after the first, one tab each, behind the
+/// first.
+///
+/// After the first has been told to load, so that the page the person will
+/// look at first is the one that started first. Each is `Target.createTarget`
+/// with its url, which the engine loads in the background, and the first tab
+/// is put back in front at the end without being switched away from: it was
+/// activated once, before this, and the others are tabs behind it as a link
+/// opened in the background would be. Measured against
+/// `chrome-headless-shell` 153, the first stays a visible page while the
+/// others are made, so it needs no raising again. One that cannot be opened is a note on
+/// the first tab, and the rest still open: one bad url is no reason to open
+/// none.
+fn open_the_rest(tabs: &mut Tabs<Client>, browser: &mut Client, chrome: &Chrome, urls: &[String]) {
+    for url in urls.iter().skip(1) {
+        let url = normalise(url);
+        if let Err(why) = open_tab(tabs, browser, &chrome.appearance, &url) {
+            if let Some(first) = tabs.get_mut(0) {
+                first.note = Some(format!("couldn't open {url}: {why}"));
+            }
+        }
+    }
+    tabs.select(1);
 }
 
 /// Open a page in a new tab and switch to it.
