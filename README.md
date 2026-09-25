@@ -519,9 +519,15 @@ A page whose renderer crashes stays in its tab: the picture goes, and the row
 says `this page crashed; ctrl+r reloads it` — a tab behind that crashed says
 the same in the strip. `ctrl+r` brings it back, painting, at the size it was;
 `ctrl+w` closes it; keys and the mouse do nothing to it until then. When the
-engine itself dies `blinkterm` exits, and the message says how many tabs were
-saved and that `blinkterm --restore` reopens them; the next plain start
-offers to.
+engine itself dies it is started again in place, on the same profile: the
+row says `the engine died; starting it again…`, and a moment later the same
+tabs are back in the same order with the same one in front, loading again,
+the others loading when they are next looked at. What was being typed in the
+url bar stays; a download that was coming says it did not arrive, and scroll
+positions, form contents and a login made in the last half minute are lost,
+as with `--restore`. If it dies again within a minute, or cannot be started,
+`blinkterm` exits, and the message says how many tabs were saved and that
+`blinkterm --restore` reopens them; the next plain start offers to.
 
 To know what is under the pointer the terminal is asked to report every
 mouse movement, not only presses (`?1003h`), so the page now sees the

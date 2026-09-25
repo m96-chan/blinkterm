@@ -33,10 +33,13 @@
 //! | `Browser.close`, then `SIGKILL` at once               | lost       |
 //! | `Browser.close`, then waited for (exit 0, gone 1.9 s) | **kept**   |
 //! | `SIGKILL` 35 seconds after the cookie was set         | kept       |
+//! | `SIGKILL` 35 s after, second engine at once (153)     | kept       |
 //!
-//! The last row is Chromium's periodic flush, about every thirty seconds, and
-//! is why a run that is killed outright loses the last half a minute rather
-//! than everything. Full Chromium is the same: `Browser.close` keeps the
+//! The last two rows are Chromium's periodic flush, about every thirty
+//! seconds, and are why a run that is killed outright loses the last half a
+//! minute rather than everything — and why an engine started again in place
+//! after a death ([`crate::engine::Engine::retire`]) finds what the dead one
+//! had flushed and no more. Full Chromium is the same: `Browser.close` keeps the
 //! cookie and is gone in 1.8 s, and `SIGTERM` loses it — while exiting 0, and
 //! leaving a `SingletonLock` behind that names a process that no longer
 //! exists. So "asked to stop" means one thing here, `Browser.close` over the

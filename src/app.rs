@@ -12,7 +12,10 @@
 //! keys this program keeps for itself and which the compositor took first,
 //! what a wheel notch is worth, what a click on the status row means, what
 //! happens to the frames that arrive faster than a pane can draw them, and
-//! what is on the screen in the moment between two tabs.
+//! what is on the screen in the moment between two tabs. And what happens
+//! when the engine itself dies under the loop: it is started again in place,
+//! on the same profile, and the tabs come back — see [`run`] and
+//! `relaunch`.
 //!
 //! The one that is not here is which format a frame comes in and which of two
 //! frames wins when they arrive out of order: that is [`crate::motion`],
@@ -217,6 +220,113 @@ extern "C" fn on_winch(_signal: libc::c_int) {
 /// what an engine killed from outside says first.
 const ENGINE_GRACE: Duration = Duration::from_millis(50);
 
+/// How long an error out of the loop is given to turn out to be the engine
+/// going, before it is taken as an error of its own.
+///
+/// A command written to a pipe the engine has closed fails at once, and the
+/// two things that say the engine is gone — the wrapper reaped, the reader at
+/// end of file — come a little after: 1 to 25 ms after a `SIGKILL`, measured
+/// on this machine, and slower on a loaded CI runner. Only an error waits
+/// this long, and an error that is not the engine's ends the program anyway,
+/// so a second is room rather than a cost.
+const DEATH_GRACE: Duration = Duration::from_secs(1);
+
+/// How long after the engine is started again a second death ends the
+/// program instead: see [`Relaunches`].
+const RELAUNCH_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// When the engine was last started again, for the rule that stops a page
+/// which kills the engine on load from being reloaded forever.
+///
+/// Two deaths in a minute end the program, and that is the whole rule. The
+/// first is a fluke or a page's bug, and the tabs come back; the relaunch
+/// puts the same page in front and wakes it, so a page that kills the engine
+/// kills it again within a second or two, and the second death is that page
+/// saying so. An engine that dies every few minutes is started again every
+/// time. The minute runs from the relaunch, not the death, so a death during
+/// the restore itself counts. Counting N deaths in M minutes was left out:
+/// one a minute is the rule a person can predict, and a page that kills the
+/// engine is found out on the second death either way.
+#[derive(Debug, Default)]
+struct Relaunches {
+    last: Option<Instant>,
+}
+
+impl Relaunches {
+    /// Whether a death now is one to start the engine again for: yes unless
+    /// it was started again less than [`RELAUNCH_COOLDOWN`] ago.
+    fn allows(&self, now: Instant) -> bool {
+        self.last
+            .is_none_or(|last| now.saturating_duration_since(last) >= RELAUNCH_COOLDOWN)
+    }
+
+    /// The engine was started again now.
+    fn relaunched(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+}
+
+/// How recently the tab list must have shrunk for the tabs it had before to
+/// be the ones a relaunch brings back: see [`Shrunk`].
+const SHRUNK_WITHIN: Duration = Duration::from_secs(3);
+
+/// The tabs as they were before the list last shrank, for an engine stopped
+/// with `SIGTERM`.
+///
+/// A relaunch takes its tabs from the live list, which is exact when the
+/// engine is killed outright: the pipe closes with every tab still in it. A
+/// `SIGTERM` is different. The engine destroys every page, 5 ms before it
+/// closes the pipe (measured against chrome-headless-shell 153), and the
+/// `Target.targetDestroyed` for each is read and taken off the list over a
+/// pass or two before the death is known — so the live list is short, or
+/// empty, by then. The session is no help: it records once a pass, so it
+/// saw the list shrinking too. So the loop keeps, beside the list, the list
+/// as it was just before the first time it shrank in [`SHRUNK_WITHIN`]; a
+/// relaunch within that time of a shrink takes that one when it has more
+/// tabs. A tab the person closed in the seconds before the engine died comes
+/// back with the rest, which is the cheaper mistake.
+#[derive(Debug, Default)]
+struct Shrunk {
+    /// What the list was on the last pass, and how many tabs it had: the
+    /// count and not the snapshot's length, because a tab going to
+    /// `about:blank` leaves the snapshot and is not a tab lost.
+    last: Snapshot,
+    count: usize,
+    /// What it was before it shrank, and when it did.
+    before: Option<(Snapshot, Instant)>,
+}
+
+impl Shrunk {
+    /// The list as it is on this pass.
+    fn pass<C>(&mut self, tabs: &Tabs<C>, now: Instant) {
+        let snapshot = Snapshot::of(tabs);
+        let fresh = self
+            .before
+            .as_ref()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) < SHRUNK_WITHIN);
+        if tabs.len() < self.count && !fresh {
+            self.before = Some((std::mem::replace(&mut self.last, snapshot), now));
+        } else {
+            self.last = snapshot;
+        }
+        self.count = tabs.len();
+    }
+
+    /// The tabs to bring back, given the live list's: the list before a
+    /// recent shrink, when it had more.
+    fn for_relaunch(&self, live: Snapshot, now: Instant) -> Snapshot {
+        match &self.before {
+            Some((before, at))
+                if now.saturating_duration_since(*at) < SHRUNK_WITHIN
+                    && before.tabs.len() > live.tabs.len() =>
+            {
+                before.clone()
+            }
+            _ => live,
+        }
+    }
+}
+
 /// Ask to be told about the three signals that matter, without `SA_RESTART`:
 /// a `poll` that is interrupted is a `poll` that comes back and looks at the
 /// flags, which is the whole point of setting them.
@@ -347,6 +457,108 @@ struct Chrome {
 }
 
 impl Chrome {
+    /// Everything as a run starts it: nothing typed, nothing out with the
+    /// engine, and what is kept in the profile read from `profile` — or kept
+    /// only in memory, for a temporary one.
+    fn new(
+        metrics: Metrics,
+        options: &Options,
+        profile: &Profile,
+        downloads_dir: PathBuf,
+        appearance: Appearance,
+    ) -> Chrome {
+        Chrome {
+            painter: Painter::new(),
+            parser: Parser::new(),
+            clicks: Clicks::default(),
+            buttons: 0,
+            metrics,
+            motion: Motion::new(Instant::now()),
+            still: None,
+            wheel: scroll::Wheel::start(),
+            bar: None,
+            find: None,
+            last_needle: String::new(),
+            history: if profile.is_temporary() {
+                History::in_memory()
+            } else {
+                History::load(profile.dir())
+            },
+            search_url: options.search_url.clone(),
+            navigation: None,
+            downloads: Downloads::new(downloads_dir),
+            upload_dir: None,
+            hover: hover::Tracker::default(),
+            asking: None,
+            shape: Shape::Default,
+            hint: None,
+            scale_choice: options.scale,
+            scale: options.scale.resolve(metrics.cell),
+            zooms: if profile.is_temporary() {
+                Zooms::in_memory()
+            } else {
+                Zooms::load(profile.dir())
+            },
+            appearance,
+            cell_hint: None,
+            list: None,
+            list_first: Cell::new(0),
+            strip_first: Cell::new(0),
+            mode: normal::Mode::starting(options.normal_mode),
+            bindings: options.bindings.clone(),
+            hinting: None,
+            focus: None,
+            // The same file under every profile, a temporary one
+            // included: a bookmark is the person's, not the engine's.
+            bookmarks: match Profile::data_dir() {
+                Ok(dir) => Bookmarks::load(&dir),
+                Err(_) => Bookmarks::in_memory(),
+            },
+            session: if profile.is_temporary() {
+                Session::in_memory()
+            } else {
+                Session::load(profile.dir())
+            },
+            offer: None,
+        }
+    }
+
+    /// The engine is gone: forget everything that was about its pages.
+    ///
+    /// What goes is whatever holds a [`Pending`] on the dead pipe, a target
+    /// id, a world, or a picture of a page that no longer exists: the still,
+    /// the navigation, the hover's ask and what it was over, the find prompt
+    /// (its needle kept for the next `ctrl+f`), the labels, the focus
+    /// question, the tab list (its indexes are about to mean other tabs), the
+    /// strip's window, the loading hint, the motion clock, the wheel's hold
+    /// on the dead connection, and every download still coming.
+    ///
+    /// What stays is the person's, the terminal's or the profile's: the url
+    /// being typed (it names no target, and Enter navigates whichever tab is
+    /// in front), a mouse button held through the death, half a sequence
+    /// read from the terminal, the mode, the key bindings, the offer after an
+    /// unclean exit, the scale, the history, the zooms, the bookmarks and the
+    /// session.
+    /// What was on the tabs — a dialog, a file input's half-typed path — goes
+    /// with them. Nothing is sent: this is this program's memory only, and
+    /// the pointer's shape is the caller's to give back to the terminal.
+    fn engine_gone(&mut self, now: Instant) {
+        self.still = None;
+        self.navigation = None;
+        self.asking = None;
+        self.hover.left();
+        forget_find(self);
+        self.hinting = None;
+        self.focus = None;
+        self.list = None;
+        self.list_first.set(0);
+        self.strip_first.set(0);
+        self.hint = None;
+        self.motion.reset(now);
+        self.wheel.forget();
+        self.downloads.engine_died(now);
+    }
+
     /// Where a file input's prompt starts, read now: see
     /// [`upload::start_dir`].
     fn upload_base(&self) -> PathBuf {
@@ -508,7 +720,86 @@ struct Ask {
     sent: Instant,
 }
 
+/// The engine and the two kinds of client on it, as [`run`] starts them and
+/// a relaunch starts them again.
+pub struct Booted {
+    pub engine: Engine,
+    /// The browser's own client, rather than a page's. It is the only one
+    /// that can hear about a target this program did not open — a
+    /// `target=_blank`, a `window.open` — and the only one that can open,
+    /// close, raise or attach to one, which is how every page's client is
+    /// made.
+    pub browser: Client,
+    /// The one tab the engine starts with, connected as every tab is.
+    pub tabs: Tabs<Client>,
+}
+
+/// Start the engine on `profile` and set it up to its first tab: the
+/// browser's client with target discovery on, the download directory told,
+/// the first page found and connected as every tab is.
+///
+/// Called once by [`run`] and again by `relaunch` for each engine that
+/// dies, with the same [`engine::Launch`](crate::engine::Launch) — path,
+/// `--engine-arg`s, user agent, proxy — on the same profile. An `Err` drops
+/// the engine, and the profile with it. Public so that the engine tests boot
+/// the way the program does.
+pub fn boot(
+    profile: Profile,
+    launch: &crate::engine::Launch,
+    downloads_dir: &Path,
+    appearance: &Appearance,
+) -> Result<Booted, String> {
+    let engine = Engine::launch_with(profile, ENGINE_TIMEOUT, launch)?;
+    let mut browser = engine.browser()?;
+    browser.call(
+        "Target.setDiscoverTargets",
+        Json::object(vec![("discover", Json::Bool(true))]),
+    )?;
+    // Before any page can be asked for anything, because a download that
+    // begins before the engine is told where is one it refuses without a
+    // word.
+    download::enable(&mut browser, downloads_dir)?;
+    let first = crate::engine::first_page_target(&mut browser, TARGET_TIMEOUT).map_err(|why| {
+        let tail = engine.tail();
+        if tail.is_empty() {
+            why
+        } else {
+            format!("{why}; the engine said: {}", tail.join(" / "))
+        }
+    })?;
+    // Set up as every other tab is: so that the page most uploads happen in
+    // is one whose file inputs are asked on the row, so that nothing a
+    // session is told when it is made can be forgotten on this one, and so
+    // that the first page is not a tab with less known about it than the
+    // rest — its main frame's id above all, which is what its loading is
+    // told apart from an iframe's by. See [`connect_tab`].
+    let (client, frame) = connect_tab(&mut browser, &first, appearance)?;
+    let mut first = Tab::new(first, client, "about:blank");
+    first.frame = frame;
+    Ok(Booted {
+        engine,
+        browser,
+        tabs: Tabs::new(first),
+    })
+}
+
+/// How [`drive`] ended, when it did not fail.
+enum Driven {
+    /// The person quit, the last tab closed, or the terminal went.
+    Quit,
+    /// The engine is gone, with the reason [`Engine::check`] or the browser's
+    /// connection gave. What to do about it is [`run`]'s.
+    EngineDied(String),
+}
+
 /// Run until the person quits or something goes wrong.
+///
+/// The engine is started, the terminal taken, and then `drive` runs until
+/// it ends. When it ends because the engine died, the engine is started
+/// again in place on the same profile and the tabs come back (`relaunch`),
+/// and `drive` carries on with the new one; only a second death within
+/// a minute, or an engine that will not start again, ends the
+/// program — with the sentence that says the tabs are saved.
 pub fn run(options: Options) -> Result<(), String> {
     // SAFETY: `isatty(3)` takes a descriptor, reads no memory, and only
     // reports. 1 is stdout, which this program has by definition.
@@ -528,148 +819,138 @@ pub fn run(options: Options) -> Result<(), String> {
     // Taken before the engine is started, so that a profile another blinkterm
     // is using is refused before anything has written to it.
     let profile = Profile::take(options.profile.clone())?;
-    let mut engine = Engine::launch_with(profile, ENGINE_TIMEOUT, &options.engine)?;
-    // The browser's own client, rather than a page's. It is the only one that
-    // can hear about a target this program did not open — a `target=_blank`,
-    // a `window.open` — and the only one that can open, close, raise or
-    // attach to one, which is how every page's client is made.
-    let mut browser = engine.browser()?;
-    browser.call(
-        "Target.setDiscoverTargets",
-        Json::object(vec![("discover", Json::Bool(true))]),
-    )?;
-    // Before any page can be asked for anything, because a download that
-    // begins before the engine is told where is one it refuses without a
-    // word; and before the pane is taken, so that a directory which is a
-    // file is a sentence in the shell.
-    let downloads_dir = download::prepare(options.download.clone())?;
-    download::enable(&mut browser, &downloads_dir)?;
-    let first = crate::engine::first_page_target(&mut browser, TARGET_TIMEOUT).map_err(|why| {
-        let tail = engine.tail();
-        if tail.is_empty() {
-            why
-        } else {
-            format!("{why}; the engine said: {}", tail.join(" / "))
-        }
-    })?;
     // What pages are told about light and dark, before there is a page to
     // tell: the flags now, the terminal's answer when it comes.
     let appearance = Appearance::new(options.scheme, options.force_dark);
-    // Set up as every other tab is: so that the page most uploads happen in
-    // is one whose file inputs are asked on the row, so that nothing a
-    // session is told when it is made can be forgotten on this one, and so
-    // that the first page is not a tab with less known about it than the
-    // rest — its main frame's id above all, which is what its loading is
-    // told apart from an iframe's by. See [`connect_tab`].
-    let (client, frame) = connect_tab(&mut browser, &first, &appearance)?;
-    let mut first = Tab::new(first, client, "about:blank");
-    first.frame = frame;
-    let mut tabs = Tabs::new(first);
+    // Once for the run, and before the pane is taken, so that a directory
+    // which is a file is a sentence in the shell. Every engine is told it.
+    let downloads_dir = download::prepare(options.download.clone())?;
+    let first = boot(profile, &options.engine, &downloads_dir, &appearance)?;
 
     let mut pane = Pane::enter(0, 1).map_err(|e| format!("cannot take the terminal: {e}"))?;
+    // `None` once a relaunch has failed: the old engine was stopped and the
+    // profile went with the new one that did not start, so there is nothing
+    // left at the end to ask to close.
+    let mut booted: Option<Booted>;
     // Built here rather than in `drive`, so that what it knows about the
     // downloads is still here when `drive` is over and the engine is being
-    // stopped. The rest of it goes at the end of this block, before the pane
-    // is given back, as it always did.
+    // stopped — and so that it outlives an engine that dies. The rest of it
+    // goes at the end of this block, before the pane is given back, as it
+    // always did.
     let (outcome, downloads) = match pane.metrics(None) {
         Ok(metrics) => {
-            let mut chrome = Chrome {
-                painter: Painter::new(),
-                parser: Parser::new(),
-                clicks: Clicks::default(),
-                buttons: 0,
+            let mut chrome = Chrome::new(
                 metrics,
-                motion: Motion::new(Instant::now()),
-                still: None,
-                wheel: scroll::Wheel::start(),
-                bar: None,
-                find: None,
-                last_needle: String::new(),
-                history: if engine.profile().is_temporary() {
-                    History::in_memory()
-                } else {
-                    History::load(engine.profile().dir())
-                },
-                search_url: options.search_url.clone(),
-                navigation: None,
-                downloads: Downloads::new(downloads_dir),
-                upload_dir: None,
-                hover: hover::Tracker::default(),
-                asking: None,
-                shape: Shape::Default,
-                hint: None,
-                scale_choice: options.scale,
-                scale: options.scale.resolve(metrics.cell),
-                zooms: if engine.profile().is_temporary() {
-                    Zooms::in_memory()
-                } else {
-                    Zooms::load(engine.profile().dir())
-                },
+                &options,
+                first.engine.profile(),
+                downloads_dir.clone(),
                 appearance,
-                cell_hint: None,
-                list: None,
-                list_first: Cell::new(0),
-                strip_first: Cell::new(0),
-                mode: normal::Mode::starting(options.normal_mode),
-                bindings: options.bindings.clone(),
-                hinting: None,
-                focus: None,
-                // The same file under every profile, a temporary one
-                // included: a bookmark is the person's, not the engine's.
-                bookmarks: match Profile::data_dir() {
-                    Ok(dir) => Bookmarks::load(&dir),
-                    Err(_) => Bookmarks::in_memory(),
-                },
-                session: if engine.profile().is_temporary() {
-                    Session::in_memory()
-                } else {
-                    Session::load(engine.profile().dir())
-                },
-                offer: None,
-            };
-            let outcome = drive(
-                &mut pane,
-                &mut tabs,
-                &mut browser,
-                &mut engine,
-                &mut chrome,
-                options,
             );
+            booted = Some(first);
+            let mut relaunches = Relaunches::default();
+            let mut shrunk = Shrunk::default();
+            let mut opening = true;
+            let outcome = loop {
+                let Some(live) = booted.as_mut() else {
+                    break Ok(());
+                };
+                let Booted {
+                    engine,
+                    browser,
+                    tabs,
+                } = live;
+                // What the last run left and what the command line asked
+                // for are opened once, on the first engine; a relaunch opens
+                // the tabs that were there when it died.
+                let opened = if std::mem::take(&mut opening) {
+                    open_first(&mut pane, tabs, browser, &mut chrome, &options)
+                } else {
+                    Ok(())
+                };
+                let driven = opened
+                    .and_then(|()| {
+                        drive(&mut pane, tabs, browser, engine, &mut chrome, &mut shrunk)
+                    })
+                    .or_else(|why| ended_by_engine(why, engine, browser));
+                match driven {
+                    Ok(Driven::Quit) => break Ok(()),
+                    Err(why) => break Err(why),
+                    Ok(Driven::EngineDied(why)) => {
+                        // Two deaths in a minute end the program: see
+                        // [`Relaunches`].
+                        if !relaunches.allows(Instant::now()) {
+                            break Err(died(gave_up(why), &chrome.session));
+                        }
+                        let Some(dead) = booted.take() else {
+                            break Err(why);
+                        };
+                        let snapshot =
+                            shrunk.for_relaunch(Snapshot::of(&dead.tabs), Instant::now());
+                        match relaunch(
+                            &mut pane,
+                            dead,
+                            &mut chrome,
+                            &options,
+                            &downloads_dir,
+                            why,
+                            snapshot,
+                        ) {
+                            Ok(again) => {
+                                booted = Some(again);
+                                relaunches.relaunched(Instant::now());
+                                shrunk = Shrunk::default();
+                            }
+                            Err(sentence) => break Err(sentence),
+                        }
+                    }
+                }
+            };
             // A quit says the session is closed; anything else leaves it
             // open, with what was still waiting to be written, so that the
             // next start offers it back. See [`crate::session`].
             chrome.session.finish(outcome.is_ok());
             (outcome, Some(chrome.downloads))
         }
-        Err(e) => (Err(format!("cannot measure the pane: {e}")), None),
+        Err(e) => {
+            booted = Some(first);
+            (Err(format!("cannot measure the pane: {e}")), None)
+        }
     };
     pane.leave();
-    // Dropping the tabs closes every page's session, which is all a tab is
-    // once the engine is about to be killed anyway.
-    drop(tabs);
     let mut downloads = downloads;
-    if let Some(downloads) = downloads.as_mut() {
-        // Whatever is still coming is cancelled, whichever way the engine is
-        // about to stop: `Browser.close` would cancel it too, but the
-        // temporary profile's way out is a kill, and a kill leaves the
-        // engine's partial file behind. Cancelled, the engine removes it.
-        downloads.cancel_all(&mut browser);
+    if let Some(Booted {
+        mut engine,
+        mut browser,
+        tabs,
+    }) = booted
+    {
+        // Dropping the tabs closes every page's session, which is all a tab
+        // is once the engine is about to be killed anyway.
+        drop(tabs);
+        if let Some(downloads) = downloads.as_mut() {
+            // Whatever is still coming is cancelled, whichever way the engine
+            // is about to stop: `Browser.close` would cancel it too, but the
+            // temporary profile's way out is a kill, and a kill leaves the
+            // engine's partial file behind. Cancelled, the engine removes it.
+            downloads.cancel_all(&mut browser);
+        }
+        if !engine.profile().is_temporary() {
+            // `Browser.close` is the only stop that writes the cookie jar — a
+            // `SIGTERM` loses it; `crate::profile` has the measurements — and
+            // the writing happens after the reply, in the two seconds before
+            // the process ends, so the engine is waited for rather than just
+            // asked. Every way out comes through here: ctrl+q, the last tab
+            // closed, the terminal gone, a SIGTERM, SIGINT or SIGHUP by way
+            // of QUIT, and an error out of `drive`, where a connection that
+            // has already ended makes this fail at once. A temporary profile
+            // has nothing worth writing and skips it, which keeps its quit as
+            // fast as it was.
+            let _ = browser.call_within("Browser.close", Json::empty(), CLOSE_TIMEOUT);
+            engine.wait_for_exit(CLOSE_TIMEOUT);
+        }
+        browser.close();
+        engine.kill();
     }
-    if !engine.profile().is_temporary() {
-        // `Browser.close` is the only stop that writes the cookie jar — a
-        // `SIGTERM` loses it; `crate::profile` has the measurements — and the
-        // writing happens after the reply, in the two seconds before the
-        // process ends, so the engine is waited for rather than just asked.
-        // Every way out comes through here: ctrl+q, the last tab closed, the
-        // terminal gone, a SIGTERM, SIGINT or SIGHUP by way of QUIT, and an
-        // error out of `drive`, where a connection that has already ended
-        // makes this fail at once. A temporary profile has nothing worth
-        // writing and skips it, which keeps its quit as fast as it was.
-        let _ = browser.call_within("Browser.close", Json::empty(), CLOSE_TIMEOUT);
-        engine.wait_for_exit(CLOSE_TIMEOUT);
-    }
-    browser.close();
-    engine.kill();
     // And the partial files of every download this run saw begin and not
     // save, now that nothing can be writing them: the engine removes the
     // ones it cancelled, but after it has said so, and a kill can come in
@@ -680,14 +961,16 @@ pub fn run(options: Options) -> Result<(), String> {
     outcome
 }
 
-/// Everything between taking the terminal and giving it back.
-fn drive(
+/// What the last run left and what the command line asked for, opened on
+/// the first engine before the loop starts: the saved tabs with `--restore`,
+/// the offer after an unclean exit, the first url in front and the rest
+/// behind it. Once per run — a relaunch reopens the tabs it had instead.
+fn open_first(
     pane: &mut Pane,
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
-    engine: &mut Engine,
     chrome: &mut Chrome,
-    options: Options,
+    options: &Options,
 ) -> Result<(), String> {
     // What the last run left, decided before anything is opened: its tabs,
     // with `--restore`; a question on the row, after a run that did not quit.
@@ -695,7 +978,7 @@ fn drive(
     let mut restored = false;
     if let Some(snapshot) = plan.restore {
         chrome.session.take_saved();
-        restore_tabs(tabs, browser, chrome, snapshot);
+        restore_tabs(tabs, browser, &chrome.appearance, snapshot);
         restored = true;
     }
     if let Some(offer) = plan.offer {
@@ -739,8 +1022,170 @@ fn drive(
     // did not come has replaced the loading note with why.
     redraw_row(pane, tabs, chrome)?;
     open_the_rest(tabs, browser, chrome, &options.urls);
-    redraw_row(pane, tabs, chrome)?;
+    redraw_row(pane, tabs, chrome)
+}
 
+/// An error out of [`drive`] or [`open_first`], read again in the light of
+/// the engine: if it has gone, the error was only the first sign of it —
+/// "cannot send …: the engine closed its end of the pipe" from a resize, a
+/// switch, a new tab — and it is a death, for [`relaunch`]; if not, it is an
+/// error of its own and ends the program as it always did.
+///
+/// The two signs of a death can come a little after the error that the
+/// death caused, so they are looked for over [`DEATH_GRACE`] before the
+/// error is believed.
+fn ended_by_engine(why: String, engine: &mut Engine, browser: &Client) -> Result<Driven, String> {
+    let deadline = Instant::now() + DEATH_GRACE;
+    loop {
+        if let Err(death) = engine.check() {
+            return Ok(Driven::EngineDied(death));
+        }
+        if let Some(ended) = browser.ended() {
+            return Ok(Driven::EngineDied(format!(
+                "the engine stopped talking: {ended}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(why);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Start the engine again after it died under a running session, and bring
+/// the tabs back on it.
+///
+/// `snapshot` is the tabs to bring back, taken from the live list rather
+/// than from the session — what the session last recorded is up to half a
+/// second old, and nothing at all while the offer after an unclean exit is
+/// on the row — or from just before it shrank ([`Shrunk`]). They come back as a
+/// `--restore` brings them, dormant, the one in front woken, so that a
+/// hundred tabs are a hundred blank pages and one real one rather than a
+/// hundred fetched at once on a machine whose browser just died. Nothing is
+/// sent to the dead engine: its clients are dropped before the new ones
+/// exist. While this runs the loop reads no input; the terminal's bytes wait
+/// in the pty — about a tenth of a second, and a fortieth more per tab
+/// (measured against chrome-headless-shell 153).
+///
+/// The old engine's profile is moved into the new one without ever being let
+/// go ([`Engine::retire`]): a kept profile's lock released for a moment is a
+/// moment for another `blinkterm` to take it.
+///
+/// An `Err` is the sentence the program ends with — an engine that would
+/// not start again, with what [`died`] adds about the saved tabs — or a
+/// terminal that could not be written to. Whether to start it again at all
+/// ([`Relaunches`]) is decided before this is called.
+fn relaunch(
+    pane: &mut Pane,
+    dead: Booted,
+    chrome: &mut Chrome,
+    options: &Options,
+    downloads_dir: &Path,
+    why: String,
+    snapshot: Snapshot,
+) -> Result<Booted, String> {
+    let now = Instant::now();
+    // The picture goes, as it does for a renderer that died in front: a dead
+    // page that looks alive is a click that does nothing. The row is written
+    // directly, because `redraw_row` draws from the tabs and these are going.
+    pane.write(&crate::graphics::clear_command())
+        .map_err(|e| e.to_string())?;
+    pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())?;
+    pane.write(&screen::status_line(
+        chrome.metrics.cols,
+        "the engine died; starting it again…",
+    ))
+    .map_err(|e| e.to_string())?;
+    chrome.engine_gone(now);
+    sync_shape(pane, chrome)?;
+
+    // Every tab's `Client::close` sees the pipe ended and sends no detach.
+    let Booted {
+        engine,
+        browser,
+        tabs,
+    } = dead;
+    drop(tabs);
+    drop(browser);
+    let profile = engine.retire();
+    // Nothing can be writing the downloads that were coming now; the exit
+    // would remove the same files.
+    for partial in chrome.downloads.partials() {
+        let _ = std::fs::remove_file(partial);
+    }
+
+    let Booted {
+        engine,
+        mut browser,
+        mut tabs,
+    } = match boot(profile, &options.engine, downloads_dir, &chrome.appearance) {
+        Ok(booted) => booted,
+        Err(failure) => return Err(died(could_not_restart(why, failure), &chrome.session)),
+    };
+    let saved = snapshot.tabs.len().min(session::RESTORE_CAP);
+    // The new engine's one blank tab is untouched, so the first saved tab
+    // adopts it; with nothing saved — every tab was blank — it stays in
+    // front as it is.
+    restore_tabs(&mut tabs, &mut browser, &chrome.appearance, snapshot);
+    // A failure here is put on the tab rather than returned: whether the
+    // engine is gone again is for the next pass's checks to say.
+    let trouble = activate(&mut tabs, &mut browser, chrome).err();
+    let mut sentence = relaunched_words(saved, tabs.len());
+    if let Some(trouble) = trouble {
+        sentence = format!("{sentence}; {trouble}");
+    }
+    // After `activate`, so that it stands in front of the woken tab's
+    // "loading …" until the page lands and replaces it; the seconds still
+    // count on the right.
+    note(&mut tabs, sentence);
+    redraw_row(pane, &tabs, chrome)?;
+    Ok(Booted {
+        engine,
+        browser,
+        tabs,
+    })
+}
+
+/// What the row says once the engine has been started again: how many of
+/// the `saved` tabs came back, when there were any to bring back — `open`
+/// is how many are open now.
+fn relaunched_words(saved: usize, open: usize) -> String {
+    const STARTED: &str = "the engine died and was started again";
+    match saved {
+        0 => STARTED.to_string(),
+        1 if open >= 1 => format!("{STARTED}; 1 tab restored"),
+        saved if open >= saved => format!("{STARTED}; {saved} tabs restored"),
+        saved => format!("{STARTED}; {open} of {saved} tabs restored"),
+    }
+}
+
+/// The reason for a death that is not started again: the second within a
+/// minute of the first. See [`Relaunches`].
+fn gave_up(why: String) -> String {
+    format!(
+        "{why}; it died a second time within a minute of being started again, \
+         so it is not started a third time"
+    )
+}
+
+/// The reason for a death after which the engine would not start again.
+fn could_not_restart(why: String, failure: String) -> String {
+    format!("{why}; starting it again failed: {failure}")
+}
+
+/// Everything between taking the terminal and giving it back, on one engine.
+///
+/// It no longer decides what to open — [`open_first`] does, once — and it
+/// no longer ends the program when the engine dies: it says so,
+/// [`Driven::EngineDied`], and [`run`] decides.
+fn drive(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    engine: &mut Engine,
+    chrome: &mut Chrome,
+    shrunk: &mut Shrunk,
+) -> Result<Driven, String> {
     let mut last_check = Instant::now();
     let mut buf = [0u8; 8192];
     // When the terminal last sent a byte of a paste that is still open; see
@@ -756,15 +1201,16 @@ fn drive(
             // before this is believed.
             let deadline = Instant::now() + ENGINE_GRACE;
             loop {
-                engine.check().map_err(|why| died(why, &chrome.session))?;
+                if let Err(why) = engine.check() {
+                    return Ok(Driven::EngineDied(why));
+                }
                 if let Some(ended) = browser.ended() {
-                    return Err(died(
-                        format!("the engine stopped talking: {ended}"),
-                        &chrome.session,
-                    ));
+                    return Ok(Driven::EngineDied(format!(
+                        "the engine stopped talking: {ended}"
+                    )));
                 }
                 if Instant::now() >= deadline {
-                    return Ok(());
+                    return Ok(Driven::Quit);
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -830,13 +1276,14 @@ fn drive(
         // later.
         if last_check.elapsed() > Duration::from_millis(500) {
             last_check = Instant::now();
-            engine.check().map_err(|why| died(why, &chrome.session))?;
+            if let Err(why) = engine.check() {
+                return Ok(Driven::EngineDied(why));
+            }
         }
         if let Some(ended) = browser.ended() {
-            return Err(died(
-                format!("the engine stopped talking: {ended}"),
-                &chrome.session,
-            ));
+            return Ok(Driven::EngineDied(format!(
+                "the engine stopped talking: {ended}"
+            )));
         }
         reap_dead_tabs(pane, tabs, browser, chrome)?;
 
@@ -853,11 +1300,11 @@ fn drive(
                     paste_heard = chrome.parser.pasting().then(Instant::now);
                     for input in inputs {
                         if !handle_input(pane, tabs, browser, chrome, input)? {
-                            return Ok(());
+                            return Ok(Driven::Quit);
                         }
                     }
                 }
-                Ok(ReadOutcome::Eof) => return Ok(()),
+                Ok(ReadOutcome::Eof) => return Ok(Driven::Quit),
                 Ok(ReadOutcome::WouldBlock) => {}
                 Err(err) => return Err(format!("cannot read the terminal: {err}")),
             }
@@ -872,7 +1319,7 @@ fn drive(
         } else if let Some(input) = chrome.parser.flush() {
             // Nothing arrived, so a held escape was the Escape key after all.
             if !handle_input(pane, tabs, browser, chrome, input)? {
-                return Ok(());
+                return Ok(Driven::Quit);
             }
         }
         // Whatever the pointer did in all the reports just read, told to the
@@ -935,12 +1382,13 @@ fn drive(
         // few string clones; a write only when it differs from the last, at
         // most once every [`session::WRITE_EVERY`].
         chrome.session.record(Snapshot::of(tabs), Instant::now());
+        shrunk.pass(tabs, Instant::now());
         if let Err(why) = chrome.session.flush(Instant::now()) {
             note(tabs, why);
             redraw_row(pane, tabs, chrome)?;
         }
     }
-    Ok(())
+    Ok(Driven::Quit)
 }
 
 /// The sentence for an engine that died, with what was not lost: the tabs
@@ -1330,10 +1778,10 @@ fn activate(
 fn open_dormant(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
-    chrome: &Chrome,
+    appearance: &Appearance,
     entry: session::Entry,
 ) -> Result<(), String> {
-    open_tab(tabs, browser, &chrome.appearance, "about:blank")?;
+    open_tab(tabs, browser, appearance, "about:blank")?;
     if let Some(tab) = tabs.active_mut() {
         tab.url = entry.url;
         tab.title = entry.title;
@@ -1366,7 +1814,7 @@ fn wake_dormant(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
 
 /// Open the tabs of a saved session, dormant, in order, and put the one
 /// that was in front in front — in the list; making it the engine's tab in
-/// front is the caller's, by [`activate`] or [`switched`].
+/// front is the caller's, by `activate` or `switched`.
 ///
 /// The first adopts the tab this program started with when nobody has done
 /// anything with it yet — a lone, blank, untitled tab, which a restore
@@ -1374,10 +1822,14 @@ fn wake_dormant(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
 /// will not open says why on the row and ends the restore there, with the
 /// tabs before it open. At most [`session::RESTORE_CAP`], which the file's
 /// reading has already held it to.
-fn restore_tabs(
+///
+/// The same whether the snapshot is the file's (`--restore`, the offer) or
+/// the live list's, on a new engine after the old one died (`relaunch`).
+/// Public so that the engine tests restore the way the program does.
+pub fn restore_tabs(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
-    chrome: &Chrome,
+    appearance: &Appearance,
     snapshot: Snapshot,
 ) {
     let untouched = tabs.len() == 1
@@ -1399,7 +1851,7 @@ fn restore_tabs(
             }
             continue;
         }
-        if let Err(why) = open_dormant(tabs, browser, chrome, entry) {
+        if let Err(why) = open_dormant(tabs, browser, appearance, entry) {
             note(tabs, format!("not every tab came back: {why}"));
             return;
         }
@@ -1422,7 +1874,7 @@ fn decline_or_restore(
     if yes {
         if let Some(saved) = chrome.session.take_saved() {
             let was = tabs.active_target().map(str::to_string);
-            restore_tabs(tabs, browser, chrome, saved.snapshot);
+            restore_tabs(tabs, browser, &chrome.appearance, saved.snapshot);
             switched(pane, tabs, browser, chrome, was)?;
             // The tab the program started with, adopted and still in front,
             // was not switched to and is woken here.
@@ -3350,7 +3802,8 @@ fn handle_input(
                         Some(entry) => {
                             // Dormant, and woken at once by being brought to
                             // the front: the same road as a restored tab.
-                            if let Err(why) = open_dormant(tabs, browser, chrome, entry) {
+                            if let Err(why) = open_dormant(tabs, browser, &chrome.appearance, entry)
+                            {
                                 note(tabs, why);
                             }
                             switched(pane, tabs, browser, chrome, was)?;
@@ -4816,6 +5269,16 @@ fn pump_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
     changed
 }
 
+/// The half of [`close_find`] that sends nothing: the prompt taken off the
+/// chrome and its needle remembered for the next `ctrl+f`. On its own when
+/// the engine has gone ([`Chrome::engine_gone`]) and there is no page to
+/// clear.
+fn forget_find(chrome: &mut Chrome) -> Option<Find> {
+    let find = chrome.find.take()?;
+    chrome.last_needle = find.finder.line.text().to_string();
+    Some(find)
+}
+
 /// Close the find prompt, from wherever it is closed: Escape, a tab switch,
 /// a navigation of the page it was searching. The needle is remembered for
 /// the next `ctrl+f`.
@@ -4826,10 +5289,9 @@ fn pump_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
 /// withdraws the claim on its answer. Quitting does not come here: the
 /// engine is being stopped, and there is no page to leave clear.
 fn close_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
-    let Some(find) = chrome.find.take() else {
+    let Some(find) = forget_find(chrome) else {
         return;
     };
-    chrome.last_needle = find.finder.line.text().to_string();
     let (Some(context), Some(index)) = (find.context, tabs.index_of(&find.target)) else {
         return;
     };
@@ -6051,6 +6513,202 @@ mod tests {
             "a temporary profile keeps none"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_first_death_is_started_again_and_a_second_within_a_minute_is_not() {
+        let t = Instant::now();
+        let mut relaunches = Relaunches::default();
+        assert!(relaunches.allows(t), "the first death is a fluke");
+        relaunches.relaunched(t);
+        assert!(!relaunches.allows(t + Duration::from_secs(59)));
+        assert!(relaunches.allows(t + Duration::from_secs(60)));
+        let later = t + Duration::from_secs(300);
+        relaunches.relaunched(later);
+        assert!(
+            !relaunches.allows(later + Duration::from_secs(1)),
+            "measured from the latest relaunch"
+        );
+    }
+
+    #[test]
+    fn the_sentences_for_an_engine_that_could_not_be_started_again_keep_the_saved_tabs_clause() {
+        let why = || "the browser engine exited (signal: 11 (SIGSEGV))".to_string();
+        let dir =
+            std::env::temp_dir().join(format!("blinkterm-app-gave-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let mut kept = Session::load(&dir);
+        kept.record(
+            Snapshot {
+                tabs: (0..3)
+                    .map(|i| session::Entry {
+                        url: format!("https://example.com/{i}"),
+                        title: String::new(),
+                    })
+                    .collect(),
+                active: 0,
+            },
+            Instant::now(),
+        );
+        let saved = "the 3 tabs you had are saved: blinkterm --restore reopens them";
+        assert_eq!(
+            died(gave_up(why()), &kept),
+            format!(
+                "{}; it died a second time within a minute of being started again, \
+                 so it is not started a third time; {saved}",
+                why()
+            )
+        );
+        assert_eq!(
+            died(could_not_restart(why(), "no engine".to_string()), &kept),
+            format!("{}; starting it again failed: no engine; {saved}", why())
+        );
+        let memory = Session::in_memory();
+        assert_eq!(
+            died(could_not_restart(why(), "no engine".to_string()), &memory),
+            format!("{}; starting it again failed: no engine", why())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_tabs_before_a_recent_shrink_are_the_ones_a_relaunch_brings_back() {
+        let list = |urls: &[&str]| {
+            let mut tabs: Tabs<()> = Tabs::new(Tab::new("0", (), urls[0]));
+            for (i, url) in urls.iter().enumerate().skip(1) {
+                tabs.open_behind(Tab::new(i.to_string(), (), *url));
+            }
+            tabs
+        };
+        let three = list(&[
+            "https://a.example/",
+            "https://b.example/",
+            "https://c.example/",
+        ]);
+        let one = list(&["https://a.example/"]);
+        let t = Instant::now();
+        let mut shrunk = Shrunk::default();
+        shrunk.pass(&three, t);
+        assert_eq!(
+            shrunk.for_relaunch(Snapshot::of(&three), t),
+            Snapshot::of(&three),
+            "the live list, when it has not shrunk"
+        );
+
+        // A `SIGTERM`: the pages go over two passes, then the pipe.
+        let two = list(&["https://a.example/", "https://b.example/"]);
+        shrunk.pass(&two, t + Duration::from_millis(5));
+        shrunk.pass(&one, t + Duration::from_millis(10));
+        let dying = t + Duration::from_millis(60);
+        assert_eq!(
+            shrunk.for_relaunch(Snapshot::of(&one), dying),
+            Snapshot::of(&three),
+            "the list before the first shrink, not the one in between"
+        );
+        assert_eq!(
+            shrunk.for_relaunch(
+                Snapshot::of(&one),
+                t + Duration::from_millis(5) + SHRUNK_WITHIN
+            ),
+            Snapshot::of(&one),
+            "a shrink long enough ago was the person closing tabs"
+        );
+
+        // A tab that went to `about:blank` is not a tab lost.
+        let mut shrunk = Shrunk::default();
+        shrunk.pass(&three, t);
+        let blanked = list(&["https://a.example/", "https://b.example/", "about:blank"]);
+        shrunk.pass(&blanked, t + Duration::from_millis(5));
+        assert_eq!(
+            shrunk.for_relaunch(Snapshot::of(&blanked), t + Duration::from_millis(10)),
+            Snapshot::of(&blanked)
+        );
+    }
+
+    #[test]
+    fn the_row_after_a_relaunch_counts_the_tabs_that_came_back() {
+        let started = "the engine died and was started again";
+        assert_eq!(relaunched_words(0, 1), started, "a blank page is no tab");
+        assert_eq!(relaunched_words(1, 1), format!("{started}; 1 tab restored"));
+        assert_eq!(
+            relaunched_words(3, 3),
+            format!("{started}; 3 tabs restored")
+        );
+        assert_eq!(
+            relaunched_words(3, 2),
+            format!("{started}; 2 of 3 tabs restored")
+        );
+    }
+
+    #[test]
+    fn when_the_engine_goes_the_pages_prompts_go_and_the_persons_typing_stays() {
+        let metrics = Metrics {
+            cols: 80,
+            rows: 24,
+            cell: (8, 16),
+        };
+        let options = crate::options::resolve(
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+        )
+        .expect("the defaults");
+        let profile = Profile::temporary().expect("a temporary profile");
+        let downloads =
+            std::env::temp_dir().join(format!("blinkterm-app-engine-gone-{}", std::process::id()));
+        let mut chrome = Chrome::new(
+            metrics,
+            &options,
+            &profile,
+            downloads.clone(),
+            Appearance::new(crate::appearance::Choice::default(), false),
+        );
+        chrome.find = Some(Find {
+            target: "a".to_string(),
+            finder: find::Finder::open("needle"),
+            context: Some(7),
+            pending: None,
+            wanted: None,
+            remade: false,
+        });
+        chrome.list = Some(TabList::open(2));
+        chrome.list_first.set(3);
+        chrome.strip_first.set(4);
+        chrome.hinting = Some(Hinting {
+            target: "a".to_string(),
+            new_tab: false,
+            context: Some(1),
+            pending: None,
+            hints: None,
+            remade: false,
+        });
+        chrome.hint = Some("5s".to_string());
+        chrome.bar = Some(UrlBar::new(Line::selected("https://typed.example/")));
+        chrome.mode = normal::Mode::starting(true);
+        chrome.offer = Some(Offer { tabs: 2 });
+        chrome.buttons = 1;
+
+        chrome.engine_gone(Instant::now());
+
+        assert!(chrome.find.is_none());
+        assert_eq!(chrome.last_needle, "needle", "the needle is the person's");
+        assert!(chrome.list.is_none());
+        assert!(chrome.hinting.is_none());
+        assert!(chrome.hint.is_none());
+        assert_eq!(chrome.list_first.get(), 0);
+        assert_eq!(chrome.strip_first.get(), 0);
+        assert!(!chrome.motion.still_in_flight());
+        assert_eq!(
+            chrome.bar.as_ref().map(|bar| bar.line.text()),
+            Some("https://typed.example/")
+        );
+        assert!(chrome.mode.normal);
+        assert_eq!(chrome.offer, Some(Offer { tabs: 2 }));
+        assert_eq!(chrome.buttons, 1, "a button held through the death");
+        drop(chrome);
+        drop(profile);
+        let _ = std::fs::remove_dir_all(&downloads);
     }
 
     #[test]

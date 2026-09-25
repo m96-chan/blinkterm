@@ -59,8 +59,10 @@ flag, a different default, a raised Rust floor all do.
 - A page whose renderer crashes keeps its tab, with `this page crashed;
   ctrl+r reloads it` on the row, rather than the tab closing
   ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
-- When the engine dies the exit message says the tabs are saved and how to
-  get them back ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
+- When the engine dies it is started again in place and the tabs come back,
+  the one in front loading; the program exits with the saved-tabs sentence
+  only if it dies twice in a minute or cannot be started again
+  ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
 
 ### Fixed
 

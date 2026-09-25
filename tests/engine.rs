@@ -7418,3 +7418,251 @@ fn a_dormant_tab_is_a_blank_target_that_keeps_its_name_and_loads_when_asked() {
     browser.close();
     engine.kill();
 }
+
+// ---------------------------------------------------------------------------
+// The engine started again in place when it dies (#18)
+// ---------------------------------------------------------------------------
+
+use blinkterm::app::Booted;
+
+/// Whether an engine is named for these tests; says why not when it is not.
+/// For the tests that start their engine with `app::boot`, as the program
+/// does, rather than through [`connect_in_with_target`].
+fn engine_named() -> bool {
+    if std::env::var_os(engine::ENGINE_ENV).is_none() {
+        eprintln!(
+            "skipped: {} is not set; name a Chromium to run this against",
+            engine::ENGINE_ENV
+        );
+        return false;
+    }
+    match engine::locate() {
+        Ok(path) => {
+            eprintln!("engine: {}", path.display());
+            true
+        }
+        Err(why) => {
+            eprintln!("skipped: {why}");
+            false
+        }
+    }
+}
+
+/// How many page targets the engine has.
+fn page_targets(browser: &mut Client) -> usize {
+    let reply = browser
+        .call("Target.getTargets", Json::empty())
+        .expect("the targets");
+    reply
+        .get("targetInfos")
+        .and_then(Json::as_array)
+        .map(|infos| {
+            infos
+                .iter()
+                .filter(|info| info.get("type").and_then(Json::as_str) == Some("page"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Every step `app::relaunch` takes, in its order, through the public
+/// pieces: an engine with three tabs killed from outside, its clients
+/// dropped, the engine retired with the profile's lock still held, a second
+/// engine booted on the same profile, the live list's tabs restored on it
+/// dormant, and the one in front woken as `activate` wakes it.
+#[test]
+fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tabs_back() {
+    if !engine_named() {
+        return;
+    }
+    let root = temp_dir("relaunch");
+    let dir = root.join("profile");
+    let downloads = root.join("downloads");
+    std::fs::create_dir_all(&downloads).expect("a download directory");
+    let appearance =
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+    let launch = engine::Launch::default();
+    let profile = Profile::take(Choice::At(dir.clone())).expect("a kept profile");
+    let Booted {
+        engine,
+        mut browser,
+        mut tabs,
+    } = blinkterm::app::boot(profile, &launch, &downloads, &appearance).expect("the engine boots");
+    let base = serve();
+
+    // Three tabs, as the program would have them once each had landed: the
+    // first in front, two opened behind it.
+    {
+        let tab = tabs.active_mut().expect("the first tab");
+        tab.connection
+            .call(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(&base))]),
+            )
+            .expect("the first page");
+        assert_eq!(
+            wait_for_title(&mut tab.connection, "first", Duration::from_secs(10)),
+            "first"
+        );
+        tab.url = base.clone();
+        tab.title = "first".to_string();
+    }
+    for name in ["second", "plain"] {
+        let index = blinkterm::app::open_behind(
+            &mut tabs,
+            &mut browser,
+            &appearance,
+            &format!("{base}{name}"),
+        )
+        .expect("a tab behind");
+        let tab = tabs.get_mut(index).expect("the tab behind");
+        assert_eq!(
+            wait_for_title(&mut tab.connection, name, Duration::from_secs(10)),
+            name
+        );
+        tab.title = name.to_string();
+    }
+    let snapshot = Snapshot::of(&tabs);
+    assert_eq!(snapshot.tabs.len(), 3);
+    assert_eq!(snapshot.active, 0);
+
+    let group = engine.group().expect("a group of its own");
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{group}")])
+        .status()
+        .expect("kill runs");
+    assert!(killed.success());
+    let deadline = Instant::now() + CRASH_NOTICE;
+    while browser.ended().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        browser.ended().is_some(),
+        "the pipe says the engine is gone"
+    );
+
+    // What `relaunch` does with the dead engine: its clients go first,
+    // sending nothing, and the profile comes out of it still locked.
+    drop(tabs);
+    drop(browser);
+    let retired = Instant::now();
+    let profile = engine.retire();
+    eprintln!("retired in {:?}", retired.elapsed());
+    match Profile::take(Choice::At(dir.clone())) {
+        Ok(_) => panic!("the profile's lock was let go between the two engines"),
+        Err(why) => assert!(
+            why.contains(&std::process::id().to_string()),
+            "refused, as held by this process: {why}"
+        ),
+    }
+
+    let started = Instant::now();
+    let Booted {
+        mut engine,
+        mut browser,
+        mut tabs,
+    } = blinkterm::app::boot(profile, &launch, &downloads, &appearance)
+        .expect("a second engine on the same profile");
+    blinkterm::app::restore_tabs(&mut tabs, &mut browser, &appearance, snapshot.clone());
+    let took = started.elapsed();
+    eprintln!("second engine up with the tabs back in {took:?}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert_eq!(
+        tabs.len(),
+        3,
+        "the blank tab was adopted, not left before them"
+    );
+    assert_eq!(
+        tabs.iter()
+            .map(|tab| tab.title.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second", "plain"]
+    );
+    assert_eq!(
+        Snapshot::of(&tabs),
+        snapshot,
+        "the same tabs, in the same order"
+    );
+    assert_eq!(tabs.active_index(), 0);
+    assert!(tabs.iter().all(|tab| tab.dormant));
+    assert_eq!(page_targets(&mut browser), 3);
+    assert!(engine.check().is_ok());
+
+    // What `activate` and `wake_dormant` do to the tab in front.
+    let target = tabs.active_target().expect("a tab in front").to_string();
+    browser
+        .call(
+            "Target.activateTarget",
+            Json::object(vec![("targetId", Json::string(&target))]),
+        )
+        .expect("raised");
+    let tab = tabs.active_mut().expect("the tab in front");
+    viewport(&mut tab.connection);
+    tab.dormant = false;
+    let url = tab.url.clone();
+    tab.connection
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(&url))]),
+        )
+        .expect("the page again");
+    assert_eq!(
+        wait_for_title(&mut tab.connection, "first", Duration::from_secs(10)),
+        "first"
+    );
+    cast(&mut tab.connection, "png", None, WIDTH, HEIGHT);
+    assert!(
+        wait_for_frame(&mut tab.connection, Duration::from_secs(10)).is_some(),
+        "the page is painting on the new engine"
+    );
+    assert!(
+        Profile::take(Choice::At(dir.clone())).is_err(),
+        "the new engine holds the profile"
+    );
+
+    drop(tabs);
+    browser.close();
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `Engine::retire` on an engine that is still running, which is the path a
+/// relaunch takes when the death was the pipe's rather than the process's:
+/// the group is stopped, and the profile is handed back still locked and
+/// ready for a second engine.
+#[test]
+fn an_engine_retired_alive_is_stopped_and_its_profile_is_free_to_start_another() {
+    let root = temp_dir("retire");
+    let dir = root.join("profile");
+    let profile = Profile::take(Choice::At(dir.clone())).expect("a kept profile");
+    let Some((engine, page)) = connect_in(profile) else {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    let group = engine.group().expect("a group of its own");
+    drop(page);
+    let profile = engine.retire();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut left = group_members(group);
+    while !left.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        left = group_members(group);
+    }
+    assert!(
+        left.is_empty(),
+        "retired and these are still running: {}",
+        describe(&left)
+    );
+    assert!(
+        Profile::take(Choice::At(dir.clone())).is_err(),
+        "the lock is still this program's"
+    );
+    assert!(dir.exists(), "a kept profile is not removed by a retire");
+
+    let mut engine =
+        Engine::launch(profile, Duration::from_secs(30)).expect("a second engine starts on it");
+    assert!(engine.check().is_ok());
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&root);
+}
