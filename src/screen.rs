@@ -78,6 +78,18 @@ pub fn enter_sequence() -> Vec<u8> {
 /// to treat coordinates as pixels.
 pub const ASK_PIXEL_MOUSE: &[u8] = b"\x1b[?1016$p";
 
+/// The question that decides whether a page is told it is being shown on a
+/// dark background: what colour is the pane's?
+///
+/// Asked once, beside [`ASK_PIXEL_MOUSE`], and never waited for. tOS, Kitty,
+/// WezTerm, Ghostty, foot and xterm answer `OSC 11 ; rgb:… ST`, which
+/// [`crate::input`] reads as a colour rather than as alt+`]` and typing, and
+/// [`crate::appearance`] as light or dark; a terminal that does not know the
+/// question says nothing, and its pages are told nothing. `ST` rather than
+/// `BEL` to end it, as the clipboard's command is ended: xterm answers the
+/// way it was asked, and `ST` cannot ring.
+pub const ASK_BACKGROUND: &[u8] = b"\x1b]11;?\x1b\\";
+
 /// Everything turned off at the end, in the reverse order.
 ///
 /// With the pointer's shape put back to the arrow as well: it is not set at
@@ -186,6 +198,7 @@ impl Pane {
         };
         pane.write(&enter_sequence())?;
         pane.write(ASK_PIXEL_MOUSE)?;
+        pane.write(ASK_BACKGROUND)?;
         Ok(pane)
     }
 
@@ -906,6 +919,23 @@ mod tests {
         assert!(terminal.take_output().is_empty());
         assert_eq!(terminal.title(), "");
         assert!(terminal.grid().row(0).to_text().trim().is_empty());
+    }
+
+    /// The question about the background, asked of the compositor's own
+    /// terminal and its answer read back by this program's parser: the colour
+    /// the terminal was configured with, and nothing typed.
+    #[test]
+    fn a_terminal_answers_what_its_background_is_and_the_answer_is_a_colour() {
+        let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+        terminal.advance(&enter_sequence());
+        let _ = terminal.take_output();
+        terminal.advance(ASK_BACKGROUND);
+        let answer = terminal.take_output();
+        let inputs = crate::input::Parser::new().feed(&answer);
+        match inputs.as_slice() {
+            [crate::input::Input::Colour { slot: 11, .. }] => {}
+            other => panic!("{:?} read as {other:?}", text(&answer)),
+        }
     }
 
     #[test]

@@ -72,6 +72,16 @@ carry, and the list is kept as things land rather than written at the end.
   The terminal is asked for all mouse motion (mode 1003) and, where it
   understands OSC 22, told the pointer's shape
   ([#15](https://github.com/m96-chan/blinkterm/issues/15)).
+- Zoom: `alt+=`/`alt+-` (and `ctrl+=`/`ctrl+-` where the terminal passes
+  them) through Chrome's steps from 25% to 300%, `alt+0`/`ctrl+0` back to
+  100%; remembered per host in the profile's `zoom` file (0600), shown on
+  the row as `150%` ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
+- `--scale <n|auto>` for HiDPI terminals: auto says 2 when a cell is 28 px
+  or taller ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
+- `--color-scheme auto|light|dark`: a dark terminal gets dark pages, by
+  asking the terminal its background (`OSC 11`); `--force-dark` paints even
+  pages with no dark style dark
+  ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
 
 ### Changed
 

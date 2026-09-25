@@ -5234,3 +5234,462 @@ fn a_search_that_asks_nothing_of_the_page_still_answers_on_about_blank_and_the_e
     client.close();
     engine.kill();
 }
+
+// ---------------------------------------------------------------------------
+// Zoom, the HiDPI scale, and light and dark
+// ---------------------------------------------------------------------------
+
+/// A box at CSS (100..150, 50..100) that says when it is pressed, on a page
+/// tall enough to scroll. Every press puts where the page saw it, and whether
+/// it was on the box, into the title.
+const BOXES: &str = "data:text/html,<body style='margin:0;height:3000px;background:%23fff'>\
+<div id=b style='position:absolute;left:100px;top:50px;width:50px;height:50px;background:%23c33'></div>\
+<script>document.title='ready';\
+addEventListener('mousedown',function(e){document.title=(e.target.id==='b'?'box ':'miss ')+e.clientX+' '+e.clientY});\
+</script></body>";
+
+/// A page that is white, or black when it is told dark is preferred.
+const SCHEME: &str = "data:text/html,<style>body{margin:0;background:white}\
+@media (prefers-color-scheme: dark){body{background:black}}</style>\
+<body><script>document.title='ready'</script></body>";
+
+/// A page with no dark style at all: white, whatever it is told.
+const WHITE: &str = "data:text/html,<body style='margin:0'><p>Some text on a white page.</p>\
+<script>document.title='ready'</script></body>";
+
+/// The override the program sends for `factor` on the test's pane.
+fn zoom_to(client: &mut Client, factor: f64) -> blinkterm::zoom::Viewport {
+    let viewport = blinkterm::zoom::Viewport::fit((WIDTH, HEIGHT), factor);
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            viewport.metrics_params(),
+        )
+        .expect("the zoom");
+    viewport
+}
+
+/// [`prepare`], and then the page zoomed to `factor`.
+fn prepare_at(client: &mut Client, factor: f64) -> blinkterm::zoom::Viewport {
+    prepare(client);
+    zoom_to(client, factor)
+}
+
+/// Go to `url` and wait for it to say it is ready — having said something
+/// else first, so that the page being left is not taken for it.
+fn go_to(client: &mut Client, url: &str) {
+    evaluate(client, "document.title='leaving'");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+}
+
+/// `innerWidth`, `innerHeight` and `devicePixelRatio`, as the page sees them.
+fn page_metrics(client: &mut Client) -> (f64, f64, f64) {
+    let answer = evaluate(client, "[innerWidth, innerHeight, devicePixelRatio]");
+    let numbers: Vec<f64> = answer
+        .as_array()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(Json::as_f64)
+        .collect();
+    match numbers.as_slice() {
+        [w, h, ratio] => (*w, *h, *ratio),
+        _ => panic!("the page said {answer}"),
+    }
+}
+
+/// A still, decoded.
+fn still(client: &mut Client) -> (Vec<u8>, u32, u32) {
+    let png = screenshot(client, "png", None);
+    let image = tos_term::png::decode(&png, 64 * 1024 * 1024).expect("a still decodes");
+    (image.rgba, image.width, image.height)
+}
+
+/// A press and a release at a CSS point, as `send_mouse` sends them.
+fn click_css(client: &mut Client, (x, y): (f64, f64)) {
+    for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+        client
+            .call(
+                "Input.dispatchMouseEvent",
+                Json::object(vec![
+                    ("type", Json::string(kind)),
+                    ("x", Json::number(x)),
+                    ("y", Json::number(y)),
+                    ("button", Json::string("left")),
+                    ("buttons", Json::number(buttons)),
+                    ("clickCount", Json::number(1)),
+                    ("modifiers", Json::number(0)),
+                ]),
+            )
+            .expect("the click is dispatched");
+    }
+}
+
+/// Whether the page is being told dark is preferred.
+fn prefers_dark(client: &mut Client) -> bool {
+    evaluate(client, "matchMedia('(prefers-color-scheme: dark)').matches").as_bool() == Some(true)
+}
+
+/// Wait for `wanted` to be what `ask` says, and say what it said last.
+fn wait_until<T: PartialEq + Copy>(
+    client: &mut Client,
+    wanted: T,
+    ask: impl Fn(&mut Client) -> T,
+) -> T {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = ask(client);
+        if now == wanted || Instant::now() >= deadline {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The still's pixel at (5, 5), as a luminance.
+fn corner_luminance(client: &mut Client) -> f64 {
+    let (rgba, width, _) = still(client);
+    let at = (5 * width as usize + 5) * 4;
+    blinkterm::appearance::luminance((rgba[at], rgba[at + 1], rgba[at + 2]))
+}
+
+/// 200%: the page is laid out for half the pane and draws itself at the
+/// whole of it. The still is the pane's size and goes into the same cells as
+/// ever; a moving frame is the CSS viewport's size, and goes into the same
+/// cells too.
+#[test]
+fn zoom_changes_what_the_page_sees_and_the_still_stays_the_panes_size() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare_at(&mut client, 2.0);
+    assert_eq!(page_metrics(&mut client), (320.0, 180.0, 2.0));
+
+    let dir = temp_dir("zoom");
+    let mut painter = Painter::at(&dir);
+    let mut terminal = a_terminal(&dir);
+    let cells = Cells {
+        cols: WIDTH / CELL.0,
+        rows: HEIGHT / CELL.1,
+    };
+    let (rgba, width, height) = still(&mut client);
+    assert_eq!((width, height), (WIDTH, HEIGHT), "the still is the pane's");
+    terminal.advance(&painter.frame(Raw::rgba(&rgba, width, height), cells, 2, 1));
+    let store = terminal.graphics();
+    let image = store.image(IMAGE_ID).expect("the still is in the store");
+    assert_eq!((image.width, image.height), (WIDTH, HEIGHT));
+    let placement = store.placements().next().expect("one placement");
+    assert_eq!(
+        (placement.cols as u32, placement.rows as u32),
+        (cells.cols, cells.rows)
+    );
+
+    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDTH, HEIGHT);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut frame = None;
+    while frame.is_none() && Instant::now() < deadline {
+        frame = take_frames(&mut client).pop();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (jpeg, _) = frame.expect("a frame");
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    let image = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+    assert_eq!(
+        (image.width, image.height),
+        (WIDTH / 2, HEIGHT / 2),
+        "a moving frame is the CSS viewport's size"
+    );
+    terminal.advance(&painter.frame(Raw::rgb(&image.rgb, image.width, image.height), cells, 2, 1));
+    let store = terminal.graphics();
+    assert_eq!(store.placements().count(), 1);
+    let placement = store.placements().next().expect("one placement");
+    assert_eq!(
+        (placement.cols as u32, placement.rows as u32),
+        (cells.cols, cells.rows),
+        "and goes into the same cells, for the terminal to scale"
+    );
+
+    // A fractional level: the ratio is the level, and the still fits the
+    // pane exactly once it has been fitted.
+    zoom_to(&mut client, 1.5);
+    let (_, _, ratio) = wait_until(&mut client, (427.0, 240.0, 1.5), page_metrics);
+    assert_eq!(ratio, 1.5);
+    let (rgba, width, height) = still(&mut client);
+    eprintln!("a still at 150% on {WIDTH}x{HEIGHT} came {width}x{height}");
+    let fitted = blinkterm::zoom::fit(&rgba, width, height, 4, (WIDTH, HEIGHT)).unwrap_or(rgba);
+    assert_eq!(fitted.len(), (WIDTH * HEIGHT * 4) as usize);
+
+    painter.clean_up();
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
+/// A point on the screen is the same element at every level: the terminal's
+/// pixels divided by the factor, and nothing else.
+#[test]
+fn a_click_lands_on_the_same_element_at_every_zoom() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let viewport = prepare_at(&mut client, 2.0);
+    // The cell `a_click_lands_where_the_cell_was` clicks, at 200%.
+    let report = blinkterm::input::MouseInput {
+        kind: blinkterm::input::MouseKind::Press,
+        button: Some(0),
+        mods: Mods::default(),
+        x: 11,
+        y: 4,
+        wheel: (0, 0),
+    };
+    let (x, y) = blinkterm::input::page_point(&report, false, CELL, 1);
+    assert_eq!((x, y), (84, 40));
+    assert_eq!(viewport.css_point(x, y), (42.0, 20.0));
+    click_css(&mut client, viewport.css_point(x, y));
+    assert_eq!(
+        wait_for_title(&mut client, "click ", Duration::from_secs(5)),
+        "click 0 42 20"
+    );
+
+    go_to(&mut client, BOXES);
+    for (factor, point, hit) in [
+        (2.0, (250, 150), true),
+        (0.5, (60, 30), true),
+        (1.0, (250, 150), false),
+    ] {
+        let viewport = zoom_to(&mut client, factor);
+        wait_until(&mut client, factor, |client| page_metrics(client).2);
+        evaluate(&mut client, "document.title='waiting'");
+        click_css(&mut client, viewport.css_point(point.0, point.1));
+        let seen = wait_for_title(
+            &mut client,
+            if hit { "box " } else { "miss " },
+            Duration::from_secs(5),
+        );
+        assert!(
+            seen.starts_with(if hit { "box " } else { "miss " }),
+            "{point:?} at {factor}: {seen}"
+        );
+    }
+
+    client.close();
+    engine.kill();
+}
+
+/// A notch is 120 pixels of the screen at every level, which at 200% is 60
+/// of the page's.
+#[test]
+fn a_wheel_notch_moves_the_page_the_same_distance_on_screen_at_any_zoom() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    go_to(&mut client, BOXES);
+    let wire = blinkterm::app::Wire::new(client.notifier());
+    for (factor, css) in [(2.0, 60.0), (1.0, 120.0), (0.5, 240.0)] {
+        let viewport = zoom_to(&mut client, factor);
+        wait_until(&mut client, factor, |client| page_metrics(client).2);
+        evaluate(&mut client, "scrollTo(0,0)");
+        let at = viewport.css_point(320, 180);
+        wire.send(Step {
+            at: (at.0.round() as i32, at.1.round() as i32),
+            delta: viewport.notch((0, 1), blinkterm::app::WHEEL_PIXELS),
+        })
+        .expect("the wheel event goes out");
+        let moved = wait_until(&mut client, css, scroll_y);
+        assert_eq!(moved, css, "at {factor}");
+        assert_eq!(moved * factor, 120.0, "on the screen, at {factor}");
+    }
+
+    client.close();
+    engine.kill();
+}
+
+/// The override is the session's: a navigation keeps it, and a session made
+/// afterwards starts without it — which is why the program sends it every
+/// time a tab comes to the front.
+#[test]
+fn the_zoom_survives_a_navigation_and_a_new_tab_starts_at_its_hosts_level() {
+    let Some((mut engine, mut page, target)) = connect_with_target() else {
+        return;
+    };
+    prepare_at(&mut page, 2.0);
+    for url in [BOXES, PAGE] {
+        go_to(&mut page, url);
+        assert_eq!(page_metrics(&mut page).0, 320.0, "after going to {url}");
+    }
+
+    let (mut browser, tabs) = tabbed(&engine, page, target);
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("a new target");
+    let opened = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("the engine says which")
+        .to_string();
+    let mut second = browser
+        .attach(&opened, Duration::from_secs(10))
+        .expect("a session on it");
+    second
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    blinkterm::app::prepare_session(
+        &mut second,
+        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+    );
+    let (width, _, ratio) = page_metrics(&mut second);
+    eprintln!("a new session, told nothing about its size, is {width} wide");
+    assert_ne!(width, 320.0, "a new session starts at the engine's size");
+    assert_eq!(ratio, 1.0);
+    // Which `activate` then tells it.
+    zoom_to(&mut second, 2.0);
+    assert_eq!(page_metrics(&mut second), (320.0, 180.0, 2.0));
+
+    second.close();
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// A dark terminal's answer makes a loaded page dark where it stands, the
+/// next page dark, and a tab opened afterwards dark; a light answer after it
+/// makes the page light again, and none of it is a reload.
+#[test]
+fn a_dark_terminal_gets_dark_pages_and_so_does_a_tab_opened_later() {
+    let Some((mut engine, mut page, target)) = connect_with_target() else {
+        return;
+    };
+    page.call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut page);
+    go_to(&mut page, SCHEME);
+    assert!(!prefers_dark(&mut page), "the engine's own answer is light");
+    assert!(corner_luminance(&mut page) > 0.9);
+
+    let mut appearance =
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+    assert!(appearance.learned((0x1c, 0x1c, 0x1c)));
+    blinkterm::app::prepare_session(&mut page, &appearance);
+    assert!(
+        wait_until(&mut page, true, prefers_dark),
+        "told on the loaded page"
+    );
+    evaluate(&mut page, "window.kept=1");
+    assert!(corner_luminance(&mut page) < 0.05);
+
+    // Which survives the page being left.
+    go_to(&mut page, SCHEME);
+    assert!(prefers_dark(&mut page), "after a navigation");
+    evaluate(&mut page, "window.kept=1");
+
+    // A tab made afterwards is told when it is made.
+    let (mut browser, tabs) = tabbed(&engine, page, target);
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("a new target");
+    let opened = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("the engine says which")
+        .to_string();
+    let mut second = browser
+        .attach(&opened, Duration::from_secs(10))
+        .expect("a session on it");
+    second
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    blinkterm::app::prepare_session(&mut second, &appearance);
+    viewport(&mut second);
+    go_to(&mut second, SCHEME);
+    assert!(prefers_dark(&mut second), "a tab opened later");
+
+    // And the terminal turning light turns the first page light, live.
+    assert!(appearance.learned((0xfd, 0xf6, 0xe3)));
+    let mut tabs = tabs;
+    let first = &mut tabs.active_mut().expect("the first tab").connection;
+    blinkterm::app::prepare_session(first, &appearance);
+    assert!(!wait_until(first, false, prefers_dark), "told light");
+    assert_eq!(
+        evaluate(first, "window.kept").as_f64(),
+        Some(1.0),
+        "and not by a reload"
+    );
+
+    second.close();
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
+/// `--force-dark`: a page with no dark style of its own is painted dark, and
+/// stays dark on the next page.
+#[test]
+fn forced_dark_paints_a_white_page_dark() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    go_to(&mut client, WHITE);
+    assert!(corner_luminance(&mut client) > 0.9, "white to begin with");
+
+    let forced = blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, true);
+    blinkterm::app::prepare_session(&mut client, &forced);
+    let dark = |client: &mut Client| corner_luminance(client) < 0.1;
+    assert!(wait_until(&mut client, true, dark), "painted dark");
+    go_to(&mut client, WHITE);
+    assert!(
+        wait_until(&mut client, true, dark),
+        "and after a navigation"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// At every fractional level in the table that the engine rounds, the still
+/// is made exactly the pane's size, which is what keeps the terminal from
+/// resampling it.
+#[test]
+fn the_still_at_a_fractional_level_is_cut_to_the_pane() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    for factor in [1.1, 1.5, 1.75, 3.0] {
+        let viewport = zoom_to(&mut client, factor);
+        wait_until(&mut client, factor, |client| page_metrics(client).2);
+        let (rgba, width, height) = still(&mut client);
+        eprintln!(
+            "at {factor}: css {:?}, the still came {width}x{height}",
+            viewport.css
+        );
+        assert!(
+            width.abs_diff(WIDTH) <= blinkterm::zoom::SLACK
+                && height.abs_diff(HEIGHT) <= blinkterm::zoom::SLACK,
+            "{width}x{height} at {factor}"
+        );
+        let fitted = blinkterm::zoom::fit(&rgba, width, height, 4, (WIDTH, HEIGHT)).unwrap_or(rgba);
+        assert_eq!(fitted.len(), (WIDTH * HEIGHT * 4) as usize, "at {factor}");
+    }
+
+    client.close();
+    engine.kill();
+}

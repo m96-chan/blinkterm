@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::{Cells, Metrics};
 
+use crate::appearance::{self, Appearance};
 use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::clipboard;
 use crate::dialog::{Answer, Dialog, Kind};
@@ -54,6 +55,7 @@ use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::tabs::{Outcome, Tab, Tabs};
 use crate::upload::{self, Upload};
+use crate::zoom::{self, Scale, Viewport, Zoom, Zooms};
 
 /// How long the engine gets to answer on its pipe.
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -225,6 +227,14 @@ pub struct Options {
     /// where they go; or none, in which case what is typed is always a url.
     /// See [`destination`].
     pub search_url: Option<String>,
+    /// `--scale`: terminal pixels per CSS pixel before any zoom, or `Auto`
+    /// to guess it from the cell. See [`crate::zoom::Scale`].
+    pub scale: Scale,
+    /// `--color-scheme`: what a page is told it prefers, or `Auto` for what
+    /// the terminal's background says. See [`crate::appearance`].
+    pub scheme: appearance::Choice,
+    /// `--force-dark`: every page painted dark, dark style or none.
+    pub force_dark: bool,
 }
 
 /// Everything the loop owns that is not the terminal, the tabs or the engine.
@@ -275,6 +285,18 @@ struct Chrome {
     /// The right-hand hint last drawn for a load in progress, so that the row
     /// is redrawn when its seconds change and not otherwise.
     hint: Option<String>,
+    /// `--scale` as it was given, which `Auto` makes a question asked again
+    /// of every new cell size.
+    scale_choice: Scale,
+    /// The answer to it for the pane as it is now: terminal pixels per CSS
+    /// pixel before the tab's zoom. See [`viewport`].
+    scale: f64,
+    /// The zoom levels remembered per host; kept in the profile, or only in
+    /// memory for a temporary one. See [`crate::zoom`].
+    zooms: Zooms,
+    /// What every page is told about light and dark, once the terminal has
+    /// said. See [`crate::appearance`] and [`prepare_session`].
+    appearance: Appearance,
 }
 
 impl Chrome {
@@ -401,7 +423,9 @@ struct Still {
 /// host that never answers, forever. See [`crate::hover`].
 struct Ask {
     target: String,
-    /// The point it is about, in the page's CSS pixels.
+    /// The point it is about, as the [`hover::Tracker`] keeps it: in the
+    /// terminal's pixels, which is what its answer is matched against. The
+    /// page was asked about the same point in its own.
     at: (i32, i32),
     pending: Pending,
     /// When it went out, against [`hover::ASK_TIMEOUT`].
@@ -452,12 +476,16 @@ pub fn run(options: Options) -> Result<(), String> {
             format!("{why}; the engine said: {}", tail.join(" / "))
         }
     })?;
+    // What pages are told about light and dark, before there is a page to
+    // tell: the flags now, the terminal's answer when it comes.
+    let appearance = Appearance::new(options.scheme, options.force_dark);
     // Set up as every other tab is: so that the page most uploads happen in
-    // is one whose file inputs are asked on the row, and so that the first
-    // page is not a tab with less known about it than the rest — its main
-    // frame's id above all, which is what its loading is told apart from an
-    // iframe's by. See [`connect_tab`].
-    let (client, frame) = connect_tab(&mut browser, &first)?;
+    // is one whose file inputs are asked on the row, so that nothing a
+    // session is told when it is made can be forgotten on this one, and so
+    // that the first page is not a tab with less known about it than the
+    // rest — its main frame's id above all, which is what its loading is
+    // told apart from an iframe's by. See [`connect_tab`].
+    let (client, frame) = connect_tab(&mut browser, &first, &appearance)?;
     let mut first = Tab::new(first, client, "about:blank");
     first.frame = frame;
     let mut tabs = Tabs::new(first);
@@ -494,6 +522,14 @@ pub fn run(options: Options) -> Result<(), String> {
                 asking: None,
                 shape: Shape::Default,
                 hint: None,
+                scale_choice: options.scale,
+                scale: options.scale.resolve(metrics.cell),
+                zooms: if engine.profile().is_temporary() {
+                    Zooms::in_memory()
+                } else {
+                    Zooms::load(engine.profile().dir())
+                },
+                appearance,
             };
             let outcome = drive(
                 &mut pane,
@@ -602,11 +638,17 @@ fn drive(
             chrome.metrics = pane
                 .metrics()
                 .map_err(|e| format!("cannot measure the pane: {e}"))?;
+            // A font made bigger in the terminal is a resize too, and a cell
+            // that has grown past 28 pixels is a HiDPI answer that follows it.
+            chrome.scale = chrome.scale_choice.resolve(chrome.metrics.cell);
             pane.write(b"\x1b[2J").map_err(|e| e.to_string())?;
             let metrics = chrome.metrics;
+            let mut css = page_pixels(metrics);
             if let Some(tab) = tabs.active_mut() {
                 let stopped = tab.dialog.is_some();
-                emulate(&mut tab.connection, metrics, stopped)?;
+                let viewport = viewport(chrome, tab);
+                css = viewport.css;
+                emulate(&mut tab.connection, viewport, stopped)?;
                 restart_screencast(&mut tab.connection, metrics, stopped)?;
             }
             // The screen was cleared and the page is a different size, so
@@ -618,9 +660,9 @@ fn drive(
             // page to stop dead halfway through a flick; what a resize really
             // invalidates is the *point* the events are sent at, which may now
             // be off the page, so that is brought back inside it and the
-            // notches carry on. See `docs/design/browser.md`.
-            let (width, height) = page_pixels(chrome.metrics);
-            chrome.wheel.resized((width as i32, height as i32));
+            // notches carry on. See `docs/design/browser.md`. Inside it in
+            // the page's own pixels, which is what the point is sent in.
+            chrome.wheel.resized((css.0 as i32, css.1 as i32));
             // The page is a different size under the same pointer, so what
             // was under it is not known any more.
             forget_hover(pane, chrome)?;
@@ -758,24 +800,48 @@ fn tell(
     }
 }
 
-/// Tell the engine how big the page is.
-fn emulate(client: &mut Client, metrics: Metrics, stopped: bool) -> Result<(), String> {
-    let (width, height) = page_pixels(metrics);
+/// The page as the tab in front is told it: the pane, less the row, divided
+/// by the terminal's scale and the tab's zoom.
+///
+/// Everything that sends the engine a size or a point asks this: the
+/// override itself, a click, the wheel, and anything that hit-tests the page.
+/// See [`crate::zoom::Viewport::css_point`] for the one mapping from the
+/// terminal's pixels to the page's.
+fn viewport(chrome: &Chrome, tab: &Tab<Client>) -> Viewport {
+    Viewport::fit(
+        page_pixels(chrome.metrics),
+        chrome.scale * tab.zoom.factor(),
+    )
+}
+
+/// Tell the engine how big the page is, and how many of the pane's pixels
+/// are one of the page's.
+///
+/// One `Emulation.setDeviceMetricsOverride`, with the CSS size and the factor
+/// as the device's pixel ratio, which is what a browser's zoom and a HiDPI
+/// display both are to a page: it lays itself out again for the size, live,
+/// and draws its stills at the pane's resolution. It outlives navigations and
+/// reloads on its session, and a session made afterwards starts without it,
+/// so it is sent where the size always was — when a tab comes to the front
+/// and when the pane is resized — and when the level changes. The measurements
+/// are in [`crate::zoom`].
+fn emulate(client: &mut Client, viewport: Viewport, stopped: bool) -> Result<(), String> {
     tell(
         client,
         stopped,
         "Emulation.setDeviceMetricsOverride",
-        Json::object(vec![
-            ("width", Json::number(width)),
-            ("height", Json::number(height)),
-            ("deviceScaleFactor", Json::number(1)),
-            ("mobile", Json::Bool(false)),
-        ]),
+        viewport.metrics_params(),
         crate::cdp::CALL_TIMEOUT,
     )
 }
 
 /// Start the frames coming, in the format [`crate::motion`] argues for.
+///
+/// At the pane's size whatever the zoom: the engine casts no more pixels than
+/// the page's CSS viewport has, so a page zoomed in sends frames smaller than
+/// the pane — at 200%, half of it each way — and the terminal scales them
+/// into the same cells, until the still at the pane's own resolution replaces
+/// them. See [`crate::zoom`] for why nothing sharper was taken.
 fn start_screencast(client: &mut Client, metrics: Metrics, stopped: bool) -> Result<(), String> {
     let (width, height) = page_pixels(metrics);
     tell(
@@ -997,7 +1063,14 @@ fn activate(
         }
         stopped = true;
     }
-    emulate(&mut tab.connection, metrics, stopped)?;
+    // The level its host was left at, which another tab on the same site may
+    // have changed while this one was behind. A page with no host keeps the
+    // tab's own.
+    if let Some(host) = zoom::host_key(&tab.url) {
+        tab.zoom = chrome.zooms.get(Some(&host));
+    }
+    let viewport = viewport(chrome, tab);
+    emulate(&mut tab.connection, viewport, stopped)?;
     // Whatever this tab queued and nobody has read goes in the bin, frames
     // above all: the newest of them is older than the tab was, and painting it
     // would put the page as it looked before it was left behind on screen
@@ -1123,7 +1196,12 @@ fn switched(
 }
 
 /// Open a page in a new tab and switch to it.
-fn open_tab(tabs: &mut Tabs<Client>, browser: &mut Client, url: &str) -> Result<(), String> {
+fn open_tab(
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    appearance: &Appearance,
+    url: &str,
+) -> Result<(), String> {
     let created = browser.call(
         "Target.createTarget",
         Json::object(vec![("url", Json::string(url))]),
@@ -1133,7 +1211,7 @@ fn open_tab(tabs: &mut Tabs<Client>, browser: &mut Client, url: &str) -> Result<
         .and_then(Json::as_str)
         .ok_or_else(|| "the engine opened a page and did not say which".to_string())?
         .to_string();
-    let (connection, frame) = connect_tab(browser, &target)?;
+    let (connection, frame) = connect_tab(browser, &target, appearance)?;
     let mut tab = Tab::new(target, connection, url);
     tab.frame = frame;
     tabs.open(tab);
@@ -1157,6 +1235,11 @@ fn open_tab(tabs: &mut Tabs<Client>, browser: &mut Client, url: &str) -> Result<
 /// `chrome-headless-shell` 153. It survives the page navigating. See
 /// [`crate::upload`].
 ///
+/// Then [`prepare_session`], which is everything else a session is told once
+/// for its whole life: sent and not waited for, so it costs the new tab
+/// nothing, and ahead of the frame tree only because it is the one of these
+/// the page will be looked at through.
+///
 /// `Page.getFrameTree` last, because a page's loading and an iframe's
 /// arrive as the same events under different frame ids, and the main frame's
 /// is what tells them apart ([`crate::load::is_main`]). It is browser-side
@@ -1165,7 +1248,14 @@ fn open_tab(tabs: &mut Tabs<Client>, browser: &mut Client, url: &str) -> Result<
 /// The interception is not optional in the same way: a tab without it would
 /// be one whose file inputs cancel themselves, so a refusal there is the
 /// tab's failure, as `Page.enable`'s is.
-fn connect_tab(browser: &mut Client, target: &str) -> Result<(Client, Option<String>), String> {
+///
+/// Every tab is made here, the first one included: a session made any other
+/// way would be a page that was never told what the rest were.
+fn connect_tab(
+    browser: &mut Client,
+    target: &str,
+    appearance: &Appearance,
+) -> Result<(Client, Option<String>), String> {
     let mut connection = browser.attach(target, CONNECT_TIMEOUT)?;
     connection.call_within("Page.enable", Json::empty(), SWITCH_TIMEOUT)?;
     connection.call_within(
@@ -1173,11 +1263,32 @@ fn connect_tab(browser: &mut Client, target: &str) -> Result<(Client, Option<Str
         Json::object(vec![("enabled", Json::Bool(true))]),
         SWITCH_TIMEOUT,
     )?;
+    prepare_session(&mut connection, appearance);
     let frame = connection
         .call_within("Page.getFrameTree", Json::empty(), SWITCH_TIMEOUT)
         .ok()
         .and_then(|tree| load::main_frame(&tree));
     Ok((connection, frame))
+}
+
+/// Tell a new session what every session is told and nothing resets: the
+/// colour scheme a page is to see, and whether it is to be painted dark.
+///
+/// This is where every per-session `Emulation` command that is not about the
+/// size belongs. The size is not here because it changes with the pane and
+/// the zoom, and is sent by `activate` to the tab in front; what is here is
+/// per session and survives every navigation on it, and a target attached
+/// later starts without it — measured, in [`crate::appearance`] — so a
+/// session that missed this would be the one page in the browser that was
+/// light in a dark terminal.
+///
+/// Told rather than asked: a page that has just been made may already be
+/// stopped behind a dialog, and a scheme that did not take is a page that is
+/// light, which is no reason not to open it.
+pub fn prepare_session(client: &mut Client, appearance: &Appearance) {
+    for (method, params) in appearance.commands() {
+        let _ = client.notify(method, params);
+    }
 }
 
 /// Close one tab: the page in the engine, and the session on it.
@@ -1305,6 +1416,16 @@ fn page_cells(metrics: Metrics) -> Cells {
 /// being too narrow to carry it. Markers are ASCII words, not glyphs: a
 /// padlock or a spinner is ambiguous-width in East Asian terminals, and a row
 /// one cell out wraps.
+///
+/// The zoom level is one more word of the same kind: `150%` while the tab in
+/// front is not at 100%. With one tab it goes after whatever else is at the
+/// right-hand end — the download's words or the loading hint — because the
+/// right is clipped from its end when the pane is narrow, and `esc stops` is
+/// a key that does something while the level is only news. With the strip it
+/// goes after the download, the link or the hint that stands in the url's
+/// place, for the same reason, and before the url when the url is there, so
+/// that it is the url that runs out of room first. Beside the title, never
+/// instead of it, and nothing of it under a line that owns the row.
 fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(), String> {
     let cols = chrome.metrics.cols;
     let Some(active) = tabs.active() else {
@@ -1317,11 +1438,13 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
     let loading = active
         .loading
         .then(|| load::loading_hint(active.loading_for(now)));
+    let marker = active.zoom.marker();
     let bytes = if let Some(owner) = row_owner(tabs, chrome.bar.as_ref(), chrome.find.as_ref()) {
         owned_row(cols, owner)
     } else if tabs.len() < 2 {
         let left = pointing.unwrap_or_else(|| active.line());
-        match downloading.or(loading) {
+        // The download's words or the loading hint, then the level.
+        match words(&[downloading.or(loading).as_deref(), marker.as_deref()]) {
             Some(right) => screen::split_line(cols, &left, &right),
             None => screen::status_line(cols, &left),
         }
@@ -1341,17 +1464,14 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
                 dialog: tab.asks(),
             })
             .collect();
-        let right = downloading
-            .or(pointing)
-            .or(loading)
-            .or_else(|| {
-                active
-                    .trust
-                    .words()
-                    .map(|words| format!("{words}  {}", active.url))
-            })
-            .unwrap_or_else(|| active.url.clone());
-        screen::tab_line(cols, &labels, &right)
+        // After the strip, the download, the link or the hint in the url's
+        // place and the level after it; or the level, the transport's warning
+        // and the url, which is the one to run out of room.
+        let right = match downloading.or(pointing).or(loading) {
+            Some(news) => words(&[Some(&news), marker.as_deref()]),
+            None => words(&[marker.as_deref(), active.trust.words(), Some(&active.url)]),
+        };
+        screen::tab_line(cols, &labels, right.as_deref().unwrap_or_default())
     };
     pane.write(&bytes).map_err(|e| e.to_string())
 }
@@ -1430,6 +1550,12 @@ fn row_owner<'a, C>(
     tab.upload.as_ref().map(RowOwner::Upload)
 }
 
+/// The words that are there, two spaces apart, or `None` for none.
+fn words(parts: &[Option<&str>]) -> Option<String> {
+    let there: Vec<&str> = parts.iter().flatten().copied().collect();
+    (!there.is_empty()).then(|| there.join("  "))
+}
+
 /// The row as `line` being typed after `prompt`: as much of it as fits, with
 /// the cursor in sight.
 fn typing_row(cols: u32, prompt: &str, line: &Line) -> Vec<u8> {
@@ -1464,9 +1590,10 @@ fn handle_target_events(
         if chrome.downloads.take(event, Instant::now()) {
             redraw = true;
         }
+        let appearance = chrome.appearance;
         let mut frame = None;
         let outcome = tabs.take(event, |target| {
-            connect_tab(browser, target).map(|(connection, main)| {
+            connect_tab(browser, target, &appearance).map(|(connection, main)| {
                 frame = main;
                 connection
             })
@@ -1620,6 +1747,26 @@ fn handle_page_events(
                             .is_some_and(|find| find.target == tab.target);
                         if index == active {
                             left_page = true;
+                        }
+                        // A page lands at its host's level, as it would in a
+                        // browser: a link from a zoomed site to another lands
+                        // at that one's. The tab in front is told now — told,
+                        // not asked, because a page that has just landed may
+                        // already be asking something — and a tab behind is
+                        // told when it comes to the front.
+                        let wanted =
+                            zoom::host_key(&tab.url).map(|host| chrome.zooms.get(Some(&host)));
+                        if let Some(wanted) = wanted.filter(|&wanted| wanted != tab.zoom) {
+                            tab.zoom = wanted;
+                            if index == active {
+                                let viewport = viewport(chrome, tab);
+                                let _ = emulate(&mut tab.connection, viewport, true);
+                                chrome.motion.reset(Instant::now());
+                                chrome.still = None;
+                                chrome
+                                    .wheel
+                                    .resized((viewport.css.0 as i32, viewport.css.1 as i32));
+                            }
                         }
                     }
                 }
@@ -1882,7 +2029,15 @@ fn collect_still(
         chrome.motion.still_failed();
         return Ok(());
     };
-    let raw = Raw::rgba(&image.rgba, image.width, image.height);
+    // At a fractional level the engine's rounding leaves the still a pixel or
+    // two off the pane, and a picture that is not the pane's size is one the
+    // terminal resamples until the text goes soft. See [`zoom::fit`].
+    let pane_pixels = page_pixels(chrome.metrics);
+    let fitted = zoom::fit(&image.rgba, image.width, image.height, 4, pane_pixels);
+    let raw = match &fitted {
+        Some(pixels) => Raw::rgba(pixels, pane_pixels.0, pane_pixels.1),
+        None => Raw::rgba(&image.rgba, image.width, image.height),
+    };
     paint(pane, tabs, chrome, raw)
 }
 
@@ -1976,7 +2131,7 @@ impl scroll::Dispatch for Wire {
 /// opposite of what `Input.synthesizeScrollGesture`'s `yDistance` wanted.
 fn scroll(tabs: &Tabs<Client>, chrome: &Chrome, report: &MouseInput) {
     let pixels = chrome.parser.pixel_coordinates();
-    let (x, y) = css_point(report, pixels, chrome.metrics);
+    let (x, y) = crate::input::page_point(report, pixels, chrome.metrics.cell, 1);
     if y < 0 {
         // The status row is this program's, and turning the wheel over it is
         // not the page's business.
@@ -1985,15 +2140,15 @@ fn scroll(tabs: &Tabs<Client>, chrome: &Chrome, report: &MouseInput) {
     let Some(tab) = tabs.active() else {
         return;
     };
-    let distance = (
-        report.wheel.0 as f64 * WHEEL_PIXELS,
-        report.wheel.1 as f64 * WHEEL_PIXELS,
-    );
+    // In the page's pixels, both of them: the point, and a notch that moves
+    // the page the same distance on the screen whatever it is zoomed to.
+    let viewport = viewport(chrome, tab);
+    let at = css_point(viewport, (x, y));
     chrome.wheel.notch(
         &tab.target,
         Arc::new(Wire::new(tab.connection.notifier())),
-        (x, y),
-        distance,
+        (at.0.round() as i32, at.1.round() as i32),
+        viewport.notch(report.wheel, WHEEL_PIXELS),
     );
 }
 
@@ -2028,10 +2183,16 @@ fn tick_hover(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> 
     }
     let now = Instant::now();
     let buttons = chrome.buttons;
+    // The tracker keeps the pointer in the terminal's pixels; the page is
+    // told and asked in its own, at the level it is at now.
+    let Some(viewport) = tabs.active().map(|tab| viewport(chrome, tab)) else {
+        return Ok(());
+    };
     let Some(tab) = tabs.active_mut() else {
         return Ok(());
     };
-    if let Some(((x, y), modifiers)) = chrome.hover.tell(now) {
+    if let Some((at, modifiers)) = chrome.hover.tell(now) {
+        let (x, y) = css_point(viewport, at);
         let _ = tab.connection.notify(
             "Input.dispatchMouseEvent",
             Json::object(vec![
@@ -2054,10 +2215,11 @@ fn tick_hover(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> 
     // cannot take a command is heard about elsewhere, and asking it again
     // every pass would not help.
     chrome.hover.asked(at, now);
-    if let Ok(pending) = tab
-        .connection
-        .send("Runtime.evaluate", hover::ask(at.0, at.1))
-    {
+    let (x, y) = css_point(viewport, at);
+    if let Ok(pending) = tab.connection.send(
+        "Runtime.evaluate",
+        hover::ask(x.round() as i32, y.round() as i32),
+    ) {
         chrome.asking = Some(Ask {
             target: tab.target.clone(),
             at,
@@ -2134,15 +2296,22 @@ fn routes_to_hover(report: &MouseInput) -> bool {
     report.kind == MouseKind::Move && report.button.is_none()
 }
 
-/// Where a report points on the page, in CSS pixels: the one place a
-/// terminal's coordinates become the page's, for a click, a wheel notch and
-/// the hover alike.
+/// Where a point in the page's part of the pane is on the page, in CSS
+/// pixels: the one place a terminal's coordinates become the page's, for a
+/// click, a wheel notch and the hover alike.
 ///
-/// Today that is [`crate::input::page_point`] less the status row, since a
-/// CSS pixel is a device pixel here (`deviceScaleFactor` 1, no zoom). A zoom
-/// changes the second half of that sentence, and this is where it would.
-fn css_point(report: &MouseInput, pixels: bool, metrics: Metrics) -> (i32, i32) {
-    crate::input::page_point(report, pixels, metrics.cell, 1)
+/// The arithmetic is [`Viewport::css_point`]'s and nowhere else's; this is
+/// the loop's one door to it, so that a caller holding a terminal point asks
+/// here with the [`viewport`] of the tab it is about, and cannot do the
+/// division some other way. What comes in is [`crate::input::page_point`]'s
+/// — the report in terminal pixels, less the status row — and everything
+/// that is about the screen rather than the page is decided on that before
+/// it gets here: whether the point is on the row, whether two presses are a
+/// double click, and whether the pointer has moved far enough to ask the page
+/// again ([`hover::ASK_STEP`]), which at 300% would otherwise be twelve of
+/// the screen's pixels and at 25% one.
+fn css_point(viewport: Viewport, at: (i32, i32)) -> (f64, f64) {
+    viewport.css_point(at.0, at.1)
 }
 
 /// Handle one thing the terminal said. `false` means quit.
@@ -2155,6 +2324,21 @@ fn handle_input(
 ) -> Result<bool, String> {
     match input {
         Input::Mode { .. } => {}
+        // The terminal's background, which this program asked for: if it
+        // changes what pages are told, every tab is told again, in front or
+        // behind, and a page already loaded changes where it stands. Told,
+        // not asked, so that a tab stopped behind a dialog costs nothing.
+        Input::Colour { slot: 11, rgb } => {
+            if chrome.appearance.learned(rgb) {
+                for index in 0..tabs.len() {
+                    if let Some(tab) = tabs.get_mut(index) {
+                        prepare_session(&mut tab.connection, &chrome.appearance);
+                    }
+                }
+            }
+        }
+        // Another colour is nothing this program asked about.
+        Input::Colour { .. } => {}
         Input::PasteRefused { bytes } => {
             note(
                 tabs,
@@ -2286,7 +2470,8 @@ fn handle_input(
                 Some(Command::Back) => go(tabs, -1),
                 Some(Command::Forward) => go(tabs, 1),
                 Some(Command::NewTab) => {
-                    match open_tab(tabs, browser, "about:blank") {
+                    let appearance = chrome.appearance;
+                    match open_tab(tabs, browser, &appearance, "about:blank") {
                         Ok(()) => {
                             switched(pane, tabs, browser, chrome, was)?;
                             // A new tab is a tab somebody is about to type an
@@ -2329,6 +2514,15 @@ fn handle_input(
                     let url = tabs.active().map(|tab| tab.url.clone()).unwrap_or_default();
                     copy_out(pane, tabs, &url, Copied::Url)?;
                     redraw_row(pane, tabs, chrome)?;
+                }
+                Some(what @ (Command::ZoomIn | Command::ZoomOut | Command::ZoomReset)) => {
+                    let now = tabs.active().map(|tab| tab.zoom).unwrap_or_default();
+                    let wanted = match what {
+                        Command::ZoomIn => now.step_in(),
+                        Command::ZoomOut => now.step_out(),
+                        _ => Zoom::DEFAULT,
+                    };
+                    rezoom(pane, tabs, chrome, wanted)?;
                 }
                 Some(Command::CopySelection) => {
                     let answer = tabs.active_mut().map(|tab| {
@@ -2385,9 +2579,12 @@ fn handle_input(
                 chrome.hover.scrolled();
                 return Ok(true);
             }
-            let metrics = chrome.metrics;
+            let cell = chrome.metrics.cell;
             let pixels = chrome.parser.pixel_coordinates();
-            let point = css_point(&report, pixels, metrics);
+            // In the terminal's pixels, inside the page: whether it is on the
+            // row, and how far the pointer has moved, are about the screen.
+            // The page's pixels come after, at the one place they are made.
+            let point = crate::input::page_point(&report, pixels, cell, 1);
             // A bare motion is the hover's: remembered here and told to the
             // page once a pass by `tick_hover`, since a terminal in any-event
             // mode can send a thousand of them a second. Over the row it is
@@ -2409,6 +2606,9 @@ fn handle_input(
             if report.kind == MouseKind::Press && point.1 >= 0 {
                 chrome.hover.moved(point, report.mods.cdp());
             }
+            let Some(viewport) = tabs.active().map(|tab| viewport(chrome, tab)) else {
+                return Ok(true);
+            };
             let clicks = &mut chrome.clicks;
             let buttons = &mut chrome.buttons;
             if let Some(tab) = tabs.active_mut() {
@@ -2417,7 +2617,8 @@ fn handle_input(
                     pixels,
                     clicks,
                     buttons,
-                    metrics,
+                    cell,
+                    viewport,
                     report,
                 );
             }
@@ -2448,6 +2649,12 @@ enum Command {
     CopyUrl,
     /// `ctrl+f`: find in the page. See [`crate::find`].
     Find,
+    /// `alt+=` or `ctrl+=`: the next of [`crate::zoom::LEVELS`] up.
+    ZoomIn,
+    /// `alt+-` or `ctrl+-`: the next one down.
+    ZoomOut,
+    /// `alt+0` or `ctrl+0`: back to 100%.
+    ZoomReset,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -2469,9 +2676,16 @@ enum Command {
 /// which [`handle_input`] does before it gets here. Find does not survive
 /// either, for the same reason: it asks the page.
 ///
+/// A zoom waits too. The page is stopped, so it would not lay itself out
+/// again or be photographed at the new level until it was answered, and the
+/// level then arrives with whatever else was queued — which is the reload
+/// case again.
+///
 /// The same keys survive a file input's prompt, and the same wait, although
 /// that page is not stopped: what waits is still what would do something to
 /// the page the path is being typed for, and the copy is still of the line.
+/// A zoom there would lay the page out again under an input the person is
+/// answering for, and it is one key to finish the path first.
 fn survives_dialog(command: Command) -> bool {
     match command {
         Command::Quit
@@ -2486,7 +2700,10 @@ fn survives_dialog(command: Command) -> bool {
         | Command::Back
         | Command::Forward
         | Command::CopySelection
-        | Command::Find => false,
+        | Command::Find
+        | Command::ZoomIn
+        | Command::ZoomOut
+        | Command::ZoomReset => false,
     }
 }
 
@@ -2796,6 +3013,19 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// nothing on it. What it shadows is a page's own `ctrl+f` handler, which in
 /// a headless engine opened nothing anyway. Inside a line being typed it is
 /// readline's forward-a-character, because the line is asked first.
+///
+/// Zoom is on both. `ctrl+=`, `ctrl+-` and `ctrl+0` are the browser's reflex
+/// and are bound, but only some terminals let them through: Kitty passes them
+/// (its own font size is `ctrl+shift+=`) and so does tOS, whose compositor
+/// binds `=` only under its `ctrl+a` leader; WezTerm and Ghostty keep them
+/// for their own font size by default, and a legacy terminal sends `ctrl+=`
+/// as a bare `=`. `alt+=`, `alt+-` and `alt+0` are the program's own, on the
+/// modifier it already uses for back, forward, tabs and copying, and pass
+/// through every one of them and over any ssh. `+` and `_` are the same keys
+/// shifted, and `ctrl+_` is what a legacy terminal sends for `ctrl+-`
+/// (`0x1f`). `ctrl+0` is the one ctrl-digit taken, because no page has ever
+/// been sent it by a browser; `ctrl+1`..`ctrl+9` stay the page's. What the
+/// alt forms shadow is an `accesskey` on `=`, `-` or `0`.
 fn command(key: &KeyInput) -> Option<Command> {
     if key.action == KeyAction::Release {
         return None;
@@ -2810,6 +3040,9 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('f') => Some(Command::Find),
             Key::Tab if key.mods.shift() => Some(Command::PreviousTab),
             Key::Tab => Some(Command::NextTab),
+            Key::Char('=' | '+') => Some(Command::ZoomIn),
+            Key::Char('-' | '_') => Some(Command::ZoomOut),
+            Key::Char('0') => Some(Command::ZoomReset),
             _ => None,
         };
     }
@@ -2820,10 +3053,63 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char(digit @ '1'..='9') => Some(Command::SelectTab(digit as usize - '0' as usize)),
             Key::Char('c') => Some(Command::CopySelection),
             Key::Char('u') => Some(Command::CopyUrl),
+            Key::Char('=' | '+') => Some(Command::ZoomIn),
+            Key::Char('-' | '_') => Some(Command::ZoomOut),
+            Key::Char('0') => Some(Command::ZoomReset),
             _ => None,
         };
     }
     None
+}
+
+/// A new level for the tab in front: told to the engine, remembered for the
+/// host, and the row redrawn.
+///
+/// No screencast restart and no screen clear: a running cast follows the new
+/// size by itself (measured, 45 frames at the new size in the next 1.5 s and
+/// none at the old), and the picture that is up stays up until the first of
+/// them replaces it. The motion clock is reset, so that the page laid out
+/// again gets its lossless still, and a still already asked for is dropped,
+/// because it is of the page at the old level. A scroll in flight carries on
+/// at a point brought back inside the new CSS size, as after a resize, and
+/// what is under the pointer is asked again, as after a scroll.
+///
+/// A page with no host is zoomed all the same, on its tab alone; see
+/// [`crate::zoom::host_key`]. A level that cannot be written to the profile
+/// is still the level the page is at.
+fn rezoom(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    level: Zoom,
+) -> Result<(), String> {
+    let Some(tab) = tabs.active_mut() else {
+        return Ok(());
+    };
+    if tab.zoom == level {
+        return Ok(());
+    }
+    tab.zoom = level;
+    if let Some(host) = zoom::host_key(&tab.url) {
+        let _ = chrome.zooms.set(&host, level);
+    }
+    let viewport = viewport(chrome, tab);
+    let stopped = tab.dialog.is_some();
+    if let Err(why) = emulate(&mut tab.connection, viewport, stopped) {
+        tab.note = Some(why);
+    }
+    chrome.motion.reset(Instant::now());
+    chrome.still = None;
+    chrome
+        .wheel
+        .resized((viewport.css.0 as i32, viewport.css.1 as i32));
+    // The page is laid out again under a pointer that did not move, as a
+    // wheel moves it: an ask that is out is about the old layout and is
+    // dropped, and the same place is asked about once more. The link on the
+    // row stays until the answer says otherwise, as it does after a scroll.
+    chrome.asking = None;
+    chrome.hover.scrolled();
+    redraw_row(pane, tabs, chrome)
 }
 
 /// Type into the url bar. Returns `false` only if the person quit.
@@ -3372,15 +3658,23 @@ fn button_bit(button: Option<u32>) -> u32 {
     }
 }
 
+/// One mouse report as the page's `Input.dispatchMouseEvent`.
+///
+/// Measured in the terminal's pixels until it goes on the wire — whether it
+/// is on the status row, and whether two presses are close enough to be a
+/// double click, are about the screen — and then in the page's, through
+/// [`Viewport::css_point`]. `cell` is the terminal's, which turns a report
+/// into a point, and `viewport` is the page as the engine was told it.
 fn send_mouse(
     client: &mut Client,
     pixel_coordinates: bool,
     clicks: &mut Clicks,
     buttons: &mut u32,
-    metrics: Metrics,
+    cell: (u32, u32),
+    viewport: Viewport,
     report: MouseInput,
 ) {
-    let (x, y) = css_point(&report, pixel_coordinates, metrics);
+    let (x, y) = crate::input::page_point(&report, pixel_coordinates, cell, 1);
     if y < 0 {
         // The status row is this program's, and a click on it is not the
         // page's business. A release is still forwarded, so that a drag that
@@ -3409,6 +3703,7 @@ fn send_mouse(
         MouseKind::Wheel => return,
     };
 
+    let (x, y) = css_point(viewport, (x, y));
     let mut fields = vec![
         ("type", Json::string(kind)),
         ("x", Json::number(x)),
@@ -3643,8 +3938,12 @@ mod tests {
                 "alt+{n}"
             );
         }
-        // There is no tab zero, and a digit on its own is typing.
-        assert_eq!(command(&key(Key::Char('0'), Mods::ALT)), None);
+        // There is no tab zero — alt+0 is back to 100% — and a digit on its
+        // own is still typing.
+        assert_eq!(
+            command(&key(Key::Char('0'), Mods::ALT)),
+            Some(Command::ZoomReset)
+        );
         assert_eq!(command(&key(Key::Char('1'), 0)), None);
         // ctrl+digit stays the page's: a page may bind it, and the compositor
         // puts its own workspace digits on ctrl+shift and on super.
@@ -3747,6 +4046,65 @@ mod tests {
         // A tab behind with a prompt does not own the row in front.
         tabs.open(Tab::new("b", (), "https://b.example/"));
         assert_eq!(owner(&tabs, None), "page");
+    }
+
+    #[test]
+    fn the_zoom_keys_are_the_browsers_and_the_ones_every_terminal_lets_through() {
+        for mods in [Mods::CTRL, Mods::ALT, Mods::CTRL | Mods::SHIFT] {
+            for (c, wanted) in [
+                ('=', Command::ZoomIn),
+                ('+', Command::ZoomIn),
+                ('-', Command::ZoomOut),
+                ('_', Command::ZoomOut),
+                ('0', Command::ZoomReset),
+            ] {
+                assert_eq!(
+                    command(&key(Key::Char(c), mods)),
+                    Some(wanted),
+                    "{c} {mods:?}"
+                );
+            }
+        }
+        // `ctrl+-` in a legacy terminal is `0x1f`, which is ctrl+_.
+        match Parser::new().feed(&[0x1f]).as_slice() {
+            [Input::Key(legacy)] => assert_eq!(command(legacy), Some(Command::ZoomOut)),
+            other => panic!("{other:?}"),
+        }
+        // Unmodified they are typing, both at once is the page's, and the
+        // other ctrl-digits stay the page's.
+        assert_eq!(command(&key(Key::Char('='), 0)), None);
+        assert_eq!(command(&key(Key::Char('-'), Mods::SHIFT)), None);
+        assert_eq!(command(&key(Key::Char('0'), Mods::CTRL | Mods::ALT)), None);
+        for n in 1..=9u8 {
+            assert_eq!(
+                command(&key(Key::Char((b'0' + n) as char), Mods::CTRL)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn the_zoom_keys_wait_for_a_dialog_and_a_file_inputs_path() {
+        // One rule for both, `survives_dialog`, which `handle_input` asks for
+        // a dialog and for a path alike: a level changed under either would
+        // lay the page out again behind something the person is answering.
+        for command in [Command::ZoomIn, Command::ZoomOut, Command::ZoomReset] {
+            assert!(!survives_dialog(command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn the_words_at_the_end_of_the_row_are_what_there_is_two_spaces_apart() {
+        assert_eq!(words(&[None, None]), None);
+        assert_eq!(words(&[Some("150%"), None]).as_deref(), Some("150%"));
+        assert_eq!(
+            words(&[Some("downloading report.pdf 42%"), Some("150%")]).as_deref(),
+            Some("downloading report.pdf 42%  150%")
+        );
+        assert_eq!(
+            words(&[Some("150%"), Some("https://example.com")]).as_deref(),
+            Some("150%  https://example.com")
+        );
     }
 
     #[test]
@@ -4051,6 +4409,13 @@ mod tests {
             page_cells(metrics).rows * metrics.cell.1,
             page_pixels(metrics).1
         );
+        // At 200% — a HiDPI scale, a zoom, or one of each — the page is laid
+        // out in half that, and the middle of cell (11, 4) is half as far in.
+        let viewport = Viewport::fit(page_pixels(metrics), 2.0);
+        assert_eq!(viewport.css, (320, 184));
+        assert_eq!(viewport.css_point(84, 40), (42.0, 20.0));
+        // And the placement does not move: the cells are the pane's.
+        assert_eq!(page_cells(metrics), Cells { cols: 80, rows: 23 });
     }
 
     #[test]
@@ -4184,8 +4549,18 @@ mod tests {
             wheel: (0, 0),
         };
         // In cells: the middle of the third cell of the first page row.
-        assert_eq!(css_point(&report, false, metrics), (20, 8));
+        let cells = crate::input::page_point(&report, false, metrics.cell, 1);
+        assert_eq!(cells, (20, 8));
         // In pixels: the pixel itself, less the row.
-        assert_eq!(css_point(&report, true, metrics), (2, -15));
+        assert_eq!(
+            crate::input::page_point(&report, true, metrics.cell, 1),
+            (2, -15)
+        );
+        // Then the page's pixels, at the level the page is at: the same
+        // point at 100%, half as far in at 200% — a HiDPI scale, a zoom, or
+        // one of each — whichever of the three is asking.
+        let at = |factor: f64| css_point(Viewport::fit(page_pixels(metrics), factor), cells);
+        assert_eq!(at(1.0), (20.0, 8.0));
+        assert_eq!(at(2.0), (10.0, 4.0));
     }
 }

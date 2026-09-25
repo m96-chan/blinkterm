@@ -269,7 +269,11 @@ pub const ASK_STEP: i32 = 4;
 /// decides what is on the wire, and this decides how much.
 #[derive(Debug, Default)]
 pub struct Tracker {
-    /// The last report inside the page, in CSS pixels, and its modifiers.
+    /// The last report inside the page, and its modifiers. In the
+    /// terminal's pixels, less the status row, not the page's: every
+    /// distance here — [`ASK_STEP`] above all — is about how far a hand moved
+    /// on the screen, which a zoom does not change. The loop turns a position
+    /// into the page's own pixels when it tells or asks the page.
     latest: Option<((i32, i32), u32)>,
     /// The last position the page was told, and when.
     told: Option<(i32, i32)>,

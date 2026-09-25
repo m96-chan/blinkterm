@@ -131,6 +131,15 @@ A full `chromium` rather than the headless shell still writes
 `~/.config/chromium/Crash Reports` whatever profile it is given; that
 directory is Chromium's, not `blinkterm`'s.
 
+### Zoom levels
+
+A page you zoom is remembered by its host, in a file called `zoom` beside
+the history: one line per change, the host and the level, and nothing for a
+site at 100%. It is a list of sites you have visited, so it is readable by
+you alone (0600) too, and keeps the last 500. `--temp-profile` keeps the
+levels in memory for the run and writes none; deleting the file forgets
+every level.
+
 ## Downloads
 
 A file a page offers — a link to a PDF, anything served as
@@ -194,6 +203,8 @@ not a thing a terminal has.
 | `ctrl+w` | close this tab; closing the last one quits |
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
 | `alt+1` … `alt+9` | the nth tab |
+| `alt+=` / `alt+-` | zoom in and out (`ctrl+=` / `ctrl+-` where your terminal lets them through) |
+| `alt+0` / `ctrl+0` | back to 100% |
 | your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
 | `alt+c` | copy the page's selection to your clipboard; with the url bar, the find prompt, a `prompt()` or a file input's path open, copy that line |
 | `alt+u` | copy the page's url to your clipboard |
@@ -256,9 +267,35 @@ waiting is marked `!` as one with a dialog is. A dialog the page opens while a
 path is half typed takes the row first; the path is there again once it is
 answered.
 
+### Zoom, scale and dark pages
+
+`alt+=` and `alt+-` zoom the page in and out through Chrome's own steps
+(25% to 300%), `alt+0` puts it back; `ctrl+=`, `ctrl+-` and `ctrl+0` do the
+same where your terminal lets them through — Kitty and tOS do, WezTerm and
+Ghostty keep them for their own font size. The level is remembered per
+site, in the profile's `zoom` file (0600, a list of hosts; `--temp-profile`
+keeps none), and shows on the row as `150%` while it is not 100%. Zooming
+reflows the page as a browser's zoom does — `devicePixelRatio` and
+`innerWidth` change, and the page lays itself out for the narrower width —
+rather than magnifying a picture of it. While the page is moving the frames
+are at the page's own resolution and the terminal scales them; the lossless
+still that follows is at the pane's.
+
+On a HiDPI terminal a page at one CSS pixel per terminal pixel is tiny.
+`--scale 2` makes it two, and the default, `auto`, says 2 when a cell is 28
+px or taller — a 2x display's cells are, a 1x display's are not — and
+follows the terminal's font size as it changes.
+
+A page is told whether you prefer dark: `--color-scheme dark|light|auto`.
+`auto` (the default) asks the terminal its background colour (`OSC 11`) and
+calls it dark below mid-grey; a terminal that does not answer gets light. A
+page with no dark style stays white; `--force-dark` has the engine paint
+every page dark regardless, which is Chromium's auto dark mode and is off
+unless you ask.
+
 ## The status row
 
-The top row is the page's title and url, and four other things when they
+The top row is the page's title and url, and five other things when they
 apply. A link under the pointer shows where it goes — `link: https://…` —
 which is the one defence against a link whose text says one place and whose
 href says another; the url shown is the one the engine resolved, with
@@ -272,7 +309,8 @@ that domain costs more than the row is worth (`src/load.rs` has the
 numbers). `esc` stops the load and leaves the page where it was: the
 previous page if nothing had arrived, the half-loaded page if something had.
 A terminal that understands OSC 22 (Kitty, Ghostty) also gets a hand over a
-link and an I-beam over a text field; the rest ignore it.
+link and an I-beam over a text field; the rest ignore it. A zoom that is not
+100% is a word at the right too, `150%`, after the loading hint.
 
 The url bar, the find prompt, a page's dialog and a file input's path take
 the whole row while they are open, and `esc` goes to whichever of them has it

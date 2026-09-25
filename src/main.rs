@@ -4,9 +4,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use blinkterm::app::{self, Options};
+use blinkterm::appearance;
 use blinkterm::download;
 use blinkterm::engine;
 use blinkterm::profile::Choice;
+use blinkterm::zoom::Scale;
 
 const USAGE: &str = "\
 blinkterm, a real browser in a terminal pane
@@ -27,6 +29,14 @@ options:
                    send what is typed in the url bar and is not a url to
                    <url>, with %s where the words go (off by default: nothing
                    typed leaves the machine unless you say so)
+  --scale <n|auto> terminal pixels per CSS pixel before any zoom: 2 on a
+                   HiDPI terminal. auto (the default) says 2 when a cell is
+                   28 px or taller, else 1
+  --color-scheme <auto|light|dark>
+                   what a page is told it prefers (prefers-color-scheme).
+                   auto (the default) asks the terminal its background
+  --force-dark     paint every page dark, even one with no dark style
+                   (Chromium's auto dark mode)
 
 The page is rendered by a headless Chromium, which this program starts and
 stops. It is looked for in $BLINKTERM_ENGINE first, then on PATH as
@@ -56,6 +66,8 @@ keys:
   ctrl+w         close this tab; closing the last one quits
   ctrl+tab       the next tab, ctrl+shift+tab the one before
   alt+1 .. alt+9 the nth tab
+  alt+= / alt+-  zoom in, out (ctrl+= / ctrl+- where the terminal lets them
+                 through); alt+0 / ctrl+0 back to 100%
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no
 Everything else goes to the page. A link that asks for a new window gets a
@@ -115,11 +127,20 @@ fn main() -> ExitCode {
 /// `--search-url` is taken the same two ways, and refused without a `%s`,
 /// which is where the words go: a search url without one would send every
 /// search to the same page, and the person would find that out by searching.
+///
+/// `--scale` and `--color-scheme` are taken the same two ways and refused
+/// twice for the same reason, each with its own parser's sentence for a value
+/// it does not know. `--force-dark` is a flag with nothing after it, and is
+/// refused twice as everything else is: a command line that says a thing
+/// twice was put together by something that meant two different things.
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut url = None;
     let mut profile = None;
     let mut downloads = None;
     let mut search_url = None;
+    let mut scale = None;
+    let mut scheme = None;
+    let mut force_dark = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let dir = if arg == "--download-dir" {
@@ -160,6 +181,25 @@ fn parse(args: &[String]) -> Result<Options, String> {
             }
             continue;
         }
+        if let Some(text) = value_of(arg, "--scale", &mut args) {
+            if scale.replace(Scale::parse(text)?).is_some() {
+                return Err("one scale at a time".to_string());
+            }
+            continue;
+        }
+        if let Some(text) = value_of(arg, "--color-scheme", &mut args) {
+            if scheme.replace(appearance::Choice::parse(text)?).is_some() {
+                return Err("one colour scheme at a time".to_string());
+            }
+            continue;
+        }
+        if arg == "--force-dark" {
+            if force_dark {
+                return Err("--force-dark once is enough".to_string());
+            }
+            force_dark = true;
+            continue;
+        }
         let chosen = if arg == "--temp-profile" {
             Some(Choice::Temporary)
         } else if arg == "--profile" {
@@ -193,7 +233,24 @@ fn parse(args: &[String]) -> Result<Options, String> {
         profile: profile.unwrap_or(Choice::Default),
         download: downloads.map_or(download::Choice::Default, download::Choice::At),
         search_url,
+        scale: scale.unwrap_or(Scale::Auto),
+        scheme: scheme.unwrap_or_default(),
+        force_dark,
     })
+}
+
+/// The value of `--name value` or `--name=value`, when `arg` is that option:
+/// what came after it, or an empty string when nothing did, for the option's
+/// own parser to refuse by name.
+fn value_of<'a>(
+    arg: &'a str,
+    name: &str,
+    rest: &mut std::slice::Iter<'a, String>,
+) -> Option<&'a str> {
+    if arg == name {
+        return Some(rest.next().map(String::as_str).unwrap_or_default());
+    }
+    arg.strip_prefix(name)?.strip_prefix('=')
 }
 
 const DOWNLOAD_DIR_NEEDED: &str = "--download-dir needs a directory: --download-dir <dir>";
@@ -248,6 +305,86 @@ mod tests {
             .err()
             .expect("refused");
         assert_eq!(why, "one search url at a time");
+    }
+
+    #[test]
+    fn with_no_flags_the_scale_and_the_scheme_are_auto() {
+        let options = parsed(&[]).expect("nothing is fine");
+        assert_eq!(options.scale, Scale::Auto);
+        assert_eq!(options.scheme, appearance::Choice::Auto);
+        assert!(!options.force_dark, "nothing is painted dark unasked");
+    }
+
+    #[test]
+    fn a_scale_can_be_named_either_way_round_the_equals_sign() {
+        for args in [
+            &["--scale", "2", "example.com"][..],
+            &["--scale=2", "example.com"][..],
+            &["example.com", "--scale", "2"][..],
+        ] {
+            let options = parsed(args).expect("a scale");
+            assert_eq!(options.scale, Scale::Fixed(2.0), "{args:?}");
+            assert_eq!(options.url, "example.com", "{args:?}");
+        }
+        let options = parsed(&["--scale=auto"]).expect("auto");
+        assert_eq!(options.scale, Scale::Auto);
+    }
+
+    #[test]
+    fn a_scale_that_is_not_a_number_in_range_is_an_error_that_names_the_option() {
+        for args in [
+            &["--scale"][..],
+            &["--scale="][..],
+            &["--scale", "0"][..],
+            &["--scale=5"][..],
+            &["--scale", "big"][..],
+        ] {
+            let why = parsed(args).err().expect("refused");
+            assert!(why.contains("--scale"), "{args:?}: {why}");
+        }
+    }
+
+    #[test]
+    fn two_scales_are_one_too_many() {
+        let why = parsed(&["--scale=2", "--scale", "auto"])
+            .err()
+            .expect("refused");
+        assert_eq!(why, "one scale at a time");
+    }
+
+    #[test]
+    fn a_colour_scheme_is_one_of_three_words() {
+        for (word, choice) in [
+            ("auto", appearance::Choice::Auto),
+            ("light", appearance::Choice::Light),
+            ("dark", appearance::Choice::Dark),
+        ] {
+            let options = parsed(&["--color-scheme", word]).expect("a scheme");
+            assert_eq!(options.scheme, choice, "{word}");
+            let options = parsed(&[&format!("--color-scheme={word}")]).expect("a scheme");
+            assert_eq!(options.scheme, choice, "{word}");
+        }
+        for args in [&["--color-scheme"][..], &["--color-scheme=black"][..]] {
+            let why = parsed(args).err().expect("refused");
+            assert!(why.contains("--color-scheme"), "{args:?}: {why}");
+        }
+        let why = parsed(&["--color-scheme=dark", "--color-scheme=light"])
+            .err()
+            .expect("refused");
+        assert_eq!(why, "one colour scheme at a time");
+    }
+
+    #[test]
+    fn force_dark_is_a_flag_with_nothing_after_it() {
+        let options = parsed(&["--force-dark", "example.com"]).expect("a flag");
+        assert!(options.force_dark);
+        assert_eq!(options.url, "example.com", "what follows is the page");
+        let why = parsed(&["--force-dark=yes"]).err().expect("refused");
+        assert!(why.contains("--force-dark=yes"), "{why}");
+        let why = parsed(&["--force-dark", "--force-dark"])
+            .err()
+            .expect("refused");
+        assert_eq!(why, "--force-dark once is enough");
     }
 
     #[test]

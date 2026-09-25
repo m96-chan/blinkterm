@@ -120,7 +120,20 @@ machine. It prints a warning when it does. Do not browse as root.
   visited — url, title, how often, when — kept in the profile as `history`,
   made readable by you alone (0600) like the cookies beside it, and never
   written for a `--temp-profile`. It is read by nothing but the url bar, and
-  deleting the file forgets it.
+  deleting the file forgets it. The zoom levels are kept beside it as
+  `zoom`, which is a list of the hosts you zoomed — as private as the
+  history, so 0600 too, and never written for a `--temp-profile`
+  ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
+
+- **What the terminal answers.** `blinkterm` asks the terminal one question
+  whose answer is not a key: its background colour (`OSC 11 ; ?`), for
+  whether pages are told dark is preferred. The answer arrives on the same
+  descriptor as your typing, so it is parsed as a colour and nothing else —
+  `11;rgb:…` or `#rrggbb`, at most 256 bytes — and any other operating
+  system command that arrives there is read to its end and dropped, never
+  typed into the page or shown on the row. The colour itself goes nowhere:
+  a page is told light or dark, as any browser tells it, and nothing more
+  ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
 
 - **The engine's lifetime.** `blinkterm` starts Chromium in a process group of
   its own and kills the group on exit, on a signal, and from a panic hook.

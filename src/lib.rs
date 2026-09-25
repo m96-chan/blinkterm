@@ -117,6 +117,7 @@
 //! that made the port indefensible, and [`cdp`] the framing that replaced it.
 
 pub mod app;
+pub mod appearance;
 pub mod base64;
 pub mod cdp;
 pub mod clipboard;
@@ -139,6 +140,7 @@ pub mod scroll;
 pub mod tabs;
 pub mod text;
 pub mod upload;
+pub mod zoom;
 
 pub use app::Options;
 pub use json::Json;

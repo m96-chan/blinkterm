@@ -55,6 +55,7 @@ use crate::json::Json;
 use crate::load::{self, Landing, Loaded, Problem, Trust};
 use crate::text;
 use crate::upload::{Chooser, Upload};
+use crate::zoom::Zoom;
 
 /// One page target, and what the row says about it.
 pub struct Tab<C> {
@@ -128,6 +129,14 @@ pub struct Tab<C> {
     /// Whether the document came over a transport the row should warn about.
     /// Set at each landing, from the landing; see [`crate::load::trust`].
     pub trust: Trust,
+    /// The level the page is zoomed to; see [`crate::zoom`].
+    ///
+    /// On the tab rather than looked up by host each time it is wanted,
+    /// because a page with no host — `about:blank`, a `data:` url — can be
+    /// zoomed too, and its level has to live somewhere that is not the file.
+    /// A page with a host takes its host's level when it lands and when its
+    /// tab comes to the front, so two tabs on one site zoom together.
+    pub zoom: Zoom,
 }
 
 impl<C> Tab<C> {
@@ -146,6 +155,7 @@ impl<C> Tab<C> {
             since: None,
             committed: true,
             trust: Trust::Plain,
+            zoom: Zoom::DEFAULT,
         }
     }
 

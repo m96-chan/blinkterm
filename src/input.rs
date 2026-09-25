@@ -7,16 +7,19 @@
 //! to parse here into the event it came from — which is the only way to keep a
 //! decoder honest about a protocol with this many optional fields.
 //!
-//! Three grammars arrive down the same descriptor:
+//! Four grammars arrive down the same descriptor:
 //!
 //! - the Kitty keyboard protocol, `CSI key[:shifted:base] [; mods[:event]]
 //!   [; text] u` and its cousins that end in `A`-`H`, `P`-`S` and `~`;
 //! - SGR mouse reports, `CSI < button ; x ; y M|m`, whose coordinates are
 //!   cells or pixels depending on whether mode 1016 took;
 //! - the DECRPM answer `CSI ? mode ; state $ y`, which is how that question
-//!   gets answered.
+//!   gets answered;
+//! - a colour report, `OSC 11 ; rgb:rrrr/gggg/bbbb ST`, which is the
+//!   terminal's answer to being asked its background — see the section on
+//!   it below.
 //!
-//! And under all three, the legacy encodings, because the same binary has to
+//! And under all of them, the legacy encodings, because the same binary has to
 //! work in a terminal that answered `0` to every capability it was asked
 //! about. A press of an unmodified printable key arrives as its own UTF-8
 //! bytes even at the flag level this program asks for — `tos_input` sends the
@@ -80,6 +83,38 @@
 //! cost is the engine's, per paragraph. 64 KiB is also tOS's
 //! `MAX_CLIPBOARD_BYTES`, the most its compositor will hold, so the most it
 //! will ever send.
+//!
+//! # Colour reports
+//!
+//! [`crate::screen`] asks the terminal what colour its background is
+//! (`OSC 11 ; ?`), because that is the one thing a page is told about where
+//! it is being shown that a terminal knows and a headless engine does not:
+//! whether it is dark ([`crate::appearance`]). tOS, Kitty, WezTerm, Ghostty,
+//! foot and xterm all answer, as `ESC ] 11 ; rgb:rrrr/gggg/bbbb` ended by
+//! `ST`, or by `BEL` if that is how the question was ended; a terminal that
+//! does not know the question says nothing at all.
+//!
+//! The answer comes down the same descriptor as the keys, and before this
+//! parser knew it, `ESC ]` was only the legacy spelling of alt+`]`: the report
+//! would have been alt+`]` and then `11;rgb:…` typed into the page. So an
+//! `ESC ]` followed by digits and a `;` is an operating system command, read
+//! up to its `BEL` or `ST` and handed over as [`Input::Colour`] if it is a
+//! colour, or dropped if it is anything else. `ESC ]` followed by anything
+//! else is still alt+`]`, as it was, and so is an `ESC ]` with nothing after
+//! it when the wait for the lone escape is over — which is how a legacy
+//! terminal sends the key. A report is at most [`OSC_LIMIT`] bytes, ten times
+//! what an `OSC 11` answer is; one longer is read to its end and dropped, so
+//! that the rest of it is not typed either.
+//!
+//! The lone-escape wait has a rule for this too, the third beside the two
+//! above. A bare `ESC` still becomes Escape when the wait is over; an open
+//! paste still does not, because a paste can pause; and an open command —
+//! one whose `ESC ] digits` has arrived and whose end has not — is dropped. A
+//! report arrives whole, in one write, so the only thing that looks like an
+//! unfinished one after a whole poll interval is somebody in a legacy
+//! terminal typing alt+`]` and then a digit, which is nothing this program or
+//! a page wants; and dropping it is the one rule that can never turn half a
+//! colour into an Escape press or into typing.
 
 /// Modifiers, in the protocol's own bitfield: the CSI parameter minus one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -234,6 +269,12 @@ pub enum Input {
     PasteRefused {
         bytes: usize,
     },
+    /// An `OSC slot ; rgb:… ST` colour report: `slot` 11 is the background,
+    /// which is the one this program asks about. See [`colour_report`].
+    Colour {
+        slot: u32,
+        rgb: (u8, u8, u8),
+    },
 }
 
 /// The most a paste may be, in bytes of text.
@@ -247,6 +288,19 @@ pub const PASTE_LIMIT: usize = 64 * 1024;
 /// What ends a paste.
 const PASTE_END: &[u8] = b"\x1b[201~";
 
+/// The most an operating system command may be, in bytes of its body.
+///
+/// An `OSC 11` answer's body is `11;rgb:rrrr/gggg/bbbb`, twenty-one bytes,
+/// and the longest colour spelling there is fits in it ten times over.
+/// Anything longer is not a colour, and is read to its end and dropped
+/// rather than held.
+pub const OSC_LIMIT: usize = 256;
+
+/// How many digits an OSC's number may have before `ESC ]` and digits is
+/// taken for a key and typing instead: no command a terminal answers with
+/// has more than three.
+const OSC_DIGITS: usize = 8;
+
 /// The incremental parser.
 #[derive(Debug, Default)]
 pub struct Parser {
@@ -259,6 +313,12 @@ pub struct Parser {
     /// How many bytes of the open paste have arrived, kept or not, which is
     /// what says a paste is over the limit and by how much.
     pasted: usize,
+    /// `Some` inside an operating system command, from the `;` after its
+    /// number to its `BEL` or `ST`: the body, number included. Emptied, and
+    /// left empty, once it has passed [`OSC_LIMIT`].
+    osc: Option<Vec<u8>>,
+    /// How many bytes of the open command have arrived, kept or not.
+    osc_read: usize,
 }
 
 impl Parser {
@@ -295,10 +355,38 @@ impl Parser {
     /// Never while a paste is open: an ESC there is a byte of the text, and
     /// the wait that makes it a key is a pause in a paste arriving over a slow
     /// line.
+    ///
+    /// An operating system command that is still open is dropped instead,
+    /// whatever of it has arrived, and so is an `ESC ]` and digits still
+    /// waiting for the `;` that would make it one: see the module's section
+    /// on colour reports for why that is the safe way round. An `ESC ]` with
+    /// nothing after it is alt+`]`, which is how a legacy terminal sends that
+    /// key.
     pub fn flush(&mut self) -> Option<Input> {
-        if self.paste.is_none() && self.buf == [0x1b] {
+        if self.paste.is_some() {
+            return None;
+        }
+        if self.osc.take().is_some() {
+            self.osc_read = 0;
+            // At most an `ESC` held in case it was the start of the `ST`.
+            self.buf.clear();
+            return None;
+        }
+        if self.buf == [0x1b] {
             self.buf.clear();
             return Some(Input::Key(KeyInput::press(Key::Escape)));
+        }
+        if self.buf == b"\x1b]" {
+            self.buf.clear();
+            // Exactly what the alt arm makes of `ESC ]` and something else.
+            return Some(Input::Key(KeyInput {
+                mods: Mods(Mods::ALT),
+                text: Some(']'),
+                ..KeyInput::press(Key::Char(']'))
+            }));
+        }
+        if self.buf.starts_with(b"\x1b]") && self.buf[2..].iter().all(u8::is_ascii_digit) {
+            self.buf.clear();
         }
         None
     }
@@ -332,6 +420,9 @@ impl Parser {
         if self.paste.is_some() {
             return self.paste_step();
         }
+        if self.osc.is_some() {
+            return self.osc_step();
+        }
         let Some(&first) = self.buf.first() else {
             return Step::NeedMore;
         };
@@ -351,23 +442,106 @@ impl Parser {
                     }
                 }
             },
+            Some(b']') => self.osc(),
             // ESC followed by anything else is the legacy spelling of alt.
-            Some(_) => {
-                self.buf.remove(0);
-                match self.step() {
-                    Step::Produced(Input::Key(mut key)) => {
-                        key.mods = key.mods.with(Mods::ALT);
-                        Step::Produced(Input::Key(key))
-                    }
-                    // What follows has not all arrived; put the escape back so
-                    // that the next feed sees the sequence whole.
-                    Step::NeedMore => {
-                        self.buf.insert(0, 0x1b);
-                        Step::NeedMore
-                    }
-                    other => other,
-                }
+            Some(_) => self.alt(),
+        }
+    }
+
+    /// `ESC` and a key: that key, with alt.
+    fn alt(&mut self) -> Step {
+        self.buf.remove(0);
+        match self.step() {
+            Step::Produced(Input::Key(mut key)) => {
+                key.mods = key.mods.with(Mods::ALT);
+                Step::Produced(Input::Key(key))
             }
+            // What follows has not all arrived; put the escape back so that
+            // the next feed sees the sequence whole.
+            Step::NeedMore => {
+                self.buf.insert(0, 0x1b);
+                Step::NeedMore
+            }
+            other => other,
+        }
+    }
+
+    /// `ESC ]`: the start of an operating system command if digits and a `;`
+    /// follow, and alt+`]` if anything else does.
+    fn osc(&mut self) -> Step {
+        let digits = self.buf[2..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits > OSC_DIGITS {
+            return self.alt();
+        }
+        match self.buf.get(2 + digits) {
+            None => Step::NeedMore,
+            Some(b';') if digits > 0 => {
+                self.buf.drain(..2);
+                self.osc = Some(Vec::new());
+                self.osc_read = 0;
+                self.collect_osc(digits + 1);
+                Step::Consumed
+            }
+            Some(_) => self.alt(),
+        }
+    }
+
+    /// The inside of an operating system command: everything up to `BEL` or
+    /// `ST` is its body.
+    ///
+    /// An `ESC` that is not the start of `ST` ends it too, unanswered, and is
+    /// left to start whatever it starts: that is what xterm does with a
+    /// string cut off by the next sequence, and it keeps a terminal that
+    /// never ends one from swallowing the keys typed after it.
+    fn osc_step(&mut self) -> Step {
+        let end = self
+            .buf
+            .iter()
+            .enumerate()
+            .find_map(|(at, &byte)| match byte {
+                0x07 => Some((at, 1)),
+                0x1b => match self.buf.get(at + 1) {
+                    Some(b'\\') => Some((at, 2)),
+                    Some(_) => Some((at, 0)),
+                    None => None,
+                },
+                _ => None,
+            });
+        let Some((at, terminator)) = end else {
+            // A last `ESC` may be the start of the `ST`, cut by a read.
+            let keep = usize::from(self.buf.last() == Some(&0x1b));
+            self.collect_osc(self.buf.len() - keep);
+            return Step::NeedMore;
+        };
+        self.collect_osc(at);
+        self.buf.drain(..terminator);
+        let body = self.osc.take().unwrap_or_default();
+        let read = std::mem::take(&mut self.osc_read);
+        if terminator == 0 || read > OSC_LIMIT {
+            return Step::Consumed;
+        }
+        match colour_report(&body) {
+            Some((slot, rgb)) => Step::Produced(Input::Colour { slot, rgb }),
+            None => Step::Consumed,
+        }
+    }
+
+    /// Move the first `n` bytes of the buffer into the open command, or only
+    /// count them once it is over the limit.
+    fn collect_osc(&mut self, n: usize) {
+        self.osc_read += n;
+        let over = self.osc_read > OSC_LIMIT;
+        let Some(body) = self.osc.as_mut() else {
+            return;
+        };
+        if over {
+            *body = Vec::new();
+            self.buf.drain(..n);
+        } else {
+            body.extend(self.buf.drain(..n));
         }
     }
 
@@ -519,6 +693,56 @@ impl Parser {
             text.extend(self.buf.drain(..n));
         }
     }
+}
+
+/// A colour report's body — `11;rgb:ffff/0000/8080`, what is between `ESC ]`
+/// and the `ST` — as its slot and the colour; or `None` for one that is not a
+/// colour: a question (`11;?`), a channel that is not hex, a channel missing.
+///
+/// A channel is one to four hex digits, as X11 spells it, and means a
+/// fraction of the most that many digits can say: `f`, `ff` and `ffff` are
+/// all 255, and of a four-digit channel the byte is its top byte, which is
+/// xterm's rule. `#rrggbb` is taken too, since some terminals answer in it.
+/// The slot is whatever number the report carried; 11, the background, is
+/// the one [`crate::app`] listens to.
+pub fn colour_report(body: &[u8]) -> Option<(u32, (u8, u8, u8))> {
+    let body = std::str::from_utf8(body).ok()?;
+    let (slot, spec) = body.split_once(';')?;
+    if slot.is_empty() || !slot.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let slot = slot.parse().ok()?;
+    let rgb = if let Some(channels) = spec.strip_prefix("rgb:") {
+        let mut parts = channels.split('/');
+        let rgb = (
+            channel(parts.next()?)?,
+            channel(parts.next()?)?,
+            channel(parts.next()?)?,
+        );
+        if parts.next().is_some() {
+            return None;
+        }
+        rgb
+    } else {
+        let hex = spec.strip_prefix('#').filter(|hex| hex.len() == 6)?;
+        (
+            channel(hex.get(0..2)?)?,
+            channel(hex.get(2..4)?)?,
+            channel(hex.get(4..6)?)?,
+        )
+    };
+    Some((slot, rgb))
+}
+
+/// One channel of an X11 colour: one to four hex digits, scaled to sixteen
+/// bits and cut to the top eight.
+fn channel(hex: &str) -> Option<u8> {
+    if hex.is_empty() || hex.len() > 4 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(hex, 16).ok()?;
+    let most = (1u32 << (4 * hex.len())) - 1;
+    Some(((value * 0xffff / most) >> 8) as u8)
 }
 
 /// Where `needle` first starts in `haystack`.
@@ -1169,6 +1393,157 @@ mod tests {
             feed(b"a\x1b[200~b\x1b[201~c"),
             vec![typed('a'), Input::Paste("b".to_string()), typed('c')]
         );
+    }
+
+    fn alt_bracket() -> Input {
+        Input::Key(KeyInput {
+            key: Key::Char(']'),
+            mods: Mods(Mods::ALT),
+            action: KeyAction::Press,
+            text: Some(']'),
+        })
+    }
+
+    #[test]
+    fn a_terminal_colour_report_is_an_input_and_not_typing() {
+        let dark = Input::Colour {
+            slot: 11,
+            rgb: (0x1c, 0x1c, 0x1c),
+        };
+        assert_eq!(
+            feed(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\"),
+            vec![dark.clone()]
+        );
+        // Ended by BEL, as a terminal answers a question that was.
+        assert_eq!(feed(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07"), vec![dark.clone()]);
+        // And typing on either side of it is typing.
+        assert_eq!(
+            feed(b"a\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\b"),
+            vec![typed('a'), dark, typed('b')]
+        );
+    }
+
+    #[test]
+    fn a_colour_report_cut_across_two_reads_waits() {
+        let stream = b"\x1b]11;rgb:fdfd/f6f6/e3e3\x1b\\x";
+        let wanted = vec![
+            Input::Colour {
+                slot: 11,
+                rgb: (0xfd, 0xf6, 0xe3),
+            },
+            typed('x'),
+        ];
+        for cut in 0..=stream.len() {
+            let mut parser = Parser::new();
+            let mut got = parser.feed(&stream[..cut]);
+            got.extend(parser.feed(&stream[cut..]));
+            assert_eq!(got, wanted, "cut at {cut}");
+        }
+        for size in 1..=stream.len() {
+            let mut parser = Parser::new();
+            let got: Vec<Input> = stream
+                .chunks(size)
+                .flat_map(|chunk| parser.feed(chunk))
+                .collect();
+            assert_eq!(got, wanted, "pieces of {size}");
+        }
+    }
+
+    #[test]
+    fn an_osc_that_is_not_a_colour_is_swallowed_and_an_alt_bracket_is_still_a_key() {
+        // A clipboard answer this program never asks for, and a question.
+        assert_eq!(feed(b"\x1b]52;c;aGk=\x1b\\x"), vec![typed('x')]);
+        assert_eq!(feed(b"\x1b]11;?\x07x"), vec![typed('x')]);
+        // One too long to be a colour is read to its end, not typed.
+        let mut long = b"\x1b]11;rgb:".to_vec();
+        long.extend(std::iter::repeat_n(b'f', OSC_LIMIT * 4));
+        long.extend_from_slice(b"\x1b\\x");
+        assert_eq!(feed(&long), vec![typed('x')]);
+        let mut parser = Parser::new();
+        let got: Vec<Input> = long.chunks(7).flat_map(|c| parser.feed(c)).collect();
+        assert_eq!(got, vec![typed('x')]);
+        // An escape that starts something else ends it, and is that thing.
+        assert_eq!(
+            feed(b"\x1b]11;rgb:00/00/00\x1b[C"),
+            vec![Input::Key(KeyInput::press(Key::Right))]
+        );
+        // `ESC ]` and anything but digits and `;` is alt+] and typing, as it
+        // always was.
+        assert_eq!(feed(b"\x1b]x"), vec![alt_bracket(), typed('x')]);
+        assert_eq!(
+            feed(b"\x1b]1x"),
+            vec![alt_bracket(), typed('1'), typed('x')]
+        );
+        // And alone, once the wait is over, alt+] itself.
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1b]").is_empty());
+        assert_eq!(parser.flush(), Some(alt_bracket()));
+        assert_eq!(parser.feed(b"a"), vec![typed('a')]);
+    }
+
+    #[test]
+    fn an_osc_left_open_is_dropped_at_flush() {
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1b]11;rgb:1c1c/1c").is_empty());
+        assert_eq!(parser.flush(), None, "not an Escape press");
+        assert_eq!(parser.feed(b"a"), vec![typed('a')], "and not typing");
+        // The same for one whose `ST` was half there, and one whose number
+        // had come and whose `;` had not.
+        for held in [&b"\x1b]11;rgb:00/00/00\x1b"[..], b"\x1b]11"] {
+            let mut parser = Parser::new();
+            assert!(parser.feed(held).is_empty(), "{held:?}");
+            assert_eq!(parser.flush(), None, "{held:?}");
+            assert_eq!(parser.feed(b"a"), vec![typed('a')], "{held:?}");
+        }
+        // And the two rules that were there before are what they were: a
+        // bare escape is Escape, and an open paste is left open.
+        let mut parser = Parser::new();
+        parser.feed(b"\x1b");
+        assert_eq!(
+            parser.flush(),
+            Some(Input::Key(KeyInput::press(Key::Escape)))
+        );
+        let mut parser = Parser::new();
+        parser.feed(b"\x1b[200~a\x1b]11;");
+        assert_eq!(parser.flush(), None);
+        assert!(parser.pasting());
+        assert_eq!(
+            parser.feed(b"\x1b[201~"),
+            vec![Input::Paste("a\x1b]11;".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_colour_is_read_in_every_spelling_a_terminal_answers_in() {
+        assert_eq!(
+            colour_report(b"11;rgb:ffff/0000/8080"),
+            Some((11, (0xff, 0x00, 0x80)))
+        );
+        assert_eq!(
+            colour_report(b"11;rgb:ff/00/80"),
+            Some((11, (0xff, 0x00, 0x80)))
+        );
+        assert_eq!(colour_report(b"11;rgb:f/0/8"), Some((11, (0xff, 0, 0x88))));
+        assert_eq!(colour_report(b"11;#ff0080"), Some((11, (0xff, 0x00, 0x80))));
+        // Another slot is a colour too; which slot it is, is the caller's.
+        assert_eq!(
+            colour_report(b"12;rgb:0000/0000/0000"),
+            Some((12, (0, 0, 0)))
+        );
+        for refused in [
+            &b"11;?"[..],
+            b"11;rgb:zz/00/00",
+            b"11;rgb:ff/00",
+            b"11;rgb:ff/00/00/00",
+            b"11;rgb:fffff/0/0",
+            b"11;rgb:/00/00",
+            b"11;#ff00",
+            b"11",
+            b";rgb:ff/00/00",
+            b"x;rgb:ff/00/00",
+        ] {
+            assert_eq!(colour_report(refused), None, "{:?}", bytes_as_text(refused));
+        }
     }
 
     #[test]
