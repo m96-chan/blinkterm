@@ -40,6 +40,7 @@ use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parse
 use crate::json::Json;
 use crate::keys;
 use crate::motion::{self, Motion};
+use crate::profile::{Choice, Profile};
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::tabs::{Outcome, Tab, Tabs};
@@ -49,6 +50,15 @@ const ENGINE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long it then gets to offer a page to drive.
 const TARGET_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long `Browser.close` gets, to be answered and then to finish.
+///
+/// The reply comes at once and the process is gone about two seconds later —
+/// 1.9 s measured on `about:blank` with the headless shell, 1.8 s with full
+/// Chromium — and that is the time it spends writing the profile, which is
+/// the point. So five: room for a heavier page than `about:blank`, and short
+/// enough that a quit which is not going to be clean still ends.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// CSS pixels per wheel notch.
 ///
@@ -160,6 +170,8 @@ fn install_signals() {
 /// What the person asked for on the command line.
 pub struct Options {
     pub url: String,
+    /// Where cookies, logins and site data are kept; see [`crate::profile`].
+    pub profile: Choice,
 }
 
 /// Everything the loop owns that is not the terminal, the tabs or the engine.
@@ -214,10 +226,14 @@ pub fn run(options: Options) -> Result<(), String> {
         // terminal back and stop the engine.
         screen::emergency();
         crate::engine::kill_engine();
+        crate::profile::remove_temp_profile();
         eprintln!("blinkterm: {info}");
     }));
 
-    let mut engine = Engine::launch(ENGINE_TIMEOUT)?;
+    // Taken before the engine is started, so that a profile another blinkterm
+    // is using is refused before anything has written to it.
+    let profile = Profile::take(options.profile.clone())?;
+    let mut engine = Engine::launch(profile, ENGINE_TIMEOUT)?;
     let address = engine.address()?;
     let browser_url = engine.browser_url().to_string();
     let target = crate::engine::page_target(&address, TARGET_TIMEOUT).map_err(|why| {
@@ -255,8 +271,21 @@ pub fn run(options: Options) -> Result<(), String> {
     );
     pane.leave();
     // Dropping the tabs closes every page socket, which is all a tab is once
-    // the engine is about to be killed anyway.
+    // the engine is about to be stopped anyway.
     drop(tabs);
+    if !engine.profile().is_temporary() {
+        // `Browser.close` is the only stop that writes the cookie jar — a
+        // `SIGTERM` loses it; `crate::profile` has the measurements — and the
+        // writing happens after the reply, in the two seconds before the
+        // process ends, so the engine is waited for rather than just asked.
+        // Every way out comes through here: ctrl+q, the last tab closed, the
+        // terminal gone, a SIGTERM, SIGINT or SIGHUP by way of QUIT, and an
+        // error out of `drive`, where a connection that has already ended
+        // makes this fail at once. A temporary profile has nothing worth
+        // writing and skips it, which keeps its quit as fast as it was.
+        let _ = browser.call_within("Browser.close", Json::empty(), CLOSE_TIMEOUT);
+        engine.wait_for_exit(CLOSE_TIMEOUT);
+    }
     browser.close();
     engine.kill();
     outcome

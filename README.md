@@ -82,6 +82,40 @@ first, then on `PATH` for `chromium-shell`, `chromium`, `chromium-browser` and
 BLINKTERM_ENGINE=/opt/chrome/chrome-headless-shell blinkterm
 ```
 
+## Profiles
+
+Cookies, logins, local storage and the rest of what a site keeps are kept
+between runs, in `$XDG_DATA_HOME/blinkterm/profile` — or
+`~/.local/share/blinkterm/profile` when `XDG_DATA_HOME` is not set. The
+directory is made readable by you alone (0700), since a cookie is a login.
+
+```sh
+blinkterm --profile ~/work-profile https://example.com   # somewhere else
+blinkterm --temp-profile https://example.com             # nothing kept
+```
+
+`--temp-profile` makes a fresh profile under the system's temporary directory
+and removes it when `blinkterm` exits, including when it panics; one left by a
+`blinkterm` that was killed outright is removed by the next one.
+
+One `blinkterm` uses a profile at a time. A second one started on a profile
+that is in use is refused, and told which pid has it; it does not quietly fall
+back to a throwaway profile, because a login you thought was being kept and was
+not is worse than an error. The lock is `blinkterm`'s own — an `flock` on
+`blinkterm.lock` in the profile — because the headless shell has no lock of its
+own and will happily run two engines on one cookie database.
+
+A login survives a quit because the engine is asked to close
+(`Browser.close`) and waited for, which is when Chromium writes its cookie
+jar: measured against Chromium 141, that takes about two seconds, and every
+other way of stopping it — `SIGTERM` included — loses what was not yet
+written. So a `blinkterm` that is itself `SIGKILL`ed can lose the last thirty
+seconds or so of cookies, which is Chromium's own flush interval.
+
+A full `chromium` rather than the headless shell still writes
+`~/.config/chromium/Crash Reports` whatever profile it is given; that
+directory is Chromium's, not `blinkterm`'s.
+
 ## Keys
 
 | | |
@@ -133,7 +167,7 @@ cargo test --locked
 The lint set is a `[lints]` table in `Cargo.toml` rather than a list of flags
 in the workflow, so a laptop and a runner disagree about `-D warnings` and
 nothing else. The one worth knowing about is
-`clippy::undocumented_unsafe_blocks`: there are twenty-three `unsafe` blocks in
+`clippy::undocumented_unsafe_blocks`: there are twenty-six `unsafe` blocks in
 `src/`, all of them one-line `libc` calls, and each says what makes it sound.
 
 `--locked` throughout, because every dependency but `libc` is a git revision

@@ -53,6 +53,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::json::Json;
+use crate::profile::Profile;
 
 /// The engines that are looked for, in the order they are looked for.
 ///
@@ -99,7 +100,10 @@ static TARGET: AtomicI32 = AtomicI32::new(0);
 /// Signal-safe enough for what it is used for: one `kill(2)` on an integer
 /// read out of an atomic. The panic hook and the signal path do not go through
 /// [`Engine::kill`] and have no connection to ask the browser to close on, so
-/// they take the group with `SIGKILL` and leave the lock file behind.
+/// they take the group with `SIGKILL`. Whatever the engine had not flushed of
+/// the profile is lost with it — see [`crate::profile`] for how much — and a
+/// temporary profile's directory is [`crate::profile::remove_temp_profile`]'s
+/// to take away, not this.
 pub fn kill_engine() {
     signal_all(TARGET.swap(0, Ordering::SeqCst), libc::SIGKILL);
 }
@@ -273,12 +277,20 @@ pub struct Engine {
     target: i32,
     browser_url: String,
     tail: Arc<Mutex<Vec<String>>>,
+    /// The `--user-data-dir` it was given. Declared last so that it is dropped
+    /// last: [`Engine`]'s own `Drop` kills the engine first, and only then is a
+    /// kept profile's lock let go or a temporary one's directory removed.
+    profile: Profile,
 }
 
 impl Engine {
     /// Start one and wait, for no longer than `timeout`, for it to say where
     /// its debugging port is.
-    pub fn launch(timeout: Duration) -> Result<Engine, String> {
+    ///
+    /// `profile` is where it keeps what it keeps, and is held for as long as
+    /// the engine is: see [`crate::profile`] for why the directory is always
+    /// named, and why the lock on it is this program's.
+    pub fn launch(profile: Profile, timeout: Duration) -> Result<Engine, String> {
         let path = locate()?;
         // SAFETY: `geteuid(2)` takes nothing, reads no memory and cannot fail.
         let as_root = unsafe { libc::geteuid() } == 0;
@@ -300,6 +312,7 @@ impl Engine {
         }
         let mut command = Command::new(&path);
         command
+            .arg(format!("--user-data-dir={}", profile.dir().display()))
             .args(flags(as_root))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -339,6 +352,7 @@ impl Engine {
                     target,
                     browser_url: String::new(),
                     tail,
+                    profile,
                 };
                 engine.kill();
                 return Err(format!(
@@ -354,7 +368,13 @@ impl Engine {
             target,
             browser_url,
             tail,
+            profile,
         })
+    }
+
+    /// The profile it was started with.
+    pub fn profile(&self) -> &Profile {
+        &self.profile
     }
 
     /// The engine's process group, once it has one of its own.
@@ -394,34 +414,70 @@ impl Engine {
         }
     }
 
+    /// Wait, for no longer than `timeout`, for the engine to finish on its
+    /// own — after `Browser.close`, which is the only stop that writes the
+    /// profile — and say whether it did.
+    ///
+    /// Nothing is signalled. `false` means it is still running, and
+    /// [`Engine::kill`] is what comes next.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+        self.gone_by(Instant::now() + timeout)
+    }
+
     /// Stop it, politely and then not — and the group, not the pid.
+    ///
+    /// This is not how the profile gets written, and it used to say it was:
+    /// that Chromium flushes its profile and takes its `SingletonLock` with it
+    /// when it is asked to stop. Measured against 141, `SIGTERM` ends the
+    /// group in about two seconds and in that time neither writes the cookie
+    /// jar nor removes the lock — full Chromium exits 0 while losing the
+    /// cookie. The stop that keeps a login is `Browser.close`, and that is
+    /// [`crate::app::run`]'s, before this is called; [`crate::profile`] has
+    /// the table. On that path the engine has gone by the time this runs and
+    /// there is nothing left here to signal.
+    ///
+    /// So the `SIGTERM` stays for what it is still worth — half a second to
+    /// close its files is fewer half-written ones — and the `SIGKILL` after it
+    /// is the part that is relied on, because an engine that is only ever
+    /// asked can take as long as it likes. Then a temporary profile is
+    /// removed, since nothing is left that could write into it.
     pub fn kill(&mut self) {
         TARGET.store(0, Ordering::SeqCst);
-        let target = self.target;
-        signal_all(target, libc::SIGTERM);
-        // Half a second to close its files, then the signal that is not a
-        // request. Chromium flushes its profile and takes its SingletonLock
-        // with it when it is asked to stop, leaves the lock behind if it is
-        // only ever SIGKILLed, and waits forever if it is only ever asked.
-        let deadline = Instant::now() + Duration::from_millis(500);
+        signal_all(self.target, libc::SIGTERM);
+        if !self.gone_by(Instant::now() + Duration::from_millis(500)) {
+            signal_all(self.target, libc::SIGKILL);
+            // The wrapper is this program's child and has to be waited for.
+            // The rest of the group are init's children by the time the
+            // signal lands, and die on it with nothing here left to reap.
+            let _ = self.child.wait();
+            self.target = 0;
+        }
+        self.profile.remove();
+    }
+
+    /// Whether the engine and everything it started are gone, waiting until
+    /// `deadline` for it.
+    ///
+    /// The wrapper first — a process nobody has waited for is still a member
+    /// of its own group — and then the group it led, which is where the
+    /// browser and its renderers are. Once both are gone the target is
+    /// forgotten, here and in [`TARGET`], so that a kill after
+    /// [`Engine::wait_for_exit`] — or the one in `Drop` after an explicit one
+    /// — does not signal a group id the kernel may since have given to
+    /// somebody else. [`Engine::group`] reads `None` from then on.
+    fn gone_by(&mut self, deadline: Instant) -> bool {
         loop {
-            // The wrapper first — a process nobody has waited for is still a
-            // member of its own group — and then the group it led, which is
-            // where the browser and its renderers are.
             let waited = !matches!(self.child.try_wait(), Ok(None));
-            if waited && !group_alive(target) {
-                return;
+            if waited && !group_alive(self.target) {
+                let _ = TARGET.compare_exchange(self.target, 0, Ordering::SeqCst, Ordering::SeqCst);
+                self.target = 0;
+                return true;
             }
             if Instant::now() >= deadline {
-                break;
+                return false;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        signal_all(target, libc::SIGKILL);
-        // The wrapper is this program's child and has to be waited for. The
-        // rest of the group are init's children by the time the signal lands,
-        // and die on it with nothing here left to reap.
-        let _ = self.child.wait();
     }
 }
 

@@ -118,6 +118,7 @@ pub mod input;
 pub mod json;
 pub mod keys;
 pub mod motion;
+pub mod profile;
 pub mod screen;
 pub mod scroll;
 pub mod sha1;

@@ -36,6 +36,7 @@ use blinkterm::input::{Key, KeyAction, KeyInput, Mods};
 use blinkterm::json::Json;
 use blinkterm::keys;
 use blinkterm::motion::{self, Motion};
+use blinkterm::profile::{Choice, Profile};
 use blinkterm::scroll::{self, Animator, Dispatch, Step, Wheel};
 use blinkterm::tabs::{Outcome, Tab, Tabs};
 use tos_compositor::ImageFiles;
@@ -83,7 +84,15 @@ fn connect_with_target() -> Option<(Engine, Client, String)> {
 }
 
 /// Connect to a fresh engine, or say why the test is not running.
+///
+/// On a temporary profile, so that no test reads or writes the one a person
+/// browses with.
 fn connect() -> Option<(Engine, Client)> {
+    connect_in(Profile::temporary().expect("a temporary profile"))
+}
+
+/// The same, on the profile given.
+fn connect_in(profile: Profile) -> Option<(Engine, Client)> {
     if std::env::var_os(engine::ENGINE_ENV).is_none() {
         eprintln!(
             "skipped: {} is not set; name a Chromium to run this against",
@@ -98,7 +107,7 @@ fn connect() -> Option<(Engine, Client)> {
             return None;
         }
     }
-    let engine = Engine::launch(Duration::from_secs(30)).expect("the engine starts");
+    let engine = Engine::launch(profile, Duration::from_secs(30)).expect("the engine starts");
     let address = engine.address().expect("an address");
     let target = match engine::page_target(&address, Duration::from_secs(20)) {
         Ok(target) => target,
@@ -2264,4 +2273,124 @@ fn nothing_is_kept_for_the_acknowledgements_and_the_wheel() {
 
     client.close();
     engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+//
+// What `--profile` is for, against the real engine: a cookie that survives a
+// quit. There is deliberately no test here that starts two engines on one
+// directory — the headless shell has no singleton and would run both happily,
+// so it would pass and prove nothing; the lock that prevents it is this
+// program's and is tested in `profile.rs` without an engine. Nor is there one
+// asserting that a `SIGTERM` loses the cookie: that is a fact about Chromium
+// 141 worth knowing (`profile.rs` has the table), not a behaviour of this
+// crate worth pinning.
+
+/// The cookie, from `Network.getCookies` on `client`, if the engine has it.
+fn the_cookie(client: &mut Client) -> Option<String> {
+    let reply = client
+        .call(
+            "Network.getCookies",
+            Json::object(vec![(
+                "urls",
+                Json::Array(vec![Json::string("https://example.com/")]),
+            )]),
+        )
+        .expect("the cookies");
+    reply
+        .get("cookies")
+        .and_then(Json::as_array)
+        .unwrap_or_default()
+        .iter()
+        .find(|cookie| cookie.get("name").and_then(Json::as_str) == Some("blinkterm"))
+        .and_then(|cookie| cookie.get("value"))
+        .and_then(Json::as_str)
+        .map(str::to_string)
+}
+
+/// The whole point of issue #6: a login is a cookie, and a cookie set in one
+/// run is there in the next — provided the engine is stopped the way
+/// `app::run` stops it, with `Browser.close` and a wait, rather than killed.
+#[test]
+fn a_cookie_set_in_one_session_is_there_in_the_next() {
+    let root = temp_dir("profile-kept");
+    let dir = root.join("profile");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let profile = Profile::take(Choice::At(dir.clone())).expect("the profile");
+    let Some((mut engine, mut client)) = connect_in(profile) else {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    // A day from now: a session cookie is not written to disk by design, so
+    // it would be lost however the engine stopped and prove nothing.
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs_f64()
+        + 86_400.0;
+    let set = client
+        .call(
+            "Network.setCookie",
+            Json::object(vec![
+                ("name", Json::string("blinkterm")),
+                ("value", Json::string("kept")),
+                ("url", Json::string("https://example.com/")),
+                ("expires", Json::number(expires)),
+            ]),
+        )
+        .expect("the cookie is set");
+    assert_eq!(set.get("success").and_then(Json::as_bool), Some(true));
+    assert_eq!(the_cookie(&mut client).as_deref(), Some("kept"));
+
+    let mut browser =
+        Client::connect(engine.browser_url(), Duration::from_secs(10)).expect("the browser socket");
+    let asked = Instant::now();
+    // The reply and the end of the connection race, and either is an answer.
+    let _ = browser.call_within("Browser.close", Json::empty(), Duration::from_secs(5));
+    assert!(
+        engine.wait_for_exit(Duration::from_secs(5)),
+        "the engine was asked to close and was still running five seconds later"
+    );
+    eprintln!("Browser.close to gone: {:?}", asked.elapsed());
+    drop(browser);
+    drop(client);
+    drop(engine);
+    assert!(
+        dir.join("Default").is_dir(),
+        "the engine wrote no profile into {}",
+        dir.display()
+    );
+
+    let profile = Profile::take(Choice::At(dir.clone()))
+        .expect("the profile is free once the engine that had it is gone");
+    let (engine, mut client) = connect_in(profile).expect("a second engine");
+    assert_eq!(
+        the_cookie(&mut client).as_deref(),
+        Some("kept"),
+        "the cookie did not survive a Browser.close"
+    );
+    drop(client);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `--temp-profile`, and every engine test: the directory is the program's to
+/// make and the program's to remove, whichever engine it is — full Chromium
+/// left to itself leaves a whole profile in `/tmp` after every run.
+#[test]
+fn a_temporary_profile_leaves_nothing_on_disk() {
+    let Some((engine, mut client)) = connect() else {
+        return;
+    };
+    let dir = engine.profile().dir().to_path_buf();
+    assert!(engine.profile().is_temporary());
+    assert!(dir.is_dir(), "{} was never made", dir.display());
+    prepare(&mut client);
+
+    drop(client);
+    drop(engine);
+    assert!(!dir.exists(), "{} is still there", dir.display());
 }
