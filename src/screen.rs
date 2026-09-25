@@ -16,6 +16,7 @@
 //! restoration written so it can run from a panic hook or a signal path, with
 //! nothing borrowed and one `write(2)`.
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::os::unix::io::RawFd;
 use std::sync::Mutex;
@@ -195,6 +196,10 @@ impl Drop for Pane {
 /// cannot be mistaken for part of it, and so that a picture that is one cell
 /// too tall covers something that is already there rather than the first line
 /// of the page.
+///
+/// The row is the only text this program writes to the terminal, and most of
+/// what is on it is the page's. Everything on it goes through [`clip_to`] or
+/// [`tail_to`], which is where it is made plain text for the last time.
 pub fn status_line(cols: u32, text: &str, editing: Option<&str>) -> Vec<u8> {
     if let Some(url) = editing {
         return prompt_line(cols, "url: ", url);
@@ -348,7 +353,15 @@ fn strip(cols: usize, tabs: &[TabLabel], url: &str) -> Vec<(String, bool)> {
         })
         .sum();
     let budget = cols.saturating_sub(fixed);
-    let wanted: Vec<usize> = tabs.iter().map(|tab| width(tab.title)).collect();
+    // Measured as they will be drawn. `clip_to` would clean them anyway, but
+    // after the room was shared out, and a title of forty zero-width spaces
+    // would be given forty cells and show nothing in them.
+    let names: Vec<Cow<str>> = tabs
+        .iter()
+        .map(|tab| crate::text::sanitize(tab.title))
+        .collect();
+    let url = crate::text::sanitize(url);
+    let wanted: Vec<usize> = names.iter().map(|name| width(name)).collect();
     let given = shares(budget, &wanted);
 
     let mut runs: Vec<(String, bool)> = Vec::new();
@@ -359,7 +372,11 @@ fn strip(cols: usize, tabs: &[TabLabel], url: &str) -> Vec<(String, bool)> {
             used += 2;
         }
         let mark = if tab.dialog { "!" } else { "" };
-        let text = format!("{}{mark} {}", index + 1, clip_to(tab.title, given[index]));
+        let text = format!(
+            "{}{mark} {}",
+            index + 1,
+            clip_to(&names[index], given[index])
+        );
         used += width(&text);
         runs.push((text, tab.active));
     }
@@ -368,7 +385,7 @@ fn strip(cols: usize, tabs: &[TabLabel], url: &str) -> Vec<(String, bool)> {
     // enough to read: the strip is what this row is for now.
     let left = cols.saturating_sub(used);
     if !url.is_empty() && left >= URL_MINIMUM + 2 {
-        runs.push((format!("  {}", clip_to(url, left - 2)), false));
+        runs.push((format!("  {}", clip_to(&url, left - 2)), false));
     }
 
     // Titles can be clipped to nothing but numbers cannot, so a pane narrower
@@ -464,9 +481,15 @@ fn char_width(c: char) -> usize {
 }
 
 /// As much of the front of a string as fits, with an ellipsis when it does not.
+///
+/// Sanitized first ([`crate::text::sanitize`]), whatever the caller did —
+/// this is the last function a string goes through before the terminal, and
+/// the invariant `nothing_a_page_says_can_speak_to_the_terminal` tests is
+/// kept here.
 pub fn clip_to(text: &str, cols: usize) -> String {
-    if width(text) <= cols {
-        return text.to_string();
+    let text = crate::text::sanitize(text);
+    if width(&text) <= cols {
+        return text.into_owned();
     }
     if cols <= 1 {
         return "…".chars().take(cols).collect();
@@ -485,9 +508,16 @@ pub fn clip_to(text: &str, cols: usize) -> String {
 }
 
 /// As much of the end of a string as fits, which is where a url is typed.
+///
+/// Sanitized first ([`crate::text::sanitize`]), whatever the caller did —
+/// this is the last function a string goes through before the terminal, and
+/// the invariant `nothing_a_page_says_can_speak_to_the_terminal` tests is
+/// kept here. It matters most here: what is being typed is whatever was
+/// pasted, and nothing between the paste and the row has filtered it.
 pub fn tail_to(text: &str, cols: usize) -> String {
-    if width(text) <= cols {
-        return text.to_string();
+    let text = crate::text::sanitize(text);
+    if width(&text) <= cols {
+        return text.into_owned();
     }
     let mut kept: Vec<char> = Vec::new();
     let mut used = 0;
@@ -827,6 +857,154 @@ mod tests {
         tabs[0].dialog = true;
         let line = String::from_utf8(tab_line(80, &tabs, "")).expect("ascii");
         assert!(line.contains("\x1b[27m1! One\x1b[7m"), "{line:?}");
+    }
+
+    /// What a page might title itself, or put in a url, or ask in a dialog,
+    /// to get a word with the terminal: set its title, clear it, a C1 CSI, a
+    /// bidi override, and three characters that are there and cannot be seen.
+    const HOSTILE: [&str; 5] = [
+        "\x1b]0;x\x07",
+        "a\rb",
+        "\u{9b}2J",
+        "\u{202e}moc.knab",
+        "\u{200b}\u{200b}\u{200b}",
+    ];
+
+    /// Whether a row is text between its own escapes and nothing else.
+    ///
+    /// The row's framing is taken off — the escapes this module writes, which
+    /// are the only ones a row may hold — and what is left must have no C0,
+    /// no DEL, and no C1 in its UTF-8 spelling, `C2 80` to `C2 9F`.
+    fn only_the_rows_own_escapes(line: &[u8]) -> bool {
+        let mut text = String::from_utf8(line.to_vec()).expect("a row is UTF-8");
+        for framing in [
+            "\x1b[1;1H\x1b[K\x1b[7m",
+            "\x1b[0m",
+            "\x1b[?25l",
+            "\x1b[?25h",
+            "\x1b[27m",
+            "\x1b[7m",
+        ] {
+            text = text.replace(framing, "");
+        }
+        // The cursor put back after a line being typed: `ESC [ 1 ; n H`.
+        while let Some(at) = text.find("\x1b[1;") {
+            let rest = &text[at + 4..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 || !rest[digits..].starts_with('H') {
+                return false;
+            }
+            text.replace_range(at..at + 4 + digits + 1, "");
+        }
+        let bytes = text.as_bytes();
+        let c1 = bytes
+            .windows(2)
+            .any(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]));
+        !c1 && bytes.iter().all(|&b| b >= 0x20 && b != 0x7f)
+    }
+
+    /// The part of a row that is cells, however it ends.
+    fn cells(line: &[u8]) -> usize {
+        let line = text(line);
+        let body = line
+            .trim_start_matches("\x1b[1;1H\x1b[K\x1b[7m")
+            .split("\x1b[0m")
+            .next()
+            .unwrap_or_default()
+            .replace("\x1b[27m", "")
+            .replace("\x1b[7m", "");
+        width(&body)
+    }
+
+    #[test]
+    fn nothing_a_page_says_can_speak_to_the_terminal() {
+        for cols in [4u32, 12, 40, 80] {
+            for hostile in HOSTILE {
+                let mut rows = vec![
+                    status_line(cols, hostile, None),
+                    status_line(cols, "", Some(hostile)),
+                    prompt_line(cols, hostile, hostile),
+                    dialog_line(cols, hostile, "y/n", None),
+                    dialog_line(cols, hostile, "enter/esc", Some(hostile)),
+                ];
+                for count in [2, 9] {
+                    let titles = vec![hostile; count];
+                    rows.push(tab_line(cols, &labels(&titles, 0), hostile));
+                    rows.push(tab_line(cols, &labels(&titles, count - 1), hostile));
+                }
+                for row in rows {
+                    assert!(
+                        only_the_rows_own_escapes(&row),
+                        "{cols} cols, {hostile:?}: {:?}",
+                        text(&row)
+                    );
+                    assert_eq!(
+                        cells(&row),
+                        cols as usize,
+                        "{cols} cols, {hostile:?}: {:?}",
+                        text(&row)
+                    );
+                }
+            }
+        }
+        // And what is left is the letters, which is what the person reads.
+        assert!(row_body(&text(&status_line(80, "\x1b]0;x\x07", None))).starts_with("]0;x "));
+        assert!(row_body(&text(&status_line(80, "a\rb", None))).starts_with("a b "));
+        assert!(row_body(&text(&status_line(
+            80,
+            "https://evil.example/\u{202e}moc.knab",
+            None
+        )))
+        .starts_with("https://evil.example/moc.knab "));
+    }
+
+    /// The same rows, read by a terminal: the compositor's own, which is the
+    /// one this was written for. Nothing is set, nothing is answered, and the
+    /// row says the letters.
+    #[test]
+    fn a_terminal_that_reads_the_row_is_told_nothing_but_text() {
+        for hostile in HOSTILE {
+            let rows = [
+                status_line(80, hostile, None),
+                prompt_line(80, "url: ", hostile),
+                dialog_line(80, hostile, "y/n", None),
+                tab_line(80, &labels(&[hostile, "\x1b]2;x\x07"], 0), hostile),
+            ];
+            for row in rows {
+                let mut terminal =
+                    tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+                terminal.advance(&enter_sequence());
+                let _ = terminal.take_output();
+                terminal.advance(&row);
+                assert_eq!(terminal.title(), "", "the row set the title: {row:?}");
+                assert!(
+                    terminal.take_output().is_empty(),
+                    "the row asked the terminal something: {row:?}"
+                );
+            }
+        }
+        let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+        terminal.advance(&enter_sequence());
+        terminal.advance(&status_line(80, "\x1b]0;x\x07", None));
+        assert!(
+            terminal.grid().row(0).to_text().starts_with("]0;x"),
+            "{:?}",
+            terminal.grid().row(0).to_text()
+        );
+        terminal.advance(&status_line(80, "a\rb", None));
+        assert!(terminal.grid().row(0).to_text().starts_with("a b"));
+    }
+
+    #[test]
+    fn a_tab_strip_measures_titles_after_they_are_cleaned() {
+        let invisible = format!("{}x", "\u{200b}".repeat(40));
+        let tabs = labels(&["One", &invisible, "A long title"], 0);
+        // Twenty cells, ten of them numbers and gaps. The forty zero-width
+        // spaces are given none of the other ten: what the second tab wants is
+        // the one `x` it can show, and the room it does not want goes to the
+        // title that can use it — six cells, rather than the three it would
+        // get if the invisible title were counted as forty-one.
+        assert_eq!(strip_text(20, &tabs, ""), "[1 One]  2 x  3 A lon…");
     }
 
     #[test]

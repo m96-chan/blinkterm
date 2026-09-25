@@ -282,11 +282,15 @@ impl Parser {
             .ok()
             .and_then(|s| s.chars().next())
         {
+            // A C1 control in UTF-8 — `C2 9B`, a CSI, from a paste or a
+            // terminal that sent one — is still a key, which nothing binds,
+            // but it types nothing: the same rule the `CSI u` form keeps, and
+            // the reason it cannot end up in the url bar and back on the row.
             Some(c) => Step::Produced(Input::Key(KeyInput {
                 key: Key::Char(c),
                 mods: Mods::default(),
                 action: KeyAction::Press,
-                text: Some(c),
+                text: Some(c).filter(|c| !c.is_control()),
             })),
             None => Step::Consumed,
         }
@@ -685,6 +689,15 @@ mod tests {
                 text: Some('\u{65e5}'),
             })]
         );
+    }
+
+    #[test]
+    fn a_c1_control_typed_as_a_character_is_a_key_with_no_text() {
+        let key = one_key(b"\xc2\x9b");
+        assert_eq!(key.key, Key::Char('\u{9b}'));
+        assert_eq!(key.text, None);
+        // Which is what the Kitty form of the same key already said.
+        assert_eq!(one_key(b"\x1b[155u").text, None);
     }
 
     #[test]

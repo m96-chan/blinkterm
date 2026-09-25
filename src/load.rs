@@ -80,6 +80,7 @@
 //! each time, which is a prompt this program does not have yet.
 
 use crate::json::Json;
+use crate::text;
 
 /// Where the main frame ended up after a navigation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,12 +114,16 @@ pub enum Problem {
 /// `net::ERR_ABORTED` — which is not a failure but a navigation that was
 /// superseded by another before it committed, or a url that turned out to be
 /// a download. Neither is anything the person needs telling about.
+///
+/// The code is the engine's and not the page's, but it is a string off the
+/// pipe that [`reason`] prints when it does not know it, so it comes out as
+/// plain text ([`crate::text::sanitize`]) like everything else read here.
 pub fn failed(reply: &Json) -> Option<String> {
-    let text = reply.get("errorText").and_then(Json::as_str)?;
-    if text.is_empty() || text == "net::ERR_ABORTED" {
+    let code = reply.get("errorText").and_then(Json::as_str)?;
+    if code.is_empty() || code == "net::ERR_ABORTED" {
         return None;
     }
-    Some(text.to_string())
+    Some(text::sanitize(code).into_owned())
 }
 
 /// Where a `Page.frameNavigated` says the main frame went.
@@ -127,6 +132,10 @@ pub fn failed(reply: &Json) -> Option<String> {
 /// changing, not the page — and for anything that is not the shape the engine
 /// sends. The error page's own url, `chrome-error://chromewebdata/`, is never
 /// what comes out: when `unreachableUrl` is there, it is the address.
+///
+/// Either url is plain text by the time it is a [`Landing`]: a page steers
+/// where its frame goes, and whatever the engine's spelling of that turns out
+/// to be, it is going on the row ([`crate::text::sanitize`]).
 pub fn landing(params: &Json) -> Option<Landing> {
     let frame = params.get("frame")?;
     if frame.get("parentId").is_some() {
@@ -134,11 +143,30 @@ pub fn landing(params: &Json) -> Option<Landing> {
     }
     if let Some(unreachable) = frame.get("unreachableUrl").and_then(Json::as_str) {
         if !unreachable.is_empty() {
-            return Some(Landing::Unreachable(unreachable.to_string()));
+            return Some(Landing::Unreachable(
+                text::sanitize(unreachable).into_owned(),
+            ));
         }
     }
     let url = frame.get("url").and_then(Json::as_str)?;
-    Some(Landing::Document(url.to_string()))
+    Some(Landing::Document(text::sanitize(url).into_owned()))
+}
+
+/// The url the tab is at, read off a `Page.getNavigationHistory` reply: the
+/// entry at `currentIndex`. `None` when the reply is not that shape.
+///
+/// Here rather than where it is used because it is the one place a url comes
+/// out of the history, and a url that comes out of anywhere is sanitized
+/// where it is read ([`crate::text::sanitize`]).
+pub fn current_url(history: &Json) -> Option<String> {
+    let index = history.get("currentIndex").and_then(Json::as_i64)?;
+    let url = history
+        .get("entries")
+        .and_then(Json::as_array)?
+        .get(usize::try_from(index).ok()?)?
+        .get("url")
+        .and_then(Json::as_str)?;
+    Some(text::sanitize(url).into_owned())
 }
 
 /// A `net::ERR_` code in words.
@@ -269,6 +297,8 @@ s=n?n.responseStatus:0}catch(e){}return [document.title,s]})()";
 /// What [`LOADED`] answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded {
+    /// Plain text: [`crate::text::sanitize`] has been over it, so a title
+    /// that was an escape sequence is its letters.
     pub title: String,
     /// The document's status, only when it is an error: a 200 is not news,
     /// and a 0 is a page that had no response to have a status — an error
@@ -283,7 +313,7 @@ pub struct Loaded {
 /// the question that was asked.
 pub fn loaded(reply: &Json) -> Option<Loaded> {
     let value = reply.path(&["result", "value"])?.as_array()?;
-    let title = value.first()?.as_str()?.to_string();
+    let title = text::sanitize(value.first()?.as_str()?).into_owned();
     let status = value
         .get(1)
         .and_then(Json::as_f64)
@@ -448,6 +478,68 @@ mod tests {
         );
         assert_eq!(answer(r#""just a title""#), None);
         assert_eq!(loaded(&json(r#"{"exceptionDetails":{}}"#)), None);
+    }
+
+    #[test]
+    fn a_title_with_an_escape_in_it_is_read_as_its_letters() {
+        // The issue's pair, as the engine would send them: a JSON `\u` escape
+        // is how a control character arrives, and `json.rs` has made it the
+        // character itself before anything here sees it.
+        let answer = |value: &str| {
+            loaded(&json(&format!(
+                r#"{{"result":{{"type":"object","value":{value}}}}}"#
+            )))
+            .map(|loaded| loaded.title)
+        };
+        assert_eq!(
+            answer(r#"["\u001b]0;x\u0007",0]"#),
+            Some("]0;x".to_string())
+        );
+        assert_eq!(answer(r#"["a\rb",0]"#), Some("a b".to_string()));
+    }
+
+    #[test]
+    fn a_landing_and_a_reason_are_plain_text() {
+        let error_page = json(
+            r#"{"frame":{"id":"F","url":"chrome-error://chromewebdata/",
+                "unreachableUrl":"http://example.com/\u001b]0;x\u0007"}}"#,
+        );
+        assert_eq!(
+            landing(&error_page),
+            Some(Landing::Unreachable("http://example.com/]0;x".to_string()))
+        );
+        let document = json(r#"{"frame":{"id":"F","url":"https://example.com/\u001b[2J"}}"#);
+        assert_eq!(
+            landing(&document),
+            Some(Landing::Document("https://example.com/[2J".to_string()))
+        );
+        assert_eq!(
+            failed(&json(r#"{"errorText":"net::ERR_\u009b2JODD"}"#)),
+            Some("net::ERR_2JODD".to_string())
+        );
+    }
+
+    #[test]
+    fn the_current_url_comes_out_of_the_history() {
+        let history = json(
+            r#"{"currentIndex":1,"entries":[
+                {"id":1,"url":"about:blank","title":""},
+                {"id":2,"url":"https://example.com/\u202emoc.knab","title":"x"}]}"#,
+        );
+        assert_eq!(
+            current_url(&history),
+            Some("https://example.com/moc.knab".to_string())
+        );
+        assert_eq!(
+            current_url(&json(r#"{"currentIndex":5,"entries":[]}"#)),
+            None,
+            "an index past the end is no url"
+        );
+        assert_eq!(
+            current_url(&json(r#"{"currentIndex":-1,"entries":[]}"#)),
+            None
+        );
+        assert_eq!(current_url(&json(r#"{"entries":[{"url":"x"}]}"#)), None);
     }
 
     #[test]

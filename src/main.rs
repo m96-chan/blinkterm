@@ -70,7 +70,10 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             // The terminal has already been put back by the time this runs, so
-            // the sentence lands in a shell the person can read it in.
+            // the sentence lands in a shell the person can read it in. A shell
+            // is still a terminal, and the sentence can quote the engine, so it
+            // is plain text first, whatever made it.
+            let message = blinkterm::text::sanitize(&message);
             eprintln!("blinkterm: {message}");
             if message.contains(engine::ENGINE_ENV) || message.contains("PATH") {
                 eprintln!(

@@ -44,12 +44,25 @@ machine. It prints a warning when it does. Do not browse as root.
 
 - **What gets written to your terminal.** A terminal executes the bytes it is
   sent, so anything page-derived that reaches the status row is a place where a
-  page could try to speak to your terminal instead of to you. `blinkterm` puts
-  the page's **title** (`document.title`, which the page sets to whatever it
-  likes) and its **url** on that row, and **does not currently strip control
-  or escape bytes from either**. Treat that as an open hole, not a solved
-  problem. The page *body* is safe in this respect by construction: it arrives
-  as decoded pixels and is written as a graphics payload, never as text.
+  page could try to speak to your terminal instead of to you. The row is the
+  only text this program writes, and everything on it that a page or the
+  engine can put words into — `document.title`, the url, a dialog's message
+  and a `prompt()`'s default, the engine's error text, and the last lines of
+  its stderr quoted in an error after the terminal has been given back — goes
+  through `text::sanitize` where it is read off the pipe, and once more as the
+  row is built. C0 and C1 control characters and DEL are dropped (a line break
+  becomes a space); so are Unicode's bidi controls, which could make one url
+  read as another, and the invisible format characters that make two
+  different strings look the same. A title that is `\x1b]0;x\x07` is shown as
+  `]0;x`; the engine tests set one against a real Chromium and parse the row
+  with the compositor's own terminal
+  ([#28](https://github.com/m96-chan/blinkterm/issues/28)). What is
+  deliberately not filtered is visible text: a title in Cyrillic that looks
+  like Latin is the page's to write and yours to read, as in any browser's tab
+  strip, and a character the row measures wrongly — a combining mark — is a
+  row one cell short, not an escape. The page *body* is safe in this respect
+  by construction: it arrives as decoded pixels and is written as a graphics
+  payload, never as text.
 
 - **`/dev/shm`.** Frames go through POSIX shared memory objects named
   `blinkterm-<pid>-...`, created with your umask and unlinked by the terminal

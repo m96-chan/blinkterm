@@ -536,8 +536,15 @@ impl Engine {
     }
 
     /// The last lines the engine wrote, for an error message.
+    ///
+    /// Plain text ([`crate::text::sanitize`]). The engine's stderr is not the
+    /// page's, but it is not this program's either: what Chromium logs can
+    /// quote a url, and whether a page's console reaches it depends on flags
+    /// this program does not set. And it is printed into a shell, after the
+    /// terminal has been given back, where an escape works as well as on the
+    /// row.
     pub fn tail(&self) -> Vec<String> {
-        self.tail.lock().map(|t| t.clone()).unwrap_or_default()
+        plain_lines(&self.tail)
     }
 
     /// `Ok` while the engine is running; the reason, with its own last words,
@@ -633,8 +640,23 @@ impl Drop for Engine {
     }
 }
 
+/// The lines the reader thread kept, as plain text.
+///
+/// The thread keeps them raw, and they are cleaned here, where they are read:
+/// the boundary is the read, as it is for everything else off the pipe.
+fn plain_lines(tail: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    tail.lock()
+        .map(|lines| {
+            lines
+                .iter()
+                .map(|line| crate::text::sanitize(line).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn describe_tail(tail: &Arc<Mutex<Vec<String>>>) -> String {
-    let lines = tail.lock().map(|t| t.clone()).unwrap_or_default();
+    let lines = plain_lines(tail);
     if lines.is_empty() {
         return String::new();
     }

@@ -2845,6 +2845,102 @@ fn the_status_of_the_document_comes_with_its_title() {
     engine.kill();
 }
 
+/// Whether a row, fed to the compositor's own terminal, only ever wrote text:
+/// no title set, no question answered, and nothing below a space between the
+/// row's own escapes. Returns what the top row reads as.
+fn a_terminal_reads_only_text_in(row: &[u8]) -> String {
+    let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+    terminal.advance(&blinkterm::screen::enter_sequence());
+    let _ = terminal.take_output();
+    terminal.advance(row);
+    assert_eq!(
+        terminal.title(),
+        "",
+        "the row set the window title: {row:?}"
+    );
+    assert!(
+        terminal.take_output().is_empty(),
+        "the row asked the terminal something: {row:?}"
+    );
+    // And byte for byte: nothing below a space between the framing.
+    let body = String::from_utf8_lossy(row);
+    let body = body
+        .trim_start_matches("\x1b[1;1H\x1b[K\x1b[7m")
+        .trim_end_matches("\x1b[0m\x1b[?25l")
+        .replace("\x1b[27m", "")
+        .replace("\x1b[7m", "");
+    assert!(body.bytes().all(|b| b >= 0x20 && b != 0x7f), "{body:?}");
+    terminal.grid().row(0).to_text()
+}
+
+/// A page whose title is an OSC sequence, and whose dialog is one too. What
+/// is checked is not the title the engine reports — it reports what the
+/// script set, escape and all, as `\u001b` in its JSON — but that nothing of
+/// it survives into the row, measured the way the frame tests measure: the
+/// bytes this program would write, parsed by the compositor's own terminal.
+#[test]
+fn a_page_that_titles_itself_with_an_escape_sequence_cannot_reach_the_terminal() {
+    use blinkterm::screen::{self, TabLabel};
+    let Some((mut engine, mut tab)) = failing_tab() else {
+        return;
+    };
+    // Set from a script rather than in the url, so that the url's own
+    // canonicalisation is not what is being tested.
+    const HOSTILE: &str = "data:text/html,<title>plain</title><script>\
+document.title=String.fromCharCode(27)+']0;pwned'+String.fromCharCode(7)\
++' a'+String.fromCharCode(13)+'b '+String.fromCharCode(0x202e)+'moc.elpmaxe';\
+</script>";
+    navigate_tab(&mut tab, HOSTILE);
+    follow(&mut tab, Duration::from_secs(10));
+    // `document.title`'s getter collapses ASCII whitespace itself, so the
+    // `\r` is a space before this program sees it; ESC, BEL and the override
+    // are not whitespace and arrive whole, as `\u001b`, `\u0007`, `\u202e`.
+    // The expected string is the same whichever does the collapsing, on
+    // purpose.
+    let loaded = blinkterm::app::page_loaded(&mut tab.connection).expect("the page answers");
+    assert_eq!(loaded.title, "]0;pwned a b moc.elpmaxe");
+    assert_eq!(tab.title, loaded.title, "and that is what the tab holds");
+
+    let status = screen::status_line(80, &tab.line(), None);
+    let text = a_terminal_reads_only_text_in(&status);
+    assert!(text.starts_with("]0;pwned a b moc.elpmaxe"), "{text:?}");
+
+    let label = tab.label();
+    let strip = screen::tab_line(
+        80,
+        &[
+            TabLabel {
+                title: &label,
+                active: true,
+                dialog: false,
+            },
+            TabLabel {
+                title: "\x1b]2;x\x07",
+                active: false,
+                dialog: true,
+            },
+        ],
+        &tab.url,
+    );
+    let text = a_terminal_reads_only_text_in(&strip);
+    assert!(text.starts_with("1 ]0;pwned"), "{text:?}");
+
+    // The same through a dialog, which is the other thing a page writes.
+    raise(
+        &mut tab.connection,
+        "alert(String.fromCharCode(27)+']0;pwned'+String.fromCharCode(7))",
+    );
+    let dialog = wait_for_dialog(&tab.connection, Duration::from_secs(5));
+    assert_eq!(dialog.caption(), "alert: ]0;pwned");
+    let row = screen::dialog_line(80, &dialog.caption(), dialog.hint(), None);
+    let text = a_terminal_reads_only_text_in(&row);
+    assert!(text.starts_with("alert: ]0;pwned"), "{text:?}");
+    answer(&mut tab.connection, dialog, &[press(Key::Enter)]);
+
+    tab.connection.close();
+    engine.kill();
+}
+
 // ---------------------------------------------------------------------------
 // Dialogs
 // ---------------------------------------------------------------------------
@@ -2980,7 +3076,9 @@ fn an_alert_is_seen_and_any_key_lets_the_page_carry_on() {
     );
     let dialog = wait_for_dialog(&client, Duration::from_secs(5));
     assert_eq!(dialog.kind, blinkterm::dialog::Kind::Alert);
-    assert_eq!(dialog.message, "saved\nthree files");
+    // The newline the page wrote is a space once the event has been read:
+    // the message is plain text before it is anything else.
+    assert_eq!(dialog.message, "saved three files");
     assert_eq!(dialog.caption(), "alert: saved three files");
     assert!(dialog.url.starts_with("data:text/html"), "{}", dialog.url);
 

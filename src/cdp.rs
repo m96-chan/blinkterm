@@ -1031,12 +1031,18 @@ fn message(id: i64, session: Option<&str>, method: &str, params: Json) -> String
 }
 
 /// What one reply means: the result, or the engine's refusal in words.
+///
+/// The words are plain text ([`crate::text::sanitize`]): a refusal can quote
+/// what it refused — a url, a selector — and it ends up as a note on the row
+/// or a line printed into the shell. The method name is this program's own.
 fn outcome(method: &str, reply: &Json) -> Result<Json, String> {
     if let Some(error) = reply.get("error") {
-        let what = error
-            .get("message")
-            .and_then(Json::as_str)
-            .unwrap_or("the engine refused it");
+        let what = crate::text::sanitize(
+            error
+                .get("message")
+                .and_then(Json::as_str)
+                .unwrap_or("the engine refused it"),
+        );
         return Err(format!("{method}: {what}"));
     }
     Ok(reply.get("result").cloned().unwrap_or(Json::Null))
@@ -1163,6 +1169,23 @@ mod tests {
         assert_eq!(
             reply.path(&["error", "message"]).and_then(Json::as_str),
             Some("Cannot navigate to invalid URL")
+        );
+    }
+
+    #[test]
+    fn an_engines_refusal_is_plain_text() {
+        let reply = Json::parse(
+            r#"{"id":1,"error":{"code":-32000,"message":"Cannot \u001b[2J navigate"}}"#,
+        )
+        .expect("the test's own JSON");
+        assert_eq!(
+            outcome("Page.navigate", &reply),
+            Err("Page.navigate: Cannot [2J navigate".to_string())
+        );
+        let bare = Json::parse(r#"{"id":1,"error":{}}"#).expect("the test's own JSON");
+        assert_eq!(
+            outcome("Page.navigate", &bare),
+            Err("Page.navigate: the engine refused it".to_string())
         );
     }
 

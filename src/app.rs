@@ -1679,18 +1679,8 @@ fn stayed(tab: &mut Tab<Client>) {
     else {
         return;
     };
-    let index = history
-        .get("currentIndex")
-        .and_then(Json::as_i64)
-        .unwrap_or(-1);
-    let url = history
-        .get("entries")
-        .and_then(Json::as_array)
-        .and_then(|entries| entries.get(usize::try_from(index).ok()?))
-        .and_then(|entry| entry.get("url"))
-        .and_then(Json::as_str);
-    if let Some(url) = url {
-        tab.url = url.to_string();
+    if let Some(url) = load::current_url(&history) {
+        tab.url = url;
     }
 }
 
@@ -1940,8 +1930,13 @@ fn send_mouse(
 /// a search engine: sending what somebody typed to a third party because it
 /// did not parse as a host is a decision about their privacy, and it is not
 /// this program's to make.
+///
+/// What comes out is plain text first ([`crate::text::sanitize`]), because
+/// it is going to be both shown on the row and sent to the engine, and what
+/// went in may have been pasted from anywhere.
 pub fn normalise(input: &str) -> String {
-    let text = input.trim();
+    let text = crate::text::sanitize(input);
+    let text = text.trim();
     if text.is_empty() {
         return "about:blank".to_string();
     }
@@ -2069,6 +2064,14 @@ mod tests {
         assert_eq!(normalise("/etc/hostname"), "file:///etc/hostname");
         assert_eq!(normalise(""), "about:blank");
         assert_eq!(normalise("   "), "about:blank");
+        // A paste is plain text before it is a url: what is sent is what is
+        // shown, and neither can be an override or an escape.
+        assert_eq!(normalise("exa\u{202e}mple.com"), "https://example.com");
+        assert_eq!(
+            normalise("\x1b]0;x\x07example.com"),
+            "https://]0;xexample.com"
+        );
+        assert_eq!(normalise("example.com\r\n"), "https://example.com");
     }
 
     #[test]

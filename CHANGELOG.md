@@ -51,4 +51,12 @@ carry, and the list is kept as things land rather than written at the end.
 
 - `tools/run.sh` no longer trips shellcheck's SC1007 on `CDPATH= cd`.
 
+### Security
+
+- A page's title, its url, its dialogs' words and the engine's error text are
+  stripped of control characters, bidi overrides and invisible characters
+  before they reach the status row, so a `document.title` that is an escape
+  sequence is shown as its letters and cannot set the terminal's title or
+  clipboard ([#28](https://github.com/m96-chan/blinkterm/issues/28)).
+
 [Unreleased]: https://github.com/m96-chan/blinkterm/commits/main
