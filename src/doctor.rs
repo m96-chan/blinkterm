@@ -215,8 +215,9 @@ pub fn ask_terminal(input: RawFd, timeout: Duration) -> io::Result<TerminalAnswe
     Ok(read_answer(&heard))
 }
 
-/// The column the facts start in, after their names.
-const LABEL: usize = 11;
+/// The column the facts start in, after their names: one past the widest,
+/// `shared memory:`.
+const LABEL: usize = 15;
 
 /// One fact, its name in the margin.
 fn say(name: &str, fact: &str) {
