@@ -170,12 +170,19 @@ pub struct Launch {
     pub user_agent: Option<String>,
     /// `--proxy`: the engine's `--proxy-server=`.
     pub proxy: Option<String>,
+    /// `--mute`: the engine's `--mute-audio`. Pages play, silently, and
+    /// cannot tell; the audio stack is otherwise the engine's own (see the
+    /// README's section on sound).
+    pub mute: bool,
 }
 
 impl Launch {
     /// The engine's whole argument list after `--user-data-dir`: the fixed
-    /// flags, then `--user-agent=`, `--proxy-server=`, then `args`, then the
-    /// url. Pure; this is what the unit test checks.
+    /// flags, then `--user-agent=`, `--proxy-server=`, `--mute-audio`, then
+    /// `args`, then the url. The person's `args` come after everything this
+    /// program derived from an option, so that an `--engine-arg` can still
+    /// contradict one — the engine takes the last. Pure; this is what the
+    /// unit test checks.
     pub fn arguments(&self, as_root: bool) -> Vec<String> {
         let mut fixed: Vec<String> = flags(as_root).into_iter().map(String::from).collect();
         let url = fixed.pop();
@@ -184,6 +191,9 @@ impl Launch {
         }
         if let Some(proxy) = &self.proxy {
             fixed.push(format!("--proxy-server={proxy}"));
+        }
+        if self.mute {
+            fixed.push("--mute-audio".to_string());
         }
         fixed.extend(self.args.iter().cloned());
         fixed.extend(url);
@@ -1116,6 +1126,7 @@ mod tests {
             args: vec!["--accept-lang=ja".into(), "--headless=old".into()],
             user_agent: Some("blinkterm-test/1.0 (measured)".into()),
             proxy: Some("socks5://127.0.0.1:1080".into()),
+            mute: false,
         };
         let mut wanted: Vec<String> = flags(false).into_iter().map(String::from).collect();
         let url = wanted.pop().expect("a url");
@@ -1127,6 +1138,28 @@ mod tests {
             url,
         ]);
         assert_eq!(launch.arguments(false), wanted);
+    }
+
+    #[test]
+    fn mute_adds_mute_audio_after_the_fixed_flags_and_before_the_persons_args() {
+        let launch = Launch {
+            proxy: Some("127.0.0.1:1".into()),
+            args: vec!["--autoplay-policy=no-user-gesture-required".into()],
+            mute: true,
+            ..Launch::default()
+        };
+        let mut wanted: Vec<String> = flags(false).into_iter().map(String::from).collect();
+        let url = wanted.pop().expect("a url");
+        wanted.extend([
+            "--proxy-server=127.0.0.1:1".to_string(),
+            "--mute-audio".to_string(),
+            "--autoplay-policy=no-user-gesture-required".to_string(),
+            url,
+        ]);
+        assert_eq!(launch.arguments(false), wanted);
+        assert!(!Launch::default()
+            .arguments(false)
+            .contains(&"--mute-audio".to_string()));
     }
 
     #[test]

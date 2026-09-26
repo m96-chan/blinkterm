@@ -7487,7 +7487,14 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         engine,
         mut browser,
         mut tabs,
-    } = blinkterm::app::boot(profile, &launch, &downloads, &appearance).expect("the engine boots");
+    } = blinkterm::app::boot(
+        profile,
+        &launch,
+        &downloads,
+        &appearance,
+        &Allowed::in_memory(),
+    )
+    .expect("the engine boots");
     let base = serve();
 
     // Three tabs, as the program would have them once each had landed: the
@@ -7561,8 +7568,14 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         mut engine,
         mut browser,
         mut tabs,
-    } = blinkterm::app::boot(profile, &launch, &downloads, &appearance)
-        .expect("a second engine on the same profile");
+    } = blinkterm::app::boot(
+        profile,
+        &launch,
+        &downloads,
+        &appearance,
+        &Allowed::in_memory(),
+    )
+    .expect("a second engine on the same profile");
     blinkterm::app::restore_tabs(&mut tabs, &mut browser, &appearance, snapshot.clone());
     let took = started.elapsed();
     eprintln!("second engine up with the tabs back in {took:?}");
@@ -7665,4 +7678,423 @@ fn an_engine_retired_alive_is_stopped_and_its_profile_is_free_to_start_another()
     assert!(engine.check().is_ok());
     engine.kill();
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// Sound, permissions and fullscreen (#20)
+// ---------------------------------------------------------------------------
+
+use blinkterm::fullscreen::{self, Heard};
+use blinkterm::permissions::{self, Allowed, Permission};
+
+/// A page with a button that takes a box fullscreen, or lets it go.
+const FULLSCREEN_PAGE: &str = "<!doctype html><title>fs</title>\
+    <body style='margin:0;background:#fff'>\
+    <div id=box style='width:200px;height:100px;background:#c33'></div>\
+    <button id=go style='position:absolute;left:0;top:200px;width:100px;height:40px'>go</button>\
+    <script>document.getElementById('go').onclick = function () {\
+    if (document.fullscreenElement) document.exitFullscreen();\
+    else document.getElementById('box').requestFullscreen(); };</script>";
+
+/// A page with an `<audio>` of [`tone`], not playing.
+const AUDIO_PAGE: &str = "<!doctype html><title>audio</title>\
+    <body style='margin:0'><audio id=a src='/tone.wav'></audio>";
+
+/// Two seconds of a 440 Hz tone, 8 kHz mono 16-bit PCM, as a WAV: a few
+/// lines of packing rather than a file in the repository.
+fn tone() -> Vec<u8> {
+    let rate: u32 = 8000;
+    let samples: Vec<i16> = (0..rate * 2)
+        .map(|n| {
+            let t = n as f64 / rate as f64;
+            ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16
+        })
+        .collect();
+    let data = (samples.len() * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + data as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * 2).to_le_bytes()); // bytes a second
+    wav.extend_from_slice(&2u16.to_le_bytes()); // bytes a frame
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits a sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data.to_le_bytes());
+    for sample in samples {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
+}
+
+/// Serve [`FULLSCREEN_PAGE`] at `/fs`, [`AUDIO_PAGE`] at `/audio`, the tone
+/// at `/tone.wav` and [`PLAIN_PAGE`] for anything else, on a loopback port:
+/// an origin, which a `data:` page is not and the engine grants nothing to.
+/// The origin comes back without a trailing slash, as
+/// [`permissions::origin_of`] writes one.
+fn serve_media() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
+    let address = listener.local_addr().expect("an address");
+    let wav = tone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = [0u8; 2048];
+            let read = stream.read(&mut head).unwrap_or(0);
+            let request = String::from_utf8_lossy(&head[..read]).to_string();
+            let (kind, body): (&str, &[u8]) = if request.starts_with("GET /fs") {
+                ("text/html", FULLSCREEN_PAGE.as_bytes())
+            } else if request.starts_with("GET /audio") {
+                ("text/html", AUDIO_PAGE.as_bytes())
+            } else if request.starts_with("GET /tone.wav") {
+                ("audio/wav", &wav)
+            } else {
+                ("text/html", PLAIN_PAGE.as_bytes())
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    format!("http://{address}")
+}
+
+/// Evaluate an expression whose value is a promise, and hand back what it
+/// resolved to.
+fn evaluate_awaited(client: &mut Client, expression: &str) -> Json {
+    client
+        .call_within(
+            "Runtime.evaluate",
+            Json::object(vec![
+                ("expression", Json::string(expression)),
+                ("awaitPromise", Json::Bool(true)),
+                ("returnByValue", Json::Bool(true)),
+            ]),
+            CRASH_NOTICE,
+        )
+        .ok()
+        .and_then(|reply| reply.path(&["result", "value"]).cloned())
+        .unwrap_or(Json::Null)
+}
+
+/// What `navigator.permissions.query` says for each name, as `name=state`
+/// words: the state a site reads before deciding whether to ask.
+fn permission_states(client: &mut Client, names: &[&str]) -> String {
+    let names: Vec<String> = names.iter().map(|name| format!("'{name}'")).collect();
+    let expression = format!(
+        "Promise.all([{}].map(function (n) {{ return navigator.permissions.query({{name: n}})\
+         .then(function (s) {{ return n + '=' + s.state; }}, \
+         function (e) {{ return n + '=!' + e.name; }}); }}))\
+         .then(function (a) {{ return a.join(' '); }})",
+        names.join(",")
+    );
+    match evaluate_awaited(client, &expression) {
+        Json::String(states) => states,
+        other => panic!("no answer from permissions.query: {other:?}"),
+    }
+}
+
+/// Navigate a page's session and wait for the title it should land with.
+fn land_on(client: &mut Client, url: &str, title: &str) {
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the page loads");
+    assert_eq!(wait_for_title(client, title, CRASH_NOTICE), title, "{url}");
+}
+
+/// Ask until `states` answers `wanted` or [`CRASH_NOTICE`] is up, and hand
+/// back the last answer: a notification on the browser's connection is in
+/// force for the next page command, but a test that waits costs nothing.
+fn states_become(client: &mut Client, names: &[&str], wanted: &str) -> String {
+    let deadline = Instant::now() + CRASH_NOTICE;
+    loop {
+        let states = permission_states(client, names);
+        if states == wanted || Instant::now() >= deadline {
+            return states;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Boot as the program does, with the browser-wide deny and one origin
+/// allowed the camera, and read what pages are told: `denied` for every name
+/// the program sets, `granted` for what the person allowed, the same in a
+/// second tab on that origin, `denied` on a `data:` page; then the allowance
+/// taken back by the allow line's commands, and `denied` again.
+#[test]
+fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_allowed() {
+    if !engine_named() {
+        return;
+    }
+    let origin = serve_media();
+    let root = temp_dir("permissions");
+    let downloads = root.join("downloads");
+    std::fs::create_dir_all(&downloads).expect("a download directory");
+    let appearance =
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+    let mut allowed = Allowed::in_memory();
+    allowed
+        .set(&origin, &[Permission::Camera])
+        .expect("kept in memory");
+    assert_eq!(
+        permissions::origin_of(&format!("{origin}/plain")).as_deref(),
+        Some(origin.as_str())
+    );
+    let Booted {
+        engine: _engine,
+        mut browser,
+        mut tabs,
+    } = blinkterm::app::boot(
+        Profile::temporary().expect("a temporary profile"),
+        &engine::Launch::default(),
+        &downloads,
+        &appearance,
+        &allowed,
+    )
+    .expect("the engine boots");
+    let names = [
+        "camera",
+        "microphone",
+        "geolocation",
+        "notifications",
+        "clipboard-read",
+        "clipboard-write",
+    ];
+    let wanted = "camera=granted microphone=denied geolocation=denied notifications=denied \
+                  clipboard-read=denied clipboard-write=denied";
+    {
+        let tab = tabs.active_mut().expect("the first tab");
+        land_on(&mut tab.connection, &format!("{origin}/plain"), "plain");
+        assert_eq!(permission_states(&mut tab.connection, &names), wanted);
+        // What the engine answers when nobody set anything is `default`;
+        // with the deny it is `denied`, at once.
+        assert_eq!(
+            evaluate_awaited(&mut tab.connection, "Notification.requestPermission()"),
+            Json::string("denied")
+        );
+    }
+    let behind = blinkterm::app::open_behind(
+        &mut tabs,
+        &mut browser,
+        &appearance,
+        &format!("{origin}/fs"),
+    )
+    .expect("a tab behind");
+    {
+        let tab = tabs.get_mut(behind).expect("the tab behind");
+        assert_eq!(
+            wait_for_title(&mut tab.connection, "fs", CRASH_NOTICE),
+            "fs"
+        );
+        assert_eq!(
+            permission_states(&mut tab.connection, &names),
+            wanted,
+            "a second tab on the origin"
+        );
+    }
+    let tab = tabs.active_mut().expect("the first tab");
+    land_on(
+        &mut tab.connection,
+        "data:text/html,<title>opaque</title>",
+        "opaque",
+    );
+    assert_eq!(
+        permission_states(&mut tab.connection, &["camera"]),
+        "camera=denied",
+        "an opaque origin is denied browser-wide too"
+    );
+    land_on(&mut tab.connection, &format!("{origin}/plain"), "plain");
+    // The allow line with nothing on it: every name denied by origin, which
+    // is what takes a grant back.
+    for (method, params) in permissions::origin_commands(&origin, &[]) {
+        browser.notify(method, params).expect("told");
+    }
+    assert_eq!(
+        states_become(&mut tab.connection, &["camera"], "camera=denied"),
+        "camera=denied"
+    );
+    // And a word given again is granted again, by origin.
+    for (method, params) in permissions::origin_commands(&origin, &[Permission::Clipboard]) {
+        browser.notify(method, params).expect("told");
+    }
+    let wanted = "clipboard-read=granted clipboard-write=granted camera=denied";
+    assert_eq!(
+        states_become(
+            &mut tab.connection,
+            &["clipboard-read", "clipboard-write", "camera"],
+            wanted
+        ),
+        wanted
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The isolated world a watch is armed in, made as `app` makes it.
+fn fullscreen_world(client: &mut Client) -> i64 {
+    let tree = client
+        .call("Page.getFrameTree", Json::empty())
+        .expect("the frame tree");
+    let frame = find::main_frame(&tree).expect("a main frame");
+    let world = client
+        .call("Page.createIsolatedWorld", find::world_params(&frame))
+        .expect("a world");
+    find::context(&world).expect("the world's id")
+}
+
+/// Arm a watch as `pump_fullscreen` does: sent, never called.
+fn arm(client: &mut Client, world: i64, expected: bool) -> Pending {
+    client
+        .send(
+            "Runtime.evaluate",
+            fullscreen::watch_params(world, expected),
+        )
+        .expect("the watch is sent")
+}
+
+/// The watch's answer, waited for up to [`CRASH_NOTICE`] — the CI runner has
+/// taken seconds to deliver what a workstation delivers in milliseconds —
+/// with how long it took printed.
+fn heard_within(client: &mut Client, pending: &Pending, what: &str) -> Option<Heard> {
+    let started = Instant::now();
+    while started.elapsed() < CRASH_NOTICE {
+        if let Some(reply) = client.take_reply(pending) {
+            eprintln!("{what}: heard in {:?}", started.elapsed());
+            return Some(fullscreen::heard(&reply));
+        }
+        // What the page says meanwhile is nothing to this test.
+        let _ = client.events();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+/// The watch hears a click take an element fullscreen and `esc`'s exit let
+/// it go; a watch armed after the fact catches up at once; a watch left
+/// behind by a tab switch does not starve the next one; and a navigation
+/// answers `Gone`.
+#[test]
+fn a_page_going_fullscreen_is_heard_and_esc_s_exit_is_heard_and_a_navigation_says_gone() {
+    let Some((_engine, mut client)) = connect() else {
+        return;
+    };
+    let origin = serve_media();
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    land_on(&mut client, &format!("{origin}/fs"), "fs");
+    let world = fullscreen_world(&mut client);
+    let fullscreen = |client: &mut Client| evaluate(client, "!!document.fullscreenElement");
+
+    // Nothing happens, so nothing is answered.
+    let watch = arm(&mut client, world, false);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(client.take_reply(&watch).is_none(), "a watch waits");
+    // A click on the button is a gesture, and the page goes fullscreen.
+    click_with(&mut client, (50, 220), "left", 1, 0);
+    assert_eq!(heard_within(&mut client, &watch, "in"), Some(Heard::In));
+    assert_eq!(fullscreen(&mut client), Json::Bool(true));
+
+    // `esc`: the exit, in the watch's world, as a notification.
+    let watch = arm(&mut client, world, true);
+    client
+        .notify("Runtime.evaluate", fullscreen::exit_params(Some(world)))
+        .expect("the exit is sent");
+    assert_eq!(heard_within(&mut client, &watch, "out"), Some(Heard::Out));
+    assert_eq!(fullscreen(&mut client), Json::Bool(false));
+
+    // Armed expecting fullscreen on a page that is not: it catches up at
+    // once, which is how a tab coming to the front is caught up.
+    let watch = arm(&mut client, world, true);
+    assert_eq!(
+        heard_within(&mut client, &watch, "catch-up"),
+        Some(Heard::Out)
+    );
+
+    // A watch let go of — its tab went behind — is still waiting in the page;
+    // the next one armed settles it, and is the one answered.
+    let left = arm(&mut client, world, false);
+    std::thread::sleep(Duration::from_millis(100));
+    drop(left);
+    let watch = arm(&mut client, world, false);
+    click_with(&mut client, (50, 220), "left", 1, 0);
+    assert_eq!(
+        heard_within(&mut client, &watch, "after a stale watch"),
+        Some(Heard::In)
+    );
+
+    // A navigation takes the document, and the watch hears that.
+    let watch = arm(&mut client, world, true);
+    let navigation = client
+        .send(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(format!("{origin}/plain")))]),
+        )
+        .expect("the navigation is sent");
+    assert_eq!(heard_within(&mut client, &watch, "gone"), Some(Heard::Gone));
+    drop(navigation);
+    assert_eq!(wait_for_title(&mut client, "plain", CRASH_NOTICE), "plain");
+    assert_eq!(fullscreen(&mut client), Json::Bool(false), "and nothing is");
+}
+
+/// Chrome's autoplay rule, and nothing of this program's in its way: a
+/// `play()` before any gesture is refused, a dispatched click is the
+/// gesture, and after it the audio plays — its clock runs — with the engine
+/// muted or not. This does not test a speaker; it tests that a page is not
+/// silent for a reason this program caused.
+#[test]
+fn a_click_is_the_gesture_a_video_needs_and_the_engine_starts_its_audio_service() {
+    let origin = serve_media();
+    for mute in [false, true] {
+        let launch = engine::Launch {
+            mute,
+            ..engine::Launch::default()
+        };
+        let Some((_engine, _browser, mut page)) = launched(&launch) else {
+            return;
+        };
+        page.call("Page.enable", Json::empty())
+            .expect("Page.enable");
+        viewport(&mut page);
+        land_on(&mut page, &format!("{origin}/audio"), "audio");
+        let play = "document.getElementById('a').play()\
+                    .then(function () { return 'played'; }, function (e) { return e.name; })";
+        assert_eq!(
+            evaluate_awaited(&mut page, play),
+            Json::string("NotAllowedError"),
+            "mute {mute}: no gesture, no sound"
+        );
+        click_with(&mut page, (5, 5), "left", 1, 0);
+        assert_eq!(
+            evaluate_awaited(&mut page, play),
+            Json::string("played"),
+            "mute {mute}: a click is the gesture"
+        );
+        let started = Instant::now();
+        let mut time = 0.0;
+        while started.elapsed() < CRASH_NOTICE {
+            time = evaluate(&mut page, "document.getElementById('a').currentTime")
+                .as_f64()
+                .unwrap_or(0.0);
+            if time > 0.0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!(
+            "mute {mute}: currentTime {time} after {:?}",
+            started.elapsed()
+        );
+        assert!(time > 0.0, "mute {mute}: the audio's clock runs");
+    }
 }
