@@ -521,7 +521,6 @@ impl Drop for Wheel {
 /// The step is worked out under the lock and sent outside it, so that a notch
 /// arriving from the loop waits for arithmetic rather than for a socket.
 fn animate(shared: &Shared) {
-    interactive();
     loop {
         let sending = {
             let Ok(mut state) = shared.state.lock() else {
@@ -566,27 +565,6 @@ fn animate(shared: &Shared) {
             .store(since.as_nanos().max(1) as u64, Ordering::Relaxed);
     }
 }
-
-/// Tell the system this thread drives something a person is watching.
-///
-/// On macOS a thread's quality-of-service class decides how much slack its
-/// timed waits are given. At the default class, on the CI runner, a 16 ms
-/// wait came back about 10 ms late even with nothing else running.
-/// User-interactive is the class Apple names for work that updates what is on
-/// screen, which a scroll animation is.
-#[cfg(target_os = "macos")]
-fn interactive() {
-    // SAFETY: the call takes two plain values and changes only the calling
-    // thread's scheduling class. A failure is a return code, ignored: the
-    // thread works at any class, only less punctually.
-    unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-    }
-}
-
-/// Elsewhere there is no class to ask for.
-#[cfg(not(target_os = "macos"))]
-fn interactive() {}
 
 #[cfg(test)]
 mod tests {
