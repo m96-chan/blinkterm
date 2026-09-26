@@ -23,9 +23,8 @@ below.
 
 ## Before a release
 
-- CI green on `main`, all five jobs in `CI`. The `engine` job is the one that
-  matters most and the one that cannot run on a laptop without a Chromium;
-  `mac` is the same tests on macOS.
+- CI green on `main`, all four jobs in `CI`. The `engine` job is the one that
+  matters most and the one that cannot run on a laptop without a Chromium.
 - The `Homebrew` workflow is green too: it builds `packaging/homebrew/blinkterm.rb`
   the way `brew install` would, and runs on pull requests that touch it, the
   lock file, or the workflow.
@@ -72,7 +71,7 @@ $EDITOR packaging/homebrew/blinkterm.rb
 #     url "https://github.com/m96-chan/blinkterm/archive/refs/tags/vX.Y.Z.tar.gz"
 #     sha256 "<the sum>"
 #   `head` stays. With the first release that carries macOS support
-#   (#21), also remove `depends_on :linux` (and its comment), add a macOS
+#   (#46), also remove `depends_on :linux` (and its comment), add a macOS
 #   line to the caveats, and add `macos-15` back to the `os:` matrix in
 #   .github/workflows/homebrew.yml. Land it through a pull request: the
 #   Homebrew workflow installs the stable spec now that there is one, then
@@ -111,8 +110,7 @@ are part of what the release *is*:
   handling and the cell arithmetic, so it is as much of the program as `src/`.
 - **the Chromium the engine tests passed against**. The `engine` job pins a
   `chrome-headless-shell` by version and checksum and prints its `--version`;
-  take it from that run's log, and the mac-arm64 one the `mac` job prints
-  from the same run's. The program does not
+  take it from that run's log. The program does not
   ship an engine, so "it works" is always "it worked against this one".
 
 ## Not on crates.io

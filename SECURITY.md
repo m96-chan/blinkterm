@@ -114,7 +114,7 @@ machine. It prints a warning when it does. Do not browse as root.
 - **Shared memory.** Frames go through POSIX shared memory objects named
   `blinkterm-<pid>-...` and unlinked by the terminal as it reads them — a
   frame is a picture of whatever you are looking at. On Linux they are files
-  in `/dev/shm`; on macOS, `shm_open(3)` objects with no path. Either way they
+  in `/dev/shm`; in the macOS code, not yet run ([#46](https://github.com/m96-chan/blinkterm/issues/46)), `shm_open(3)` objects with no path. Either way they
   are created readable and writable by you alone (0600), whatever your umask,
   so in the window between write and unlink another local user cannot read
   one. `Painter` falls back to inline base64 when no object can be made.

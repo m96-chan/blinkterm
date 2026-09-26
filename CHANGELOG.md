@@ -12,12 +12,10 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
-- Runs on macOS: frames go through `shm_open` shared memory (Kitty,
-  Ghostty), Chrome and Chromium are found in `/Applications`, and the engine
-  gets `--use-mock-keychain` so a headless run never asks the Keychain. CI
-  runs the engine tests on a Mac. The Homebrew formula stays Linux-only
-  until a release carries this; on macOS, `cargo install --git` for now
-  ([#21](https://github.com/m96-chan/blinkterm/issues/21)).
+- The groundwork for macOS: frames through `shm_open` shared memory,
+  Chrome and Chromium found in `/Applications`, `--use-mock-keychain` for
+  the engine. It builds for macOS but has not run on a Mac, so macOS is not
+  supported yet ([#46](https://github.com/m96-chan/blinkterm/issues/46)).
 - The terminal is asked before the engine starts, and one that does not
   answer the graphics query gets a sentence instead of a blank pane
   (`--no-probe` skips it). Inside tmux (`set -g allow-passthrough on`) the
