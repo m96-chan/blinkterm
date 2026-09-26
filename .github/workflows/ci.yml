@@ -252,10 +252,13 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # The unit tests, engine-less, exactly as `check` runs them on Linux:
-      # the object-store round trip and the name-length test are here and
-      # nowhere else.
-      - run: cargo test --locked
+      # The unit tests, engine-less, in a debug build: the object-store round
+      # trip and the name-length test are here and nowhere else. One at a
+      # time, unlike `check`: on this three-core runner a parallel debug run
+      # starved the scroll thread's timing test (18, then 11, of the 20 ticks
+      # it needs in 420 ms), which measures the thread's schedule, not the
+      # runner's load.
+      - run: cargo test --locked -- --test-threads=1
       - name: Install the engine
         # Chrome for Testing's chrome-headless-shell for mac-arm64, the same
         # version the Linux job pins, by checksum. `curl` sets no quarantine
