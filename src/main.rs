@@ -50,6 +50,8 @@ options:
                    what pages are told the browser is
   --proxy <host:port|scheme://host:port|direct://>
                    send requests through a proxy (loopback never is)
+  --mute           start the engine silent (--mute-audio); pages play and
+                   cannot tell
   --home <url>     the page opened when no url is given (default: about:blank)
   --restore        reopen the tabs the last run had
   --normal-mode    start in normal mode (ctrl+., below)
@@ -119,6 +121,9 @@ keys:
                  link in a tab behind), j/k scroll a notch, d/u half a
                  screen, gg/G to the ends, H/L back and forward, r reload,
                  o the url bar, O a new tab, / find, i back to the page
+  alt+p          allow this site camera, microphone, location, notifications
+                 or clipboard: type the words, enter sets exactly those
+  esc            leave a page's fullscreen; stop a page that is loading
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no
 Everything else goes to the page. A link that asks for a new window gets a

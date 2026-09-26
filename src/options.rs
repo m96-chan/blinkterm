@@ -173,6 +173,8 @@ pub struct Settings {
     pub engine_args: Vec<String>,
     pub user_agent: Option<String>,
     pub proxy: Option<String>,
+    /// `--mute`, `mute = true`: the engine's `--mute-audio`.
+    pub mute: Option<bool>,
     pub restore: Option<bool>,
     pub normal_mode: Option<bool>,
     /// File only: a binding is not a one-run thing.
@@ -208,6 +210,7 @@ impl Settings {
             engine_args,
             user_agent: self.user_agent.or(under.user_agent),
             proxy: self.proxy.or(under.proxy),
+            mute: self.mute.or(under.mute),
             restore: self.restore.or(under.restore),
             normal_mode: self.normal_mode.or(under.normal_mode),
             bindings,
@@ -429,6 +432,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             )?,
             "--force-dark" => once(&mut s.force_dark, true, "--force-dark once is enough")?,
             "--restore" => once(&mut s.restore, true, "--restore once is enough")?,
+            "--mute" => once(&mut s.mute, true, "--mute once is enough")?,
             "--normal-mode" => once(&mut s.normal_mode, true, "--normal-mode once is enough")?,
             "--no-config" => config_choice(&mut s, ConfigChoice::None)?,
             "--print-engine" => what(&mut s, What::PrintEngine)?,
@@ -495,7 +499,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 14] = [
+const KEYS: [&str; 15] = [
     "home",
     "profile",
     "temp-profile",
@@ -508,6 +512,7 @@ const KEYS: [&str; 14] = [
     "engine-arg",
     "user-agent",
     "proxy",
+    "mute",
     "restore",
     "normal-mode",
 ];
@@ -604,6 +609,7 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
                 .push(parse_engine_arg(key, value).map_err(at)?),
             "user-agent" => s.user_agent = Some(value.to_string()),
             "proxy" => s.proxy = Some(parse_proxy(key, value).map_err(at)?),
+            "mute" => s.mute = Some(parse_bool(key, value).map_err(at)?),
             "restore" => s.restore = Some(parse_bool(key, value).map_err(at)?),
             "normal-mode" => s.normal_mode = Some(parse_bool(key, value).map_err(at)?),
             _ => unreachable!("every key in KEYS has an arm"),
@@ -700,6 +706,7 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
             args: s.engine_args,
             user_agent: s.user_agent,
             proxy: s.proxy,
+            mute: s.mute.unwrap_or(false),
         },
         restore: s.restore.unwrap_or(false),
         normal_mode: s.normal_mode.unwrap_or(false),
@@ -922,6 +929,38 @@ mod tests {
             parsed(&["--color-scheme=dark", "--color-scheme=light"]),
             Err("one colour scheme at a time".to_string())
         );
+    }
+
+    #[test]
+    fn mute_is_a_flag_with_nothing_after_it_and_a_file_boolean() {
+        let s = parsed(&["--mute", "example.com"]).expect("a flag");
+        assert_eq!(s.mute, Some(true));
+        assert_eq!(s.urls, ["example.com"], "what follows is the page");
+        let why = parsed(&["--mute=yes"]).expect_err("refused");
+        assert!(why.contains("--mute=yes"), "{why}");
+        assert_eq!(
+            parsed(&["--mute", "--mute"]),
+            Err("--mute once is enough".to_string())
+        );
+        assert_eq!(file("mute = true").map(|s| s.mute), Ok(Some(true)));
+        assert_eq!(
+            file("mute = loud"),
+            Err("/c:1: mute is true or false, not \"loud\"".to_string())
+        );
+        let options = resolve(
+            Settings::default(),
+            Settings::default(),
+            Settings::default(),
+        )
+        .expect("the defaults");
+        assert!(!options.engine.mute, "sound is on unless asked");
+        let options = resolve(
+            Settings::default(),
+            Settings::default(),
+            file("mute = true").expect("a file"),
+        )
+        .expect("folded");
+        assert!(options.engine.mute, "the file's word reaches the launch");
     }
 
     #[test]

@@ -183,6 +183,19 @@ you alone (0600) too, and keeps the last 500. `--temp-profile` keeps the
 levels in memory for the run and writes none; deleting the file forgets
 every level.
 
+### Permissions
+
+What you allowed a site with `alt+p` is remembered by its origin —
+`https://meet.example`, or `http://wiki.corp:8080` with its port — in a file
+called `permissions` beside the zoom levels: one line per change, the
+origin, a tab, the word, a tab, `allow` or `deny`, the last line for an
+origin and a word being the one that counts. It is a list of sites you have
+visited, so it is readable by you alone (0600), and keeps the last 500
+origins. Every engine started on the profile is told it as it starts;
+`--temp-profile` keeps it in memory for the run and writes none. Edit it by
+hand if you like — a line that is not one of these is skipped — or delete
+it to take every allowance back.
+
 ### Bookmarks
 
 `ctrl+d` bookmarks the page in front, and `ctrl+d` again removes the
@@ -257,8 +270,10 @@ line number; a missing file is nothing. A flag is `true` or `false`
 (`force-dark = true`), and a path may start with `~/`. There is no `url`
 setting: the page to open is what the command line is for, and
 `home = <url>` is the page opened when none is given. `normal-mode = true`
-starts in normal mode (`ctrl+.`), and `restore = true`
-reopens the last session's tabs (see [The session](#the-session)).
+starts in normal mode (`ctrl+.`), `restore = true`
+reopens the last session's tabs (see [The session](#the-session)), and
+`mute = true` (or `--mute`) starts the engine silent (see
+[Sound](#sound-permissions-and-fullscreen)).
 
 `--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
 repeatable. Four are refused because they would undo something this
@@ -315,6 +330,7 @@ nothing else, for scripts.
 | `zoom-out` | `alt+-`, `ctrl+-` | zoom out |
 | `zoom-reset` | `alt+0`, `ctrl+0` | back to 100% |
 | `find` | `ctrl+f` | find in the page |
+| `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
 | `copy` | `alt+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | copy the url |
 | `normal-mode` | `ctrl+.` | normal mode on or off |
@@ -408,10 +424,11 @@ not a thing a terminal has.
 | your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
 | `alt+c` | copy the page's selection to your clipboard; with the url bar, the find prompt, a `prompt()` or a file input's path open, copy that line |
 | `alt+u` | copy the page's url to your clipboard |
+| `alt+p` | allow this site something: the row says `allow https://site: ` and the words it is allowed now, all selected; type any of `camera` `microphone` `location` `notifications` `clipboard`, `enter` sets exactly those (an empty line takes them all back), `esc` leaves it. See [Sound, permissions and fullscreen](#sound-permissions-and-fullscreen) |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
-| `esc` | while a page is loading and nothing else has the row, stop it |
+| `esc` | while a page is fullscreen and nothing else has the row, leave fullscreen; while a page is loading, stop it |
 | `ctrl+.` | normal mode on or off. In normal mode the letters are keys of their own and the row says `normal`: `f` labels everything clickable on the screen and typing a label clicks it (`F` opens a link in a tab behind this one); `j`/`k` scroll a notch, `d`/`u` half a screen, `gg`/`G` to the top and bottom; `H`/`L` back and forward, `r` reload, `o` the url bar, `O` a new tab, `/` find; `i` goes back to typing into the page, as does clicking into a field. Off by default: nothing changes until you press it |
 
 Everything else goes to the page, including the mouse, unless a `key.` line
@@ -537,10 +554,11 @@ A terminal that understands OSC 22 (Kitty, Ghostty) also gets a hand over a
 link and an I-beam over a text field; the rest ignore it. A zoom that is not
 100% is a word at the right too, `150%`, after the loading hint.
 
-The url bar, the find prompt, a page's dialog and a file input's path take
-the whole row while they are open, and `esc` goes to whichever of them has it
-before it stops a load; no link is shown while one of them is there. The
-offer to restore the last run's tabs takes it too, after all of them.
+The url bar, the find prompt, the tab list, the allow line (`alt+p`), a
+page's dialog and a file input's path take the whole row while they are
+open, and `esc` goes to whichever of them has it before it leaves
+fullscreen or stops a load; no link is shown while one of them is there.
+The offer to restore the last run's tabs takes it too, after all of them.
 
 A page whose renderer crashes stays in its tab: the picture goes, and the row
 says `this page crashed; ctrl+r reloads it` — a tab behind that crashed says
@@ -561,6 +579,56 @@ mouse movement, not only presses (`?1003h`), so the page now sees the
 pointer move — hover styling and tooltips work — at the cost of one small
 command to the engine per screen refresh while it moves and nothing while
 it rests.
+
+## Sound, permissions and fullscreen
+
+**Sound** comes out of the machine `blinkterm` runs on, through the
+engine's own audio: PulseAudio or PipeWire where `libpulse.so.0` is
+installed and a server answers, else ALSA — the headless shell has the whole
+of Chrome's audio stack and tries them in that order (measured with
+`strace`), and plays into nothing when there is neither. Over SSH that is
+the far machine's speakers, or nothing; a terminal cannot carry sound.
+Chrome's autoplay rule applies: a page cannot start sound before you have
+clicked it, and a click here is a click to the page, so a video you click
+plays with sound and a page that shouts on load does not.
+`--engine-arg=--autoplay-policy=no-user-gesture-required` lifts that.
+`--mute` (`mute = true`) starts the engine with `--mute-audio`: pages play,
+silently, and cannot tell. Chrome for Testing's zip does not bring
+`libpulse0`; a distribution's `chromium` does.
+
+**Permissions**: every page is told no. From the moment the engine starts,
+notifications, location, camera, microphone and the clipboard API are
+`denied` for every site, so a site that checks hears no at once and stops
+asking, rather than waiting on a question the headless engine would never
+show. No engine says when a page asks, so there is no prompt; instead
+`alt+p` allows the site in front yourself:
+
+```text
+allow https://meet.example: camera microphone
+allowed https://meet.example: camera, microphone
+```
+
+The words are `camera`, `microphone`, `location`, `notifications` and
+`clipboard`; `enter` sets exactly the ones on the line for that origin and
+denies the rest, and the allowance is remembered in the profile (see
+[Permissions](#permissions)). A page with no origin — `about:blank`, a
+`data:` or `file:` url — has nothing to allow. What a grant buys is the
+engine's: on `chrome-headless-shell` it makes the clipboard API work, into
+the engine's own clipboard rather than yours, and lets a site believe it may
+use a camera, microphone or location that the shell then cannot find — a
+full Chromium with a webcam uses them. No headless engine shows a
+notification, whatever is allowed; the word is there so that a site stops
+asking.
+
+**Fullscreen**: when the page in front takes something fullscreen — a
+video's button, a slide deck — the status row goes and the page gets every
+row of the pane. `esc` leaves it, as do a navigation, a reload and going to
+another tab (the page's own Escape does nothing in a headless engine).
+While something needs the row — the url bar, the find prompt, the tab list,
+the allow line, a dialog the page opens, a file input's path — the row comes
+back and the page is a row shorter until it closes: a `confirm()` in a
+fullscreen video is still answered on the row. Link hints and normal mode
+work in fullscreen as anywhere.
 
 ## Tests
 
