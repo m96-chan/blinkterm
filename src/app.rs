@@ -62,6 +62,7 @@ use crate::normal;
 use crate::options::Options;
 use crate::permissions::{self, Allowed, Permission};
 use crate::profile::Profile;
+use crate::route::{self, Payload, Route, Wrap};
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::session::{self, Offer, Reply, Session, Snapshot};
@@ -120,6 +121,10 @@ const DOUBLE_CLICK_SLOP: i32 = 4;
 /// it is 400 ms — see [`motion::INPUT_QUIET`] — so fifty is eight times as
 /// often as it needs to be.
 const POLL_MS: i32 = 50;
+
+/// The poll while a frame is owed an acknowledgement, on a route paced by
+/// the link: see [`tick_frames`].
+const FRAME_POLL_MS: i32 = 4;
 
 /// How long a paste that has been opened and not closed may go without a byte
 /// before it is given up on.
@@ -474,6 +479,22 @@ struct Chrome {
     /// The origins the person allowed something, kept in the profile, or
     /// only in memory for a temporary one. See [`crate::permissions`].
     allowed: Allowed,
+    /// The newest frame not yet acknowledged, on a route whose frames are
+    /// acknowledged once they have gone to the terminal. See
+    /// [`tick_frames`].
+    unacked: Option<Unacked>,
+    /// How the motion cast is asked for; its size steps with `throttle`.
+    cast: motion::Cast,
+    /// Steps the cast's size down when frames wait on the link.
+    throttle: motion::Throttle,
+}
+
+/// A screencast frame this program has not acknowledged yet: which tab's,
+/// and the number to acknowledge it with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Unacked {
+    target: String,
+    session: i64,
 }
 
 impl Chrome {
@@ -549,7 +570,18 @@ impl Chrome {
             layout: Layout::default(),
             allow: None,
             allowed,
+            unacked: None,
+            cast: motion::Cast::default(),
+            throttle: motion::Throttle::default(),
         }
+    }
+
+    /// The route [`run`] chose for this run's frames: the painter that sends
+    /// them and the cast that asks for them. Once, before the first frame.
+    fn take_route(&mut self, route: Route) {
+        self.painter = Painter::with_route(route);
+        self.cast = motion::Cast::for_route(&route);
+        self.throttle = motion::Throttle::default();
     }
 
     /// The engine is gone: forget everything that was about its pages.
@@ -562,8 +594,9 @@ impl Chrome {
     /// strip's window, the loading hint, the motion clock, the wheel's hold
     /// on the dead connection, every download still coming, the fullscreen
     /// watch and the world asked for it (and the tab that would not be
-    /// watched), and the layout — every relaunched tab lands afresh, not
-    /// fullscreen.
+    /// watched), the layout — every relaunched tab lands afresh, not
+    /// fullscreen — and the frame owed an acknowledgement, whose number was
+    /// the dead engine's.
     ///
     /// What stays is the person's, the terminal's or the profile's: the url
     /// being typed (it names no target, and Enter navigates whichever tab is
@@ -572,7 +605,9 @@ impl Chrome {
     /// the death, half a sequence read from the terminal, the mode, the key
     /// bindings, the offer after an unclean exit, the scale, the history, the
     /// zooms, the allowances (the new engine's [`boot`] was told them), the
-    /// bookmarks and the session; and the launch, `--mute` with it.
+    /// bookmarks and the session; the launch, `--mute` with it; and the
+    /// route's cast and its throttle, which are about the link to the
+    /// terminal and not about the engine.
     /// What was on the tabs — a dialog, a file input's half-typed path — goes
     /// with them. Nothing is sent: this is this program's memory only, and
     /// the pointer's shape is the caller's to give back to the terminal.
@@ -595,6 +630,7 @@ impl Chrome {
         self.world_ask = None;
         self.unwatched = None;
         self.layout = Layout::default();
+        self.unacked = None;
     }
 
     /// Where a file input's prompt starts, read now: see
@@ -930,6 +966,24 @@ pub fn run(options: Options) -> Result<(), String> {
     if unsafe { libc::isatty(1) } != 1 {
         return Err("stdout is not a terminal, so there is nowhere to put a page".to_string());
     }
+    // The terminal is asked what it is before anything is started: a
+    // terminal that cannot draw costs a sentence in the shell rather than a
+    // Chromium start and a blank pane. See [`doctor::probe`] and
+    // [`route::choose`].
+    let env = route::Env::current();
+    let (verdict, heard) = if options.route.probe {
+        crate::doctor::probe(0, env.tmux || env.screen, crate::doctor::TERMINAL_TIMEOUT)
+            .map_err(|e| format!("cannot take the terminal: {e}"))?
+    } else {
+        (
+            crate::doctor::Verdict::Skipped,
+            crate::doctor::TerminalAnswer::default(),
+        )
+    };
+    if let Some(why) = crate::doctor::refusal(verdict, &env) {
+        return Err(why);
+    }
+    let route = route::choose(&env, options.route, verdict, Painter::shm_usable());
     install_signals();
     std::panic::set_hook(Box::new(|info| {
         // A release build aborts here, so this is the only chance to put the
@@ -965,7 +1019,8 @@ pub fn run(options: Options) -> Result<(), String> {
         &allowed,
     )?;
 
-    let mut pane = Pane::enter(0, 1).map_err(|e| format!("cannot take the terminal: {e}"))?;
+    let mut pane = Pane::enter(0, 1, route.wrap == Wrap::None, route.wrap)
+        .map_err(|e| format!("cannot take the terminal: {e}"))?;
     // `None` once a relaunch has failed: the old engine was stopped and the
     // profile went with the new one that did not start, so there is nothing
     // left at the end to ask to close.
@@ -975,7 +1030,9 @@ pub fn run(options: Options) -> Result<(), String> {
     // stopped — and so that it outlives an engine that dies. The rest of it
     // goes at the end of this block, before the pane is given back, as it
     // always did.
-    let (outcome, downloads) = match pane.metrics(None) {
+    // The probe asked the cell size already; over ssh it is what the page
+    // is sized for from the first frame rather than from the second.
+    let (outcome, downloads) = match pane.metrics(heard.cell) {
         Ok(metrics) => {
             let mut chrome = Chrome::new(
                 metrics,
@@ -985,6 +1042,8 @@ pub fn run(options: Options) -> Result<(), String> {
                 appearance,
                 allowed,
             );
+            chrome.cell_hint = heard.cell;
+            chrome.take_route(route);
             booted = Some(first);
             let mut relaunches = Relaunches::default();
             let mut shrunk = Shrunk::default();
@@ -1227,7 +1286,7 @@ fn relaunch(
     // The picture goes, as it does for a renderer that died in front: a dead
     // page that looks alive is a click that does nothing. The row is written
     // directly, because `redraw_row` draws from the tabs and these are going.
-    pane.write(&crate::graphics::clear_command())
+    pane.write(&chrome.painter.clear())
         .map_err(|e| e.to_string())?;
     pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())?;
     pane.write(&screen::status_line(
@@ -1403,7 +1462,7 @@ fn drive(
             chrome.layout = wanted;
             // The picture moves to another row: the old placement goes, so
             // that the row coming back is not under it until the next frame.
-            pane.write(&crate::graphics::clear_command())
+            pane.write(&chrome.painter.clear())
                 .map_err(|e| e.to_string())?;
             relayout(pane, tabs, chrome)?;
         } else if resized {
@@ -1429,7 +1488,16 @@ fn drive(
         let wake = tabs.active().map(|tab| tab.connection.wake_fd());
         let mut watching = vec![pane.input_fd(), browser.wake_fd()];
         watching.extend(wake);
-        let ready = tty::poll_readable(&watching, POLL_MS)
+        // A frame owed an acknowledgement is acknowledged the pass after the
+        // pane has written it ([`tick_frames`]), and nothing wakes this poll
+        // when the writer finishes; so while one is owed the passes come
+        // often enough that the wait is not the frame rate.
+        let wait = if chrome.unacked.is_some() {
+            FRAME_POLL_MS
+        } else {
+            POLL_MS
+        };
+        let ready = tty::poll_readable(&watching, wait)
             .map_err(|e| format!("cannot wait for input: {e}"))?;
 
         if ready.contains(&pane.input_fd()) {
@@ -1464,6 +1532,9 @@ fn drive(
         // Whatever the pointer did in all the reports just read, told to the
         // page and asked about once: see [`crate::hover`].
         tick_hover(pane, tabs, chrome)?;
+        // Frames that have gone to the terminal, acknowledged; see
+        // [`tick_frames`].
+        tick_frames(pane, tabs, chrome)?;
 
         // What the animator thread has been doing while this loop was busy.
         // Nothing here drives it — it has its own clock and its own way onto
@@ -1546,7 +1617,11 @@ fn drive(
 /// nothing.
 fn relayout(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> Result<(), String> {
     pane.write(b"\x1b[2J").map_err(|e| e.to_string())?;
+    // The clear took any placeholder cells with it, and the picture may now
+    // be another number of them: the next paint writes them again.
+    chrome.painter.invalidate_placeholders();
     let pixels = chrome.layout.pixels(chrome.metrics);
+    let cast = chrome.cast;
     let mut css = pixels;
     if let Some(tab) = tabs.active_mut() {
         let stopped = tab.dialog.is_some();
@@ -1556,7 +1631,7 @@ fn relayout(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> Re
         // ([`revive`]), and the landing that brings it back sizes it.
         if !tab.is_crashed() {
             emulate(&mut tab.connection, viewport, stopped)?;
-            restart_screencast(&mut tab.connection, pixels, stopped)?;
+            restart_screencast(&mut tab.connection, pixels, stopped, cast)?;
         }
     }
     // The screen was cleared and the page is a different size, so nothing
@@ -1677,19 +1752,33 @@ fn emulate(client: &mut Client, viewport: Viewport, stopped: bool) -> Result<(),
 /// the pane — at 200%, half of it each way — and the terminal scales them
 /// into the same cells, until the still at the pane's own resolution replaces
 /// them. See [`crate::zoom`] for why nothing sharper was taken.
-fn start_screencast(client: &mut Client, pixels: (u32, u32), stopped: bool) -> Result<(), String> {
-    let (width, height) = pixels;
+///
+/// On a route that sends the engine's PNG the cast is PNG, every nth frame,
+/// and as big as the throttle allows: see [`motion::Cast`].
+fn start_screencast(
+    client: &mut Client,
+    pixels: (u32, u32),
+    stopped: bool,
+    cast: motion::Cast,
+) -> Result<(), String> {
+    let (width, height) = cast.size(pixels);
+    let mut params = vec![(
+        "format",
+        Json::string(if cast.png { "png" } else { "jpeg" }),
+    )];
+    if !cast.png {
+        params.push(("quality", Json::number(motion::QUALITY)));
+    }
+    params.extend([
+        ("maxWidth", Json::number(width)),
+        ("maxHeight", Json::number(height)),
+        ("everyNthFrame", Json::number(cast.every_nth.max(1))),
+    ]);
     tell(
         client,
         stopped,
         "Page.startScreencast",
-        Json::object(vec![
-            ("format", Json::string("jpeg")),
-            ("quality", Json::number(motion::QUALITY)),
-            ("maxWidth", Json::number(width)),
-            ("maxHeight", Json::number(height)),
-            ("everyNthFrame", Json::number(1)),
-        ]),
+        Json::object(params),
         crate::cdp::CALL_TIMEOUT,
     )
 }
@@ -1698,6 +1787,7 @@ fn restart_screencast(
     client: &mut Client,
     pixels: (u32, u32),
     stopped: bool,
+    cast: motion::Cast,
 ) -> Result<(), String> {
     let _ = tell(
         client,
@@ -1706,7 +1796,7 @@ fn restart_screencast(
         Json::empty(),
         crate::cdp::CALL_TIMEOUT,
     );
-    start_screencast(client, pixels, stopped)
+    start_screencast(client, pixels, stopped, cast)
 }
 
 /// What a page calls itself, and the status its document came with, asked of
@@ -1881,6 +1971,7 @@ fn activate(
         SWITCH_TIMEOUT,
     );
     let pixels = chrome.layout.pixels(chrome.metrics);
+    let cast = chrome.cast;
     let base = chrome.upload_base();
     let Some(tab) = tabs.active_mut() else {
         return Ok(());
@@ -1949,7 +2040,7 @@ fn activate(
             tab.loaded(loaded);
         }
     }
-    start_screencast(&mut tab.connection, pixels, stopped)?;
+    start_screencast(&mut tab.connection, pixels, stopped, cast)?;
     // A different page, so a different clock: nothing this tab sends can be
     // compared against what the last one had on screen, and a page that is
     // already loaded and still gets its lossless picture a rest interval
@@ -2104,14 +2195,20 @@ fn decline_or_restore(
 /// Public so that the engine tests send what this program sends. At the
 /// pane less the row: a page coming back from a crash is a new document,
 /// and a new document is not fullscreen.
-pub fn revive(client: &mut Client, appearance: &Appearance, viewport: Viewport, metrics: Metrics) {
+pub fn revive(
+    client: &mut Client,
+    appearance: &Appearance,
+    viewport: Viewport,
+    metrics: Metrics,
+    cast: motion::Cast,
+) {
     let _ = client.notify(
         "Page.setInterceptFileChooserDialog",
         Json::object(vec![("enabled", Json::Bool(true))]),
     );
     prepare_session(client, appearance);
     let _ = emulate(client, viewport, true);
-    let _ = restart_screencast(client, Layout::default().pixels(metrics), true);
+    let _ = restart_screencast(client, Layout::default().pixels(metrics), true, cast);
 }
 
 /// Throw away what a tab has queued, except what it says about a dialog or a
@@ -2223,7 +2320,7 @@ fn switched(
     // goes now rather than when the new tab paints, because the new tab may
     // take a network's worth of time to paint anything and the old page under
     // the new tab's title would be a lie for all of it.
-    pane.write(&crate::graphics::clear_command())
+    pane.write(&chrome.painter.clear())
         .map_err(|e| e.to_string())?;
     pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())?;
     if let Err(why) = activate(tabs, browser, chrome) {
@@ -2916,7 +3013,7 @@ fn crashed_in_front(
     chrome: &mut Chrome,
     target: &str,
 ) -> Result<(), String> {
-    pane.write(&crate::graphics::clear_command())
+    pane.write(&chrome.painter.clear())
         .map_err(|e| e.to_string())?;
     pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())?;
     chrome.motion.reset(Instant::now());
@@ -3007,10 +3104,19 @@ fn handle_page_events(
             match method.as_str() {
                 "Page.screencastFrame" => {
                     if let Some(session) = params.get("sessionId").and_then(Json::as_i64) {
-                        let _ = tab.connection.notify(
-                            "Page.screencastFrameAck",
-                            Json::object(vec![("sessionId", Json::number(session as f64))]),
-                        );
+                        // On a route whose link is slower than the engine the
+                        // frame in front is acknowledged when it has gone to
+                        // the terminal ([`tick_frames`]), which is what makes
+                        // the engine send frames at the link's rate, each one
+                        // current. Everywhere else, now.
+                        if chrome.painter.route().paced() && index == active {
+                            chrome.unacked = Some(Unacked {
+                                target: tab.target.clone(),
+                                session,
+                            });
+                        } else {
+                            acknowledge(&mut tab.connection, session);
+                        }
                     }
                     // A frame from a tab that is not in front is a frame from
                     // before it was left: it is acknowledged, so that the tab
@@ -3234,6 +3340,7 @@ fn handle_page_events(
                 &chrome.appearance,
                 viewport,
                 chrome.metrics,
+                chrome.cast,
             );
             chrome.motion.reset(Instant::now());
             chrome.still = None;
@@ -3271,7 +3378,12 @@ fn handle_page_events(
     if redraw {
         redraw_row(pane, tabs, chrome)?;
     }
-    if let Some(jpeg) = newest_frame {
+    if let Some(frame) = newest_frame {
+        // A PNG on the route that sends the engine's PNG, as it came.
+        if chrome.painter.route().payload == Payload::Png {
+            return paint_png(pane, tabs, chrome, &frame);
+        }
+        let jpeg = frame;
         // Ordered above, decoded here: a frame that lost to the still on
         // screen is eight milliseconds of work not done.
         //
@@ -3301,11 +3413,55 @@ fn paint(
     if chrome.list.is_some() {
         return Ok(());
     }
+    put_frame(pane, tabs, chrome, |painter, cells, row| {
+        painter.frame(raw, cells, row, 1)
+    })
+}
+
+/// Put a PNG from the engine on the screen as it came, on the route that
+/// sends it that way. See [`crate::graphics::Painter::png_frame`].
+fn paint_png(
+    pane: &mut Pane,
+    tabs: &Tabs<Client>,
+    chrome: &mut Chrome,
+    png: &[u8],
+) -> Result<(), String> {
+    if chrome.list.is_some() {
+        return Ok(());
+    }
+    put_frame(pane, tabs, chrome, |painter, cells, row| {
+        painter.png_frame(png, cells, row, 1)
+    })
+}
+
+/// What [`paint`] and [`paint_png`] share: the placeholder cells first when
+/// the route draws with them and they are not on screen, as text; then the
+/// frame.
+///
+/// A frame that names a shared memory object is written as text is, never
+/// dropped: a name handed over and replaced would be a file nobody reads,
+/// and the painter counts those as a terminal that does not read names. Any
+/// other frame goes in the pane's slot, where a newer one replaces it
+/// unwritten ([`screen::Outbox`]).
+fn put_frame(
+    pane: &mut Pane,
+    tabs: &Tabs<Client>,
+    chrome: &mut Chrome,
+    make: impl FnOnce(&mut Painter, tos_preview::fit::Cells, u32) -> Vec<u8>,
+) -> Result<(), String> {
     let layout = chrome.layout;
-    let bytes = chrome
-        .painter
-        .frame(raw, layout.cells(chrome.metrics), layout.page_row(), 1);
-    pane.write(&bytes).map_err(|e| e.to_string())?;
+    let (cells, row) = (layout.cells(chrome.metrics), layout.page_row());
+    let placeholders = chrome.painter.placeholders(cells, row);
+    if !placeholders.is_empty() {
+        pane.write(&placeholders).map_err(|e| e.to_string())?;
+    }
+    let named = chrome.painter.transport() == crate::graphics::Transport::SharedMemory;
+    let bytes = make(&mut chrome.painter, cells, row);
+    if named {
+        pane.write(&bytes).map_err(|e| e.to_string())?;
+    } else {
+        pane.write_frame(bytes).map_err(|e| e.to_string())?;
+    }
     // The picture does not move the cursor (`C=1`), but the status line owns
     // the cursor's position when something is being typed on it, so it is
     // written again rather than left where the last frame found it.
@@ -3439,6 +3595,23 @@ fn collect_still(
     if !chrome.motion.still_arrived(motion::now_seconds()) {
         return Ok(());
     }
+    // On the route that sends the engine's PNG the still goes as it came:
+    // not decoded, and not fitted either — at a fractional zoom it is a
+    // pixel or two off the pane and the terminal resamples it, which is a
+    // little softness over a link against a PNG encoder in this crate.
+    if chrome.painter.route().payload == Payload::Png {
+        let png = answer
+            .ok()
+            .and_then(|reply| reply.get("data").and_then(Json::as_str).map(str::to_string))
+            .and_then(|data| crate::base64::decode(data.as_bytes()).ok());
+        return match png {
+            Some(png) => paint_png(pane, tabs, chrome, &png),
+            None => {
+                chrome.motion.still_failed();
+                Ok(())
+            }
+        };
+    }
     let decoded = answer
         .ok()
         .and_then(|reply| reply.get("data").and_then(Json::as_str).map(str::to_string))
@@ -3475,8 +3648,16 @@ fn collect_still(
 /// Nor while the tab list is open: the picture is off the screen, and one
 /// taken now would be painted over nothing. Closing the list resets the
 /// motion clock, which is what asks for the still then.
+///
+/// Nor while a frame is owed an acknowledgement on a route paced by the
+/// link: the engine is holding its next frame for it, and its silence says
+/// nothing about the page. See [`Motion::frame_acknowledged`].
 fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
-    if asking(tabs) || chrome.list.is_some() || !chrome.motion.wants_still(Instant::now()) {
+    if asking(tabs)
+        || chrome.list.is_some()
+        || chrome.unacked.is_some()
+        || !chrome.motion.wants_still(Instant::now())
+    {
         return;
     }
     // A dead renderer draws nothing and would hold the question.
@@ -3580,6 +3761,68 @@ fn scroll(tabs: &Tabs<Client>, chrome: &Chrome, report: &MouseInput) {
         (at.0.round() as i32, at.1.round() as i32),
         viewport.notch(report.wheel, WHEEL_PIXELS),
     );
+}
+
+/// Acknowledge one screencast frame, which is what lets the engine send the
+/// next.
+fn acknowledge(client: &mut Client, session: i64) {
+    let _ = client.notify(
+        "Page.screencastFrameAck",
+        Json::object(vec![("sessionId", Json::number(session as f64))]),
+    );
+}
+
+/// Once a pass, on a route whose frames are paced by the link: acknowledge
+/// the newest frame once the pane has written it, and step the cast's size
+/// by how long the frames are taking.
+///
+/// The engine casts at most three frames ahead of its acknowledgements and
+/// then waits; one acknowledgement and its next frame arrives within about
+/// sixty milliseconds, stamped after the acknowledgement — the page as it is
+/// then, not a queued one (measured against chrome-headless-shell 153). So
+/// holding the acknowledgement until the frame has left for the terminal
+/// makes the engine produce frames at the rate the link takes them, with no
+/// timer and no restart. A frame that arrives while one is still waiting
+/// replaces it ([`screen::Outbox`]), and its number is the one acknowledged:
+/// the engine counts acknowledgements, not which frame they name. A frame
+/// of a tab that is no longer in front is acknowledged at once, so that no
+/// tab is left waiting.
+fn tick_frames(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+) -> Result<(), String> {
+    let waited = pane.take_frame_wait();
+    if !chrome.painter.route().paced() {
+        return Ok(());
+    }
+    if let Some(unacked) = &chrome.unacked {
+        let in_front = tabs.active_target() == Some(unacked.target.as_str());
+        if pane.frames_flushed() || !in_front {
+            if in_front {
+                chrome.motion.frame_acknowledged(Instant::now());
+            }
+            let unacked = chrome.unacked.take();
+            if let Some(Unacked { target, session }) = unacked {
+                if let Some(tab) = tabs.index_of(&target).and_then(|i| tabs.get_mut(i)) {
+                    acknowledge(&mut tab.connection, session);
+                }
+            }
+        }
+    }
+    let Some(waited) = waited else {
+        return Ok(());
+    };
+    let Some(step) = chrome.throttle.frame_waited(waited, Instant::now()) else {
+        return Ok(());
+    };
+    chrome.cast.step = step;
+    let (pixels, cast) = (chrome.layout.pixels(chrome.metrics), chrome.cast);
+    if let Some(tab) = tabs.active_mut().filter(|tab| !tab.is_crashed()) {
+        let stopped = tab.dialog.is_some();
+        restart_screencast(&mut tab.connection, pixels, stopped, cast)?;
+    }
+    Ok(())
 }
 
 /// Once a pass: what the pointer did, told to the page and asked about, for
@@ -5813,7 +6056,7 @@ fn close_find(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
 fn open_list_screen(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> {
     // A still in flight is of a picture that is not going to be drawn.
     chrome.still = None;
-    pane.write(&crate::graphics::clear_command())
+    pane.write(&chrome.painter.clear())
         .map_err(|e| e.to_string())?;
     pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())
 }

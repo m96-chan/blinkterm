@@ -143,6 +143,7 @@ pub mod normal;
 pub mod options;
 pub mod permissions;
 pub mod profile;
+pub mod route;
 pub mod screen;
 pub mod scroll;
 pub mod session;

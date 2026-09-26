@@ -60,6 +60,30 @@ On a Mac there is no `/dev/shm`, so the frames go through `shm_open(3)`
 shared memory objects instead, which Kitty and Ghostty read; a terminal that
 does not gets the inline fallback, as anywhere else.
 
+The terminal is asked before the engine is started. One that does not
+answer the graphics query gets a sentence in the shell saying why and what
+to do, not a blank pane; `--no-probe` skips the question for a terminal
+that draws and does not answer.
+
+**Inside tmux** it works with `set -g allow-passthrough on` in `tmux.conf`
+and a terminal behind tmux that speaks the protocol. tmux eats graphics
+commands otherwise, so the picture goes wrapped in tmux's passthrough and is
+drawn as Kitty's Unicode placeholders — text tmux can see, move and redraw —
+with the engine's PNG as the frames (at most 297 columns of picture, and
+30 frames a second). Two things are lost inside tmux: the Kitty keyboard
+protocol (tmux re-encodes keys, so there are no key releases and `ctrl+i` is
+`tab`) and mouse positions finer than a cell. `--tmux on|off` overrides
+the detection.
+
+**Over ssh** (`$SSH_CONNECTION` set) the frames are the engine's PNG as it
+sent them, inline: no `/dev/shm` on the far side, and raw pixels would be
+3.9 MB a frame. Each frame is acknowledged to the engine only when it has
+gone to the terminal, so the frame rate is what the link carries, every
+frame current; frames that wait on the link make the page cast at half, then
+three-eighths, of the pane until the link catches up, and the still of a
+page at rest is always full size. `--fps <n>` caps it (15 by default over
+ssh), and `--frames raw|png` overrides the choice.
+
 ## Installing
 
 Rust 1.87 or newer — the floor comes from the dependency closure, not from
@@ -276,7 +300,9 @@ setting: the page to open is what the command line is for, and
 starts in normal mode (`ctrl+.`), `restore = true`
 reopens the last session's tabs (see [The session](#the-session)), and
 `mute = true` (or `--mute`) starts the engine silent (see
-[Sound](#sound-permissions-and-fullscreen)).
+[Sound](#sound-permissions-and-fullscreen)). `tmux = on|off|auto`,
+`frames = raw|png|auto`, `fps = <n>` and `probe = false` are `--tmux`,
+`--frames`, `--fps` and `--no-probe` (see [Where it runs](#where-it-runs)).
 
 `--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
 repeatable. Four are refused because they would undo something this
@@ -296,10 +322,11 @@ Several urls open several tabs, the first in front:
 
 `--doctor` is the first thing to run in a new terminal: it starts the engine
 on a throwaway profile, asks the terminal whether it speaks the Kitty
-graphics and keyboard protocols, and prints one line per answer, exiting 1
-when the engine did not answer or the terminal answered neither. In tmux
-without `allow-passthrough` it will tell you the terminal did not answer,
-which is the truth. `--print-engine` prints the path the search finds and
+graphics and keyboard protocols — through tmux's passthrough as well, inside
+tmux — and prints one line per answer and the route frames will take,
+exiting 1 when the engine did not answer or the terminal cannot draw. In
+tmux without `allow-passthrough` it says the graphics query went unanswered
+raw and through tmux. `--print-engine` prints the path the search finds and
 nothing else, for scripts.
 
 ### Rebinding keys
