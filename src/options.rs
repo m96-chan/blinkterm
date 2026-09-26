@@ -54,6 +54,7 @@ use crate::bindings::{Binding, Bindings};
 use crate::download;
 use crate::engine;
 use crate::profile;
+use crate::route;
 use crate::zoom::Scale;
 
 /// The largest settings file that is read. Nothing here needs a tenth of
@@ -108,6 +109,9 @@ pub struct Options {
     /// `key.<chord> = <action>` lines from the file, in file order; the loop
     /// asks them before its own table. See [`crate::bindings`].
     pub bindings: Bindings,
+    /// `--tmux`, `--frames`, `--fps` and `--no-probe`: what overrides the
+    /// route a run's frames take. See [`crate::route`].
+    pub route: route::Choices,
 }
 
 /// What `main` was asked to do, once the command line has been read.
@@ -175,6 +179,11 @@ pub struct Settings {
     pub proxy: Option<String>,
     pub restore: Option<bool>,
     pub normal_mode: Option<bool>,
+    pub tmux: Option<route::Choice>,
+    pub frames: Option<route::Frames>,
+    pub fps: Option<u32>,
+    /// `false` with `--no-probe` or `probe = false`.
+    pub probe: Option<bool>,
     /// File only: a binding is not a one-run thing.
     pub bindings: Vec<Binding>,
     /// Command line only.
@@ -210,6 +219,10 @@ impl Settings {
             proxy: self.proxy.or(under.proxy),
             restore: self.restore.or(under.restore),
             normal_mode: self.normal_mode.or(under.normal_mode),
+            tmux: self.tmux.or(under.tmux),
+            frames: self.frames.or(under.frames),
+            fps: self.fps.or(under.fps),
+            probe: self.probe.or(under.probe),
             bindings,
             config: self.config.or(under.config),
             what: self.what.or(under.what),
@@ -363,6 +376,30 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             once(&mut s.scale, Scale::parse(text)?, "one scale at a time")?;
             continue;
         }
+        if let Some(text) = value_of(arg, "--tmux", &mut args) {
+            once(
+                &mut s.tmux,
+                route::Choice::parse(text)?,
+                "--tmux once is enough",
+            )?;
+            continue;
+        }
+        if let Some(text) = value_of(arg, "--frames", &mut args) {
+            once(
+                &mut s.frames,
+                route::Frames::parse(text)?,
+                "--frames once is enough",
+            )?;
+            continue;
+        }
+        if let Some(text) = value_of(arg, "--fps", &mut args) {
+            once(
+                &mut s.fps,
+                route::parse_fps("--fps", text)?,
+                "--fps once is enough",
+            )?;
+            continue;
+        }
         if let Some(text) = value_of(arg, "--color-scheme", &mut args) {
             once(
                 &mut s.scheme,
@@ -430,6 +467,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             "--force-dark" => once(&mut s.force_dark, true, "--force-dark once is enough")?,
             "--restore" => once(&mut s.restore, true, "--restore once is enough")?,
             "--normal-mode" => once(&mut s.normal_mode, true, "--normal-mode once is enough")?,
+            "--no-probe" => once(&mut s.probe, false, "--no-probe once is enough")?,
             "--no-config" => config_choice(&mut s, ConfigChoice::None)?,
             "--print-engine" => what(&mut s, What::PrintEngine)?,
             "--doctor" => what(&mut s, What::Doctor)?,
@@ -495,7 +533,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 14] = [
+const KEYS: [&str; 18] = [
     "home",
     "profile",
     "temp-profile",
@@ -510,6 +548,10 @@ const KEYS: [&str; 14] = [
     "proxy",
     "restore",
     "normal-mode",
+    "tmux",
+    "frames",
+    "fps",
+    "probe",
 ];
 
 /// One file's text. `path` is only for the sentences, every one of which is
@@ -606,6 +648,10 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             "proxy" => s.proxy = Some(parse_proxy(key, value).map_err(at)?),
             "restore" => s.restore = Some(parse_bool(key, value).map_err(at)?),
             "normal-mode" => s.normal_mode = Some(parse_bool(key, value).map_err(at)?),
+            "tmux" => s.tmux = Some(route::Choice::parse(value).map_err(at)?),
+            "frames" => s.frames = Some(route::Frames::parse(value).map_err(at)?),
+            "fps" => s.fps = Some(route::parse_fps(key, value).map_err(at)?),
+            "probe" => s.probe = Some(parse_bool(key, value).map_err(at)?),
             _ => unreachable!("every key in KEYS has an arm"),
         }
     }
@@ -704,6 +750,12 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
         restore: s.restore.unwrap_or(false),
         normal_mode: s.normal_mode.unwrap_or(false),
         bindings: Bindings::from_rows(s.bindings),
+        route: route::Choices {
+            tmux: s.tmux.unwrap_or_default(),
+            frames: s.frames.unwrap_or_default(),
+            fps: s.fps,
+            probe: s.probe.unwrap_or(true),
+        },
     })
 }
 
@@ -1602,5 +1654,64 @@ mod tests {
             resolve(Settings::default(), Settings::default(), from_file).expect("resolves");
         assert_eq!(options.bindings, Bindings::from_rows(vec![row]));
         assert!(parsed(&["--key.alt+b=back"]).is_err(), "not an option");
+    }
+
+    #[test]
+    fn tmux_frames_fps_and_no_probe_are_parsed_from_the_line_and_the_file_and_refused_twice() {
+        let s = parsed(&["--tmux", "on", "--frames=png", "--fps", "7", "--no-probe"])
+            .expect("four settings");
+        assert_eq!(s.tmux, Some(route::Choice::On));
+        assert_eq!(s.frames, Some(route::Frames::Png));
+        assert_eq!(s.fps, Some(7));
+        assert_eq!(s.probe, Some(false));
+        for twice in [
+            &["--tmux=on", "--tmux=off"][..],
+            &["--frames=raw", "--frames", "png"][..],
+            &["--fps=1", "--fps=2"][..],
+            &["--no-probe", "--no-probe"][..],
+        ] {
+            let why = parsed(twice).expect_err("twice");
+            assert!(why.contains("once is enough"), "{twice:?}: {why}");
+        }
+        assert!(parsed(&["--no-probe=true"]).is_err());
+
+        let from_file = file("tmux = off\nframes = raw\nfps = 20\nprobe = false").expect("file");
+        let options = resolve(Settings::default(), Settings::default(), from_file).expect("ok");
+        assert_eq!(
+            options.route,
+            route::Choices {
+                tmux: route::Choice::Off,
+                frames: route::Frames::Raw,
+                fps: Some(20),
+                probe: false,
+            }
+        );
+        let cli = parsed(&["--tmux=on", "--fps=30"]).expect("cli");
+        let from_file = file("tmux = off\nfps = 20").expect("file");
+        let options = resolve(cli, Settings::default(), from_file).expect("ok");
+        assert_eq!(options.route.tmux, route::Choice::On, "the line wins");
+        assert_eq!(options.route.fps, Some(30));
+        assert!(options.route.probe, "probing is the default");
+        assert_eq!(
+            file("tmux = on\ntmux = off"),
+            Err("/c:2: tmux is already set on line 1".to_string())
+        );
+    }
+
+    #[test]
+    fn fps_outside_one_to_sixty_is_refused_by_name() {
+        for bad in ["0", "61", "fast", "2.5"] {
+            let why = parsed(&["--fps", bad]).expect_err(bad);
+            assert!(why.contains("--fps"), "{bad}: {why}");
+        }
+        assert!(parsed(&["--fps"]).is_err());
+        let why = file("fps = 90").expect_err("too many");
+        assert!(why.starts_with("/c:1: fps is"), "{why}");
+        assert!(parsed(&["--tmux=maybe"]).unwrap_err().contains("--tmux"));
+        assert!(parsed(&["--frames=jpeg"]).unwrap_err().contains("--frames"));
+        assert_eq!(
+            resolved(&[]).expect("defaults").route,
+            route::Choices::default()
+        );
     }
 }

@@ -141,6 +141,7 @@ pub mod motion;
 pub mod normal;
 pub mod options;
 pub mod profile;
+pub mod route;
 pub mod screen;
 pub mod scroll;
 pub mod session;

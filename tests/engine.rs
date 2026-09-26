@@ -38,6 +38,7 @@ use blinkterm::json::Json;
 use blinkterm::keys;
 use blinkterm::motion::{self, Motion};
 use blinkterm::profile::{Choice, Profile};
+use blinkterm::route::{Payload, Placement, Route, Wrap};
 use blinkterm::scroll::{self, Animator, Dispatch, Step, Wheel};
 use blinkterm::tabs::{Outcome, Tab, Tabs};
 use tos_compositor::ImageFiles;
@@ -7114,6 +7115,7 @@ fn a_crashed_page_keeps_its_tab_and_a_reload_brings_it_back_casting() {
             rows: HEIGHT / CELL.1 + 1,
             cell: CELL,
         },
+        motion::Cast::default(),
     );
     let after = frames_in(&mut tab.connection, Duration::from_secs(1));
     eprintln!("frames in a second after revive: {after}");
@@ -7665,4 +7667,339 @@ fn an_engine_retired_alive_is_stopped_and_its_profile_is_free_to_start_another()
     assert!(engine.check().is_ok());
     engine.kill();
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// How long a paced test waits for a frame the engine owes it. Locally the
+/// next frame after an acknowledgement is about 60 ms away; in docker on a
+/// GitHub runner an engine event has taken seconds.
+const FRAME_WAIT: Duration = Duration::from_secs(15);
+
+/// The route the program takes over ssh: the engine's PNG, inline, at the
+/// cursor.
+fn png_route(placement: Placement, wrap: Wrap) -> Route {
+    Route {
+        transport: blinkterm::graphics::Transport::Inline,
+        payload: Payload::Png,
+        placement,
+        wrap,
+        every_nth: 1,
+    }
+}
+
+/// The screencast frames in `client`'s queue, *not* acknowledged, with the
+/// number each would be acknowledged with and its capture time.
+fn unacked_frames(client: &mut Client) -> Vec<(i64, Vec<u8>, f64)> {
+    let mut frames = Vec::new();
+    for event in client.events() {
+        if event.method != "Page.screencastFrame" {
+            continue;
+        }
+        let session = event.params.get("sessionId").and_then(Json::as_i64);
+        let data = event.params.get("data").and_then(Json::as_str);
+        let stamp = event
+            .params
+            .path(&["metadata", "timestamp"])
+            .and_then(Json::as_f64);
+        if let (Some(session), Some(data), Some(stamp)) = (session, data, stamp) {
+            let png = blinkterm::base64::decode(data.as_bytes()).expect("base64");
+            frames.push((session, png, stamp));
+        }
+    }
+    frames
+}
+
+/// A PNG cast with `every_nth`, at the page's size.
+fn png_cast(client: &mut Client, every_nth: u32) {
+    client
+        .call(
+            "Page.startScreencast",
+            Json::object(vec![
+                ("format", Json::string("png")),
+                ("maxWidth", Json::number(WIDTH)),
+                ("maxHeight", Json::number(HEIGHT)),
+                ("everyNthFrame", Json::number(every_nth)),
+            ]),
+        )
+        .expect("the screencast starts");
+}
+
+/// tmux's passthrough, as a model: each `ESC P tmux;` … `ESC \` loses its
+/// wrapper and has its doubled escapes halved. The unit tests in
+/// `src/graphics.rs` hold it to what tmux 3.4 was recorded emitting.
+fn tmux_unwrap(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let Some(body) = rest.strip_prefix(b"\x1bPtmux;") else {
+            out.push(rest[0]);
+            rest = &rest[1..];
+            continue;
+        };
+        let mut i = 0;
+        loop {
+            match (body.get(i), body.get(i + 1)) {
+                (Some(0x1b), Some(0x1b)) => {
+                    out.push(0x1b);
+                    i += 2;
+                }
+                (Some(0x1b), Some(b'\\')) => {
+                    i += 2;
+                    break;
+                }
+                (Some(&byte), _) => {
+                    out.push(byte);
+                    i += 1;
+                }
+                (None, _) => panic!("an unterminated wrapper"),
+            }
+        }
+        rest = &body[i..];
+    }
+    out
+}
+
+/// The route over ssh, end to end: the engine's PNG frames and its PNG still
+/// go to the terminal as they came, and the terminal makes the picture of
+/// them. Nothing is decoded on this side at all.
+#[test]
+fn a_png_cast_reaches_the_terminal_as_pngs_it_can_decode() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    let dir = temp_dir("png");
+    let mut painter = Painter::at_with(&dir, png_route(Placement::Direct, Wrap::None));
+    assert_eq!(painter.transport(), blinkterm::graphics::Transport::Inline);
+    let mut terminal = a_terminal(&dir);
+    let cells = Cells {
+        cols: WIDTH / CELL.0,
+        rows: HEIGHT / CELL.1,
+    };
+
+    png_cast(&mut client, 1);
+    let started = Instant::now();
+    let (mut frames, mut bytes) = (0usize, 0usize);
+    while started.elapsed() < Duration::from_secs(2)
+        || (frames < 3 && started.elapsed() < FRAME_WAIT)
+    {
+        for (png, _) in take_frames(&mut client) {
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "the engine promised PNG");
+            let sequence = painter.png_frame(&png, cells, 2, 1);
+            terminal.advance(&sequence);
+            frames += 1;
+            bytes += sequence.len();
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    assert!(frames >= 3, "only {frames} frames");
+    eprintln!(
+        "png: {frames} frames in {:?}, {} bytes down the pane per frame",
+        started.elapsed(),
+        bytes / frames
+    );
+    let store = terminal.graphics();
+    assert_eq!(store.placements().count(), 1);
+    assert_eq!(
+        store.image(IMAGE_ID).map(|i| (i.width, i.height)),
+        Some((WIDTH, HEIGHT)),
+        "the terminal read the size out of the file"
+    );
+
+    // The still goes the same way.
+    let reply = client
+        .call_within(
+            "Page.captureScreenshot",
+            Json::object(vec![("format", Json::string("png"))]),
+            FRAME_WAIT,
+        )
+        .expect("a still");
+    let png = blinkterm::base64::decode(
+        reply
+            .get("data")
+            .and_then(Json::as_str)
+            .expect("data")
+            .as_bytes(),
+    )
+    .expect("base64");
+    terminal.advance(&painter.png_frame(&png, cells, 2, 1));
+    let store = terminal.graphics();
+    assert_eq!(store.placements().count(), 1);
+    assert_eq!(
+        store.image(IMAGE_ID).map(|i| (i.width, i.height)),
+        Some((WIDTH, HEIGHT))
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
+/// What the pacing in `app::tick_frames` rests on: with no acknowledgement
+/// the engine casts a few frames and then waits, and one acknowledgement
+/// brings a frame of the page as it is then — not one that was queued.
+#[test]
+fn withholding_the_ack_holds_the_engine_to_three_frames_and_one_ack_brings_a_current_one() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    png_cast(&mut client, 1);
+
+    let mut held = Vec::new();
+    let deadline = Instant::now() + FRAME_WAIT;
+    while held.is_empty() && Instant::now() < deadline {
+        held.extend(unacked_frames(&mut client));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!held.is_empty(), "no frame at all");
+    // Two seconds more with nothing acknowledged: the engine stops.
+    let quiet = Instant::now();
+    while quiet.elapsed() < Duration::from_secs(2) {
+        held.extend(unacked_frames(&mut client));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!("frames without an acknowledgement: {}", held.len());
+    assert!(
+        held.len() <= 3,
+        "{} frames arrived unacknowledged on a page animating at 60 fps",
+        held.len()
+    );
+
+    let session = held.last().expect("a frame held").0;
+    let acked_at = motion::now_seconds();
+    client
+        .notify(
+            "Page.screencastFrameAck",
+            Json::object(vec![("sessionId", Json::number(session as f64))]),
+        )
+        .expect("sent");
+    let mut next = Vec::new();
+    let deadline = Instant::now() + FRAME_WAIT;
+    while next.is_empty() && Instant::now() < deadline {
+        next.extend(unacked_frames(&mut client));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (_, png, stamp) = next.first().expect("a frame after the acknowledgement");
+    assert_eq!(&png[..4], b"\x89PNG");
+    eprintln!(
+        "the frame after the acknowledgement was captured {:+.3} s from it",
+        stamp - acked_at
+    );
+    assert!(
+        *stamp >= acked_at - 0.05,
+        "captured {:.3} s before the acknowledgement: a queued frame, not a current one",
+        acked_at - stamp
+    );
+
+    // And a cast started again owes nothing: the throttle restarts it at a
+    // new size with frames it will never acknowledge still counted against
+    // the old one, and the new one must not wait for them.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let _ = unacked_frames(&mut client);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    png_cast(&mut client, 1);
+    let mut after = Vec::new();
+    let deadline = Instant::now() + FRAME_WAIT;
+    while after.is_empty() && Instant::now() < deadline {
+        after.extend(unacked_frames(&mut client));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !after.is_empty(),
+        "a restarted cast waited on the old one's acknowledgements"
+    );
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    client.close();
+    engine.kill();
+}
+
+/// `everyNthFrame`, which is how a route's frame-rate cap reaches the engine.
+#[test]
+fn every_nth_frame_divides_the_cast() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    let count = |client: &mut Client, every_nth: u32| {
+        png_cast(client, every_nth);
+        // The first frame, however long the engine takes to it; then two
+        // seconds of them, every one acknowledged.
+        let deadline = Instant::now() + FRAME_WAIT;
+        while take_frames(client).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        let mut n = 0;
+        while started.elapsed() < Duration::from_secs(2) {
+            n += take_frames(client).len();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = client.call("Page.stopScreencast", Json::empty());
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = take_frames(client);
+        n
+    };
+    let every = count(&mut client, 1);
+    let sixth = count(&mut client, 6);
+    eprintln!("two seconds: {every} frames at every frame, {sixth} at every sixth");
+    assert!(sixth >= 2, "{sixth} frames at every sixth");
+    assert!(
+        sixth * 3 <= every + 6,
+        "{sixth} at every sixth against {every} at every one"
+    );
+    client.close();
+    engine.kill();
+}
+
+/// The route through tmux, to the terminal behind it: the frame wrapped,
+/// through the model of tmux's passthrough, into the real parser, as a
+/// virtual placement under the placeholder id.
+#[test]
+fn the_wrapped_frame_parses_once_the_tmux_model_has_unwrapped_it() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    let dir = temp_dir("tmux");
+    let mut painter = Painter::at_with(&dir, png_route(Placement::Unicode, Wrap::Tmux));
+    let mut terminal = a_terminal(&dir);
+    let cells = Cells {
+        cols: WIDTH / CELL.0,
+        rows: HEIGHT / CELL.1,
+    };
+    png_cast(&mut client, 1);
+    let mut frames = 0;
+    let deadline = Instant::now() + FRAME_WAIT;
+    while frames < 3 && Instant::now() < deadline {
+        for (png, _) in take_frames(&mut client) {
+            let wrapped = painter.png_frame(&png, cells, 2, 1);
+            assert!(wrapped.starts_with(b"\x1bPtmux;"));
+            assert!(
+                wrapped.len() <= blinkterm::graphics::DCS_LIMIT,
+                "one wrapper"
+            );
+            let unwrapped = tmux_unwrap(&wrapped);
+            assert!(unwrapped.starts_with(b"\x1b_Ga=T,f=100,i=16,U=1,"));
+            terminal.advance(&unwrapped);
+            frames += 1;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    assert!(frames >= 3, "only {frames} frames");
+    let image = terminal
+        .graphics()
+        .image(blinkterm::graphics::PLACEHOLDER_IMAGE_ID)
+        .expect("stored under the placeholder id");
+    assert_eq!((image.width, image.height), (WIDTH, HEIGHT));
+    assert!(
+        terminal.graphics().image(IMAGE_ID).is_none(),
+        "nothing under the direct route's id"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
 }
