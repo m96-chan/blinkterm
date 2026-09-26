@@ -12,6 +12,11 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- Runs on macOS: frames go through `shm_open` shared memory (Kitty,
+  Ghostty), Chrome and Chromium are found in `/Applications`, and the engine
+  gets `--use-mock-keychain` so a headless run never asks the Keychain. CI
+  runs the engine tests on a Mac, and the Homebrew formula installs there
+  ([#21](https://github.com/m96-chan/blinkterm/issues/21)).
 - `key.<chord> = <action>` in the settings file rebinds any of the
   program's keys (`key.f5 = reload`), and `key.<chord> = none` gives one
   back to the page; the actions are listed by `--help`. A chord needs

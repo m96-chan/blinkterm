@@ -45,15 +45,20 @@ pixels inline: correct, obviously correct, and slow.
 
 ## Where it runs
 
-Any terminal that speaks all three of the Kitty graphics protocol, the Kitty
-keyboard protocol and SGR mouse reporting — Kitty, WezTerm, Ghostty — and a
-[tOS](https://github.com/m96-chan/tOS) pane, which is where it was written.
+On Linux and macOS, in any terminal that speaks all three of the Kitty
+graphics protocol, the Kitty keyboard protocol and SGR mouse reporting —
+Kitty, WezTerm, Ghostty — and in a [tOS](https://github.com/m96-chan/tOS)
+pane, which is where it was written.
 tOS owns the display: there is no X11 and no Wayland and there never will be,
 so no browser can be ported to it in the ordinary sense. But a terminal that
 speaks those three protocols is already a screen, a mouse and a keyboard, and
 that is the whole of what an engine wants. None of that argument is about tOS,
 so the same binary runs in the others. This repository exists because tOS's CI
 has no Chromium to test against and this program is nothing without one.
+
+On a Mac there is no `/dev/shm`, so the frames go through `shm_open(3)`
+shared memory objects instead, which Kitty and Ghostty read; a terminal that
+does not gets the inline fallback, as anywhere else.
 
 ## Installing
 
@@ -64,7 +69,7 @@ anything in `src/`; see [Checks](#checks):
 cargo install --git https://github.com/m96-chan/blinkterm
 ```
 
-Or, on Linux, with [Homebrew](https://brew.sh):
+Or with [Homebrew](https://brew.sh):
 
 ```sh
 brew install m96-chan/tap/blinkterm
@@ -94,11 +99,29 @@ BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell blinkt
 It wants the usual Chromium libraries (its `deb.deps` lists them) and, if you
 read any CJK, `fonts-noto-cjk`: without it every Japanese glyph is a box.
 
+On a Mac with Apple silicon, the same version's `mac-arm64` build (an Intel
+Mac wants `mac-x64` in both places):
+
+```sh
+curl -fsSLO https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.52/mac-arm64/chrome-headless-shell-mac-arm64.zip
+unzip chrome-headless-shell-mac-arm64.zip -d ~/engine
+BLINKTERM_ENGINE=~/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell blinkterm
+```
+
+The frameworks it needs are in the zip and the fonts are the system's. A zip
+fetched with `curl` runs at once; one saved by Safari or Finder is
+quarantined, and macOS refuses to start it until
+`xattr -dr com.apple.quarantine ~/engine/chrome-headless-shell-mac-arm64`
+has removed the attribute.
+
 Anything Chromium-shaped will do, with one caution. `blinkterm` looks at
 `--engine <path>` first, then `$BLINKTERM_ENGINE`, then `engine = <path>` in
 the [settings](#settings), then on `PATH` for `chrome-headless-shell`,
 `chromium`, `chromium-browser`, `google-chrome` and `chromium-shell`, in that
-order. Debian's `chromium-shell` is last because it is Chromium's
+order — and on macOS, where a browser is an app rather than a command, then
+for Google Chrome and Chromium in `/Applications` and `~/Applications`. On a
+Mac the engine is also given `--use-mock-keychain`, so that Chromium never
+asks the Keychain for its cookie key in a dialog nobody can see. Debian's `chromium-shell` is last because it is Chromium's
 `content_shell`, not a headless shell: it keeps a DevTools port open beside
 the pipe whatever it is told, answers a page's dialogs itself, and does not
 close when asked, so a kept profile is not flushed. It renders pages; it does
@@ -110,6 +133,10 @@ Cookies, logins, local storage and the rest of what a site keeps are kept
 between runs, in `$XDG_DATA_HOME/blinkterm/profile` — or
 `~/.local/share/blinkterm/profile` when `XDG_DATA_HOME` is not set. The
 directory is made readable by you alone (0700), since a cookie is a login.
+The same on macOS, rather than `~/Library/Application Support`: this is a
+program run from a shell, the terminals it runs in keep their own settings
+under `~/.config` there too, and a cookie jar is better kept out of what Time
+Machine and iCloud copy about.
 
 ```sh
 blinkterm --profile ~/work-profile https://example.com   # somewhere else
@@ -210,8 +237,8 @@ nothing.
 
 Everything on the command line can also be kept in
 `$XDG_CONFIG_HOME/blinkterm/config` — `~/.config/blinkterm/config` when
-`XDG_CONFIG_HOME` is not set — one setting per line, named as the option is
-without its `--`:
+`XDG_CONFIG_HOME` is not set, on macOS as on Linux — one setting per line,
+named as the option is without its `--`:
 
     # what a page is told about you
     color-scheme = dark
@@ -571,9 +598,15 @@ cargo test --locked
 The lint set is a `[lints]` table in `Cargo.toml` rather than a list of flags
 in the workflow, so a laptop and a runner disagree about `-D warnings` and
 nothing else. The one worth knowing about is
-`clippy::undocumented_unsafe_blocks`: there are thirty-five `unsafe` blocks in
+`clippy::undocumented_unsafe_blocks`: there are forty-nine `unsafe` blocks in
 `src/`, nearly all of them one-line `libc` calls, and each says what makes it
 sound.
+
+CI also runs the clippy and the tests on macOS, in a `mac` job with a
+`chrome-headless-shell` of its own: the shared memory store and the app
+search are compiled only there, and a lint only sees the code that is
+built. The `msrv` job checks the same code for `aarch64-apple-darwin` on
+the floor toolchain.
 
 `--locked` throughout, because every dependency but `libc` is a git revision
 and `Cargo.lock` is the only record of which tree of tOS was built.

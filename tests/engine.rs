@@ -1478,6 +1478,7 @@ fn killing_the_engine_leaves_nothing_of_its_process_group() {
 /// process in the engine's group holds, against every TCP socket in the
 /// `LISTEN` state (`0A` in `/proc/net/tcp`). A machine with no IPv6 has no
 /// `/proc/net/tcp6`, and that is read as no listeners rather than an error.
+/// A Mac has no `/proc`, and asks `lsof(8)` the same question.
 #[test]
 fn the_engine_listens_on_no_port() {
     let Some((engine, mut client)) = connect() else {
@@ -1494,25 +1495,10 @@ fn the_engine_listens_on_no_port() {
         describe(&members)
     );
 
-    let listening: std::collections::HashSet<u64> = ["/proc/net/tcp", "/proc/net/tcp6"]
-        .iter()
-        .flat_map(|table| listening_inodes(table))
-        .collect();
-    let mut sockets = 0;
-    let mut found = Vec::new();
-    for (pid, command) in &members {
-        for inode in socket_inodes(*pid) {
-            sockets += 1;
-            if listening.contains(&inode) {
-                found.push(format!("{pid} ({command}) listens on socket:[{inode}]"));
-            }
-        }
-    }
+    let (census, found) = listening_sockets_of(group, &members);
     eprintln!(
-        "group {group}: {} processes, {sockets} sockets between them, {} listening sockets \
-         on the machine, {} of them the engine's",
+        "group {group}: {} processes, {census}, {} of them the engine's",
         members.len(),
-        listening.len(),
         found.len()
     );
     assert!(found.is_empty(), "the engine is listening: {found:?}");
@@ -1521,7 +1507,69 @@ fn the_engine_listens_on_no_port() {
     drop(engine);
 }
 
+/// Which of `members` listen on a TCP socket, one sentence each, and a
+/// count of what was looked at for the log.
+#[cfg(target_os = "linux")]
+fn listening_sockets_of(_group: i32, members: &[(i32, String)]) -> (String, Vec<String>) {
+    let listening: std::collections::HashSet<u64> = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .flat_map(|table| listening_inodes(table))
+        .collect();
+    let mut sockets = 0;
+    let mut found = Vec::new();
+    for (pid, command) in members {
+        for inode in socket_inodes(*pid) {
+            sockets += 1;
+            if listening.contains(&inode) {
+                found.push(format!("{pid} ({command}) listens on socket:[{inode}]"));
+            }
+        }
+    }
+    let census = format!(
+        "{sockets} sockets between them, {} listening sockets on the machine",
+        listening.len()
+    );
+    (census, found)
+}
+
+/// The same from `lsof(8)`, which is how a Mac lists sockets: every TCP
+/// socket in `LISTEN` held by a process in `group` (`-a` ands the three
+/// selections), as `p<pid>` and `n<address>` lines. Nothing matching is an
+/// exit status of 1 with nothing on either stream; anything else on stderr
+/// is `lsof` failing, which must not read as a pass.
+#[cfg(not(target_os = "linux"))]
+fn listening_sockets_of(group: i32, members: &[(i32, String)]) -> (String, Vec<String>) {
+    let out = std::process::Command::new("lsof")
+        .args(["-nP", "-a", "-iTCP", "-sTCP:LISTEN"])
+        .arg(format!("-g{group}"))
+        .args(["-F", "pn"])
+        .output()
+        .expect("lsof runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() || (stdout.trim().is_empty() && stderr.trim().is_empty()),
+        "lsof failed ({}): {stderr}",
+        out.status
+    );
+    let mut pid = None;
+    let mut found = Vec::new();
+    for line in stdout.lines() {
+        if let Some(number) = line.strip_prefix('p') {
+            pid = number.parse::<i32>().ok();
+        } else if let Some(address) = line.strip_prefix('n') {
+            let command = members
+                .iter()
+                .find(|(member, _)| Some(*member) == pid)
+                .map_or("?", |(_, command)| command.as_str());
+            found.push(format!("{pid:?} ({command}) listens on {address}"));
+        }
+    }
+    (format!("lsof -g{group} asked"), found)
+}
+
 /// The inodes of the sockets in `LISTEN` in one of `/proc/net/tcp{,6}`.
+#[cfg(target_os = "linux")]
 fn listening_inodes(table: &str) -> Vec<u64> {
     let Ok(text) = std::fs::read_to_string(table) else {
         return Vec::new();
@@ -1539,6 +1587,7 @@ fn listening_inodes(table: &str) -> Vec<u64> {
 }
 
 /// The inodes of every socket `pid` holds a descriptor to.
+#[cfg(target_os = "linux")]
 fn socket_inodes(pid: i32) -> Vec<u64> {
     let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
         return Vec::new();
@@ -1563,6 +1612,7 @@ fn socket_inodes(pid: i32) -> Vec<u64> {
 /// group as far as the kernel is concerned, and is not what this is looking
 /// for: the browser this test is about reparents to init, which reaps it in
 /// its own time. So state `Z` is not a member here.
+#[cfg(target_os = "linux")]
 fn group_members(group: i32) -> Vec<(i32, String)> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -1584,11 +1634,46 @@ fn group_members(group: i32) -> Vec<(i32, String)> {
     found
 }
 
+/// The same from `ps(1)`, which is how a Mac reads its process table:
+/// `-axo pid=,pgid=,stat=,command=` is one line a process, no header, and a
+/// `Z` at the front of `stat` is a zombie here as it is in `/proc`.
+#[cfg(not(target_os = "linux"))]
+fn group_members(group: i32) -> Vec<(i32, String)> {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,pgid=,stat=,command="])
+        .output()
+        .expect("ps runs");
+    let mut found: Vec<(i32, String)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid: i32 = fields.next()?.parse().ok()?;
+            let pgid: i32 = fields.next()?.parse().ok()?;
+            let state = fields.next()?;
+            (pgid == group && !state.starts_with('Z')).then(|| {
+                let line = fields.collect::<Vec<_>>().join(" ");
+                (pid, shorten(line))
+            })
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 /// The group this test process is in, read the same way as anybody else's.
+#[cfg(target_os = "linux")]
 fn own_group() -> i32 {
     state_and_group(std::path::Path::new("/proc/self"))
         .expect("this process has a /proc entry")
         .1
+}
+
+/// The group this test process is in, from the kernel, there being no
+/// `/proc` to read it the way anybody else's is read.
+#[cfg(not(target_os = "linux"))]
+fn own_group() -> i32 {
+    // SAFETY: `getpgrp(2)` takes nothing, reads no memory and cannot fail.
+    unsafe { libc::getpgrp() }
 }
 
 /// The run state and process group out of `/proc/<pid>/stat`.
@@ -1596,6 +1681,7 @@ fn own_group() -> i32 {
 /// The second field is the command in brackets and may contain spaces and
 /// brackets of its own, so the fields are counted from the last `)` rather
 /// than from the start of the line.
+#[cfg(target_os = "linux")]
 fn state_and_group(dir: &std::path::Path) -> Option<(char, i32)> {
     let text = std::fs::read_to_string(dir.join("stat")).ok()?;
     let after_command = &text[text.rfind(')')? + 1..];
@@ -1607,12 +1693,17 @@ fn state_and_group(dir: &std::path::Path) -> Option<(char, i32)> {
 }
 
 /// What a process was started as, short enough to put in a failure.
+#[cfg(target_os = "linux")]
 fn command_of(dir: &std::path::Path) -> String {
     let Ok(raw) = std::fs::read(dir.join("cmdline")) else {
         return String::from("(gone)");
     };
     let line = String::from_utf8_lossy(&raw).replace('\0', " ");
-    let line = line.trim().to_string();
+    shorten(line.trim().to_string())
+}
+
+/// A command line cut to ninety characters, for a failure message.
+fn shorten(line: String) -> String {
     match line.char_indices().nth(90) {
         Some((at, _)) => format!("{}...", &line[..at]),
         None => line,

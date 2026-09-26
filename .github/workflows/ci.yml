@@ -1,10 +1,12 @@
-# Four jobs, because they need four different things.
+# Five jobs, because they need five different things.
 #
 # `check` is the ordinary one: format, lints, docs, and the tests that need
 # nothing installed. `engine` is the reason this crate left the tOS repository
 # -- tOS's CI has no Chromium and is not going to grow one, and the tests in
-# tests/engine.rs are worth nothing without a real engine behind them. `msrv`
-# holds the `rust-version` in Cargo.toml to something true. `tools` checks the
+# tests/engine.rs are worth nothing without a real engine behind them. `mac`
+# is the same on macOS, which has code of its own (shared memory without
+# /dev/shm, browsers in app bundles) that no Linux job runs. `msrv` holds the
+# `rust-version` in Cargo.toml to something true. `tools` checks the
 # proof-of-concept scripts, which are the other half of the repository and were
 # until now the half nothing looked at.
 name: CI
@@ -100,6 +102,12 @@ jobs:
       # tree, and whether the program works is `check`'s and `engine`'s
       # business on a toolchain that can run them faster.
       - run: cargo check --all-targets --locked
+      # The macOS-only code (`cfg(not(target_os = "linux"))` in graphics.rs
+      # and engine.rs) is compiled by no Linux job; this checks it on the
+      # floor too. A `check` needs no SDK -- nothing is linked -- and it was
+      # what showed the tree compiles for a Mac before there was a Mac job.
+      - run: rustup target add aarch64-apple-darwin
+      - run: cargo check --target aarch64-apple-darwin --all-targets --locked
       # The README tells people which Rust to install, and it said 1.75 for as
       # long as Cargo.toml did. Fixing one and not the other is the same bug
       # again, so every "Rust <x>.<y>" in the README has to be this job's
@@ -225,3 +233,47 @@ jobs:
       - run: cargo test --release --locked -- --test-threads=1
         env:
           BLINKTERM_ENGINE: /opt/chrome-headless-shell-linux64/chrome-headless-shell
+
+  mac:
+    name: macOS, clippy, test, engine tests
+    # macos-15 is arm64 (M-series), like every Mac sold since 2020 and unlike
+    # the x64 engine build, which is why the pinned shell below is mac-arm64.
+    # Not fmt or doc: neither depends on the platform, and `check` runs them.
+    # Clippy does, because the shared-memory store and the bundle search are
+    # `cfg(not(target_os = "linux"))` and no Linux job compiles a line of
+    # them -- `undocumented_unsafe_blocks` in particular only sees the
+    # `unsafe` blocks that are built.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # The unit tests, engine-less, exactly as `check` runs them on Linux:
+      # the object-store round trip and the name-length test are here and
+      # nowhere else.
+      - run: cargo test --locked
+      - name: Install the engine
+        # Chrome for Testing's chrome-headless-shell for mac-arm64, the same
+        # version the Linux job pins, by checksum. `curl` sets no quarantine
+        # attribute, so Gatekeeper has no opinion about it. No apt: the
+        # frameworks are in the zip and the fonts are the system's.
+        env:
+          SHELL_VERSION: 153.0.8010.52
+          SHELL_SHA256: 47fe02eae3a1b6e9ba298c7a8aea4ca1be87741ef8fa2da55b8a6f76d636e894
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/shell.zip" \
+            "https://storage.googleapis.com/chrome-for-testing-public/$SHELL_VERSION/mac-arm64/chrome-headless-shell-mac-arm64.zip"
+          echo "$SHELL_SHA256  $RUNNER_TEMP/shell.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/shell.zip" -d "$RUNNER_TEMP/engine"
+          rm "$RUNNER_TEMP/shell.zip"
+          # Which engine this run tested against, in the log, as on Linux.
+          "$RUNNER_TEMP/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell" --version
+      # --release and --test-threads=1 for the reasons the Linux job gives:
+      # timing assertions, and one engine at a time on a three-core runner.
+      - run: cargo test --release --locked -- --test-threads=1
+        env:
+          BLINKTERM_ENGINE: ${{ runner.temp }}/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell

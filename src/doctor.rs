@@ -38,9 +38,10 @@
 //!
 //! The graphics query is asked with `t=d` only. Measured against tOS's
 //! terminal, a `t=s` query answers `OK` without looking at the file, so a
-//! query cannot tell whether the terminal will *read* `/dev/shm`; what the
-//! doctor reports about `/dev/shm` is whether this side can write there,
-//! which is what [`crate::graphics::Painter::new`] decides on.
+//! query cannot tell whether the terminal will *read* shared memory; what
+//! the doctor reports about shared memory is whether this side can make a
+//! frame there — a file in `/dev/shm` on Linux, a `shm_open(3)` object on a
+//! Mac — which is what [`crate::graphics::Painter::new`] decides on.
 //!
 //! [`crate::input`] has no arm for an APC and drops the two `CSI ?` answers,
 //! rightly — the running program never wants them — so [`read_answer`]
@@ -49,7 +50,6 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::io::RawFd;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use tos_platform::tty::{self, RawMode, ReadOutcome};
@@ -361,16 +361,18 @@ fn profile_line(choice: &profile::Choice) {
 }
 
 fn shm_line() {
-    let probe =
-        Path::new(graphics::SHM_DIR).join(format!("blinkterm-{}-doctor", std::process::id()));
-    match std::fs::write(&probe, b"probe") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            say("/dev/shm", "writable, so frames go as t=s");
-        }
+    let name = format!("blinkterm-{}-doctor", std::process::id());
+    match graphics::probe_shared_memory(&name) {
+        Ok(()) => say(
+            "shared memory",
+            &format!("{}, so frames go as t=s", graphics::SHM_HOW),
+        ),
         Err(e) => say(
-            "/dev/shm",
-            &format!("not writable ({e}), so frames go inline as base64"),
+            "shared memory",
+            &format!(
+                "{} ({e}), so frames go inline as base64",
+                graphics::SHM_HOW_NOT
+            ),
         ),
     }
 }

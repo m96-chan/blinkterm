@@ -23,10 +23,11 @@ below.
 
 ## Before a release
 
-- CI green on `main`, all four jobs in `CI`. The `engine` job is the one that
-  matters most and the one that cannot run on a laptop without a Chromium.
+- CI green on `main`, all five jobs in `CI`. The `engine` job is the one that
+  matters most and the one that cannot run on a laptop without a Chromium;
+  `mac` is the same tests on macOS.
 - The `Homebrew` workflow is green too: it builds `packaging/homebrew/blinkterm.rb`
-  the way `brew install` would, and runs on pull requests that touch it, the
+  the way `brew install` would, on Linux and on macOS, and runs on pull requests that touch it, the
   lock file, or the workflow.
 - `CHANGELOG.md` `Unreleased` section says what a person would notice.
 - The README's Rust floor still matches `Cargo.toml`; the `msrv` job checks
@@ -106,7 +107,8 @@ are part of what the release *is*:
   handling and the cell arithmetic, so it is as much of the program as `src/`.
 - **the Chromium the engine tests passed against**. The `engine` job pins a
   `chrome-headless-shell` by version and checksum and prints its `--version`;
-  take it from that run's log. The program does not
+  take it from that run's log, and the mac-arm64 one the `mac` job prints
+  from the same run's. The program does not
   ship an engine, so "it works" is always "it worked against this one".
 
 ## Not on crates.io
