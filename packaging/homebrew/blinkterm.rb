@@ -13,10 +13,17 @@ class Blinkterm < Formula
   license "MIT"
   head "https://github.com/m96-chan/blinkterm.git", branch: "main"
 
-  # No platform requirement: Linux and macOS both, the engine tests having
-  # run on each (ci.yml's `engine` and `mac` jobs), and homebrew.yml builds
-  # and tests this formula on both.
+  # Build dependencies before platform requirements: that is the order
+  # `brew audit --strict` checks components in, and it refuses the other.
   depends_on "rust" => :build
+
+  # main runs on macOS now (#21: ci.yml's `mac` job runs the engine tests on
+  # macos-15), but the stable spec above is v0.1.0, which predates that and
+  # cannot draw a frame there. This line comes out, and macos goes into
+  # homebrew.yml's matrix, with the first release that carries macOS support
+  # (RELEASING.md, "Homebrew"); a macOS line in the caveats below goes in at
+  # the same time.
+  depends_on :linux
 
   def install
     # std_cargo_args is `--jobs N --locked --root=#{prefix} --path=.`.
@@ -32,22 +39,14 @@ class Blinkterm < Formula
     <<~EOS
       blinkterm does not ship a browser engine. It looks at $BLINKTERM_ENGINE
       first, then on PATH for chrome-headless-shell, chromium, chromium-browser,
-      google-chrome and chromium-shell, in that order, and on macOS then for
-      Google Chrome or Chromium in /Applications or ~/Applications. The one it
-      is tested against is chrome-headless-shell from Chrome for Testing:
+      google-chrome and chromium-shell, in that order. The one it is tested
+      against is chrome-headless-shell from Chrome for Testing:
 
         https://googlechromelabs.github.io/chrome-for-testing/
 
-      Unzip the build for your platform (linux64, mac-arm64, mac-x64)
-      somewhere and point at it:
+      Unzip the linux64 chrome-headless-shell build somewhere and point at it:
 
         export BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell
-        export BLINKTERM_ENGINE=~/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell
-
-      On macOS, a zip saved by a browser rather than fetched with curl is
-      quarantined and the shell will not start until the attribute is removed:
-
-        xattr -dr com.apple.quarantine chrome-headless-shell-mac-arm64
 
       The README's "Installing" section has the exact download and the
       libraries it wants. Debian's chromium-shell package is Chromium's
