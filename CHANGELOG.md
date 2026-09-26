@@ -12,6 +12,11 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- `key.<chord> = <action>` in the settings file rebinds any of the
+  program's keys (`key.f5 = reload`), and `key.<chord> = none` gives one
+  back to the page; the actions are listed by `--help`. A chord needs
+  `ctrl`, `alt` or `super` unless it is an f-key
+  ([#17](https://github.com/m96-chan/blinkterm/issues/17)).
 - A settings file, `$XDG_CONFIG_HOME/blinkterm/config`: every option as
   `name = value`, `engine-arg` repeatable. The command line wins over the
   file; `$BLINKTERM_ENGINE` sits between. `--config <path>`, `--no-config`
@@ -54,8 +59,10 @@ flag, a different default, a raised Rust floor all do.
 - A page whose renderer crashes keeps its tab, with `this page crashed;
   ctrl+r reloads it` on the row, rather than the tab closing
   ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
-- When the engine dies the exit message says the tabs are saved and how to
-  get them back ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
+- When the engine dies it is started again in place and the tabs come back,
+  the one in front loading; the program exits with the saved-tabs sentence
+  only if it dies twice in a minute or cannot be started again
+  ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
 
 ### Fixed
 

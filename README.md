@@ -257,6 +257,57 @@ without `allow-passthrough` it will tell you the terminal did not answer,
 which is the truth. `--print-engine` prints the path the search finds and
 nothing else, for scripts.
 
+### Rebinding keys
+
+`key.<chord> = <action>` in the settings file puts an action on a key, and
+`key.<chord> = none` takes a key back for the page:
+
+    key.f5 = reload
+    key.ctrl+b = back
+    key.ctrl+w = none
+
+| action | default | does |
+| --- | --- | --- |
+| `quit` | `ctrl+q` | quit |
+| `url` | `ctrl+l` | type a url |
+| `reload` | `ctrl+r` | reload |
+| `back` | `alt+left` | back |
+| `forward` | `alt+right` | forward |
+| `new-tab` | `ctrl+t` | a new tab |
+| `close-tab` | `ctrl+w` | close this tab |
+| `reopen-tab` | `ctrl+shift+t`, `alt+t` | reopen the tab closed last |
+| `bookmark` | `ctrl+d` | bookmark this page, or remove the bookmark |
+| `next-tab` | `ctrl+tab` | the next tab |
+| `previous-tab` | `ctrl+shift+tab` | the tab before |
+| `tab-1` … `tab-8` | `alt+1` … `alt+8` | the nth tab |
+| `last-tab` | `alt+9` | the last tab |
+| `list-tabs` | `ctrl+shift+a`, `alt+a` | the tab list |
+| `move-tab-left` | `ctrl+shift+pageup`, `alt+shift+pageup` | move this tab left |
+| `move-tab-right` | `ctrl+shift+pagedown`, `alt+shift+pagedown` | move this tab right |
+| `zoom-in` | `alt+=`, `ctrl+=` | zoom in |
+| `zoom-out` | `alt+-`, `ctrl+-` | zoom out |
+| `zoom-reset` | `alt+0`, `ctrl+0` | back to 100% |
+| `find` | `ctrl+f` | find in the page |
+| `copy` | `alt+c` | copy the selection, or the line being typed |
+| `copy-url` | `alt+u` | copy the url |
+| `normal-mode` | `ctrl+.` | normal mode on or off |
+
+A chord is `ctrl`, `alt`, `shift` or `super` joined with `+` to a key — a
+character, or `plus`, `space`, `tab`, `enter`, `esc`, `backspace`,
+`insert`, `delete`, the arrows, `home`, `end`, `pageup`, `pagedown`,
+`f1`…`f24` — and needs `ctrl`, `alt` or `super` unless it is an f-key: a
+bare letter is the page's, always. A chord is exact: `ctrl+tab` is not
+`ctrl+shift+tab`, and `key.ctrl+= = none` leaves `ctrl+shift+=` zooming in.
+A bound key is taken from every page — `key.ctrl+b = back` is no longer an
+editor's bold. The editing keys of the url bar, the find prompt, the tab
+list and a dialog are not remappable, and `copy`, `copy-url` and `quit` are
+the only actions that reach through them, on whatever keys they are. A
+later line for the same chord replaces an earlier one; binding a chord the
+program already used moves nothing else, so `key.ctrl+t = quit` leaves
+`new-tab` on no key. Normal mode's letters are not affected by `key.` lines:
+`key.ctrl+r = none` leaves `r` as reload. `blinkterm --help` lists the
+actions too.
+
 ## Downloads
 
 A file a page offers — a link to a PDF, anything served as
@@ -336,7 +387,8 @@ not a thing a terminal has.
 | `esc` | while a page is loading and nothing else has the row, stop it |
 | `ctrl+.` | normal mode on or off. In normal mode the letters are keys of their own and the row says `normal`: `f` labels everything clickable on the screen and typing a label clicks it (`F` opens a link in a tab behind this one); `j`/`k` scroll a notch, `d`/`u` half a screen, `gg`/`G` to the top and bottom; `H`/`L` back and forward, `r` reload, `o` the url bar, `O` a new tab, `/` find; `i` goes back to typing into the page, as does clicking into a field. Off by default: nothing changes until you press it |
 
-Everything else goes to the page, including the mouse. A link that asks for a
+Everything else goes to the page, including the mouse, unless a `key.` line
+in the [settings](#rebinding-keys) takes it. A link that asks for a
 new window gets a new tab, and the tab is switched to.
 
 With more tabs than the row can name, the strip shows a run of them around
@@ -467,9 +519,15 @@ A page whose renderer crashes stays in its tab: the picture goes, and the row
 says `this page crashed; ctrl+r reloads it` — a tab behind that crashed says
 the same in the strip. `ctrl+r` brings it back, painting, at the size it was;
 `ctrl+w` closes it; keys and the mouse do nothing to it until then. When the
-engine itself dies `blinkterm` exits, and the message says how many tabs were
-saved and that `blinkterm --restore` reopens them; the next plain start
-offers to.
+engine itself dies it is started again in place, on the same profile: the
+row says `the engine died; starting it again…`, and a moment later the same
+tabs are back in the same order with the same one in front, loading again,
+the others loading when they are next looked at. What was being typed in the
+url bar stays; a download that was coming says it did not arrive, and scroll
+positions, form contents and a login made in the last half minute are lost,
+as with `--restore`. If it dies again within a minute, or cannot be started,
+`blinkterm` exits, and the message says how many tabs were saved and that
+`blinkterm --restore` reopens them; the next plain start offers to.
 
 To know what is under the pointer the terminal is asked to report every
 mouse movement, not only presses (`?1003h`), so the page now sees the
