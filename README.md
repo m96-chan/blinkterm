@@ -696,7 +696,7 @@ cargo test --locked
 The lint set is a `[lints]` table in `Cargo.toml` rather than a list of flags
 in the workflow, so a laptop and a runner disagree about `-D warnings` and
 nothing else. The one worth knowing about is
-`clippy::undocumented_unsafe_blocks`: there are fifty `unsafe` blocks in
+`clippy::undocumented_unsafe_blocks`: there are forty-nine `unsafe` blocks in
 `src/`, nearly all of them one-line `libc` calls, and each says what makes it
 sound.
 

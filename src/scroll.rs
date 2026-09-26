@@ -151,15 +151,6 @@ pub const D: Duration = Duration::from_millis(220);
 /// been told to stop — which happens once, at the end of the program.
 const IDLE: Duration = Duration::from_millis(250);
 
-/// How close to a tick the thread stops sleeping and yields instead.
-///
-/// A timed wait can come back late: macOS coalesces the timers of threads it
-/// does not think are interactive, and on the CI runner that put the ticks
-/// about 7 ms behind a 16 ms schedule. The last stretch before a tick is
-/// covered by yielding, which costs at most this much of a core per tick and
-/// only while something is being animated.
-const LEAD: Duration = Duration::from_millis(2);
-
 /// How far one notch has been delivered, as a fraction, `x` of the way through
 /// [`D`].
 ///
@@ -530,7 +521,6 @@ impl Drop for Wheel {
 /// The step is worked out under the lock and sent outside it, so that a notch
 /// arriving from the loop waits for arithmetic rather than for a socket.
 fn animate(shared: &Shared) {
-    interactive();
     loop {
         let sending = {
             let Ok(mut state) = shared.state.lock() else {
@@ -543,16 +533,7 @@ fn animate(shared: &Shared) {
                 let now = Instant::now();
                 let wait = match state.animator.until(now) {
                     Some(left) if left.is_zero() => break,
-                    Some(left) if left <= LEAD => {
-                        drop(state);
-                        std::thread::yield_now();
-                        let Ok(again) = shared.state.lock() else {
-                            return;
-                        };
-                        state = again;
-                        continue;
-                    }
-                    Some(left) => left - LEAD,
+                    Some(left) => left,
                     // Nothing to animate. A notch knocks, so this is only how
                     // long it takes to notice `stop`.
                     None => IDLE,
@@ -584,26 +565,6 @@ fn animate(shared: &Shared) {
             .store(since.as_nanos().max(1) as u64, Ordering::Relaxed);
     }
 }
-
-/// Tell the system this thread drives something a person is watching.
-///
-/// On macOS a thread's quality-of-service class sets how much slack its timers
-/// are given; at the default class a 16 ms wait was measured coming back ~7 ms
-/// late on the CI runner. User-interactive is the class Apple names for work
-/// that updates what is on screen, which is what a scroll animation is.
-#[cfg(target_os = "macos")]
-fn interactive() {
-    // SAFETY: the call takes two plain values and changes only the calling
-    // thread's own scheduling class; a failure is a return code, ignored
-    // here because the thread works at any class, only less punctually.
-    unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-    }
-}
-
-/// Elsewhere there is no timer coalescing to ask off.
-#[cfg(not(target_os = "macos"))]
-fn interactive() {}
 
 #[cfg(test)]
 mod tests {
