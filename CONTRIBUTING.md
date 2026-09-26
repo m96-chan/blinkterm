@@ -42,6 +42,9 @@ They run only when you name an engine:
 ```sh
 BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
   cargo test --release -- --test-threads=1
+# or, on a Mac
+BLINKTERM_ENGINE=~/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell \
+  cargo test --release -- --test-threads=1
 ```
 
 **Naming the engine is the consent.** A machine with a Chromium on it did not

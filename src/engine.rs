@@ -32,6 +32,11 @@
 //! and renderer processes the browser forked, all of which inherit the group
 //! and none of which this program otherwise knows the pid of.
 //!
+//! On a Mac the executable in an app bundle *is* the browser, with no
+//! wrapper in front of it, and the group is still what is signalled: the
+//! helpers it starts (`Google Chrome Helper (Renderer)`, `(GPU)` and the
+//! rest) inherit it as the zygote and renderers do on Linux.
+//!
 //! `--disable-dev-shm-usage` keeps the engine off the same `/dev/shm` the
 //! frames go through. `--no-sandbox` only when this program is root, because
 //! Chromium refuses to start as root without it and adding it as anyone else
@@ -88,6 +93,7 @@
 //! about behind its back. A second `--remote-debugging-pipe` is already
 //! there.
 
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -121,6 +127,23 @@ pub const CANDIDATES: [&str; 5] = [
     "chromium-browser",
     "google-chrome",
     "chromium-shell",
+];
+
+/// Where a browser is on a Mac when it is not on `PATH`, which on a Mac is
+/// where a browser is: an app bundle's executable, looked at after
+/// [`CANDIDATES`] and in this order. `~` is `$HOME`.
+///
+/// Chrome for Testing's `chrome-headless-shell` is not here because it has
+/// no fixed home — it is a zip the person unpacks where they like — and a
+/// guess at a Puppeteer or Playwright cache would be a guess at a version
+/// number. It is found on `PATH` or named with `$BLINKTERM_ENGINE`, as on
+/// Linux.
+#[cfg(target_os = "macos")]
+pub const BUNDLES: [&str; 4] = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "~/Applications/Chromium.app/Contents/MacOS/Chromium",
 ];
 
 /// The environment variable that overrides the search.
@@ -170,12 +193,19 @@ pub struct Launch {
     pub user_agent: Option<String>,
     /// `--proxy`: the engine's `--proxy-server=`.
     pub proxy: Option<String>,
+    /// `--mute`: the engine's `--mute-audio`. Pages play, silently, and
+    /// cannot tell; the audio stack is otherwise the engine's own (see the
+    /// README's section on sound).
+    pub mute: bool,
 }
 
 impl Launch {
     /// The engine's whole argument list after `--user-data-dir`: the fixed
-    /// flags, then `--user-agent=`, `--proxy-server=`, then `args`, then the
-    /// url. Pure; this is what the unit test checks.
+    /// flags, then `--user-agent=`, `--proxy-server=`, `--mute-audio`, then
+    /// `args`, then the url. The person's `args` come after everything this
+    /// program derived from an option, so that an `--engine-arg` can still
+    /// contradict one — the engine takes the last. Pure; this is what the
+    /// unit test checks.
     pub fn arguments(&self, as_root: bool) -> Vec<String> {
         let mut fixed: Vec<String> = flags(as_root).into_iter().map(String::from).collect();
         let url = fixed.pop();
@@ -184,6 +214,9 @@ impl Launch {
         }
         if let Some(proxy) = &self.proxy {
             fixed.push(format!("--proxy-server={proxy}"));
+        }
+        if self.mute {
+            fixed.push("--mute-audio".to_string());
         }
         fixed.extend(self.args.iter().cloned());
         fixed.extend(url);
@@ -405,6 +438,7 @@ fn group_alive(target: i32) -> bool {
 /// Whether any process in `group` is something other than a zombie, read out
 /// of `/proc`. A `/proc` that cannot be read is taken to say yes, which leaves
 /// `kill(2)`'s answer standing.
+#[cfg(target_os = "linux")]
 fn group_has_living_member(group: i32) -> bool {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return true;
@@ -421,6 +455,7 @@ fn group_has_living_member(group: i32) -> bool {
 ///
 /// The command name is the second field, in parentheses, and may itself hold
 /// spaces and parentheses, so the fields are counted from the last `)`.
+#[cfg(target_os = "linux")]
 fn state_and_group(stat: &str) -> Option<(char, i32)> {
     let rest = &stat[stat.rfind(')')? + 1..];
     let mut fields = rest.split_whitespace();
@@ -428,6 +463,14 @@ fn state_and_group(stat: &str) -> Option<(char, i32)> {
     let _parent = fields.next()?;
     let group = fields.next()?.parse().ok()?;
     Some((state, group))
+}
+
+/// Without `/proc` there is nothing to check `kill(2)`'s answer against,
+/// and nothing to check it for: the case above is a container's pid 1 that
+/// does not reap, and a Mac's pid 1 is launchd, which does.
+#[cfg(not(target_os = "linux"))]
+fn group_has_living_member(_group: i32) -> bool {
+    true
 }
 
 /// Where the engine is, or a sentence about why there is none.
@@ -467,26 +510,58 @@ fn named_engine(path: &Path, source: &str) -> Result<PathBuf, String> {
     ))
 }
 
-/// The `PATH` search over [`CANDIDATES`].
+/// The `PATH` search over [`CANDIDATES`], and on a Mac then the app
+/// bundles in [`BUNDLES`].
 fn search_candidates() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    search_candidates_in(std::env::var_os("PATH").as_deref(), home.as_deref())
+}
+
+/// [`search_candidates`] with `PATH` and `HOME` given rather than read, so
+/// that a test can point them at a scratch directory without changing the
+/// environment every other test in the process is spawning shells with.
+fn search_candidates_in(path: Option<&OsStr>, home: Option<&Path>) -> Result<PathBuf, String> {
     for candidate in CANDIDATES {
-        if let Some(found) = search_path(candidate) {
+        if let Some(found) = search_path_in(candidate, path) {
             return Ok(found);
         }
     }
-    Err(format!(
-        "no browser engine on PATH: looked for {}; set {ENGINE_ENV} to one",
-        CANDIDATES.join(", ")
-    ))
+    #[cfg(target_os = "macos")]
+    {
+        for bundle in BUNDLES {
+            let bundle = crate::options::expand_home(PathBuf::from(bundle), home);
+            if is_executable(&bundle) {
+                return Ok(bundle);
+            }
+        }
+        Err(format!(
+            "no browser engine on PATH: looked for {}; nor an app under \
+             /Applications or ~/Applications (Google Chrome, Chromium); \
+             set {ENGINE_ENV} to one",
+            CANDIDATES.join(", ")
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Only a Mac keeps browsers in the home directory's `Applications`.
+        let _ = home;
+        Err(format!(
+            "no browser engine on PATH: looked for {}; set {ENGINE_ENV} to one",
+            CANDIDATES.join(", ")
+        ))
+    }
 }
 
 fn search_path(name: &str) -> Option<PathBuf> {
+    search_path_in(name, std::env::var_os("PATH").as_deref())
+}
+
+fn search_path_in(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     if name.contains('/') {
         let path = PathBuf::from(name);
         return is_executable(&path).then_some(path);
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    std::env::split_paths(path?)
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable(candidate))
 }
@@ -498,7 +573,24 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The command line, which is fixed apart from the sandbox.
+/// The command line, which is fixed apart from the sandbox and, on a Mac,
+/// the keychain.
+///
+/// `--use-mock-keychain` on macOS only. Chromium there encrypts the cookie
+/// jar with a key it keeps in the login Keychain as "Chrome Safe Storage",
+/// and on a fresh `--user-data-dir` it asks the Keychain for it through a
+/// GUI dialog: in a terminal the dialog is behind the pane, and on a CI
+/// runner there is no Keychain session to ask, so the ask fails or hangs.
+/// That is why Puppeteer's default launch arguments carry the same switch
+/// (Chromium's `switches::kUseMockKeychain`, read by `os_crypt` on macOS and
+/// ignored elsewhere). With it the key is a fixed one, the same on every run,
+/// so a kept profile's logins survive a restart as they do on Linux; and the
+/// `--user-data-dir` is always this program's own, never the person's
+/// desktop Chrome profile, so the mock key never meets a real jar.
+///
+/// `--disable-dev-shm-usage` and `--ozone-platform=headless` stay on a Mac
+/// too, where they mean nothing: Chromium ignores a switch it does not know
+/// rather than refusing it, and one list is one thing to reason about.
 pub fn flags(as_root: bool) -> Vec<&'static str> {
     let mut flags = vec![
         "--headless",
@@ -510,6 +602,8 @@ pub fn flags(as_root: bool) -> Vec<&'static str> {
     if as_root {
         flags.push("--no-sandbox");
     }
+    #[cfg(target_os = "macos")]
+    flags.push("--use-mock-keychain");
     flags.push("about:blank");
     flags
 }
@@ -900,17 +994,19 @@ mod tests {
     #[test]
     fn the_flags_are_the_ones_that_were_measured() {
         let plain = flags(false);
-        assert_eq!(
-            plain,
-            vec![
-                "--headless",
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--ozone-platform=headless",
-                "--remote-debugging-pipe",
-                "about:blank",
-            ]
-        );
+        let mut measured = vec![
+            "--headless",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--ozone-platform=headless",
+            "--remote-debugging-pipe",
+        ];
+        // A Mac's Chromium would otherwise ask the Keychain, in a dialog.
+        if cfg!(target_os = "macos") {
+            measured.push("--use-mock-keychain");
+        }
+        measured.push("about:blank");
+        assert_eq!(plain, measured);
         for flags in [flags(false), flags(true)] {
             assert!(
                 !flags
@@ -1048,6 +1144,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_stat_line_gives_its_state_and_group_whatever_the_command_is_called() {
         assert_eq!(
             state_and_group("4082 (chrome-headless) S 4079 4079 4079 0 -1"),
@@ -1062,6 +1159,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_group_of_zombies_is_a_group_that_has_gone() {
         // A child in a group of its own that exits and is not waited for: a
         // zombie, which is what a container's pid 1 leaves of the engine's
@@ -1116,6 +1214,7 @@ mod tests {
             args: vec!["--accept-lang=ja".into(), "--headless=old".into()],
             user_agent: Some("blinkterm-test/1.0 (measured)".into()),
             proxy: Some("socks5://127.0.0.1:1080".into()),
+            mute: false,
         };
         let mut wanted: Vec<String> = flags(false).into_iter().map(String::from).collect();
         let url = wanted.pop().expect("a url");
@@ -1127,6 +1226,28 @@ mod tests {
             url,
         ]);
         assert_eq!(launch.arguments(false), wanted);
+    }
+
+    #[test]
+    fn mute_adds_mute_audio_after_the_fixed_flags_and_before_the_persons_args() {
+        let launch = Launch {
+            proxy: Some("127.0.0.1:1".into()),
+            args: vec!["--autoplay-policy=no-user-gesture-required".into()],
+            mute: true,
+            ..Launch::default()
+        };
+        let mut wanted: Vec<String> = flags(false).into_iter().map(String::from).collect();
+        let url = wanted.pop().expect("a url");
+        wanted.extend([
+            "--proxy-server=127.0.0.1:1".to_string(),
+            "--mute-audio".to_string(),
+            "--autoplay-policy=no-user-gesture-required".to_string(),
+            url,
+        ]);
+        assert_eq!(launch.arguments(false), wanted);
+        assert!(!Launch::default()
+            .arguments(false)
+            .contains(&"--mute-audio".to_string()));
     }
 
     #[test]
@@ -1164,6 +1285,64 @@ mod tests {
         let failed = with_engine_env(None, || locate_with(Some(Path::new("/nonexistent/x"))))
             .expect_err("nor is this one");
         assert!(failed.contains("/nonexistent/x"), "{failed}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_bundles_are_absolute_or_home_relative_executable_names() {
+        for bundle in BUNDLES {
+            assert!(
+                bundle.starts_with('/') || bundle.starts_with("~/"),
+                "{bundle}"
+            );
+            let (app, executable) = bundle
+                .rsplit_once(".app/Contents/MacOS/")
+                .expect("an executable inside a bundle");
+            assert!(app.ends_with(executable), "{bundle}: named after its app");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_bundle_is_looked_at_after_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch =
+            std::env::temp_dir().join(format!("blinkterm-bundles-{}", std::process::id()));
+        let executable = |path: &Path| {
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+            std::fs::write(path, "#!/bin/sh\n").expect("a script");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        };
+        let home = scratch.join("home");
+        let bundle = home.join("Applications/Chromium.app/Contents/MacOS/Chromium");
+        executable(&bundle);
+        let empty = OsStr::new("");
+        // Unless this Mac has a Chrome in /Applications, which is looked at
+        // first and is as good an answer, the one in the home directory is it.
+        let found = search_candidates_in(Some(empty), Some(&home)).expect("a bundle");
+        assert!(
+            found == bundle || found.starts_with("/Applications/"),
+            "{}",
+            found.display()
+        );
+
+        let bin = scratch.join("bin");
+        executable(&bin.join("chromium"));
+        let found = search_candidates_in(Some(bin.as_os_str()), Some(&home)).expect("found");
+        assert_eq!(found, bin.join("chromium"), "PATH comes before any bundle");
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// Not on a Mac, whose runners and desks have a Chrome in
+    /// `/Applications` for the bundle search to find.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn with_nothing_on_path_the_search_says_what_it_looked_for() {
+        let failed = search_candidates_in(Some(OsStr::new("")), Some(Path::new("/nonexistent")))
+            .expect_err("nothing to find");
+        assert!(failed.contains("chrome-headless-shell"), "{failed}");
+        assert!(failed.contains(ENGINE_ENV), "{failed}");
     }
 
     /// Set the variable, run, put it back. The tests that use it are in one

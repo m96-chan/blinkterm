@@ -178,6 +178,12 @@ pub struct Tab<C> {
     /// the crash, which the same pass can still be holding, and does not
     /// revive anything. See [`Tab::crashed`].
     pub reviving: bool,
+    /// Whether the page has an element fullscreen, as the page last said
+    /// (see [`crate::fullscreen`]); `false` at every landing, crash and
+    /// creation, since the document that was fullscreen goes with any of
+    /// them. Only ever `true` on the tab in front: a tab that is left is
+    /// told to leave fullscreen and set `false` as it goes.
+    pub fullscreen: bool,
 }
 
 impl<C> Tab<C> {
@@ -199,6 +205,7 @@ impl<C> Tab<C> {
             zoom: Zoom::DEFAULT,
             dormant: false,
             reviving: false,
+            fullscreen: false,
         }
     }
 
@@ -224,6 +231,7 @@ impl<C> Tab<C> {
         self.dialog = None;
         self.upload = None;
         self.committed = false;
+        self.fullscreen = false;
     }
 
     /// Whether the renderer is dead: nothing renderer-bound may be sent to
@@ -325,6 +333,9 @@ impl<C> Tab<C> {
             return;
         }
         self.reviving = false;
+        // Whatever was fullscreen was in the document that has just gone
+        // (measured: a navigation leaves fullscreen).
+        self.fullscreen = false;
         // Read before it is set below: it says whether a reason from
         // `failed_to_reach` belongs to this landing.
         let ours = self.loading;
@@ -1689,5 +1700,17 @@ mod tests {
         load_finished(&mut tab, "fine", None);
         assert_eq!(tab.problem, None);
         assert_eq!(tab.line(), "fine  —  http://127.0.0.1:1/");
+    }
+
+    #[test]
+    fn a_landing_and_a_crash_clear_fullscreen() {
+        let mut tab: Tab<()> = Tab::new("a", (), "https://a.example/");
+        assert!(!tab.fullscreen, "a new tab is not fullscreen");
+        tab.fullscreen = true;
+        tab.landed(Landing::Document("https://a.example/next".to_string()));
+        assert!(!tab.fullscreen, "the document that was fullscreen has gone");
+        tab.fullscreen = true;
+        tab.crashed();
+        assert!(!tab.fullscreen, "and with a renderer that died");
     }
 }

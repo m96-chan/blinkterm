@@ -45,15 +45,44 @@ pixels inline: correct, obviously correct, and slow.
 
 ## Where it runs
 
-Any terminal that speaks all three of the Kitty graphics protocol, the Kitty
-keyboard protocol and SGR mouse reporting — Kitty, WezTerm, Ghostty — and a
-[tOS](https://github.com/m96-chan/tOS) pane, which is where it was written.
+On Linux and macOS, in any terminal that speaks all three of the Kitty
+graphics protocol, the Kitty keyboard protocol and SGR mouse reporting —
+Kitty, WezTerm, Ghostty — and in a [tOS](https://github.com/m96-chan/tOS)
+pane, which is where it was written.
 tOS owns the display: there is no X11 and no Wayland and there never will be,
 so no browser can be ported to it in the ordinary sense. But a terminal that
 speaks those three protocols is already a screen, a mouse and a keyboard, and
 that is the whole of what an engine wants. None of that argument is about tOS,
 so the same binary runs in the others. This repository exists because tOS's CI
 has no Chromium to test against and this program is nothing without one.
+
+On a Mac there is no `/dev/shm`, so the frames go through `shm_open(3)`
+shared memory objects instead, which Kitty and Ghostty read; a terminal that
+does not gets the inline fallback, as anywhere else.
+
+The terminal is asked before the engine is started. One that does not
+answer the graphics query gets a sentence in the shell saying why and what
+to do, not a blank pane; `--no-probe` skips the question for a terminal
+that draws and does not answer.
+
+**Inside tmux** it works with `set -g allow-passthrough on` in `tmux.conf`
+and a terminal behind tmux that speaks the protocol. tmux eats graphics
+commands otherwise, so the picture goes wrapped in tmux's passthrough and is
+drawn as Kitty's Unicode placeholders — text tmux can see, move and redraw —
+with the engine's PNG as the frames (at most 297 columns of picture, and
+30 frames a second). Two things are lost inside tmux: the Kitty keyboard
+protocol (tmux re-encodes keys, so there are no key releases and `ctrl+i` is
+`tab`) and mouse positions finer than a cell. `--tmux on|off` overrides
+the detection.
+
+**Over ssh** (`$SSH_CONNECTION` set) the frames are the engine's PNG as it
+sent them, inline: no `/dev/shm` on the far side, and raw pixels would be
+3.9 MB a frame. Each frame is acknowledged to the engine only when it has
+gone to the terminal, so the frame rate is what the link carries, every
+frame current; frames that wait on the link make the page cast at half, then
+three-eighths, of the pane until the link catches up, and the still of a
+page at rest is always full size. `--fps <n>` caps it (15 by default over
+ssh), and `--frames raw|png` overrides the choice.
 
 ## Installing
 
@@ -74,7 +103,10 @@ That builds from source too — the tap's formula asks Homebrew for a Rust and
 runs the same `cargo install --locked` — so it is the same binary by a shorter
 command, not a prebuilt one; prebuilt binaries are
 [#22](https://github.com/m96-chan/blinkterm/issues/22). The engine below is
-still yours to install, and `brew` says so when it is done. The formula lives
+still yours to install, and `brew` says so when it is done. On macOS, use
+`cargo install` for now: the formula's release, v0.1.0, predates macOS
+support, and the formula opens to macOS with the first release that has it.
+The formula lives
 in this repository, at `packaging/homebrew/blinkterm.rb`, and
 [m96-chan/homebrew-tap](https://github.com/m96-chan/homebrew-tap) carries a
 copy.
@@ -94,11 +126,29 @@ BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell blinkt
 It wants the usual Chromium libraries (its `deb.deps` lists them) and, if you
 read any CJK, `fonts-noto-cjk`: without it every Japanese glyph is a box.
 
+On a Mac with Apple silicon, the same version's `mac-arm64` build (an Intel
+Mac wants `mac-x64` in both places):
+
+```sh
+curl -fsSLO https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.52/mac-arm64/chrome-headless-shell-mac-arm64.zip
+unzip chrome-headless-shell-mac-arm64.zip -d ~/engine
+BLINKTERM_ENGINE=~/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell blinkterm
+```
+
+The frameworks it needs are in the zip and the fonts are the system's. A zip
+fetched with `curl` runs at once; one saved by Safari or Finder is
+quarantined, and macOS refuses to start it until
+`xattr -dr com.apple.quarantine ~/engine/chrome-headless-shell-mac-arm64`
+has removed the attribute.
+
 Anything Chromium-shaped will do, with one caution. `blinkterm` looks at
 `--engine <path>` first, then `$BLINKTERM_ENGINE`, then `engine = <path>` in
 the [settings](#settings), then on `PATH` for `chrome-headless-shell`,
 `chromium`, `chromium-browser`, `google-chrome` and `chromium-shell`, in that
-order. Debian's `chromium-shell` is last because it is Chromium's
+order — and on macOS, where a browser is an app rather than a command, then
+for Google Chrome and Chromium in `/Applications` and `~/Applications`. On a
+Mac the engine is also given `--use-mock-keychain`, so that Chromium never
+asks the Keychain for its cookie key in a dialog nobody can see. Debian's `chromium-shell` is last because it is Chromium's
 `content_shell`, not a headless shell: it keeps a DevTools port open beside
 the pipe whatever it is told, answers a page's dialogs itself, and does not
 close when asked, so a kept profile is not flushed. It renders pages; it does
@@ -110,6 +160,10 @@ Cookies, logins, local storage and the rest of what a site keeps are kept
 between runs, in `$XDG_DATA_HOME/blinkterm/profile` — or
 `~/.local/share/blinkterm/profile` when `XDG_DATA_HOME` is not set. The
 directory is made readable by you alone (0700), since a cookie is a login.
+The same on macOS, rather than `~/Library/Application Support`: this is a
+program run from a shell, the terminals it runs in keep their own settings
+under `~/.config` there too, and a cookie jar is better kept out of what Time
+Machine and iCloud copy about.
 
 ```sh
 blinkterm --profile ~/work-profile https://example.com   # somewhere else
@@ -155,6 +209,19 @@ site at 100%. It is a list of sites you have visited, so it is readable by
 you alone (0600) too, and keeps the last 500. `--temp-profile` keeps the
 levels in memory for the run and writes none; deleting the file forgets
 every level.
+
+### Permissions
+
+What you allowed a site with `alt+p` is remembered by its origin —
+`https://meet.example`, or `http://wiki.corp:8080` with its port — in a file
+called `permissions` beside the zoom levels: one line per change, the
+origin, a tab, the word, a tab, `allow` or `deny`, the last line for an
+origin and a word being the one that counts. It is a list of sites you have
+visited, so it is readable by you alone (0600), and keeps the last 500
+origins. Every engine started on the profile is told it as it starts;
+`--temp-profile` keeps it in memory for the run and writes none. Edit it by
+hand if you like — a line that is not one of these is skipped — or delete
+it to take every allowance back.
 
 ### Bookmarks
 
@@ -210,8 +277,8 @@ nothing.
 
 Everything on the command line can also be kept in
 `$XDG_CONFIG_HOME/blinkterm/config` — `~/.config/blinkterm/config` when
-`XDG_CONFIG_HOME` is not set — one setting per line, named as the option is
-without its `--`:
+`XDG_CONFIG_HOME` is not set, on macOS as on Linux — one setting per line,
+named as the option is without its `--`:
 
     # what a page is told about you
     color-scheme = dark
@@ -230,8 +297,12 @@ line number; a missing file is nothing. A flag is `true` or `false`
 (`force-dark = true`), and a path may start with `~/`. There is no `url`
 setting: the page to open is what the command line is for, and
 `home = <url>` is the page opened when none is given. `normal-mode = true`
-starts in normal mode (`ctrl+.`), and `restore = true`
-reopens the last session's tabs (see [The session](#the-session)).
+starts in normal mode (`ctrl+.`), `restore = true`
+reopens the last session's tabs (see [The session](#the-session)), and
+`mute = true` (or `--mute`) starts the engine silent (see
+[Sound](#sound-permissions-and-fullscreen)). `tmux = on|off|auto`,
+`frames = raw|png|auto`, `fps = <n>` and `probe = false` are `--tmux`,
+`--frames`, `--fps` and `--no-probe` (see [Where it runs](#where-it-runs)).
 
 `--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
 repeatable. Four are refused because they would undo something this
@@ -251,10 +322,11 @@ Several urls open several tabs, the first in front:
 
 `--doctor` is the first thing to run in a new terminal: it starts the engine
 on a throwaway profile, asks the terminal whether it speaks the Kitty
-graphics and keyboard protocols, and prints one line per answer, exiting 1
-when the engine did not answer or the terminal answered neither. In tmux
-without `allow-passthrough` it will tell you the terminal did not answer,
-which is the truth. `--print-engine` prints the path the search finds and
+graphics and keyboard protocols — through tmux's passthrough as well, inside
+tmux — and prints one line per answer and the route frames will take,
+exiting 1 when the engine did not answer or the terminal cannot draw. In
+tmux without `allow-passthrough` it says the graphics query went unanswered
+raw and through tmux. `--print-engine` prints the path the search finds and
 nothing else, for scripts.
 
 ### Rebinding keys
@@ -288,6 +360,7 @@ nothing else, for scripts.
 | `zoom-out` | `alt+-`, `ctrl+-` | zoom out |
 | `zoom-reset` | `alt+0`, `ctrl+0` | back to 100% |
 | `find` | `ctrl+f` | find in the page |
+| `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
 | `copy` | `alt+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | copy the url |
 | `normal-mode` | `ctrl+.` | normal mode on or off |
@@ -381,10 +454,11 @@ not a thing a terminal has.
 | your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
 | `alt+c` | copy the page's selection to your clipboard; with the url bar, the find prompt, a `prompt()` or a file input's path open, copy that line |
 | `alt+u` | copy the page's url to your clipboard |
+| `alt+p` | allow this site something: the row says `allow https://site: ` and the words it is allowed now, all selected; type any of `camera` `microphone` `location` `notifications` `clipboard`, `enter` sets exactly those (an empty line takes them all back), `esc` leaves it. See [Sound, permissions and fullscreen](#sound-permissions-and-fullscreen) |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
-| `esc` | while a page is loading and nothing else has the row, stop it |
+| `esc` | while a page is fullscreen and nothing else has the row, leave fullscreen; while a page is loading, stop it |
 | `ctrl+.` | normal mode on or off. In normal mode the letters are keys of their own and the row says `normal`: `f` labels everything clickable on the screen and typing a label clicks it (`F` opens a link in a tab behind this one); `j`/`k` scroll a notch, `d`/`u` half a screen, `gg`/`G` to the top and bottom; `H`/`L` back and forward, `r` reload, `o` the url bar, `O` a new tab, `/` find; `i` goes back to typing into the page, as does clicking into a field. Off by default: nothing changes until you press it |
 
 Everything else goes to the page, including the mouse, unless a `key.` line
@@ -510,10 +584,11 @@ A terminal that understands OSC 22 (Kitty, Ghostty) also gets a hand over a
 link and an I-beam over a text field; the rest ignore it. A zoom that is not
 100% is a word at the right too, `150%`, after the loading hint.
 
-The url bar, the find prompt, a page's dialog and a file input's path take
-the whole row while they are open, and `esc` goes to whichever of them has it
-before it stops a load; no link is shown while one of them is there. The
-offer to restore the last run's tabs takes it too, after all of them.
+The url bar, the find prompt, the tab list, the allow line (`alt+p`), a
+page's dialog and a file input's path take the whole row while they are
+open, and `esc` goes to whichever of them has it before it leaves
+fullscreen or stops a load; no link is shown while one of them is there.
+The offer to restore the last run's tabs takes it too, after all of them.
 
 A page whose renderer crashes stays in its tab: the picture goes, and the row
 says `this page crashed; ctrl+r reloads it` — a tab behind that crashed says
@@ -534,6 +609,56 @@ mouse movement, not only presses (`?1003h`), so the page now sees the
 pointer move — hover styling and tooltips work — at the cost of one small
 command to the engine per screen refresh while it moves and nothing while
 it rests.
+
+## Sound, permissions and fullscreen
+
+**Sound** comes out of the machine `blinkterm` runs on, through the
+engine's own audio: PulseAudio or PipeWire where `libpulse.so.0` is
+installed and a server answers, else ALSA — the headless shell has the whole
+of Chrome's audio stack and tries them in that order (measured with
+`strace`), and plays into nothing when there is neither. Over SSH that is
+the far machine's speakers, or nothing; a terminal cannot carry sound.
+Chrome's autoplay rule applies: a page cannot start sound before you have
+clicked it, and a click here is a click to the page, so a video you click
+plays with sound and a page that shouts on load does not.
+`--engine-arg=--autoplay-policy=no-user-gesture-required` lifts that.
+`--mute` (`mute = true`) starts the engine with `--mute-audio`: pages play,
+silently, and cannot tell. Chrome for Testing's zip does not bring
+`libpulse0`; a distribution's `chromium` does.
+
+**Permissions**: every page is told no. From the moment the engine starts,
+notifications, location, camera, microphone and the clipboard API are
+`denied` for every site, so a site that checks hears no at once and stops
+asking, rather than waiting on a question the headless engine would never
+show. No engine says when a page asks, so there is no prompt; instead
+`alt+p` allows the site in front yourself:
+
+```text
+allow https://meet.example: camera microphone
+allowed https://meet.example: camera, microphone
+```
+
+The words are `camera`, `microphone`, `location`, `notifications` and
+`clipboard`; `enter` sets exactly the ones on the line for that origin and
+denies the rest, and the allowance is remembered in the profile (see
+[Permissions](#permissions)). A page with no origin — `about:blank`, a
+`data:` or `file:` url — has nothing to allow. What a grant buys is the
+engine's: on `chrome-headless-shell` it makes the clipboard API work, into
+the engine's own clipboard rather than yours, and lets a site believe it may
+use a camera, microphone or location that the shell then cannot find — a
+full Chromium with a webcam uses them. No headless engine shows a
+notification, whatever is allowed; the word is there so that a site stops
+asking.
+
+**Fullscreen**: when the page in front takes something fullscreen — a
+video's button, a slide deck — the status row goes and the page gets every
+row of the pane. `esc` leaves it, as do a navigation, a reload and going to
+another tab (the page's own Escape does nothing in a headless engine).
+While something needs the row — the url bar, the find prompt, the tab list,
+the allow line, a dialog the page opens, a file input's path — the row comes
+back and the page is a row shorter until it closes: a `confirm()` in a
+fullscreen video is still answered on the row. Link hints and normal mode
+work in fullscreen as anywhere.
 
 ## Tests
 
@@ -571,9 +696,15 @@ cargo test --locked
 The lint set is a `[lints]` table in `Cargo.toml` rather than a list of flags
 in the workflow, so a laptop and a runner disagree about `-D warnings` and
 nothing else. The one worth knowing about is
-`clippy::undocumented_unsafe_blocks`: there are thirty-five `unsafe` blocks in
+`clippy::undocumented_unsafe_blocks`: there are forty-nine `unsafe` blocks in
 `src/`, nearly all of them one-line `libc` calls, and each says what makes it
 sound.
+
+CI also runs the clippy and the tests on macOS, in a `mac` job with a
+`chrome-headless-shell` of its own: the shared memory store and the app
+search are compiled only there, and a lint only sees the code that is
+built. The `msrv` job checks the same code for `aarch64-apple-darwin` on
+the floor toolchain.
 
 `--locked` throughout, because every dependency but `libc` is a git revision
 and `Cargo.lock` is the only record of which tree of tOS was built.

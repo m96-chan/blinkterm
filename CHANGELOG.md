@@ -12,6 +12,19 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- Runs on macOS: frames go through `shm_open` shared memory (Kitty,
+  Ghostty), Chrome and Chromium are found in `/Applications`, and the engine
+  gets `--use-mock-keychain` so a headless run never asks the Keychain. CI
+  runs the engine tests on a Mac. The Homebrew formula stays Linux-only
+  until a release carries this; on macOS, `cargo install --git` for now
+  ([#21](https://github.com/m96-chan/blinkterm/issues/21)).
+- The terminal is asked before the engine starts, and one that does not
+  answer the graphics query gets a sentence instead of a blank pane
+  (`--no-probe` skips it). Inside tmux (`set -g allow-passthrough on`) the
+  picture goes through passthrough as Unicode placeholders; over ssh the
+  frames are the engine's PNG, paced by the link. `--tmux`, `--frames`,
+  `--fps`, and `--doctor` says which route it took
+  ([#21](https://github.com/m96-chan/blinkterm/issues/21)).
 - `key.<chord> = <action>` in the settings file rebinds any of the
   program's keys (`key.f5 = reload`), and `key.<chord> = none` gives one
   back to the page; the actions are listed by `--help`. A chord needs
