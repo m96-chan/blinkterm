@@ -84,7 +84,7 @@ unsafe_op_in_unsafe_fn = "warn"
 unused_qualifications = "warn"
 
 [lints.clippy]
-# The reason this table exists. There are 49 `unsafe` blocks in `src/` (counted
+# The reason this table exists. There are 50 `unsafe` blocks in `src/` (counted
 # as `grep -o 'unsafe {' src/*.rs | wc -l`, so the tests' among them), nearly
 # all of them one-line `libc` calls, and every one says what makes it sound. A
 # crate that explains a 150 ms rest interval at four paragraphs should not be
