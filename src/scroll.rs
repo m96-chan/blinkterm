@@ -521,6 +521,7 @@ impl Drop for Wheel {
 /// The step is worked out under the lock and sent outside it, so that a notch
 /// arriving from the loop waits for arithmetic rather than for a socket.
 fn animate(shared: &Shared) {
+    interactive();
     loop {
         let sending = {
             let Ok(mut state) = shared.state.lock() else {
@@ -565,6 +566,27 @@ fn animate(shared: &Shared) {
             .store(since.as_nanos().max(1) as u64, Ordering::Relaxed);
     }
 }
+
+/// Tell the system this thread drives something a person is watching.
+///
+/// On macOS a thread's quality-of-service class decides how much slack its
+/// timed waits are given. At the default class, on the CI runner, a 16 ms
+/// wait came back about 10 ms late even with nothing else running.
+/// User-interactive is the class Apple names for work that updates what is on
+/// screen, which a scroll animation is.
+#[cfg(target_os = "macos")]
+fn interactive() {
+    // SAFETY: the call takes two plain values and changes only the calling
+    // thread's scheduling class. A failure is a return code, ignored: the
+    // thread works at any class, only less punctually.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+/// Elsewhere there is no class to ask for.
+#[cfg(not(target_os = "macos"))]
+fn interactive() {}
 
 #[cfg(test)]
 mod tests {
@@ -952,9 +974,15 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
 
         let sent = recorder.sent.lock().expect("the recorder").clone();
+        // Every tick's time from the start, so that a failure on a machine
+        // nobody here can sit at says how the schedule slipped.
+        let times: Vec<u128> = sent
+            .iter()
+            .map(|(at, _)| at.duration_since(start).as_millis())
+            .collect();
         assert!(
             sent.len() >= 20,
-            "only {} ticks in 420 ms of {TICK:?}",
+            "only {} ticks in 420 ms of {TICK:?}, at {times:?} ms",
             sent.len()
         );
         let slack = Duration::from_millis(4);
@@ -967,7 +995,7 @@ mod tests {
             };
             assert!(
                 off <= slack,
-                "tick {} landed {off:?} from its schedule",
+                "tick {} landed {off:?} from its schedule; ticks at {times:?} ms",
                 n + 1
             );
             assert!(step.delta.1 > 0.0, "tick {} sent nothing", n + 1);
