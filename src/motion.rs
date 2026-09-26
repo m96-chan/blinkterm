@@ -262,6 +262,21 @@ impl Motion {
         });
     }
 
+    /// A frame was acknowledged on a route paced by the link
+    /// ([`crate::route::Route::paced`]): until now the engine could send
+    /// nothing, so its silence is only silence from now on.
+    ///
+    /// Without this a link that takes more than [`REST_AFTER`] a frame is a
+    /// page that looks at rest between every two frames of an animation, and
+    /// a full-size still went out after each small one — measured at
+    /// 160 kB/s, half of the frames on the wire were stills of a page that
+    /// never stopped.
+    pub fn frame_acknowledged(&mut self, now: Instant) {
+        if now > self.last_frame {
+            self.last_frame = now;
+        }
+    }
+
     /// Whether the page has been quiet long enough to be worth a lossless
     /// picture: no frame for [`REST_AFTER`], no input for [`INPUT_QUIET`],
     /// nothing already on its way, and no still already up.
@@ -330,6 +345,139 @@ impl Motion {
     /// Whether the last thing painted was a lossless still.
     pub fn at_rest(&self) -> bool {
         self.at_rest
+    }
+}
+
+/// How the motion cast is asked for.
+///
+/// On the local route it is what it always was: JPEG at [`QUALITY`], every
+/// frame, at the pane's size. On a route that sends the engine's PNG
+/// ([`crate::route::Payload::Png`]) it is PNG — which on this engine costs
+/// what JPEG does on text, 60 fps at 35 kB a frame against 59 at 110 kB on an
+/// animating page — every nth frame for the route's cap, and at a width
+/// [`Throttle`] steps down when the link cannot keep up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cast {
+    /// `format: "png"` and no quality, rather than JPEG at [`QUALITY`].
+    pub png: bool,
+    /// `everyNthFrame`.
+    pub every_nth: u32,
+    /// The cast's size as a fraction of the pane: 1, 2 or 3, meaning the
+    /// pane, half of it, and three-eighths.
+    pub step: u8,
+}
+
+impl Cast {
+    /// The cast for a route, at the pane's full size.
+    pub fn for_route(route: &crate::route::Route) -> Cast {
+        Cast {
+            png: route.payload == crate::route::Payload::Png,
+            every_nth: route.every_nth.max(1),
+            step: 1,
+        }
+    }
+
+    /// The `maxWidth` and `maxHeight` for a pane of `pane` pixels.
+    ///
+    /// Half, then three-eighths, and nothing between: resampled text
+    /// compresses worse than crisp text, so three-quarters of the pane was a
+    /// step *up* in bytes on a page of text (261 kB against 193 kB at 1280
+    /// wide), while half is a quarter of the bytes on pictures and two-thirds
+    /// on text, and three-eighths is the last step at which a page in motion
+    /// is still legible. The terminal scales the frame into the same cells,
+    /// as it already does for a zoomed page.
+    pub fn size(&self, pane: (u32, u32)) -> (u32, u32) {
+        let scale = |n: u32| match self.step {
+            0 | 1 => n,
+            2 => n.div_ceil(2),
+            _ => (n * 3).div_ceil(8),
+        };
+        (scale(pane.0).max(1), scale(pane.1).max(1))
+    }
+}
+
+impl Default for Cast {
+    /// JPEG, every frame, the pane's size: the local route.
+    fn default() -> Cast {
+        Cast {
+            png: false,
+            every_nth: 1,
+            step: 1,
+        }
+    }
+}
+
+/// How long a frame may take from being handed to the pane to being written
+/// before it counts as the link falling behind.
+pub const SLOW: Duration = Duration::from_millis(400);
+
+/// How quickly a frame has to go for it to count as the link keeping up.
+pub const FAST: Duration = Duration::from_millis(80);
+
+/// How long every frame has to have been fast before the cast steps back up.
+pub const RECOVER: Duration = Duration::from_secs(5);
+
+/// The coarsest step: three-eighths of the pane.
+pub const MAX_STEP: u8 = 3;
+
+/// Steps the cast's size down when frames wait on the link, and up when
+/// they stop waiting.
+///
+/// The acknowledgements already make the engine produce frames at the rate
+/// the link takes them (see `crate::app`): one ack when a frame has gone,
+/// and the engine's next frame is the page as it is then. What that cannot
+/// do is make a frame smaller, and a quarter-megabyte frame over a
+/// 250 kB/s link is one a second however current it is. So: two frames in a
+/// row that took [`SLOW`] or longer step down one; [`RECOVER`] of frames
+/// that each took under [`FAST`] step up one. Off on the local route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Throttle {
+    step: u8,
+    slow_in_a_row: u8,
+    fast_since: Option<Instant>,
+}
+
+impl Default for Throttle {
+    fn default() -> Throttle {
+        Throttle {
+            step: 1,
+            slow_in_a_row: 0,
+            fast_since: None,
+        }
+    }
+}
+
+impl Throttle {
+    /// The step the cast is at.
+    pub fn step(&self) -> u8 {
+        self.step
+    }
+
+    /// Told once per frame written, with how long it took. `Some(step)` when
+    /// the cast should be restarted at a new size.
+    pub fn frame_waited(&mut self, waited: Duration, now: Instant) -> Option<u8> {
+        if waited >= SLOW {
+            self.fast_since = None;
+            self.slow_in_a_row = self.slow_in_a_row.saturating_add(1);
+            if self.slow_in_a_row >= 2 && self.step < MAX_STEP {
+                self.step += 1;
+                self.slow_in_a_row = 0;
+                return Some(self.step);
+            }
+            return None;
+        }
+        self.slow_in_a_row = 0;
+        if waited >= FAST {
+            self.fast_since = None;
+            return None;
+        }
+        let since = *self.fast_since.get_or_insert(now);
+        if self.step > 1 && now.duration_since(since) >= RECOVER {
+            self.step -= 1;
+            self.fast_since = Some(now);
+            return Some(self.step);
+        }
+        None
     }
 }
 
@@ -588,5 +736,100 @@ mod tests {
         // milliseconds-or-seconds mistake and nothing else.
         assert!(seconds > 1_577_836_800.0, "{seconds}");
         assert!(seconds < 4_102_444_800.0, "{seconds}");
+    }
+
+    #[test]
+    fn on_a_paced_route_the_rest_interval_counts_from_the_acknowledgement_not_the_frame() {
+        let start = Instant::now();
+        let mut motion = Motion::new(start);
+        assert!(motion.motion_frame(Some(now_seconds()), start));
+        // The frame took a second to go down a slow link, and was
+        // acknowledged only then: the engine has had no chance to send the
+        // next one, so the page is not at rest.
+        let acked = start + Duration::from_secs(1);
+        motion.frame_acknowledged(acked);
+        assert!(!motion.wants_still(acked + REST_AFTER / 2));
+        assert!(motion.wants_still(acked + REST_AFTER));
+        // An acknowledgement never winds the clock back.
+        motion.frame_acknowledged(start);
+        assert!(motion.wants_still(acked + REST_AFTER));
+    }
+
+    #[test]
+    fn two_slow_frames_in_a_row_step_the_width_down_and_five_quiet_seconds_step_it_up() {
+        let start = Instant::now();
+        let mut throttle = Throttle::default();
+        assert_eq!(
+            throttle.frame_waited(SLOW, start),
+            None,
+            "one is not a trend"
+        );
+        assert_eq!(throttle.frame_waited(FAST, start), None);
+        assert_eq!(
+            throttle.frame_waited(SLOW, start),
+            None,
+            "the run was broken"
+        );
+        assert_eq!(throttle.frame_waited(SLOW, start), Some(2));
+        assert_eq!(throttle.step(), 2);
+        let ms = |n| start + Duration::from_millis(n);
+        assert_eq!(
+            throttle.frame_waited(Duration::from_millis(10), ms(100)),
+            None
+        );
+        assert_eq!(
+            throttle.frame_waited(Duration::from_millis(10), ms(3000)),
+            None
+        );
+        // A frame between fast and slow starts the quiet over.
+        assert_eq!(
+            throttle.frame_waited(Duration::from_millis(200), ms(4000)),
+            None
+        );
+        assert_eq!(
+            throttle.frame_waited(Duration::from_millis(10), ms(5200)),
+            None
+        );
+        assert_eq!(
+            throttle.frame_waited(Duration::from_millis(10), ms(10_199)),
+            None
+        );
+        assert_eq!(
+            throttle.frame_waited(Duration::from_millis(10), ms(10_200)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_throttle_never_goes_below_three_eighths_and_never_above_the_pane() {
+        let now = Instant::now();
+        let mut throttle = Throttle::default();
+        for _ in 0..20 {
+            throttle.frame_waited(Duration::from_secs(2), now);
+        }
+        assert_eq!(throttle.step(), MAX_STEP);
+        let mut throttle = Throttle::default();
+        for n in 0..100 {
+            let later = now + Duration::from_secs(n);
+            assert_eq!(throttle.frame_waited(Duration::ZERO, later), None);
+        }
+        assert_eq!(throttle.step(), 1);
+    }
+
+    #[test]
+    fn a_cast_at_step_two_asks_for_half_the_pane_and_at_step_three_three_eighths() {
+        let at = |step| Cast {
+            png: true,
+            every_nth: 2,
+            step,
+        };
+        assert_eq!(at(1).size((1280, 770)), (1280, 770));
+        assert_eq!(at(2).size((1280, 770)), (640, 385));
+        assert_eq!(at(3).size((1280, 770)), (480, 289));
+        assert_eq!(at(3).size((1, 1)), (1, 1));
+        assert_eq!(
+            Cast::default(),
+            Cast::for_route(&crate::route::Route::local(true))
+        );
     }
 }

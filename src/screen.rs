@@ -15,11 +15,27 @@
 //! [`emergency`] is the same
 //! restoration written so it can run from a panic hook or a signal path, with
 //! nothing borrowed and one `write(2)`.
+//!
+//! # The pane writes on a thread of its own
+//!
+//! Every byte goes through an [`Outbox`], whose thread does the `write(2)`.
+//! Locally that is a memcpy and it changes nothing; through tmux a megabyte
+//! takes a tenth of a second, and over a 1 MB/s ssh link a 260 kB frame is a
+//! quarter of a second in which a loop that wrote it itself would read no
+//! key and no mouse report — and a terminal that stops reading would stop the
+//! program, `SIGTERM` and all. Text is a queue and is never dropped; a frame
+//! is a slot, and a frame handed over while the last is still waiting
+//! replaces it unwritten, which is what makes the frame rate the link's
+//! rather than the engine's.
 
 use std::borrow::Cow;
 use std::io::{self, Write};
 use std::os::unix::io::RawFd;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::route::Wrap;
 
 use tos_preview::fit::Metrics;
 
@@ -57,6 +73,19 @@ pub const KEYBOARD_FLAGS: u8 = 1 | 2 | 4 | 16;
 /// WezTerm and Ghostty in cell mode report a motion only when the cell
 /// changes.
 pub fn enter_sequence() -> Vec<u8> {
+    enter_sequence_with(true)
+}
+
+/// [`enter_sequence`], with the keyboard flags pushed or not.
+///
+/// Not under tmux: tmux 3.4 swallows `CSI > u` raw, and wrapped it would
+/// reach the outer terminal, which would then send `CSI 105;5 u` for
+/// `ctrl+i` — which tmux, not knowing the terminal is in that mode, turns
+/// into a tab — and the pop, swallowed raw, would never reach it if the
+/// program were killed, leaving somebody's terminal in a mode their shell
+/// does not know. The keys arrive in tmux's own encoding, which
+/// [`crate::input`] reads as any legacy terminal's.
+pub fn enter_sequence_with(keyboard: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[?1049h"); // the alternate screen
     out.extend_from_slice(b"\x1b[?25l"); // no cursor
@@ -65,7 +94,9 @@ pub fn enter_sequence() -> Vec<u8> {
     out.extend_from_slice(b"\x1b[?1006h"); // in SGR, which has no 223 limit
     out.extend_from_slice(b"\x1b[?1016h"); // in pixels, if the terminal can
     out.extend_from_slice(b"\x1b[?2004h"); // a paste as a paste, not as keys
-    out.extend_from_slice(format!("\x1b[>{KEYBOARD_FLAGS}u").as_bytes());
+    if keyboard {
+        out.extend_from_slice(format!("\x1b[>{KEYBOARD_FLAGS}u").as_bytes());
+    }
     out.extend_from_slice(b"\x1b[2J"); // an empty screen to draw on
     out
 }
@@ -112,8 +143,15 @@ pub const ASK_CELL_SIZE: &[u8] = b"\x1b[16t";
 /// program ended — or panicked, since [`emergency`] writes this too — would
 /// be the shell's pointer from then on, in a terminal that understands it.
 pub fn leave_sequence() -> Vec<u8> {
+    leave_sequence_with(true)
+}
+
+/// [`leave_sequence`], popping the keyboard flags only if they were pushed.
+pub fn leave_sequence_with(keyboard: bool) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(b"\x1b[<u"); // pop the keyboard flags
+    if keyboard {
+        out.extend_from_slice(b"\x1b[<u"); // pop the keyboard flags
+    }
     out.extend_from_slice(b"\x1b[?2004l");
     out.extend_from_slice(b"\x1b[?1016l");
     out.extend_from_slice(b"\x1b[?1006l");
@@ -145,12 +183,28 @@ pub fn pointer_shape(name: &'static str) -> Vec<u8> {
 /// without a reference to anything.
 static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
 
+/// Whether the keyboard flags were pushed, for [`emergency`] to know whether
+/// to pop them. True until a pane says otherwise: a pop the terminal did not
+/// need is harmless, and the one that was needed is not.
+static KEYBOARD: AtomicBool = AtomicBool::new(true);
+
+/// What [`emergency`] writes: `ST` first, then [`leave_sequence_with`].
+///
+/// The `ST` because the writer thread may have died in the middle of a
+/// frame's escape string, and a terminal inside a string eats everything up
+/// to the next `ST` — the restoration included.
+pub fn emergency_sequence(keyboard: bool) -> Vec<u8> {
+    let mut out = b"\x1b\\".to_vec();
+    out.extend_from_slice(&leave_sequence_with(keyboard));
+    out
+}
+
 /// Put the terminal back, from anywhere.
 ///
 /// Deliberately not a method and deliberately not fallible: it runs where
 /// there is nothing left to report an error to.
 pub fn emergency() {
-    let bytes = leave_sequence();
+    let bytes = emergency_sequence(KEYBOARD.load(Ordering::SeqCst));
     // SAFETY: `bytes` is alive for the call and `bytes.len()` is exactly how
     // much of it there is. `write(2)` rather than `println!` because this runs
     // from a panic hook, where the usual machinery may be the thing that
@@ -170,11 +224,19 @@ pub fn emergency() {
     }
 }
 
+/// How long [`Pane::leave`] waits for what is queued to reach a terminal:
+/// one that has stopped reading gets the restoration put in the queue and
+/// the program goes regardless.
+pub const LEAVE_DRAIN: Duration = Duration::from_secs(2);
+
 /// The pane, in the state this program needs it, for as long as it is held.
 pub struct Pane {
     input: RawFd,
     output: RawFd,
     restored: bool,
+    /// Whether the keyboard flags were pushed, and so are popped.
+    keyboard: bool,
+    outbox: Outbox,
 }
 
 impl Pane {
@@ -183,7 +245,11 @@ impl Pane {
     /// Raw mode is done here rather than with [`tos_platform::tty::RawMode`]
     /// because the settings have to be saved somewhere a panic hook can reach
     /// them, and a guard that owns its copy cannot be that place.
-    pub fn enter(input: RawFd, output: RawFd) -> io::Result<Pane> {
+    ///
+    /// `keyboard` false pushes no keyboard flags (and pops none); `wrap`
+    /// says whether the one question that is a terminal's own business, the
+    /// cell size, has to go through tmux's passthrough to reach it.
+    pub fn enter(input: RawFd, output: RawFd, keyboard: bool, wrap: Wrap) -> io::Result<Pane> {
         // SAFETY: `termios` is a C struct of integers and byte arrays, and
         // all-zero is a valid value of every one of its fields. It is handed
         // straight to `tcgetattr` below, which overwrites it.
@@ -206,23 +272,41 @@ impl Pane {
             *slot = Some(saved);
         }
 
+        KEYBOARD.store(keyboard, Ordering::SeqCst);
         let mut pane = Pane {
             input,
             output,
             restored: false,
+            keyboard,
+            outbox: Outbox::start(io::stdout()),
         };
-        pane.write(&enter_sequence())?;
+        pane.write(&enter_sequence_with(keyboard))?;
         pane.write(ASK_PIXEL_MOUSE)?;
         pane.write(ASK_BACKGROUND)?;
-        pane.write(ASK_CELL_SIZE)?;
+        pane.write(&ask_cell_size(wrap))?;
         Ok(pane)
     }
 
-    /// Write bytes to the terminal.
+    /// Write bytes to the terminal, in order, never dropped.
     pub fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let mut stdout = io::stdout().lock();
-        stdout.write_all(bytes)?;
-        stdout.flush()
+        self.outbox.write(bytes)
+    }
+
+    /// Write a frame: it replaces a frame handed over earlier that has not
+    /// started going out yet. True when one was replaced.
+    pub fn write_frame(&mut self, bytes: Vec<u8>) -> io::Result<bool> {
+        self.outbox.write_frame(bytes)
+    }
+
+    /// Whether every frame handed over has been written or replaced.
+    pub fn frames_flushed(&self) -> bool {
+        self.outbox.frames_flushed()
+    }
+
+    /// How long the last frame written took from being handed over to being
+    /// written, once per frame. See [`Outbox::take_frame_wait`].
+    pub fn take_frame_wait(&self) -> Option<Duration> {
+        self.outbox.take_frame_wait()
     }
 
     pub fn input_fd(&self) -> RawFd {
@@ -255,7 +339,8 @@ impl Pane {
             return;
         }
         self.restored = true;
-        let _ = self.write(&leave_sequence());
+        let _ = self.write(&leave_sequence_with(self.keyboard));
+        self.outbox.drain(LEAVE_DRAIN);
         if let Ok(mut saved) = SAVED.lock() {
             if let Some(termios) = saved.take() {
                 // SAFETY: as in `emergency`: read-only through a pointer to a
@@ -271,6 +356,221 @@ impl Pane {
 impl Drop for Pane {
     fn drop(&mut self) {
         self.leave();
+    }
+}
+
+/// [`ASK_CELL_SIZE`] as the route sends it. Through tmux the bare question is
+/// swallowed and never reaches the terminal, so it goes wrapped, and tmux
+/// forwards the answer; without it the cell over ssh is a guess and the
+/// picture is letterboxed inside the placeholders, every click off by the
+/// letterbox.
+pub fn ask_cell_size(wrap: Wrap) -> Vec<u8> {
+    match wrap {
+        Wrap::None => ASK_CELL_SIZE.to_vec(),
+        Wrap::Tmux => crate::graphics::wrap_for_tmux(ASK_CELL_SIZE),
+    }
+}
+
+/// The pane's output, written by a thread of its own so that the loop never
+/// waits on the terminal. See the module's section on it.
+pub struct Outbox {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    state: Mutex<OutboxState>,
+    /// Signalled when there is something to write, and when something has
+    /// been written.
+    wake: Condvar,
+}
+
+/// One thing handed over: text, or a frame that may yet be replaced.
+enum Item {
+    Text(Vec<u8>),
+    Frame(Vec<u8>, Instant),
+}
+
+#[derive(Default)]
+struct OutboxState {
+    /// In the order handed over. At most one [`Item::Frame`], the newest.
+    queue: Vec<Item>,
+    /// Whether the writer holds bytes it has taken and not finished writing.
+    writing: bool,
+    /// When the frame being written was handed over.
+    writing_frame: Option<Instant>,
+    /// How long the last frame written took, until it is taken.
+    last_wait: Option<Duration>,
+    /// The first error the writer met; every write after it fails with it.
+    failed: Option<(io::ErrorKind, String)>,
+    stop: bool,
+}
+
+impl OutboxState {
+    fn failure(&self) -> io::Result<()> {
+        match &self.failed {
+            Some((kind, text)) => Err(io::Error::new(*kind, text.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Outbox {
+    /// Start the writer on `writer`: stdout for the pane, anything a test
+    /// can watch otherwise.
+    pub fn start(writer: impl Write + Send + 'static) -> Outbox {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(OutboxState::default()),
+            wake: Condvar::new(),
+        });
+        let theirs = Arc::clone(&shared);
+        // A thread that cannot be started is a pane that cannot be written;
+        // the next write says so through `failed`.
+        let started = std::thread::Builder::new()
+            .name("blinkterm-pane".to_string())
+            .spawn(move || write_loop(&theirs, writer));
+        if let Err(e) = started {
+            if let Ok(mut state) = shared.state.lock() {
+                state.failed = Some((e.kind(), e.to_string()));
+            }
+        }
+        Outbox { shared }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, OutboxState> {
+        // A poisoned lock is a writer that panicked, which in a release
+        // build has already aborted; the state is still the state.
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Text and commands, in order, never dropped.
+    pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.is_empty() {
+            return self.state().failure();
+        }
+        let mut state = self.state();
+        state.failure()?;
+        match state.queue.last_mut() {
+            Some(Item::Text(text)) => text.extend_from_slice(bytes),
+            _ => state.queue.push(Item::Text(bytes.to_vec())),
+        }
+        drop(state);
+        self.shared.wake.notify_all();
+        Ok(())
+    }
+
+    /// A frame: it goes after everything handed over before it, and replaces
+    /// the frame in the queue if there is one — which is dropped unwritten,
+    /// its place taken by whatever text followed it. True when one was.
+    pub fn write_frame(&self, bytes: Vec<u8>) -> io::Result<bool> {
+        let mut state = self.state();
+        state.failure()?;
+        let before = state.queue.len();
+        state.queue.retain(|item| matches!(item, Item::Text(_)));
+        let replaced = state.queue.len() != before;
+        state.queue.push(Item::Frame(bytes, Instant::now()));
+        drop(state);
+        self.shared.wake.notify_all();
+        Ok(replaced)
+    }
+
+    /// Whether every frame handed over has been written or replaced: none
+    /// waiting, none being written.
+    pub fn frames_flushed(&self) -> bool {
+        let state = self.state();
+        state.writing_frame.is_none()
+            && !state
+                .queue
+                .iter()
+                .any(|item| matches!(item, Item::Frame(..)))
+    }
+
+    /// How long the last frame written took from being handed over to its
+    /// last byte being written — what the link costs a frame — once.
+    pub fn take_frame_wait(&self) -> Option<Duration> {
+        self.state().last_wait.take()
+    }
+
+    /// Wait until everything handed over is written, or `deadline` passes.
+    pub fn drain(&self, deadline: Duration) {
+        let until = Instant::now() + deadline;
+        let mut state = self.state();
+        while (!state.queue.is_empty() || state.writing) && state.failed.is_none() {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            state = match self.shared.wake.wait_timeout(state, left) {
+                Ok((state, _)) => state,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+}
+
+impl Drop for Outbox {
+    /// The writer is told to stop and not waited for: it may be blocked on a
+    /// terminal that stopped reading, and the program is on its way out.
+    fn drop(&mut self) {
+        self.state().stop = true;
+        self.shared.wake.notify_all();
+    }
+}
+
+/// The writer: take everything handed over, write it in order, wait for more.
+fn write_loop(shared: &Shared, mut writer: impl Write) {
+    loop {
+        let items = {
+            let mut state = shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while state.queue.is_empty() && !state.stop {
+                state = match shared.wake.wait(state) {
+                    Ok(state) => state,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+            if state.queue.is_empty() {
+                return;
+            }
+            state.writing = true;
+            state.writing_frame = state.queue.iter().find_map(|item| match item {
+                Item::Frame(_, at) => Some(*at),
+                Item::Text(_) => None,
+            });
+            std::mem::take(&mut state.queue)
+        };
+        let mut result = Ok(());
+        for item in &items {
+            let bytes = match item {
+                Item::Text(bytes) | Item::Frame(bytes, _) => bytes,
+            };
+            result = writer.write_all(bytes).and_then(|()| writer.flush());
+            if result.is_err() {
+                break;
+            }
+        }
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.writing = false;
+        if let Some(at) = state.writing_frame.take() {
+            state.last_wait = Some(at.elapsed());
+        }
+        if let Err(e) = result {
+            state.failed = Some((e.kind(), e.to_string()));
+            state.queue.clear();
+        }
+        let failed = state.failed.is_some();
+        drop(state);
+        shared.wake.notify_all();
+        if failed {
+            return;
+        }
     }
 }
 
@@ -1971,5 +2271,150 @@ mod tests {
         assert_eq!(tail_to("abc", 10), "abc");
         assert_eq!(tail_to("abcdef", 3), "def");
         assert_eq!(tail_to("\u{65e5}\u{672c}\u{8a9e}", 5), "\u{672c}\u{8a9e}");
+    }
+
+    /// A terminal for the outbox to write to: it keeps what it is given, and
+    /// reads nothing until it is opened — a terminal that has stopped reading.
+    #[derive(Clone, Default)]
+    struct Gated {
+        written: Arc<Mutex<Vec<u8>>>,
+        open: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Gated {
+        fn opened() -> Gated {
+            let gated = Gated::default();
+            gated.open();
+            gated
+        }
+
+        fn open(&self) {
+            *self.open.0.lock().unwrap() = true;
+            self.open.1.notify_all();
+        }
+
+        fn written(&self) -> Vec<u8> {
+            self.written.lock().unwrap().clone()
+        }
+    }
+
+    impl Write for Gated {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut open = self.open.0.lock().unwrap();
+            while !*open {
+                open = self.open.1.wait(open).unwrap();
+            }
+            self.written.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_outbox_writes_text_in_order_and_never_drops_it() {
+        let terminal = Gated::opened();
+        let outbox = Outbox::start(terminal.clone());
+        let mut wanted = Vec::new();
+        for n in 0..2000 {
+            let line = format!("line {n}\r\n");
+            outbox.write(line.as_bytes()).expect("written");
+            wanted.extend_from_slice(line.as_bytes());
+        }
+        outbox.drain(Duration::from_secs(10));
+        assert_eq!(terminal.written(), wanted);
+    }
+
+    #[test]
+    fn a_frame_handed_over_while_one_waits_replaces_it_and_the_second_is_what_arrives() {
+        let terminal = Gated::default();
+        let outbox = Outbox::start(terminal.clone());
+        // The writer takes this and is stuck in it until the terminal reads.
+        outbox.write(b"first").expect("queued");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!outbox.write_frame(b"<one>".to_vec()).expect("queued"));
+        outbox.write(b"-text-").expect("queued");
+        assert!(
+            outbox.write_frame(b"<two>".to_vec()).expect("queued"),
+            "replaced"
+        );
+        terminal.open();
+        outbox.drain(Duration::from_secs(10));
+        assert_eq!(terminal.written(), b"first-text-<two>".to_vec());
+    }
+
+    #[test]
+    fn frames_are_flushed_once_the_writer_has_written_the_slot_and_not_before() {
+        let terminal = Gated::default();
+        let outbox = Outbox::start(terminal.clone());
+        assert!(outbox.frames_flushed(), "nothing handed over");
+        outbox.write_frame(b"frame".to_vec()).expect("queued");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!outbox.frames_flushed(), "the terminal has read nothing");
+        assert_eq!(outbox.take_frame_wait(), None);
+        std::thread::sleep(Duration::from_millis(50));
+        terminal.open();
+        outbox.drain(Duration::from_secs(10));
+        assert!(outbox.frames_flushed());
+        let waited = outbox.take_frame_wait().expect("the frame's wait");
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert_eq!(outbox.take_frame_wait(), None, "told once");
+        assert_eq!(terminal.written(), b"frame".to_vec());
+    }
+
+    #[test]
+    fn a_terminal_that_fails_fails_every_write_after_it() {
+        struct Gone;
+        impl Write for Gone {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "gone"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let outbox = Outbox::start(Gone);
+        outbox
+            .write(b"hello")
+            .expect("queued before anything failed");
+        outbox.drain(Duration::from_secs(10));
+        let err = outbox.write(b"again").expect_err("the writer has failed");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert!(outbox.write_frame(b"x".to_vec()).is_err());
+    }
+
+    #[test]
+    fn the_leave_sequence_begins_with_st_when_written_from_the_emergency_path() {
+        let bytes = emergency_sequence(true);
+        assert!(bytes.starts_with(b"\x1b\\"), "{bytes:?}");
+        assert!(bytes.ends_with(&leave_sequence()));
+        assert_eq!(bytes.len(), leave_sequence().len() + 2, "and nothing else");
+    }
+
+    #[test]
+    fn the_pane_pushes_no_keyboard_flags_under_tmux_and_pops_none() {
+        let find = |haystack: &[u8], needle: &[u8]| {
+            haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+        };
+        assert!(find(&enter_sequence_with(true), b"\x1b[>"));
+        assert!(!find(&enter_sequence_with(false), b"\x1b[>"));
+        assert!(find(&leave_sequence_with(true), b"\x1b[<u"));
+        assert!(!find(&leave_sequence_with(false), b"\x1b[<u"));
+        assert!(!find(&emergency_sequence(false), b"\x1b[<u"));
+        assert_eq!(enter_sequence(), enter_sequence_with(true));
+        assert_eq!(leave_sequence(), leave_sequence_with(true));
+    }
+
+    #[test]
+    fn the_cell_size_question_is_wrapped_under_tmux_and_bare_otherwise() {
+        assert_eq!(ask_cell_size(Wrap::None), ASK_CELL_SIZE.to_vec());
+        assert_eq!(
+            ask_cell_size(Wrap::Tmux),
+            b"\x1bPtmux;\x1b\x1b[16t\x1b\\".to_vec()
+        );
     }
 }

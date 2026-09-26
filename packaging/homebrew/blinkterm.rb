@@ -17,10 +17,12 @@ class Blinkterm < Formula
   # `brew audit --strict` checks components in, and it refuses the other.
   depends_on "rust" => :build
 
-  # It compiles for macOS (`cargo check --target x86_64-apple-darwin` is
-  # clean) but has never run there, and a formula that installs is a promise
-  # that it works. This line comes out when #21 has run the engine tests on a
-  # Mac; a macOS line in the caveats below goes in at the same time.
+  # main runs on macOS now (#21: ci.yml's `mac` job runs the engine tests on
+  # macos-15), but the stable spec above is v0.1.0, which predates that and
+  # cannot draw a frame there. This line comes out, and macos goes into
+  # homebrew.yml's matrix, with the first release that carries macOS support
+  # (RELEASING.md, "Homebrew"); a macOS line in the caveats below goes in at
+  # the same time.
   depends_on :linux
 
   def install

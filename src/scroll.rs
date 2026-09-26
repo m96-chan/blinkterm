@@ -952,9 +952,15 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
 
         let sent = recorder.sent.lock().expect("the recorder").clone();
+        // Every tick's time from the start, so that a failure on a machine
+        // nobody here can sit at says how the schedule slipped.
+        let times: Vec<u128> = sent
+            .iter()
+            .map(|(at, _)| at.duration_since(start).as_millis())
+            .collect();
         assert!(
             sent.len() >= 20,
-            "only {} ticks in 420 ms of {TICK:?}",
+            "only {} ticks in 420 ms of {TICK:?}, at {times:?} ms",
             sent.len()
         );
         let slack = Duration::from_millis(4);
@@ -967,7 +973,7 @@ mod tests {
             };
             assert!(
                 off <= slack,
-                "tick {} landed {off:?} from its schedule",
+                "tick {} landed {off:?} from its schedule; ticks at {times:?} ms",
                 n + 1
             );
             assert!(step.delta.1 > 0.0, "tick {} sent nothing", n + 1);

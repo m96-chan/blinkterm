@@ -50,6 +50,8 @@ options:
                    what pages are told the browser is
   --proxy <host:port|scheme://host:port|direct://>
                    send requests through a proxy (loopback never is)
+  --mute           start the engine silent (--mute-audio); pages play and
+                   cannot tell
   --home <url>     the page opened when no url is given (default: about:blank)
   --restore        reopen the tabs the last run had
   --normal-mode    start in normal mode (ctrl+., below)
@@ -58,8 +60,20 @@ options:
   --no-config      read no settings file
   --print-engine   print which engine would be run, and exit
   --doctor         start the engine, ask the terminal whether it speaks the
-                   Kitty graphics and keyboard protocols, print what was
-                   found, and exit; 1 if something is missing
+                   Kitty graphics and keyboard protocols and which route
+                   frames will take, print what was found, and exit; 1 if
+                   something is missing
+  --tmux <auto|on|off>
+                   wrap pictures for tmux's passthrough and draw them as
+                   unicode placeholders (at most 297 columns of picture).
+                   auto (the default) does when the terminal answers only
+                   through tmux
+  --frames <auto|raw|png>
+                   send frames as raw pixels, or as the engine's PNG as it
+                   came. auto (the default) is png over ssh and in tmux
+  --fps <n>        at most n frames a second, 1 to 60 (default: 60; 30 in
+                   tmux, 15 over ssh)
+  --no-probe       start without asking the terminal whether it draws
   --               everything after it is a url
 
 Several urls open one tab each, the first in front.
@@ -90,7 +104,11 @@ that name is taken, and the status row says so; the page stays where it was.
 Quitting cancels a download that is still coming.
 
 The terminal has to speak the Kitty graphics protocol, the Kitty keyboard
-protocol and SGR mouse reporting: a tOS pane, Kitty, WezTerm or Ghostty.
+protocol and SGR mouse reporting: a tOS pane, Kitty, WezTerm or Ghostty. It
+is asked before the engine is started, and a terminal that does not answer
+is told so in the shell. Inside tmux, set allow-passthrough on; keys then
+come in tmux's own encoding. Over ssh, frames go as PNG and come as fast as
+the link carries them.
 
 keys:
   ctrl+l         type a url; in the url bar, left/right, home/end, ctrl+a/e
@@ -119,6 +137,9 @@ keys:
                  link in a tab behind), j/k scroll a notch, d/u half a
                  screen, gg/G to the ends, H/L back and forward, r reload,
                  o the url bar, O a new tab, / find, i back to the page
+  alt+p          allow this site camera, microphone, location, notifications
+                 or clipboard: type the words, enter sets exactly those
+  esc            leave a page's fullscreen; stop a page that is loading
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no
 Everything else goes to the page. A link that asks for a new window gets a

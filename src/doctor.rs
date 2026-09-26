@@ -33,14 +33,32 @@
 //! DA1 is the sentinel. Every terminal answers it, in order, after whatever
 //! came before it; so the answers to the questions before it, if any, have
 //! arrived by the time it does, and a DA1 that does not come in two seconds
-//! means nothing on the other end is a terminal that answers — tmux without
-//! `allow-passthrough`, a `script(1)` log, a pipe.
+//! means nothing on the other end is a terminal that answers — a
+//! `script(1)` log, a pipe.
+//!
+//! # Asked before every run, and asked again through tmux
+//!
+//! A run asks the same questions before it starts the engine
+//! ([`probe`]): a terminal that cannot draw should cost a sentence in the
+//! shell, not a Chromium start and a blank pane. In tmux the first asking
+//! proves nothing either way — tmux answers DA1 itself, within a
+//! millisecond, and eats the graphics query without forwarding it,
+//! `allow-passthrough` or not — so when the environment says tmux (or
+//! screen) and the first stage heard no `OK`, the question is asked a second
+//! time wrapped for tmux's passthrough ([`ask_wrapped`]), under its own id
+//! ([`WRAPPED_QUERY_ID`]) so that the two answers are told apart in the same
+//! bytes. tmux does not answer a wrapped DA1; the terminal behind it does,
+//! and tmux forwards the answer, so the second stage has a sentinel of its
+//! own. With `allow-passthrough off` the wrapped questions go nowhere and
+//! the second stage waits out its two seconds. [`Verdict`] is what the two
+//! stages add up to, and [`crate::route::choose`] what a run makes of it.
 //!
 //! The graphics query is asked with `t=d` only. Measured against tOS's
 //! terminal, a `t=s` query answers `OK` without looking at the file, so a
-//! query cannot tell whether the terminal will *read* `/dev/shm`; what the
-//! doctor reports about `/dev/shm` is whether this side can write there,
-//! which is what [`crate::graphics::Painter::new`] decides on.
+//! query cannot tell whether the terminal will *read* shared memory; what
+//! the doctor reports about shared memory is whether this side can make a
+//! frame there — a file in `/dev/shm` on Linux, a `shm_open(3)` object on a
+//! Mac — which is what [`crate::graphics::Painter::new`] decides on.
 //!
 //! [`crate::input`] has no arm for an APC and drops the two `CSI ?` answers,
 //! rightly — the running program never wants them — so [`read_answer`]
@@ -49,7 +67,6 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::io::RawFd;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use tos_platform::tty::{self, RawMode, ReadOutcome};
@@ -71,6 +88,11 @@ pub const TERMINAL_TIMEOUT: Duration = Duration::from_secs(2);
 /// program's ([`crate::graphics::IMAGE_ID`]).
 pub const QUERY_ID: u32 = 31;
 
+/// The image id the *wrapped* query is asked under, so that the answer to
+/// the raw one and to the one that went through a multiplexer are told apart
+/// in the same bytes.
+pub const WRAPPED_QUERY_ID: u32 = 32;
+
 /// The graphics query, the keyboard query and DA1, in that order; see the
 /// module's section on them. [`ask`] puts the pane's own three in front.
 pub const ASK: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[?u\x1b[c";
@@ -85,6 +107,24 @@ pub fn ask() -> Vec<u8> {
     out
 }
 
+/// The second stage, for tmux: the graphics query under
+/// [`WRAPPED_QUERY_ID`], the cell size, `CSI ? u` and DA1, wrapped for its
+/// passthrough.
+///
+/// The cell size is asked here and not only by the pane: tmux swallows it
+/// bare, and a passthrough written in the same breath as the pane's
+/// `?1049h` never reaches the terminal — tmux drops a raw string while a
+/// redraw of the window is pending, which the alternate screen has just
+/// asked for (seen with tmux 3.4: the pane's wrapped `CSI 16 t` went
+/// nowhere, the probe's came back). Over ssh through tmux it is the only
+/// way the cell is known. Mouse and background are not asked: tmux drops
+/// both whatever is asked.
+pub fn ask_wrapped() -> Vec<u8> {
+    let query =
+        format!("\x1b_Gi={WRAPPED_QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[?u\x1b[c");
+    graphics::wrap_for_tmux(query.as_bytes())
+}
+
 /// What the bytes the terminal sent back say. Pure.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TerminalAnswer {
@@ -92,6 +132,9 @@ pub struct TerminalAnswer {
     /// `EBADF:…`, `EINVAL:…` — and `None` when no answer for [`QUERY_ID`]
     /// came.
     pub graphics: Option<Result<(), String>>,
+    /// The same for [`WRAPPED_QUERY_ID`]: the answer that came through a
+    /// multiplexer's passthrough, when one did.
+    pub wrapped_graphics: Option<Result<(), String>>,
     /// The flags in `CSI ? <n> u`, `None` when it did not come.
     pub keyboard: Option<u32>,
     /// Whether `CSI ? … c` came: the sentinel.
@@ -117,8 +160,14 @@ pub fn read_answer(bytes: &[u8]) -> TerminalAnswer {
                 break;
             };
             let command = &body[..end];
-            if let Some(result) = graphics_answer(command) {
-                answer.graphics.get_or_insert(result);
+            match graphics_answer(command) {
+                Some((QUERY_ID, result)) => {
+                    answer.graphics.get_or_insert(result);
+                }
+                Some((_, result)) => {
+                    answer.wrapped_graphics.get_or_insert(result);
+                }
+                None => {}
             }
             i += 3 + end + 2;
             continue;
@@ -154,22 +203,22 @@ pub fn read_answer(bytes: &[u8]) -> TerminalAnswer {
     answer
 }
 
-/// The control data and payload of one graphics answer, when it is the
-/// answer to [`QUERY_ID`].
-fn graphics_answer(command: &[u8]) -> Option<Result<(), String>> {
+/// The id and payload of one graphics answer, when it is the answer to
+/// [`QUERY_ID`] or [`WRAPPED_QUERY_ID`].
+fn graphics_answer(command: &[u8]) -> Option<(u32, Result<(), String>)> {
     let text = String::from_utf8_lossy(command);
     let (control, payload) = text.split_once(';')?;
-    let ours = control
-        .split(',')
-        .any(|pair| pair == format!("i={QUERY_ID}"));
-    if !ours {
-        return None;
-    }
-    Some(if payload == "OK" {
-        Ok(())
-    } else {
-        Err(crate::text::sanitize(payload).into_owned())
-    })
+    let id = [QUERY_ID, WRAPPED_QUERY_ID]
+        .into_iter()
+        .find(|id| control.split(',').any(|pair| pair == format!("i={id}")))?;
+    Some((
+        id,
+        if payload == "OK" {
+            Ok(())
+        } else {
+            Err(crate::text::sanitize(payload).into_owned())
+        },
+    ))
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -188,9 +237,16 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// terminal at rest.
 pub fn ask_terminal(input: RawFd, timeout: Duration) -> io::Result<TerminalAnswer> {
     let _raw = RawMode::acquire(input)?;
+    Ok(read_answer(&listen(input, &ask(), timeout)?))
+}
+
+/// Write `questions` to stdout and gather what comes back on `input` until
+/// a DA1 is among it or `timeout`. The caller holds raw mode.
+fn listen(input: RawFd, questions: &[u8], timeout: Duration) -> io::Result<Vec<u8>> {
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&ask())?;
+    stdout.write_all(questions)?;
     stdout.flush()?;
+    drop(stdout);
     let deadline = Instant::now() + timeout;
     let mut heard = Vec::new();
     let mut buf = [0u8; 4096];
@@ -212,11 +268,113 @@ pub fn ask_terminal(input: RawFd, timeout: Duration) -> io::Result<TerminalAnswe
             break;
         }
     }
-    Ok(read_answer(&heard))
+    Ok(heard)
 }
 
-/// The column the facts start in, after their names.
-const LABEL: usize = 11;
+/// What the terminal, or the thing in front of it, turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The raw query was answered `OK`: a Kitty, WezTerm, Ghostty or tOS
+    /// pane, whatever the environment says.
+    Direct,
+    /// The raw query went unanswered and the wrapped one was answered `OK`:
+    /// the terminal behind tmux draws, and `allow-passthrough` is on.
+    ThroughTmux,
+    /// A DA1 came and no `OK` either way: a terminal that does not speak the
+    /// protocol, or tmux with passthrough off in front of one that does —
+    /// [`refusal`] says which from the environment.
+    NoGraphics,
+    /// Nothing came in the time: a log, a pipe, a serial line.
+    NoAnswer,
+    /// `--no-probe`: assumed to draw; nothing was asked.
+    Skipped,
+}
+
+impl Verdict {
+    /// Whether a run goes ahead on this verdict.
+    pub fn draws(self) -> bool {
+        matches!(
+            self,
+            Verdict::Direct | Verdict::ThroughTmux | Verdict::Skipped
+        )
+    }
+}
+
+/// What the answers of both stages add up to. Pure.
+pub fn judge(answer: &TerminalAnswer) -> Verdict {
+    if answer.graphics == Some(Ok(())) {
+        Verdict::Direct
+    } else if answer.wrapped_graphics == Some(Ok(())) {
+        Verdict::ThroughTmux
+    } else if answer.da1 {
+        Verdict::NoGraphics
+    } else {
+        Verdict::NoAnswer
+    }
+}
+
+/// The two stages, on stdout and `input`, in raw mode for their duration:
+/// [`ask`] always, and [`ask_wrapped`] when `try_wrapped` — the environment
+/// says tmux or screen — and the first stage heard no `OK`. Each waits for
+/// its own DA1 or `timeout`. Keys typed meanwhile are read and dropped, as
+/// `--doctor` drops them.
+///
+/// Fails only when `input` is not a terminal (raw mode cannot be had) or
+/// stdout cannot be written, which a run would have failed on next anyway.
+pub fn probe(
+    input: RawFd,
+    try_wrapped: bool,
+    timeout: Duration,
+) -> io::Result<(Verdict, TerminalAnswer)> {
+    let _raw = RawMode::acquire(input)?;
+    let mut answer = read_answer(&listen(input, &ask(), timeout)?);
+    if try_wrapped && answer.graphics != Some(Ok(())) {
+        let wrapped = read_answer(&listen(input, &ask_wrapped(), timeout)?);
+        answer.wrapped_graphics = wrapped.wrapped_graphics;
+        answer.keyboard = answer.keyboard.or(wrapped.keyboard);
+        answer.cell = answer.cell.or(wrapped.cell);
+        answer.da1 |= wrapped.da1;
+    }
+    Ok((judge(&answer), answer))
+}
+
+/// The sentence a run ends with when the terminal cannot draw; `None` when
+/// it can. Plain text, one line, naming what to do.
+pub fn refusal(verdict: Verdict, env: &crate::route::Env) -> Option<String> {
+    match verdict {
+        Verdict::Direct | Verdict::ThroughTmux | Verdict::Skipped => None,
+        Verdict::NoGraphics if env.tmux => Some(
+            "the terminal behind tmux does not draw pictures, or tmux's allow-passthrough \
+             is off: set 'allow-passthrough on' in tmux.conf, and run inside a Kitty, \
+             WezTerm, Ghostty or tOS pane"
+                .to_string(),
+        ),
+        Verdict::NoGraphics if env.screen => Some(
+            "GNU screen is between this program and the terminal and does not pass \
+             pictures through; run outside screen"
+                .to_string(),
+        ),
+        Verdict::NoGraphics => Some(format!(
+            "this terminal (TERM={}) does not speak the Kitty graphics protocol; blinkterm \
+             needs a Kitty, WezTerm, Ghostty or tOS pane. --doctor says what was asked \
+             and answered",
+            if env.term.is_empty() {
+                "unset"
+            } else {
+                env.term.as_str()
+            }
+        )),
+        Verdict::NoAnswer => Some(format!(
+            "nothing answered the terminal in {} s: not a terminal that answers queries \
+             (a log? a pipe?); --no-probe skips this check",
+            TERMINAL_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// The column the facts start in, after their names: one past the widest,
+/// `shared memory:`.
+const LABEL: usize = 15;
 
 /// One fact, its name in the margin.
 fn say(name: &str, fact: &str) {
@@ -258,7 +416,7 @@ pub fn report(options: &Options, provenance: &Provenance) -> bool {
         Err(why) => say("downloads", &why),
     }
     shm_line();
-    let terminal_ok = terminal_lines();
+    let terminal_ok = terminal_lines(options);
     engine_ok && terminal_ok
 }
 
@@ -361,60 +519,95 @@ fn profile_line(choice: &profile::Choice) {
 }
 
 fn shm_line() {
-    let probe =
-        Path::new(graphics::SHM_DIR).join(format!("blinkterm-{}-doctor", std::process::id()));
-    match std::fs::write(&probe, b"probe") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            say("/dev/shm", "writable, so frames go as t=s");
-        }
+    let name = format!("blinkterm-{}-doctor", std::process::id());
+    match graphics::probe_shared_memory(&name) {
+        Ok(()) => say(
+            "shared memory",
+            &format!("{}, so frames go as t=s", graphics::SHM_HOW),
+        ),
         Err(e) => say(
-            "/dev/shm",
-            &format!("not writable ({e}), so frames go inline as base64"),
+            "shared memory",
+            &format!(
+                "{} ({e}), so frames go inline as base64",
+                graphics::SHM_HOW_NOT
+            ),
         ),
     }
 }
 
-fn terminal_lines() -> bool {
+fn terminal_lines(options: &Options) -> bool {
     if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
         say("terminal", "stdin/stdout is not a terminal; nothing asked");
         return true;
     }
-    let answer = match ask_terminal(0, TERMINAL_TIMEOUT) {
-        Ok(answer) => answer,
+    let env = crate::route::Env::current();
+    let (verdict, answer) = match probe(0, env.tmux || env.screen, TERMINAL_TIMEOUT) {
+        Ok(heard) => heard,
         Err(e) => {
             say("terminal", &format!("cannot ask: {e}"));
             return false;
         }
     };
-    if !answer.da1 && answer.graphics.is_none() && answer.keyboard.is_none() {
-        say(
-            "terminal",
-            &format!(
-                "no answer in {} s: not a terminal that answers queries \
-                 (tmux without allow-passthrough? a log?)",
-                TERMINAL_TIMEOUT.as_secs()
-            ),
-        );
-        return false;
+    let route = crate::route::choose(
+        &env,
+        options.route,
+        verdict,
+        graphics::Painter::shm_usable(),
+    );
+    let cells = tty::terminal_size(1)
+        .ok()
+        .map(|size| (u32::from(size.cols), u32::from(size.rows)));
+    let facts = terminal_facts(verdict, &answer, &env, &route, cells);
+    let mut facts = facts.iter();
+    if let Some(first) = facts.next() {
+        say("terminal", first);
     }
-    let graphics = match &answer.graphics {
-        Some(Ok(())) => "yes".to_string(),
-        Some(Err(why)) => format!("no ({why})"),
-        None => "no (no answer to the query)".to_string(),
-    };
-    say("terminal", &format!("graphics protocol: {graphics}"));
-    more(&match answer.keyboard {
+    for fact in facts {
+        more(fact);
+    }
+    matches!(verdict, Verdict::Direct | Verdict::ThroughTmux)
+}
+
+/// The terminal's lines, the first under the `terminal:` label: what was
+/// heard, and the route a run would take on it. Pure, so that what the doctor
+/// says about tmux is a test rather than a hope.
+pub fn terminal_facts(
+    verdict: Verdict,
+    answer: &TerminalAnswer,
+    env: &crate::route::Env,
+    route: &crate::route::Route,
+    cells: Option<(u32, u32)>,
+) -> Vec<String> {
+    if verdict == Verdict::NoAnswer {
+        return vec![format!(
+            "no answer in {} s: not a terminal that answers queries (a log? a pipe?)",
+            TERMINAL_TIMEOUT.as_secs()
+        )];
+    }
+    let tmux = route.wrap == crate::route::Wrap::Tmux;
+    let mut facts = Vec::new();
+    facts.push(match (verdict, &answer.graphics) {
+        (Verdict::Direct, _) => "graphics protocol: yes".to_string(),
+        (Verdict::ThroughTmux, _) => "graphics protocol: yes, through tmux passthrough".to_string(),
+        (_, Some(Err(why))) => format!("graphics protocol: no ({why})"),
+        _ if env.tmux => "graphics protocol: no (no answer raw or through tmux; \
+                          is allow-passthrough on?)"
+            .to_string(),
+        _ => "graphics protocol: no (no answer to the query)".to_string(),
+    });
+    facts.push(match answer.keyboard {
+        _ if tmux => "keyboard protocol: not used inside tmux (tmux re-encodes keys)".to_string(),
         Some(0) => "keyboard protocol: yes (no flags pushed)".to_string(),
         Some(flags) => format!("keyboard protocol: yes (flags {flags} pushed)"),
         None => "keyboard protocol: no (no answer to CSI ? u)".to_string(),
     });
-    more(&match answer.pixel_mouse {
+    facts.push(match answer.pixel_mouse {
+        _ if tmux => "mouse in pixels: no (cells; tmux)".to_string(),
         Some(1..=3) => "mouse in pixels: yes".to_string(),
         _ => "mouse in pixels: no (cells)".to_string(),
     });
-    if let Some(rgb) = answer.background {
-        more(&format!(
+    match answer.background {
+        Some(rgb) => facts.push(format!(
             "background: #{:02x}{:02x}{:02x}, {}",
             rgb.0,
             rgb.1,
@@ -424,22 +617,22 @@ fn terminal_lines() -> bool {
             } else {
                 "light"
             }
-        ));
+        )),
+        None if env.tmux => facts.push("background: not answered (tmux)".to_string()),
+        None => {}
     }
-    let cells = tty::terminal_size(1).ok();
     match (answer.cell, cells) {
-        (Some((w, h)), Some(size)) => more(&format!(
-            "cell: {w}x{h} px, {}x{} cells",
-            size.cols, size.rows
-        )),
-        (Some((w, h)), None) => more(&format!("cell: {w}x{h} px")),
-        (None, Some(size)) => more(&format!(
-            "cell: not answered, {}x{} cells",
-            size.cols, size.rows
-        )),
+        (Some((w, h)), Some((cols, rows))) => {
+            facts.push(format!("cell: {w}x{h} px, {cols}x{rows} cells"))
+        }
+        (Some((w, h)), None) => facts.push(format!("cell: {w}x{h} px")),
+        (None, Some((cols, rows))) => {
+            facts.push(format!("cell: not answered, {cols}x{rows} cells"))
+        }
         (None, None) => {}
     }
-    matches!(answer.graphics, Some(Ok(())))
+    facts.push(format!("route: {}", route.describe()));
+    facts
 }
 
 #[cfg(test)]
@@ -511,5 +704,156 @@ mod tests {
         assert!(answer.pixel_mouse.is_some(), "{bytes:?}");
         assert!(answer.background.is_some(), "{bytes:?}");
         assert_eq!(answer.cell, Some((width, height)));
+    }
+
+    use crate::route::{self, Env};
+
+    fn in_tmux() -> Env {
+        Env {
+            tmux: true,
+            term: "tmux-256color".to_string(),
+            ..Env::default()
+        }
+    }
+
+    #[test]
+    fn the_wrapped_query_is_the_raw_one_with_id_thirty_two_inside_a_dcs_with_every_escape_doubled()
+    {
+        let wrapped = ask_wrapped();
+        assert!(wrapped.starts_with(b"\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA"));
+        assert!(wrapped.ends_with(b"\x1b\x1b[16t\x1b\x1b[?u\x1b\x1b[c\x1b\\"));
+        let unwrapped = graphics::tests::tmux_unwrap(&wrapped);
+        let asked = String::from_utf8(ASK.to_vec()).unwrap();
+        let asked = asked
+            .replace("i=31,", "i=32,")
+            .replace("\x1b[?u", "\x1b[16t\x1b[?u");
+        assert_eq!(unwrapped, asked.into_bytes());
+        // And a terminal behind tmux answers it under its own id.
+        let mut terminal = terminal();
+        terminal.advance(&unwrapped);
+        let answer = read_answer(&terminal.take_output());
+        assert_eq!(answer.wrapped_graphics, Some(Ok(())));
+        assert_eq!(answer.graphics, None);
+        assert!(answer.cell.is_some(), "the cell, which tmux swallows bare");
+        assert!(answer.da1);
+    }
+
+    #[test]
+    fn an_answer_for_id_thirty_two_is_the_wrapped_answer_and_does_not_count_as_the_raw_one() {
+        let answer = read_answer(b"\x1b_Gi=32;OK\x1b\\\x1b[?62;22c");
+        assert_eq!(answer.wrapped_graphics, Some(Ok(())));
+        assert_eq!(answer.graphics, None);
+        let both = read_answer(b"\x1b_Gi=31;ENOENT:x\x1b\\\x1b_Gi=32;OK\x1b\\\x1b[?62c");
+        assert_eq!(both.graphics, Some(Err("ENOENT:x".to_string())));
+        assert_eq!(both.wrapped_graphics, Some(Ok(())));
+    }
+
+    #[test]
+    fn a_raw_da1_with_no_graphics_answer_and_a_wrapped_ok_is_through_tmux() {
+        // Stage one: tmux answers DA1 itself and nothing else. Stage two: the
+        // terminal behind it, forwarded.
+        let mut answer = read_answer(b"\x1b[?1;2;4c");
+        let wrapped = read_answer(b"\x1b_Gi=32;OK\x1b\\\x1b[?0u\x1b[?62;22c");
+        answer.wrapped_graphics = wrapped.wrapped_graphics;
+        assert_eq!(judge(&answer), Verdict::ThroughTmux);
+    }
+
+    #[test]
+    fn a_raw_ok_is_direct_even_when_tmux_is_in_the_environment() {
+        let answer = read_answer(b"\x1b_Gi=31;OK\x1b\\\x1b[?0u\x1b[?62;22c");
+        assert_eq!(judge(&answer), Verdict::Direct);
+        assert_eq!(refusal(Verdict::Direct, &in_tmux()), None);
+    }
+
+    #[test]
+    fn da1_and_no_ok_either_way_is_no_graphics_and_silence_is_no_answer() {
+        assert_eq!(judge(&read_answer(b"\x1b[?62;22c")), Verdict::NoGraphics);
+        assert_eq!(
+            judge(&read_answer(b"\x1b_Gi=31;EINVAL:no\x1b\\\x1b[?62c")),
+            Verdict::NoGraphics
+        );
+        assert_eq!(judge(&read_answer(b"")), Verdict::NoAnswer);
+        assert!(!Verdict::NoGraphics.draws() && !Verdict::NoAnswer.draws());
+        assert!(Verdict::Skipped.draws(), "--no-probe assumes it draws");
+    }
+
+    #[test]
+    fn the_refusal_names_tmux_when_tmux_is_in_the_environment_and_screen_when_screen_is() {
+        let tmux = refusal(Verdict::NoGraphics, &in_tmux()).expect("a refusal");
+        assert!(tmux.contains("allow-passthrough on"), "{tmux}");
+        let screen = Env {
+            screen: true,
+            ..Env::default()
+        };
+        let screen = refusal(Verdict::NoGraphics, &screen).expect("a refusal");
+        assert!(screen.contains("GNU screen"), "{screen}");
+        let silent = refusal(Verdict::NoAnswer, &Env::default()).expect("a refusal");
+        assert!(silent.contains("--no-probe"), "{silent}");
+        for sentence in [&tmux, &screen, &silent] {
+            assert!(!sentence.contains('\n'), "one line: {sentence}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_quotes_term_and_names_the_four_terminals_otherwise() {
+        let env = Env {
+            term: "xterm-256color".to_string(),
+            ..Env::default()
+        };
+        let why = refusal(Verdict::NoGraphics, &env).expect("a refusal");
+        assert!(why.contains("TERM=xterm-256color"), "{why}");
+        for name in ["Kitty", "WezTerm", "Ghostty", "tOS"] {
+            assert!(why.contains(name), "{why}");
+        }
+        assert!(why.contains("--doctor"), "{why}");
+    }
+
+    #[test]
+    fn the_doctor_prints_the_route_the_run_would_take() {
+        let env = in_tmux();
+        let mut answer = read_answer(b"\x1b[?1;2;4c\x1b[6;16;8t");
+        answer.wrapped_graphics = Some(Ok(()));
+        let verdict = judge(&answer);
+        let route = route::choose(&env, route::Choices::default(), verdict, true);
+        let facts = terminal_facts(verdict, &answer, &env, &route, Some((100, 30)));
+        assert_eq!(
+            facts,
+            [
+                "graphics protocol: yes, through tmux passthrough",
+                "keyboard protocol: not used inside tmux (tmux re-encodes keys)",
+                "mouse in pixels: no (cells; tmux)",
+                "background: not answered (tmux)",
+                "cell: 8x16 px, 100x30 cells",
+                "route: png frames, unicode placeholders, wrapped for tmux, inline, 30 fps cap",
+            ]
+        );
+
+        let direct = read_answer(b"\x1b_Gi=31;OK\x1b\\\x1b[?0u\x1b[?62c");
+        let route = route::choose(
+            &Env::default(),
+            route::Choices::default(),
+            Verdict::Direct,
+            true,
+        );
+        let facts = terminal_facts(Verdict::Direct, &direct, &Env::default(), &route, None);
+        assert_eq!(facts[0], "graphics protocol: yes");
+        assert_eq!(facts[1], "keyboard protocol: yes (no flags pushed)");
+        assert!(
+            facts.last().unwrap().starts_with("route: raw frames"),
+            "{facts:?}"
+        );
+
+        let silent = terminal_facts(
+            Verdict::NoAnswer,
+            &TerminalAnswer::default(),
+            &env,
+            &route,
+            None,
+        );
+        assert_eq!(silent.len(), 1);
+        assert!(
+            !silent[0].contains("tmux"),
+            "tmux answers; it is not the silent one"
+        );
     }
 }

@@ -3,8 +3,11 @@
 # `check` is the ordinary one: format, lints, docs, and the tests that need
 # nothing installed. `engine` is the reason this crate left the tOS repository
 # -- tOS's CI has no Chromium and is not going to grow one, and the tests in
-# tests/engine.rs are worth nothing without a real engine behind them. `msrv`
-# holds the `rust-version` in Cargo.toml to something true. `tools` checks the
+# tests/engine.rs are worth nothing without a real engine behind them. (A
+# `mac` job running them on macOS is #46: the hosted macos-15 runner
+# oversleeps every timed wait, so the timing tests cannot pass there as they
+# stand.) `msrv` holds the
+# `rust-version` in Cargo.toml to something true. `tools` checks the
 # proof-of-concept scripts, which are the other half of the repository and were
 # until now the half nothing looked at.
 name: CI
@@ -100,6 +103,12 @@ jobs:
       # tree, and whether the program works is `check`'s and `engine`'s
       # business on a toolchain that can run them faster.
       - run: cargo check --all-targets --locked
+      # The macOS-only code (`cfg(not(target_os = "linux"))` in graphics.rs
+      # and engine.rs) is compiled by no Linux job; this checks it on the
+      # floor too. A `check` needs no SDK -- nothing is linked -- and until
+      # there is a Mac job (#46) it is the only thing that builds that code.
+      - run: rustup target add aarch64-apple-darwin
+      - run: cargo check --target aarch64-apple-darwin --all-targets --locked
       # The README tells people which Rust to install, and it said 1.75 for as
       # long as Cargo.toml did. Fixing one and not the other is the same bug
       # again, so every "Rust <x>.<y>" in the README has to be this job's

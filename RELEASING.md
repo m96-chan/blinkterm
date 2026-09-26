@@ -70,8 +70,12 @@ $EDITOR packaging/homebrew/blinkterm.rb
 #   above `license "MIT"`:
 #     url "https://github.com/m96-chan/blinkterm/archive/refs/tags/vX.Y.Z.tar.gz"
 #     sha256 "<the sum>"
-#   `head` stays. Land it through a pull request: the Homebrew workflow
-#   installs the stable spec now that there is one, then HEAD.
+#   `head` stays. With the first release that carries macOS support
+#   (#46), also remove `depends_on :linux` (and its comment), add a macOS
+#   line to the caveats, and add `macos-15` back to the `os:` matrix in
+#   .github/workflows/homebrew.yml. Land it through a pull request: the
+#   Homebrew workflow installs the stable spec now that there is one, then
+#   HEAD.
 
 # 5. copy it to the tap
 git clone https://github.com/m96-chan/homebrew-tap

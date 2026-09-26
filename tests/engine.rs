@@ -38,6 +38,7 @@ use blinkterm::json::Json;
 use blinkterm::keys;
 use blinkterm::motion::{self, Motion};
 use blinkterm::profile::{Choice, Profile};
+use blinkterm::route::{Payload, Placement, Route, Wrap};
 use blinkterm::scroll::{self, Animator, Dispatch, Step, Wheel};
 use blinkterm::tabs::{Outcome, Tab, Tabs};
 use tos_compositor::ImageFiles;
@@ -1478,6 +1479,7 @@ fn killing_the_engine_leaves_nothing_of_its_process_group() {
 /// process in the engine's group holds, against every TCP socket in the
 /// `LISTEN` state (`0A` in `/proc/net/tcp`). A machine with no IPv6 has no
 /// `/proc/net/tcp6`, and that is read as no listeners rather than an error.
+/// A Mac has no `/proc`, and asks `lsof(8)` the same question.
 #[test]
 fn the_engine_listens_on_no_port() {
     let Some((engine, mut client)) = connect() else {
@@ -1494,25 +1496,10 @@ fn the_engine_listens_on_no_port() {
         describe(&members)
     );
 
-    let listening: std::collections::HashSet<u64> = ["/proc/net/tcp", "/proc/net/tcp6"]
-        .iter()
-        .flat_map(|table| listening_inodes(table))
-        .collect();
-    let mut sockets = 0;
-    let mut found = Vec::new();
-    for (pid, command) in &members {
-        for inode in socket_inodes(*pid) {
-            sockets += 1;
-            if listening.contains(&inode) {
-                found.push(format!("{pid} ({command}) listens on socket:[{inode}]"));
-            }
-        }
-    }
+    let (census, found) = listening_sockets_of(group, &members);
     eprintln!(
-        "group {group}: {} processes, {sockets} sockets between them, {} listening sockets \
-         on the machine, {} of them the engine's",
+        "group {group}: {} processes, {census}, {} of them the engine's",
         members.len(),
-        listening.len(),
         found.len()
     );
     assert!(found.is_empty(), "the engine is listening: {found:?}");
@@ -1521,7 +1508,69 @@ fn the_engine_listens_on_no_port() {
     drop(engine);
 }
 
+/// Which of `members` listen on a TCP socket, one sentence each, and a
+/// count of what was looked at for the log.
+#[cfg(target_os = "linux")]
+fn listening_sockets_of(_group: i32, members: &[(i32, String)]) -> (String, Vec<String>) {
+    let listening: std::collections::HashSet<u64> = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .flat_map(|table| listening_inodes(table))
+        .collect();
+    let mut sockets = 0;
+    let mut found = Vec::new();
+    for (pid, command) in members {
+        for inode in socket_inodes(*pid) {
+            sockets += 1;
+            if listening.contains(&inode) {
+                found.push(format!("{pid} ({command}) listens on socket:[{inode}]"));
+            }
+        }
+    }
+    let census = format!(
+        "{sockets} sockets between them, {} listening sockets on the machine",
+        listening.len()
+    );
+    (census, found)
+}
+
+/// The same from `lsof(8)`, which is how a Mac lists sockets: every TCP
+/// socket in `LISTEN` held by a process in `group` (`-a` ands the three
+/// selections), as `p<pid>` and `n<address>` lines. Nothing matching is an
+/// exit status of 1 with nothing on either stream; anything else on stderr
+/// is `lsof` failing, which must not read as a pass.
+#[cfg(not(target_os = "linux"))]
+fn listening_sockets_of(group: i32, members: &[(i32, String)]) -> (String, Vec<String>) {
+    let out = std::process::Command::new("lsof")
+        .args(["-nP", "-a", "-iTCP", "-sTCP:LISTEN"])
+        .arg(format!("-g{group}"))
+        .args(["-F", "pn"])
+        .output()
+        .expect("lsof runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() || (stdout.trim().is_empty() && stderr.trim().is_empty()),
+        "lsof failed ({}): {stderr}",
+        out.status
+    );
+    let mut pid = None;
+    let mut found = Vec::new();
+    for line in stdout.lines() {
+        if let Some(number) = line.strip_prefix('p') {
+            pid = number.parse::<i32>().ok();
+        } else if let Some(address) = line.strip_prefix('n') {
+            let command = members
+                .iter()
+                .find(|(member, _)| Some(*member) == pid)
+                .map_or("?", |(_, command)| command.as_str());
+            found.push(format!("{pid:?} ({command}) listens on {address}"));
+        }
+    }
+    (format!("lsof -g{group} asked"), found)
+}
+
 /// The inodes of the sockets in `LISTEN` in one of `/proc/net/tcp{,6}`.
+#[cfg(target_os = "linux")]
 fn listening_inodes(table: &str) -> Vec<u64> {
     let Ok(text) = std::fs::read_to_string(table) else {
         return Vec::new();
@@ -1539,6 +1588,7 @@ fn listening_inodes(table: &str) -> Vec<u64> {
 }
 
 /// The inodes of every socket `pid` holds a descriptor to.
+#[cfg(target_os = "linux")]
 fn socket_inodes(pid: i32) -> Vec<u64> {
     let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
         return Vec::new();
@@ -1563,6 +1613,7 @@ fn socket_inodes(pid: i32) -> Vec<u64> {
 /// group as far as the kernel is concerned, and is not what this is looking
 /// for: the browser this test is about reparents to init, which reaps it in
 /// its own time. So state `Z` is not a member here.
+#[cfg(target_os = "linux")]
 fn group_members(group: i32) -> Vec<(i32, String)> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -1584,11 +1635,46 @@ fn group_members(group: i32) -> Vec<(i32, String)> {
     found
 }
 
+/// The same from `ps(1)`, which is how a Mac reads its process table:
+/// `-axo pid=,pgid=,stat=,command=` is one line a process, no header, and a
+/// `Z` at the front of `stat` is a zombie here as it is in `/proc`.
+#[cfg(not(target_os = "linux"))]
+fn group_members(group: i32) -> Vec<(i32, String)> {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,pgid=,stat=,command="])
+        .output()
+        .expect("ps runs");
+    let mut found: Vec<(i32, String)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid: i32 = fields.next()?.parse().ok()?;
+            let pgid: i32 = fields.next()?.parse().ok()?;
+            let state = fields.next()?;
+            (pgid == group && !state.starts_with('Z')).then(|| {
+                let line = fields.collect::<Vec<_>>().join(" ");
+                (pid, shorten(line))
+            })
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 /// The group this test process is in, read the same way as anybody else's.
+#[cfg(target_os = "linux")]
 fn own_group() -> i32 {
     state_and_group(std::path::Path::new("/proc/self"))
         .expect("this process has a /proc entry")
         .1
+}
+
+/// The group this test process is in, from the kernel, there being no
+/// `/proc` to read it the way anybody else's is read.
+#[cfg(not(target_os = "linux"))]
+fn own_group() -> i32 {
+    // SAFETY: `getpgrp(2)` takes nothing, reads no memory and cannot fail.
+    unsafe { libc::getpgrp() }
 }
 
 /// The run state and process group out of `/proc/<pid>/stat`.
@@ -1596,6 +1682,7 @@ fn own_group() -> i32 {
 /// The second field is the command in brackets and may contain spaces and
 /// brackets of its own, so the fields are counted from the last `)` rather
 /// than from the start of the line.
+#[cfg(target_os = "linux")]
 fn state_and_group(dir: &std::path::Path) -> Option<(char, i32)> {
     let text = std::fs::read_to_string(dir.join("stat")).ok()?;
     let after_command = &text[text.rfind(')')? + 1..];
@@ -1607,12 +1694,17 @@ fn state_and_group(dir: &std::path::Path) -> Option<(char, i32)> {
 }
 
 /// What a process was started as, short enough to put in a failure.
+#[cfg(target_os = "linux")]
 fn command_of(dir: &std::path::Path) -> String {
     let Ok(raw) = std::fs::read(dir.join("cmdline")) else {
         return String::from("(gone)");
     };
     let line = String::from_utf8_lossy(&raw).replace('\0', " ");
-    let line = line.trim().to_string();
+    shorten(line.trim().to_string())
+}
+
+/// A command line cut to ninety characters, for a failure message.
+fn shorten(line: String) -> String {
     match line.char_indices().nth(90) {
         Some((at, _)) => format!("{}...", &line[..at]),
         None => line,
@@ -7114,6 +7206,7 @@ fn a_crashed_page_keeps_its_tab_and_a_reload_brings_it_back_casting() {
             rows: HEIGHT / CELL.1 + 1,
             cell: CELL,
         },
+        motion::Cast::default(),
     );
     let after = frames_in(&mut tab.connection, Duration::from_secs(1));
     eprintln!("frames in a second after revive: {after}");
@@ -7487,7 +7580,14 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         engine,
         mut browser,
         mut tabs,
-    } = blinkterm::app::boot(profile, &launch, &downloads, &appearance).expect("the engine boots");
+    } = blinkterm::app::boot(
+        profile,
+        &launch,
+        &downloads,
+        &appearance,
+        &Allowed::in_memory(),
+    )
+    .expect("the engine boots");
     let base = serve();
 
     // Three tabs, as the program would have them once each had landed: the
@@ -7561,8 +7661,14 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         mut engine,
         mut browser,
         mut tabs,
-    } = blinkterm::app::boot(profile, &launch, &downloads, &appearance)
-        .expect("a second engine on the same profile");
+    } = blinkterm::app::boot(
+        profile,
+        &launch,
+        &downloads,
+        &appearance,
+        &Allowed::in_memory(),
+    )
+    .expect("a second engine on the same profile");
     blinkterm::app::restore_tabs(&mut tabs, &mut browser, &appearance, snapshot.clone());
     let took = started.elapsed();
     eprintln!("second engine up with the tabs back in {took:?}");
@@ -7665,4 +7771,758 @@ fn an_engine_retired_alive_is_stopped_and_its_profile_is_free_to_start_another()
     assert!(engine.check().is_ok());
     engine.kill();
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// Sound, permissions and fullscreen (#20)
+// ---------------------------------------------------------------------------
+
+use blinkterm::fullscreen::{self, Heard};
+use blinkterm::permissions::{self, Allowed, Permission};
+
+/// A page with a button that takes a box fullscreen, or lets it go.
+const FULLSCREEN_PAGE: &str = "<!doctype html><title>fs</title>\
+    <body style='margin:0;background:#fff'>\
+    <div id=box style='width:200px;height:100px;background:#c33'></div>\
+    <button id=go style='position:absolute;left:0;top:200px;width:100px;height:40px'>go</button>\
+    <script>document.getElementById('go').onclick = function () {\
+    if (document.fullscreenElement) document.exitFullscreen();\
+    else document.getElementById('box').requestFullscreen(); };</script>";
+
+/// A page with an `<audio>` of [`tone`], not playing.
+const AUDIO_PAGE: &str = "<!doctype html><title>audio</title>\
+    <body style='margin:0'><audio id=a src='/tone.wav'></audio>";
+
+/// Two seconds of a 440 Hz tone, 8 kHz mono 16-bit PCM, as a WAV: a few
+/// lines of packing rather than a file in the repository.
+fn tone() -> Vec<u8> {
+    let rate: u32 = 8000;
+    let samples: Vec<i16> = (0..rate * 2)
+        .map(|n| {
+            let t = n as f64 / rate as f64;
+            ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16
+        })
+        .collect();
+    let data = (samples.len() * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + data as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * 2).to_le_bytes()); // bytes a second
+    wav.extend_from_slice(&2u16.to_le_bytes()); // bytes a frame
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits a sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data.to_le_bytes());
+    for sample in samples {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
+}
+
+/// Serve [`FULLSCREEN_PAGE`] at `/fs`, [`AUDIO_PAGE`] at `/audio`, the tone
+/// at `/tone.wav` and [`PLAIN_PAGE`] for anything else, on a loopback port:
+/// an origin, which a `data:` page is not and the engine grants nothing to.
+/// The origin comes back without a trailing slash, as
+/// [`permissions::origin_of`] writes one.
+fn serve_media() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
+    let address = listener.local_addr().expect("an address");
+    let wav = tone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = [0u8; 2048];
+            let read = stream.read(&mut head).unwrap_or(0);
+            let request = String::from_utf8_lossy(&head[..read]).to_string();
+            let (kind, body): (&str, &[u8]) = if request.starts_with("GET /fs") {
+                ("text/html", FULLSCREEN_PAGE.as_bytes())
+            } else if request.starts_with("GET /audio") {
+                ("text/html", AUDIO_PAGE.as_bytes())
+            } else if request.starts_with("GET /tone.wav") {
+                ("audio/wav", &wav)
+            } else {
+                ("text/html", PLAIN_PAGE.as_bytes())
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    format!("http://{address}")
+}
+
+/// Evaluate an expression whose value is a promise, and hand back what it
+/// resolved to.
+fn evaluate_awaited(client: &mut Client, expression: &str) -> Json {
+    client
+        .call_within(
+            "Runtime.evaluate",
+            Json::object(vec![
+                ("expression", Json::string(expression)),
+                ("awaitPromise", Json::Bool(true)),
+                ("returnByValue", Json::Bool(true)),
+            ]),
+            CRASH_NOTICE,
+        )
+        .ok()
+        .and_then(|reply| reply.path(&["result", "value"]).cloned())
+        .unwrap_or(Json::Null)
+}
+
+/// What `navigator.permissions.query` says for each name, as `name=state`
+/// words: the state a site reads before deciding whether to ask.
+fn permission_states(client: &mut Client, names: &[&str]) -> String {
+    let names: Vec<String> = names.iter().map(|name| format!("'{name}'")).collect();
+    let expression = format!(
+        "Promise.all([{}].map(function (n) {{ return navigator.permissions.query({{name: n}})\
+         .then(function (s) {{ return n + '=' + s.state; }}, \
+         function (e) {{ return n + '=!' + e.name; }}); }}))\
+         .then(function (a) {{ return a.join(' '); }})",
+        names.join(",")
+    );
+    match evaluate_awaited(client, &expression) {
+        Json::String(states) => states,
+        other => panic!("no answer from permissions.query: {other:?}"),
+    }
+}
+
+/// Navigate a page's session and wait for the title it should land with.
+fn land_on(client: &mut Client, url: &str, title: &str) {
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the page loads");
+    assert_eq!(wait_for_title(client, title, CRASH_NOTICE), title, "{url}");
+}
+
+/// Ask until `states` answers `wanted` or [`CRASH_NOTICE`] is up, and hand
+/// back the last answer: a notification on the browser's connection is in
+/// force for the next page command, but a test that waits costs nothing.
+fn states_become(client: &mut Client, names: &[&str], wanted: &str) -> String {
+    let deadline = Instant::now() + CRASH_NOTICE;
+    loop {
+        let states = permission_states(client, names);
+        if states == wanted || Instant::now() >= deadline {
+            return states;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Boot as the program does, with the browser-wide deny and one origin
+/// allowed the camera, and read what pages are told: `denied` for every name
+/// the program sets, `granted` for what the person allowed, the same in a
+/// second tab on that origin, `denied` on a `data:` page; then the allowance
+/// taken back by the allow line's commands, and `denied` again.
+#[test]
+fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_allowed() {
+    if !engine_named() {
+        return;
+    }
+    let origin = serve_media();
+    let root = temp_dir("permissions");
+    let downloads = root.join("downloads");
+    std::fs::create_dir_all(&downloads).expect("a download directory");
+    let appearance =
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+    let mut allowed = Allowed::in_memory();
+    allowed
+        .set(&origin, &[Permission::Camera])
+        .expect("kept in memory");
+    assert_eq!(
+        permissions::origin_of(&format!("{origin}/plain")).as_deref(),
+        Some(origin.as_str())
+    );
+    let Booted {
+        engine: _engine,
+        mut browser,
+        mut tabs,
+    } = blinkterm::app::boot(
+        Profile::temporary().expect("a temporary profile"),
+        &engine::Launch::default(),
+        &downloads,
+        &appearance,
+        &allowed,
+    )
+    .expect("the engine boots");
+    let names = [
+        "camera",
+        "microphone",
+        "geolocation",
+        "notifications",
+        "clipboard-read",
+        "clipboard-write",
+    ];
+    let wanted = "camera=granted microphone=denied geolocation=denied notifications=denied \
+                  clipboard-read=denied clipboard-write=denied";
+    {
+        let tab = tabs.active_mut().expect("the first tab");
+        land_on(&mut tab.connection, &format!("{origin}/plain"), "plain");
+        assert_eq!(permission_states(&mut tab.connection, &names), wanted);
+        // What the engine answers when nobody set anything is `default`;
+        // with the deny it is `denied`, at once.
+        assert_eq!(
+            evaluate_awaited(&mut tab.connection, "Notification.requestPermission()"),
+            Json::string("denied")
+        );
+    }
+    let behind = blinkterm::app::open_behind(
+        &mut tabs,
+        &mut browser,
+        &appearance,
+        &format!("{origin}/fs"),
+    )
+    .expect("a tab behind");
+    {
+        let tab = tabs.get_mut(behind).expect("the tab behind");
+        assert_eq!(
+            wait_for_title(&mut tab.connection, "fs", CRASH_NOTICE),
+            "fs"
+        );
+        assert_eq!(
+            permission_states(&mut tab.connection, &names),
+            wanted,
+            "a second tab on the origin"
+        );
+    }
+    let tab = tabs.active_mut().expect("the first tab");
+    land_on(
+        &mut tab.connection,
+        "data:text/html,<title>opaque</title>",
+        "opaque",
+    );
+    assert_eq!(
+        permission_states(&mut tab.connection, &["camera"]),
+        "camera=denied",
+        "an opaque origin is denied browser-wide too"
+    );
+    land_on(&mut tab.connection, &format!("{origin}/plain"), "plain");
+    // The allow line with nothing on it: every name denied by origin, which
+    // is what takes a grant back.
+    for (method, params) in permissions::origin_commands(&origin, &[]) {
+        browser.notify(method, params).expect("told");
+    }
+    assert_eq!(
+        states_become(&mut tab.connection, &["camera"], "camera=denied"),
+        "camera=denied"
+    );
+    // And a word given again is granted again, by origin.
+    for (method, params) in permissions::origin_commands(&origin, &[Permission::Clipboard]) {
+        browser.notify(method, params).expect("told");
+    }
+    let wanted = "clipboard-read=granted clipboard-write=granted camera=denied";
+    assert_eq!(
+        states_become(
+            &mut tab.connection,
+            &["clipboard-read", "clipboard-write", "camera"],
+            wanted
+        ),
+        wanted
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The isolated world a watch is armed in, made as `app` makes it.
+fn fullscreen_world(client: &mut Client) -> i64 {
+    let tree = client
+        .call("Page.getFrameTree", Json::empty())
+        .expect("the frame tree");
+    let frame = find::main_frame(&tree).expect("a main frame");
+    let world = client
+        .call("Page.createIsolatedWorld", find::world_params(&frame))
+        .expect("a world");
+    find::context(&world).expect("the world's id")
+}
+
+/// Arm a watch as `pump_fullscreen` does: sent, never called.
+fn arm(client: &mut Client, world: i64, expected: bool) -> Pending {
+    client
+        .send(
+            "Runtime.evaluate",
+            fullscreen::watch_params(world, expected),
+        )
+        .expect("the watch is sent")
+}
+
+/// The watch's answer, waited for up to [`CRASH_NOTICE`] — the CI runner has
+/// taken seconds to deliver what a workstation delivers in milliseconds —
+/// with how long it took printed.
+fn heard_within(client: &mut Client, pending: &Pending, what: &str) -> Option<Heard> {
+    let started = Instant::now();
+    while started.elapsed() < CRASH_NOTICE {
+        if let Some(reply) = client.take_reply(pending) {
+            eprintln!("{what}: heard in {:?}", started.elapsed());
+            return Some(fullscreen::heard(&reply));
+        }
+        // What the page says meanwhile is nothing to this test.
+        let _ = client.events();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+/// The watch hears a click take an element fullscreen and `esc`'s exit let
+/// it go; a watch armed after the fact catches up at once; a watch left
+/// behind by a tab switch does not starve the next one; and a navigation
+/// answers `Gone`.
+#[test]
+fn a_page_going_fullscreen_is_heard_and_esc_s_exit_is_heard_and_a_navigation_says_gone() {
+    let Some((_engine, mut client)) = connect() else {
+        return;
+    };
+    let origin = serve_media();
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    land_on(&mut client, &format!("{origin}/fs"), "fs");
+    let world = fullscreen_world(&mut client);
+    let fullscreen = |client: &mut Client| evaluate(client, "!!document.fullscreenElement");
+
+    // Nothing happens, so nothing is answered.
+    let watch = arm(&mut client, world, false);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(client.take_reply(&watch).is_none(), "a watch waits");
+    // A click on the button is a gesture, and the page goes fullscreen.
+    click_with(&mut client, (50, 220), "left", 1, 0);
+    assert_eq!(heard_within(&mut client, &watch, "in"), Some(Heard::In));
+    assert_eq!(fullscreen(&mut client), Json::Bool(true));
+
+    // `esc`: the exit, in the watch's world, as a notification.
+    let watch = arm(&mut client, world, true);
+    client
+        .notify("Runtime.evaluate", fullscreen::exit_params(Some(world)))
+        .expect("the exit is sent");
+    assert_eq!(heard_within(&mut client, &watch, "out"), Some(Heard::Out));
+    assert_eq!(fullscreen(&mut client), Json::Bool(false));
+
+    // Armed expecting fullscreen on a page that is not: it catches up at
+    // once, which is how a tab coming to the front is caught up.
+    let watch = arm(&mut client, world, true);
+    assert_eq!(
+        heard_within(&mut client, &watch, "catch-up"),
+        Some(Heard::Out)
+    );
+
+    // A watch let go of — its tab went behind — is still waiting in the page;
+    // the next one armed settles it, and is the one answered.
+    let left = arm(&mut client, world, false);
+    std::thread::sleep(Duration::from_millis(100));
+    drop(left);
+    let watch = arm(&mut client, world, false);
+    click_with(&mut client, (50, 220), "left", 1, 0);
+    assert_eq!(
+        heard_within(&mut client, &watch, "after a stale watch"),
+        Some(Heard::In)
+    );
+
+    // A navigation takes the document, and the watch hears that.
+    let watch = arm(&mut client, world, true);
+    let navigation = client
+        .send(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(format!("{origin}/plain")))]),
+        )
+        .expect("the navigation is sent");
+    assert_eq!(heard_within(&mut client, &watch, "gone"), Some(Heard::Gone));
+    drop(navigation);
+    assert_eq!(wait_for_title(&mut client, "plain", CRASH_NOTICE), "plain");
+    assert_eq!(fullscreen(&mut client), Json::Bool(false), "and nothing is");
+}
+
+/// Chrome's autoplay rule, and nothing of this program's in its way: a
+/// `play()` before any gesture is refused, a dispatched click is the
+/// gesture, and after it the audio plays — its clock runs — with the engine
+/// muted or not. This does not test a speaker; it tests that a page is not
+/// silent for a reason this program caused.
+#[test]
+fn a_click_is_the_gesture_a_video_needs_and_the_engine_starts_its_audio_service() {
+    let origin = serve_media();
+    for mute in [false, true] {
+        let launch = engine::Launch {
+            mute,
+            ..engine::Launch::default()
+        };
+        let Some((_engine, _browser, mut page)) = launched(&launch) else {
+            return;
+        };
+        page.call("Page.enable", Json::empty())
+            .expect("Page.enable");
+        viewport(&mut page);
+        land_on(&mut page, &format!("{origin}/audio"), "audio");
+        let play = "document.getElementById('a').play()\
+                    .then(function () { return 'played'; }, function (e) { return e.name; })";
+        assert_eq!(
+            evaluate_awaited(&mut page, play),
+            Json::string("NotAllowedError"),
+            "mute {mute}: no gesture, no sound"
+        );
+        click_with(&mut page, (5, 5), "left", 1, 0);
+        assert_eq!(
+            evaluate_awaited(&mut page, play),
+            Json::string("played"),
+            "mute {mute}: a click is the gesture"
+        );
+        let started = Instant::now();
+        let mut time = 0.0;
+        while started.elapsed() < CRASH_NOTICE {
+            time = evaluate(&mut page, "document.getElementById('a').currentTime")
+                .as_f64()
+                .unwrap_or(0.0);
+            if time > 0.0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!(
+            "mute {mute}: currentTime {time} after {:?}",
+            started.elapsed()
+        );
+        assert!(time > 0.0, "mute {mute}: the audio's clock runs");
+    }
+}
+
+/// How long a paced test waits for a frame the engine owes it. Locally the
+/// next frame after an acknowledgement is about 60 ms away; in docker on a
+/// GitHub runner an engine event has taken seconds.
+const FRAME_WAIT: Duration = Duration::from_secs(15);
+
+/// The route the program takes over ssh: the engine's PNG, inline, at the
+/// cursor.
+fn png_route(placement: Placement, wrap: Wrap) -> Route {
+    Route {
+        transport: blinkterm::graphics::Transport::Inline,
+        payload: Payload::Png,
+        placement,
+        wrap,
+        every_nth: 1,
+    }
+}
+
+/// The screencast frames in `client`'s queue, *not* acknowledged, with the
+/// number each would be acknowledged with and its capture time.
+fn unacked_frames(client: &mut Client) -> Vec<(i64, Vec<u8>, f64)> {
+    let mut frames = Vec::new();
+    for event in client.events() {
+        if event.method != "Page.screencastFrame" {
+            continue;
+        }
+        let session = event.params.get("sessionId").and_then(Json::as_i64);
+        let data = event.params.get("data").and_then(Json::as_str);
+        let stamp = event
+            .params
+            .path(&["metadata", "timestamp"])
+            .and_then(Json::as_f64);
+        if let (Some(session), Some(data), Some(stamp)) = (session, data, stamp) {
+            let png = blinkterm::base64::decode(data.as_bytes()).expect("base64");
+            frames.push((session, png, stamp));
+        }
+    }
+    frames
+}
+
+/// A PNG cast with `every_nth`, at the page's size.
+fn png_cast(client: &mut Client, every_nth: u32) {
+    client
+        .call(
+            "Page.startScreencast",
+            Json::object(vec![
+                ("format", Json::string("png")),
+                ("maxWidth", Json::number(WIDTH)),
+                ("maxHeight", Json::number(HEIGHT)),
+                ("everyNthFrame", Json::number(every_nth)),
+            ]),
+        )
+        .expect("the screencast starts");
+}
+
+/// tmux's passthrough, as a model: each `ESC P tmux;` … `ESC \` loses its
+/// wrapper and has its doubled escapes halved. The unit tests in
+/// `src/graphics.rs` hold it to what tmux 3.4 was recorded emitting.
+fn tmux_unwrap(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let Some(body) = rest.strip_prefix(b"\x1bPtmux;") else {
+            out.push(rest[0]);
+            rest = &rest[1..];
+            continue;
+        };
+        let mut i = 0;
+        loop {
+            match (body.get(i), body.get(i + 1)) {
+                (Some(0x1b), Some(0x1b)) => {
+                    out.push(0x1b);
+                    i += 2;
+                }
+                (Some(0x1b), Some(b'\\')) => {
+                    i += 2;
+                    break;
+                }
+                (Some(&byte), _) => {
+                    out.push(byte);
+                    i += 1;
+                }
+                (None, _) => panic!("an unterminated wrapper"),
+            }
+        }
+        rest = &body[i..];
+    }
+    out
+}
+
+/// The route over ssh, end to end: the engine's PNG frames and its PNG still
+/// go to the terminal as they came, and the terminal makes the picture of
+/// them. Nothing is decoded on this side at all.
+#[test]
+fn a_png_cast_reaches_the_terminal_as_pngs_it_can_decode() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    let dir = temp_dir("png");
+    let mut painter = Painter::at_with(&dir, png_route(Placement::Direct, Wrap::None));
+    assert_eq!(painter.transport(), blinkterm::graphics::Transport::Inline);
+    let mut terminal = a_terminal(&dir);
+    let cells = Cells {
+        cols: WIDTH / CELL.0,
+        rows: HEIGHT / CELL.1,
+    };
+
+    png_cast(&mut client, 1);
+    let started = Instant::now();
+    let (mut frames, mut bytes) = (0usize, 0usize);
+    while started.elapsed() < Duration::from_secs(2)
+        || (frames < 3 && started.elapsed() < FRAME_WAIT)
+    {
+        for (png, _) in take_frames(&mut client) {
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "the engine promised PNG");
+            let sequence = painter.png_frame(&png, cells, 2, 1);
+            terminal.advance(&sequence);
+            frames += 1;
+            bytes += sequence.len();
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    assert!(frames >= 3, "only {frames} frames");
+    eprintln!(
+        "png: {frames} frames in {:?}, {} bytes down the pane per frame",
+        started.elapsed(),
+        bytes / frames
+    );
+    let store = terminal.graphics();
+    assert_eq!(store.placements().count(), 1);
+    assert_eq!(
+        store.image(IMAGE_ID).map(|i| (i.width, i.height)),
+        Some((WIDTH, HEIGHT)),
+        "the terminal read the size out of the file"
+    );
+
+    // The still goes the same way.
+    let reply = client
+        .call_within(
+            "Page.captureScreenshot",
+            Json::object(vec![("format", Json::string("png"))]),
+            FRAME_WAIT,
+        )
+        .expect("a still");
+    let png = blinkterm::base64::decode(
+        reply
+            .get("data")
+            .and_then(Json::as_str)
+            .expect("data")
+            .as_bytes(),
+    )
+    .expect("base64");
+    terminal.advance(&painter.png_frame(&png, cells, 2, 1));
+    let store = terminal.graphics();
+    assert_eq!(store.placements().count(), 1);
+    assert_eq!(
+        store.image(IMAGE_ID).map(|i| (i.width, i.height)),
+        Some((WIDTH, HEIGHT))
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
+/// What the pacing in `app::tick_frames` rests on: with no acknowledgement
+/// the engine casts a few frames and then waits, and one acknowledgement
+/// brings a frame of the page as it is then — not one that was queued.
+#[test]
+fn withholding_the_ack_holds_the_engine_to_three_frames_and_one_ack_brings_a_current_one() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    png_cast(&mut client, 1);
+
+    let mut held = Vec::new();
+    let deadline = Instant::now() + FRAME_WAIT;
+    while held.is_empty() && Instant::now() < deadline {
+        held.extend(unacked_frames(&mut client));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!held.is_empty(), "no frame at all");
+    // Two seconds more with nothing acknowledged: the engine stops.
+    let quiet = Instant::now();
+    while quiet.elapsed() < Duration::from_secs(2) {
+        held.extend(unacked_frames(&mut client));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!("frames without an acknowledgement: {}", held.len());
+    assert!(
+        held.len() <= 3,
+        "{} frames arrived unacknowledged on a page animating at 60 fps",
+        held.len()
+    );
+
+    let session = held.last().expect("a frame held").0;
+    let acked_at = motion::now_seconds();
+    client
+        .notify(
+            "Page.screencastFrameAck",
+            Json::object(vec![("sessionId", Json::number(session as f64))]),
+        )
+        .expect("sent");
+    let mut next = Vec::new();
+    let deadline = Instant::now() + FRAME_WAIT;
+    while next.is_empty() && Instant::now() < deadline {
+        next.extend(unacked_frames(&mut client));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (_, png, stamp) = next.first().expect("a frame after the acknowledgement");
+    assert_eq!(&png[..4], b"\x89PNG");
+    eprintln!(
+        "the frame after the acknowledgement was captured {:+.3} s from it",
+        stamp - acked_at
+    );
+    assert!(
+        *stamp >= acked_at - 0.05,
+        "captured {:.3} s before the acknowledgement: a queued frame, not a current one",
+        acked_at - stamp
+    );
+
+    // And a cast started again owes nothing: the throttle restarts it at a
+    // new size with frames it will never acknowledge still counted against
+    // the old one, and the new one must not wait for them.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let _ = unacked_frames(&mut client);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    png_cast(&mut client, 1);
+    let mut after = Vec::new();
+    let deadline = Instant::now() + FRAME_WAIT;
+    while after.is_empty() && Instant::now() < deadline {
+        after.extend(unacked_frames(&mut client));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !after.is_empty(),
+        "a restarted cast waited on the old one's acknowledgements"
+    );
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    client.close();
+    engine.kill();
+}
+
+/// `everyNthFrame`, which is how a route's frame-rate cap reaches the engine.
+#[test]
+fn every_nth_frame_divides_the_cast() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    let count = |client: &mut Client, every_nth: u32| {
+        png_cast(client, every_nth);
+        // The first frame, however long the engine takes to it; then two
+        // seconds of them, every one acknowledged.
+        let deadline = Instant::now() + FRAME_WAIT;
+        while take_frames(client).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        let mut n = 0;
+        while started.elapsed() < Duration::from_secs(2) {
+            n += take_frames(client).len();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = client.call("Page.stopScreencast", Json::empty());
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = take_frames(client);
+        n
+    };
+    let every = count(&mut client, 1);
+    let sixth = count(&mut client, 6);
+    eprintln!("two seconds: {every} frames at every frame, {sixth} at every sixth");
+    assert!(sixth >= 2, "{sixth} frames at every sixth");
+    assert!(
+        sixth * 3 <= every + 6,
+        "{sixth} at every sixth against {every} at every one"
+    );
+    client.close();
+    engine.kill();
+}
+
+/// The route through tmux, to the terminal behind it: the frame wrapped,
+/// through the model of tmux's passthrough, into the real parser, as a
+/// virtual placement under the placeholder id.
+#[test]
+fn the_wrapped_frame_parses_once_the_tmux_model_has_unwrapped_it() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    prepare(&mut client);
+    let dir = temp_dir("tmux");
+    let mut painter = Painter::at_with(&dir, png_route(Placement::Unicode, Wrap::Tmux));
+    let mut terminal = a_terminal(&dir);
+    let cells = Cells {
+        cols: WIDTH / CELL.0,
+        rows: HEIGHT / CELL.1,
+    };
+    png_cast(&mut client, 1);
+    let mut frames = 0;
+    let deadline = Instant::now() + FRAME_WAIT;
+    while frames < 3 && Instant::now() < deadline {
+        for (png, _) in take_frames(&mut client) {
+            let wrapped = painter.png_frame(&png, cells, 2, 1);
+            assert!(wrapped.starts_with(b"\x1bPtmux;"));
+            assert!(
+                wrapped.len() <= blinkterm::graphics::DCS_LIMIT,
+                "one wrapper"
+            );
+            let unwrapped = tmux_unwrap(&wrapped);
+            assert!(unwrapped.starts_with(b"\x1b_Ga=T,f=100,i=16,U=1,"));
+            terminal.advance(&unwrapped);
+            frames += 1;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    assert!(frames >= 3, "only {frames} frames");
+    let image = terminal
+        .graphics()
+        .image(blinkterm::graphics::PLACEHOLDER_IMAGE_ID)
+        .expect("stored under the placeholder id");
+    assert_eq!((image.width, image.height), (WIDTH, HEIGHT));
+    assert!(
+        terminal.graphics().image(IMAGE_ID).is_none(),
+        "nothing under the direct route's id"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
 }
