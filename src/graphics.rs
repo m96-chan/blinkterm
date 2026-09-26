@@ -58,6 +58,22 @@
 //! unconsumed names [`Painter`] gives up and sends the bytes inline instead.
 //! That check is what makes the same binary work in Kitty.
 //!
+//! # On macOS
+//!
+//! A Mac has no `/dev/shm`: a POSIX shared memory object made by
+//! `shm_open(3)` has a name and no path, so the file store above cannot make
+//! one. The object store in this module does, with three rules the readers
+//! (kitty's `graphics.c`, Ghostty's `graphics_image.zig`) already work
+//! around on their side. The object is written through a mapping, because
+//! macOS refuses `read(2)` and `write(2)` on a shared memory descriptor. It
+//! is sized once, because macOS refuses a second `ftruncate(2)`, so there is
+//! no `.part` to rename: the object is whole before its name is sent. And
+//! its size as `fstat` reports it is rounded up to a page, so the command
+//! carries `S=`, the protocol's key for exactly that. Consumption is noticed
+//! the same way: a reader unlinks what it read, so a name this program can
+//! still unlink is one nobody read, and the fallback to inline works for
+//! objects as it does for files.
+//!
 //! **The fallback sends the same raw pixels, base64, and it is slow.** That
 //! is a decision rather than an oversight. Sending the encoded frame instead
 //! is not available: the motion frames are JPEG and no terminal's graphics
@@ -82,8 +98,22 @@ pub const CHUNK: usize = 4096;
 pub const IMAGE_ID: u32 = 1;
 pub const PLACEMENT_ID: u32 = 1;
 
-/// Where POSIX shared memory objects live, as files.
+/// Where POSIX shared memory objects live, as files — on Linux. Elsewhere
+/// the directory does not exist and [`Painter::new`] does not look at it;
+/// the constant stays unconditional so that nothing naming it needs a `cfg`.
 pub const SHM_DIR: &str = "/dev/shm";
+
+/// What the doctor says about shared memory when [`probe_shared_memory`]
+/// succeeds, and when it does not: the thing that was tried, in this
+/// platform's words.
+#[cfg(target_os = "linux")]
+pub const SHM_HOW: &str = "/dev/shm writable";
+#[cfg(target_os = "linux")]
+pub const SHM_HOW_NOT: &str = "/dev/shm not writable";
+#[cfg(not(target_os = "linux"))]
+pub const SHM_HOW: &str = "shm_open works";
+#[cfg(not(target_os = "linux"))]
+pub const SHM_HOW_NOT: &str = "shm_open fails";
 
 /// How many frames may be in flight before an unconsumed name means the
 /// terminal is not reading them.
@@ -145,20 +175,47 @@ impl<'a> Raw<'a> {
 /// How the payload reaches the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
-    /// `t=s`: a name in `/dev/shm`, which the terminal reads and unlinks.
+    /// `t=s`: a POSIX shared memory name, which the terminal reads and
+    /// unlinks.
     SharedMemory,
     /// `t=d`: base64 in the escape sequence itself.
     Inline,
+}
+
+/// Where a `t=s` frame is kept: as a file in a directory, or as a POSIX
+/// shared memory object with no path at all.
+enum Store {
+    /// `<dir>/<name>`: `/dev/shm` on Linux, or a test's directory anywhere.
+    Files(PathBuf),
+    /// `shm_open(3)` objects, which is the only kind of `t=s` a Mac has.
+    #[cfg(not(target_os = "linux"))]
+    Objects,
+}
+
+impl Store {
+    /// Whether a frame's command says how many bytes it is, with `S=`.
+    ///
+    /// Only for objects, whose size as a reader's `fstat` sees it is rounded
+    /// up to a page. A file is exactly as long as the frame, and the command
+    /// for one stays byte for byte what every measured terminal has read.
+    fn announces_size(&self) -> bool {
+        match self {
+            Store::Files(_) => false,
+            #[cfg(not(target_os = "linux"))]
+            Store::Objects => true,
+        }
+    }
 }
 
 /// The state a sequence of frames needs: which names are outstanding, and
 /// whether the terminal is reading them.
 pub struct Painter {
     transport: Transport,
-    dir: PathBuf,
+    store: Store,
     prefix: String,
     counter: u64,
-    outstanding: VecDeque<PathBuf>,
+    /// Names without their leading `/`, oldest first.
+    outstanding: VecDeque<String>,
     unconsumed: u32,
 }
 
@@ -167,24 +224,51 @@ impl Painter {
     ///
     /// `/dev/shm` may be absent, read-only or full — in a container, in a
     /// rescue shell, on a machine whose tmpfs is exhausted — and each of those
-    /// is a reason to send frames inline rather than to fail.
+    /// is a reason to send frames inline rather than to fail. Off Linux there
+    /// is no `/dev/shm` to try, and the store is `shm_open(3)` objects,
+    /// tried the same way.
     pub fn new() -> Painter {
-        Painter::at(Path::new(SHM_DIR))
+        #[cfg(target_os = "linux")]
+        {
+            Painter::at(Path::new(SHM_DIR))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Painter::objects()
+        }
     }
 
     /// The same, in a directory a test can watch.
     pub fn at(dir: &Path) -> Painter {
-        let prefix = format!("blinkterm-{}", std::process::id());
-        let probe = dir.join(format!("{prefix}-probe"));
-        let usable = std::fs::write(&probe, b"probe").is_ok();
-        let _ = std::fs::remove_file(&probe);
+        let prefix = default_prefix();
+        let usable = probe_file(dir, &format!("{prefix}-probe")).is_ok();
+        Painter::with(Store::Files(dir.to_path_buf()), prefix, usable)
+    }
+
+    /// Frames as `shm_open(3)` objects, if one can be made here.
+    #[cfg(not(target_os = "linux"))]
+    pub fn objects() -> Painter {
+        Painter::objects_named(default_prefix())
+    }
+
+    /// [`Painter::objects`] under a prefix of the caller's: objects share
+    /// one namespace across the machine, so two painters in one process —
+    /// two tests running at once — need prefixes of their own where two
+    /// directories would have kept them apart.
+    #[cfg(not(target_os = "linux"))]
+    fn objects_named(prefix: String) -> Painter {
+        let usable = object::probe(&format!("/{prefix}-probe")).is_ok();
+        Painter::with(Store::Objects, prefix, usable)
+    }
+
+    fn with(store: Store, prefix: String, usable: bool) -> Painter {
         Painter {
             transport: if usable {
                 Transport::SharedMemory
             } else {
                 Transport::Inline
             },
-            dir: dir.to_path_buf(),
+            store,
             prefix,
             counter: 0,
             outstanding: VecDeque::new(),
@@ -205,9 +289,12 @@ impl Painter {
         let mut out = format!("\x1b[{row};{col}H").into_bytes();
         match self.transport {
             Transport::SharedMemory => match self.write_object(raw.pixels) {
-                Some(name) => out.extend_from_slice(&shared_memory_command(&name, &raw, cells)),
+                Some(name) => {
+                    let size = self.store.announces_size().then_some(raw.pixels.len());
+                    out.extend_from_slice(&shared_memory_command_sized(&name, &raw, cells, size));
+                }
                 None => {
-                    // Writing failed, so the directory that worked at startup
+                    // Writing failed, so the store that worked at startup
                     // does not any more; the picture is more important than
                     // the transport it arrives by.
                     self.transport = Transport::Inline;
@@ -224,27 +311,36 @@ impl Painter {
     fn write_object(&mut self, pixels: &[u8]) -> Option<String> {
         self.counter += 1;
         let name = format!("{}-{}", self.prefix, self.counter);
-        let path = self.dir.join(&name);
-        let partial = self.dir.join(format!("{name}.part"));
+        match &self.store {
+            Store::Files(dir) => {
+                let path = dir.join(&name);
+                let partial = dir.join(format!("{name}.part"));
 
-        // Written under another name and renamed, so that the compositor never
-        // sees a file that is still growing: it takes the size from the
-        // descriptor and would read a short image.
-        if std::fs::write(&partial, pixels).is_err() {
-            let _ = std::fs::remove_file(&partial);
-            return None;
-        }
-        if std::fs::rename(&partial, &path).is_err() {
-            let _ = std::fs::remove_file(&partial);
-            return None;
+                // Written under another name and renamed, so that the
+                // compositor never sees a file that is still growing: it
+                // takes the size from the descriptor and would read a short
+                // image.
+                if write_private(&partial, pixels).is_err() {
+                    let _ = std::fs::remove_file(&partial);
+                    return None;
+                }
+                if std::fs::rename(&partial, &path).is_err() {
+                    let _ = std::fs::remove_file(&partial);
+                    return None;
+                }
+            }
+            // Whole before anyone is told its name: `create` maps, copies and
+            // unmaps before it returns.
+            #[cfg(not(target_os = "linux"))]
+            Store::Objects => object::create(&format!("/{name}"), pixels)?,
         }
 
-        self.outstanding.push_back(path);
+        self.outstanding.push_back(name.clone());
         if self.outstanding.len() > IN_FLIGHT {
             if let Some(old) = self.outstanding.pop_front() {
                 // Still there means the terminal never read it. A few of those
                 // in a row and this is not a terminal that speaks `t=s`.
-                if std::fs::remove_file(&old).is_ok() {
+                if self.retire(&old) {
                     self.unconsumed += 1;
                     if self.unconsumed >= IN_FLIGHT as u32 / 2 {
                         self.transport = Transport::Inline;
@@ -257,15 +353,197 @@ impl Painter {
         Some(format!("/{name}"))
     }
 
-    /// Remove anything this program left in `/dev/shm`.
+    /// Remove the frame called `name`, and say whether it was still there —
+    /// which, once the terminal has had its chance, means it never read it.
+    /// A reader unlinks what it reads, a file and an object alike, so this is
+    /// one question with two ways of asking it.
+    fn retire(&self, name: &str) -> bool {
+        match &self.store {
+            Store::Files(dir) => std::fs::remove_file(dir.join(name)).is_ok(),
+            #[cfg(not(target_os = "linux"))]
+            Store::Objects => object::unlink(&format!("/{name}")),
+        }
+    }
+
+    /// Remove anything this program left in shared memory.
     ///
     /// Called on the way out, including from the panic path: a frame written
-    /// and not read is a file that would otherwise sit in a tmpfs until the
-    /// machine is rebooted.
+    /// and not read is a file in a tmpfs, or on a Mac an object, that would
+    /// otherwise stay until the machine is rebooted.
     pub fn clean_up(&mut self) {
-        for path in self.outstanding.drain(..) {
-            let _ = std::fs::remove_file(path);
+        while let Some(name) = self.outstanding.pop_front() {
+            self.retire(&name);
         }
+    }
+}
+
+/// `blinkterm-<pid>`: unique across the machine while this process lives,
+/// which is what an object's namespace needs, and short enough that a name
+/// under it fits macOS's 31 bytes (a test pins the arithmetic).
+fn default_prefix() -> String {
+    format!("blinkterm-{}", std::process::id())
+}
+
+/// Write `bytes` to a new file at `path` that only this user can read.
+///
+/// 0600 rather than the umask's 0644: a frame is a picture of whatever is on
+/// the screen, and between the write and the terminal's unlink it would
+/// otherwise be readable by every local user. The reader is this user's own
+/// terminal, so nothing that should read a frame is refused.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(bytes)
+}
+
+/// Whether a file can be written into `dir` as `name` and removed again.
+fn probe_file(dir: &Path, name: &str) -> std::io::Result<()> {
+    let probe = dir.join(name);
+    let written = std::fs::write(&probe, b"probe");
+    let _ = std::fs::remove_file(&probe);
+    written
+}
+
+/// Whether this side can make a `t=s` frame at all, tried under `name` (no
+/// `/`): a file in [`SHM_DIR`] on Linux, a `shm_open(3)` object elsewhere.
+/// The same test [`Painter::new`] makes, for the doctor, which reports the
+/// error as well as the answer.
+pub fn probe_shared_memory(name: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        probe_file(Path::new(SHM_DIR), name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        object::probe(&format!("/{name}"))
+    }
+}
+
+/// `PSHMNAMLEN` in XNU's `sys/posix_shm.h`: macOS refuses a shared memory
+/// name longer than this, slash included, with `ENAMETOOLONG`. Compiled for
+/// the tests everywhere, so that the arithmetic in the names is checked on
+/// Linux too.
+#[cfg(any(test, not(target_os = "linux")))]
+const OBJECT_NAME_MAX: usize = 31;
+
+/// A `t=s` frame as a POSIX shared memory object, for the systems where
+/// `shm_open(3)` makes something that is not a file.
+///
+/// Written through a mapping and never through `write(2)`, because on macOS
+/// a shared memory descriptor cannot be read or written, only mapped (kitty's
+/// reader says the same of its side). Sized exactly once, because macOS
+/// refuses a second `ftruncate`. Created `O_EXCL` under a name nobody else
+/// has, and 0600: unlike a file in `/dev/shm` made with the umask, a frame
+/// here is readable by this user alone.
+#[cfg(not(target_os = "linux"))]
+mod object {
+    use std::ffi::CString;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    use super::OBJECT_NAME_MAX as NAME_MAX;
+
+    /// Make `name` hold exactly `bytes`. `None` is any failure, and the
+    /// object is unlinked again on the way out of one so nothing is left.
+    pub fn create(name: &str, bytes: &[u8]) -> Option<()> {
+        make(name, bytes).ok()
+    }
+
+    /// Unlink `name`; `true` if it was still there, which after the terminal
+    /// has had its chance means the terminal never read it.
+    pub fn unlink(name: &str) -> bool {
+        let Ok(name) = CString::new(name) else {
+            return false;
+        };
+        // SAFETY: `name` is a NUL-terminated string that outlives the call,
+        // and `shm_unlink(2)` only reads it.
+        unsafe { libc::shm_unlink(name.as_ptr()) == 0 }
+    }
+
+    /// Whether an object can be made, mapped and removed here at all, with
+    /// the error that says why not: `ENAMETOOLONG`, `EACCES`, `ENOSPC`.
+    pub fn probe(name: &str) -> io::Result<()> {
+        make(name, b"probe")?;
+        unlink(name);
+        Ok(())
+    }
+
+    /// [`create`], with the reason. The name is checked against
+    /// [`NAME_MAX`] here rather than left to `shm_open`, so that a longer
+    /// prefix fails a test on any platform instead of a frame on a Mac.
+    fn make(name: &str, bytes: &[u8]) -> io::Result<()> {
+        if name.len() > NAME_MAX {
+            return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+        }
+        let c_name =
+            CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: `c_name` is NUL-terminated and outlives the call, which
+        // only reads it. The mode goes through the variadic tail as the
+        // `unsigned int` a promoted `mode_t` is.
+        let fd = unsafe {
+            libc::shm_open(
+                c_name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was returned open by `shm_open` just now and nothing
+        // else holds it, so the `OwnedFd` is its only owner and closes it on
+        // every way out of this function.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let filled = fill(&fd, bytes);
+        if filled.is_err() {
+            unlink(name);
+        }
+        filled
+    }
+
+    /// Size the object once and copy `bytes` in through a mapping.
+    fn fill(fd: &OwnedFd, bytes: &[u8]) -> io::Result<()> {
+        let len = libc::off_t::try_from(bytes.len())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EFBIG))?;
+        // SAFETY: `ftruncate(2)` takes a descriptor and a length and reads no
+        // memory; `fd` is open for writing for the whole call.
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), len) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if bytes.is_empty() {
+            // Complete once truncated, and `mmap` of nothing would fail.
+            return Ok(());
+        }
+        // SAFETY: a fresh shared mapping of the object, placed by the kernel
+        // (null hint), `bytes.len()` long — exactly the size just set — from
+        // a descriptor open read-write. No Rust reference points into it.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes.len(),
+                libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `map` is `bytes.len()` writable bytes that this function
+        // alone can see, so the copy stays inside it, and it cannot overlap
+        // `bytes`, which lives in this process's own heap or stack.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), map.cast::<u8>(), bytes.len()) };
+        // SAFETY: `map` and the length are exactly what `mmap` was given and
+        // returned, and nothing refers into the mapping after this.
+        unsafe { libc::munmap(map, bytes.len()) };
+        Ok(())
     }
 }
 
@@ -303,9 +581,22 @@ fn control(raw: &Raw<'_>, cells: Cells) -> String {
 
 /// `t=s`: the payload is the name of the object, not the image.
 pub fn shared_memory_command(name: &str, raw: &Raw<'_>, cells: Cells) -> Vec<u8> {
+    shared_memory_command_sized(name, raw, cells, None)
+}
+
+/// [`shared_memory_command`], with `S=` when `size` is given: the
+/// protocol's key for how many of the object's bytes are the image, which
+/// matters where a reader's `fstat` sees the size rounded up to a page.
+fn shared_memory_command_sized(
+    name: &str,
+    raw: &Raw<'_>,
+    cells: Cells,
+    size: Option<usize>,
+) -> Vec<u8> {
     let control = control(raw, cells);
+    let size = size.map(|bytes| format!(",S={bytes}")).unwrap_or_default();
     format!(
-        "\x1b_G{control},t=s;{}\x1b\\",
+        "\x1b_G{control},t=s{size};{}\x1b\\",
         base64::encode(name.as_bytes())
     )
     .into_bytes()
@@ -504,6 +795,11 @@ mod tests {
             // The file is there, whole, and nothing is left half-written.
             let path = dir.join(name.trim_start_matches('/'));
             assert_eq!(std::fs::read(&path).unwrap(), b"rgb");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "a frame is this user's alone");
+            }
             names.push(name);
             // The terminal reads and unlinks; here the test does.
             std::fs::remove_file(&path).expect("consume");
@@ -555,6 +851,164 @@ mod tests {
         assert_eq!(placement.image_id, IMAGE_ID);
         assert_eq!(placement.placement_id, PLACEMENT_ID);
         assert_eq!((placement.cols, placement.rows), (8, 4));
+    }
+
+    #[test]
+    fn an_object_name_never_exceeds_the_macos_limit() {
+        // The largest pid macOS hands out and ten digits of counter, which at
+        // sixty frames a second is five and a half years of frames.
+        let longest = format!("/blinkterm-{}-{}", 99_999, u32::MAX);
+        assert!(longest.len() <= OBJECT_NAME_MAX, "{longest}");
+        let ours = format!("/{}-{}", default_prefix(), 9_999_999_999u64);
+        assert!(ours.len() <= OBJECT_NAME_MAX, "{ours}");
+        let probe = format!("/{}-probe", default_prefix());
+        assert!(probe.len() <= OBJECT_NAME_MAX, "{probe}");
+    }
+
+    #[test]
+    fn a_file_frame_says_nothing_about_its_size_and_is_the_command_it_always_was() {
+        let dir = temp_dir("unsized");
+        let mut painter = Painter::at(&dir);
+        let pixels = rgb();
+        let bytes = painter.frame(Raw::rgb(&pixels, 2, 2), cells(4, 2), 2, 1);
+        let body = apc_bodies(&bytes).remove(0);
+        let cmd = GraphicsCommand::parse(&body).expect("parses");
+        let name = String::from_utf8(cmd.payload).expect("a name");
+        let mut wanted = b"\x1b[2;1H".to_vec();
+        wanted.extend(shared_memory_command(
+            &name,
+            &Raw::rgb(&pixels, 2, 2),
+            cells(4, 2),
+        ));
+        assert_eq!(bytes, wanted);
+        assert!(!body.windows(3).any(|w| w == b",S="), "no S= on a file");
+        painter.clean_up();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The object store, which exists only where there is no `/dev/shm`,
+    /// read back the way a terminal on a Mac reads it.
+    #[cfg(not(target_os = "linux"))]
+    mod objects {
+        use super::*;
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        /// What Kitty and Ghostty do with a name on macOS: open it read-only,
+        /// ask its size, map that much and copy it out. `read(2)` is not an
+        /// option there, which is the point of mapping.
+        fn read_object(name: &str) -> std::io::Result<Vec<u8>> {
+            let c_name = CString::new(name).expect("a name without NUL");
+            // SAFETY: `c_name` is NUL-terminated and outlives the call; with
+            // no `O_CREAT` the variadic mode is not read, so none is passed.
+            let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `fd` was just returned open and nothing else owns it.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `fstat(2)` fills in the whole `stat` it is pointed at,
+            // and `stat` is exactly that much space, alive for the call.
+            if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `fstat` succeeded, so every field has been written.
+            let size = unsafe { stat.assume_init() }.st_size;
+            let size = usize::try_from(size).expect("a size");
+            if size == 0 {
+                return Ok(Vec::new());
+            }
+            // SAFETY: a fresh read-only shared mapping the kernel places, of
+            // the size `fstat` reported, from a descriptor open for reading.
+            let map = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd.as_raw_fd(),
+                    0,
+                )
+            };
+            if map == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `map` is `size` readable bytes until the `munmap`
+            // below, and the slice is copied out before that.
+            let bytes = unsafe { std::slice::from_raw_parts(map.cast::<u8>(), size) }.to_vec();
+            // SAFETY: exactly the pointer and length `mmap` gave, and the
+            // slice above is gone.
+            unsafe { libc::munmap(map, size) };
+            Ok(bytes)
+        }
+
+        /// A prefix of the test's own, so that tests running at once do not
+        /// make the same name in the machine-wide namespace.
+        fn painter(which: &str) -> Painter {
+            Painter::objects_named(format!("blinkterm-{}-{which}", std::process::id()))
+        }
+
+        #[test]
+        fn an_object_frame_is_mapped_whole_and_unlinks_once() {
+            let mut painter = painter("m");
+            assert_eq!(painter.transport(), Transport::SharedMemory);
+            let pixels: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
+            let bytes = painter.frame(Raw::rgb(&pixels, 10, 10), cells(4, 2), 2, 1);
+            let cmd = GraphicsCommand::parse(&apc_bodies(&bytes)[0]).expect("parses");
+            assert_eq!(cmd.medium, Medium::SharedMemory);
+            assert_eq!(
+                cmd.data_size,
+                pixels.len() as u64,
+                "S= says how much of a page-rounded object is the frame"
+            );
+            let name = String::from_utf8(cmd.payload).expect("a name");
+            assert!(name.starts_with('/') && !name[1..].contains('/'), "{name}");
+
+            let read = read_object(&name).expect("a terminal can open and map it");
+            assert!(read.len() >= pixels.len(), "{} bytes", read.len());
+            assert_eq!(&read[..pixels.len()], &pixels[..]);
+
+            // The terminal's unlink, and then ours finding nothing: which is
+            // how a consumed frame is told from an unread one.
+            assert!(object::unlink(&name), "the reader's unlink finds it");
+            assert!(!object::unlink(&name), "and a second finds nothing");
+            let gone = read_object(&name).expect_err("unlinked");
+            assert_eq!(gone.raw_os_error(), Some(libc::ENOENT));
+            painter.clean_up();
+        }
+
+        #[test]
+        fn a_terminal_that_never_unlinks_an_object_gets_the_bytes_instead() {
+            let mut painter = painter("u");
+            assert_eq!(painter.transport(), Transport::SharedMemory);
+            let mut names = Vec::new();
+            for _ in 0..IN_FLIGHT * 2 {
+                let bytes = painter.frame(Raw::rgb(b"rgb", 1, 1), cells(4, 2), 2, 1);
+                let cmd = GraphicsCommand::parse(&apc_bodies(&bytes)[0]).expect("parses");
+                if cmd.medium == Medium::SharedMemory {
+                    names.push(String::from_utf8(cmd.payload).expect("a name"));
+                }
+            }
+            assert_eq!(
+                painter.transport(),
+                Transport::Inline,
+                "unread objects mean the terminal does not speak t=s"
+            );
+            painter.clean_up();
+            for name in &names {
+                let gone = read_object(name).expect_err("nothing is left behind");
+                assert_eq!(gone.raw_os_error(), Some(libc::ENOENT), "{name}");
+            }
+        }
+
+        #[test]
+        fn an_object_name_that_is_too_long_is_refused_before_shm_open() {
+            let long = format!("/{}", "x".repeat(OBJECT_NAME_MAX));
+            assert_eq!(object::create(&long, b"x"), None);
+            let too_long = object::probe(&long).expect_err("refused");
+            assert_eq!(too_long.raw_os_error(), Some(libc::ENAMETOOLONG));
+        }
     }
 
     fn temp_dir(what: &str) -> PathBuf {

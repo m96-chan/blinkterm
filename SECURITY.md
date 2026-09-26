@@ -111,12 +111,13 @@ machine. It prints a warning when it does. Do not browse as root.
   record of what was uploaded is kept, in the profile or anywhere
   ([#11](https://github.com/m96-chan/blinkterm/issues/11)).
 
-- **`/dev/shm`.** Frames go through POSIX shared memory objects named
-  `blinkterm-<pid>-...`, created with your umask and unlinked by the terminal
-  as it reads them. On a default umask another local user can read a frame in
-  the window between write and unlink — that is a picture of whatever you are
-  looking at. `Painter` falls back to inline base64 when `/dev/shm` is not
-  usable, but it does not currently tighten the mode.
+- **Shared memory.** Frames go through POSIX shared memory objects named
+  `blinkterm-<pid>-...` and unlinked by the terminal as it reads them — a
+  frame is a picture of whatever you are looking at. On Linux they are files
+  in `/dev/shm`; on macOS, `shm_open(3)` objects with no path. Either way they
+  are created readable and writable by you alone (0600), whatever your umask,
+  so in the window between write and unlink another local user cannot read
+  one. `Painter` falls back to inline base64 when no object can be made.
 
 - **The history.** The url bar's history is a record of the pages you
   visited — url, title, how often, when — kept in the profile as `history`,

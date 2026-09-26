@@ -24,7 +24,7 @@
 //!
 //! The numbers it was built against: 57.8 frames a second at 1280x770, about
 //! 185 kB per frame on the engine's side, 8 ms to decode one here. The frames
-//! go through `/dev/shm` (`t=s`) rather than as base64 in the escape sequence
+//! go through POSIX shared memory (`t=s`) rather than as base64 in the escape sequence
 //! wherever the terminal will read them, and they go as raw pixels (`f=24`,
 //! `f=32`) rather than as files the terminal decodes — see [`graphics`] for
 //! the id, the format and the transport, all three of which are decisions
