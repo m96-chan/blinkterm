@@ -151,6 +151,17 @@ pub const SHM_HOW: &str = "shm_open works";
 #[cfg(not(target_os = "linux"))]
 pub const SHM_HOW_NOT: &str = "shm_open fails";
 
+/// How [`crate::route::Route::describe`] names this transport, in the same
+/// platform's words as [`SHM_HOW`].
+///
+/// The doctor prints both lines, and until this was a constant the Mac
+/// printed them disagreeing: `shm_open works` above and `through /dev/shm`
+/// below, naming a directory a Mac has none of.
+#[cfg(target_os = "linux")]
+pub const SHM_THROUGH: &str = "through /dev/shm";
+#[cfg(not(target_os = "linux"))]
+pub const SHM_THROUGH: &str = "through shm_open objects";
+
 /// The largest DCS [`wrap_for_tmux`] makes.
 ///
 /// tmux 3.4 passed a 1,020,428-byte DCS through whole and dropped a
