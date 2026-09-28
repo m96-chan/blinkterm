@@ -4507,7 +4507,7 @@ fn handle_input(
             // the pointer leaving the page.
             if routes_to_hover(&report) {
                 if point.1 >= 0 {
-                    chrome.hover.moved(point, report.mods.cdp());
+                    chrome.hover.moved(point, report.mods.cdp_mouse());
                     return Ok(true);
                 }
                 let shown = !chrome.hover.shown().href.is_empty();
@@ -4520,7 +4520,7 @@ fn handle_input(
             // A press is where the pointer is, too, so a click's position
             // is the hover's.
             if report.kind == MouseKind::Press && point.1 >= 0 {
-                chrome.hover.moved(point, report.mods.cdp());
+                chrome.hover.moved(point, report.mods.cdp_mouse());
             }
             let Some(viewport) = tabs.active().map(|tab| viewport(chrome, tab)) else {
                 return Ok(true);
@@ -6548,7 +6548,7 @@ fn send_mouse(
         ("type", Json::string(kind)),
         ("x", Json::number(x)),
         ("y", Json::number(y)),
-        ("modifiers", Json::number(report.mods.cdp())),
+        ("modifiers", Json::number(report.mods.cdp_mouse())),
         ("button", Json::string(button_name(report.button))),
         ("buttons", Json::number(*buttons)),
     ];

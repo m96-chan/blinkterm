@@ -749,7 +749,7 @@ width:240px;height:60px;background:#3c3'>blank</a>\
 <div id=box style='position:absolute;left:0;top:200px;width:40px;height:40px;\
 background:#c33'></div>\
 <script>window.log=[];\
-for(const t of ['click','auxclick'])addEventListener(t,e=>log.push(t+':'+e.button+':'+e.ctrlKey));\
+for(const t of ['click','auxclick'])addEventListener(t,e=>log.push(t+':'+e.button+':'+e.ctrlKey+':'+e.metaKey));\
 let x=0;(function f(){x=(x+4)%600;box.style.left=x+'px';requestAnimationFrame(f)})();\
 </script></body>";
 
@@ -999,6 +999,28 @@ fn click_with(client: &mut Client, at: (i32, i32), button: &str, bit: u32, modif
     }
 }
 
+/// The modifier mask this program sends when a terminal reports a ctrl+click.
+///
+/// Not the constant 2: on a Mac the engine reads the tab-opening modifier as
+/// Meta and a literal ctrl+click opens nothing, so the program sends 4 there.
+/// Asking [`Mods::cdp_mouse`] rather than writing the number keeps these
+/// tests measuring the gesture — a ctrl+click opens a tab behind — instead of
+/// the spelling it happens to go out with.
+fn ctrl_click() -> u32 {
+    Mods::default().with(Mods::CTRL).cdp_mouse()
+}
+
+/// What [`OPENS_PAGE`]'s log says for a left click made with [`ctrl_click`].
+///
+/// That page logs `ctrlKey` and `metaKey` both, because which of the two a
+/// ctrl+click reaches the page as is the platform's business: a Mac is told
+/// Meta, everywhere else is told Ctrl, and either way the page saw the click
+/// with the tab-opening modifier held, which is what these tests are about.
+fn ctrl_click_logged() -> String {
+    let mac = cfg!(target_os = "macos");
+    format!("click:0:{}:{}", !mac, mac)
+}
+
 /// Everything a page's session says for `within`, every screencast frame
 /// acknowledged as `handle_page_events` acknowledges them: how many frames
 /// came, and the other events.
@@ -1124,7 +1146,7 @@ fn a_middle_click_and_a_ctrl_click_on_a_link_open_a_tab_behind_the_one_in_front(
 
     // The ctrl key on the left button: the same.
     let first = &mut tabs.active_mut().expect("the first tab").connection;
-    click_with(first, (40, 30), "left", 1, 2);
+    click_with(first, (40, 30), "left", 1, ctrl_click());
     let _ = watch_page(first, Duration::from_millis(200));
     assert!(
         pump(
@@ -1138,11 +1160,11 @@ fn a_middle_click_and_a_ctrl_click_on_a_link_open_a_tab_behind_the_one_in_front(
     assert_eq!(tabs.active_index(), 0, "still behind");
     let first = &mut tabs.active_mut().expect("the first tab").connection;
     let log = page_log(first);
-    assert!(log.contains("click:0:true"), "{log}");
+    assert!(log.contains(&ctrl_click_logged()), "{log}");
 
     // A ctrl+click on something that is not a link is the page's, and opens
     // nothing.
-    click_with(first, (340, 30), "left", 1, 2);
+    click_with(first, (340, 30), "left", 1, ctrl_click());
     let _ = watch_page(first, Duration::from_millis(200));
     assert!(
         !pump(&mut browser, &mut tabs, Duration::from_secs(2), |tabs| tabs
@@ -1151,7 +1173,8 @@ fn a_middle_click_and_a_ctrl_click_on_a_link_open_a_tab_behind_the_one_in_front(
         "a ctrl+click on nothing opened a tab"
     );
     let first = &mut tabs.active_mut().expect("the first tab").connection;
-    let clicks = |log: &str| log.matches("click:0:true").count();
+    let wanted = ctrl_click_logged();
+    let clicks = |log: &str| log.matches(&wanted).count();
     let after = page_log(first);
     assert_eq!(clicks(&after), clicks(&log) + 1, "{after}");
 
@@ -6824,7 +6847,7 @@ fn a_hint_opened_in_a_new_tab_is_a_target_this_program_made() {
         };
         for (name, value) in fields.iter_mut() {
             if name == "modifiers" {
-                *value = Json::number(2);
+                *value = Json::number(ctrl_click());
             }
         }
         page.call("Input.dispatchMouseEvent", Json::Object(fields))
