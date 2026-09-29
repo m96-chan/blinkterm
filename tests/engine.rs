@@ -9220,3 +9220,282 @@ fn a_url_handed_over_the_socket_becomes_the_tab_in_front() {
     engine.kill();
     std::fs::remove_dir_all(&root).ok();
 }
+
+use blinkterm::block::{self, Blocker};
+
+/// A page on this machine that loads three scripts from its own address
+/// and three from `x.ads.test`, which `--host-resolver-rules` sends here
+/// too, and puts in its title how many loaded and how many failed.
+///
+/// Scripts rather than images, because the server is text and a script's
+/// `load` needs only a 200: `0;` is a script.
+fn page_with_ads(port: u16) -> String {
+    format!(
+        "<title>waiting</title><script>var ok=0,er=0;\
+         function n(){{if(ok+er==6)document.title='done ok='+ok+' er='+er}}\
+         ['127.0.0.1','127.0.0.1','127.0.0.1','x.ads.test','x.ads.test','x.ads.test']\
+         .forEach(function(h,i){{var s=document.createElement('script');\
+         s.src='http://'+h+':{port}/s'+i+'.js';\
+         s.onload=function(){{ok++;n()}};s.onerror=function(){{er++;n()}};\
+         document.head.appendChild(s)}});</script>"
+    )
+}
+
+/// A page of `count` scripts from its own address, which says in its title
+/// when every one has answered.
+fn heavy_page(port: u16, count: usize) -> String {
+    format!(
+        "<title>waiting</title><script>var left={count};\
+         for(var i=0;i<{count};i++){{var s=document.createElement('script');\
+         s.src='http://127.0.0.1:{port}/h'+i+'.js';\
+         s.onload=s.onerror=function(){{if(--left==0)document.title='heavy done'}};\
+         document.head.appendChild(s)}}</script>"
+    )
+}
+
+const HEAVY: usize = 300;
+
+/// The engine booted as the program boots it, with `--host-resolver-rules`
+/// sending `*.test` to this machine and the blocker given or not.
+fn booted_blocking(blocker: Option<&Arc<Blocker>>) -> Booted {
+    let downloads = temp_dir("block-downloads");
+    let appearance =
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+    let launch = engine::Launch {
+        args: vec!["--host-resolver-rules=MAP *.test 127.0.0.1".to_string()],
+        ..engine::Launch::default()
+    };
+    blinkterm::app::boot(
+        Profile::temporary().expect("a temporary profile"),
+        &launch,
+        &downloads,
+        &appearance,
+        &Allowed::in_memory(),
+        blocker,
+    )
+    .expect("the engine boots")
+}
+
+/// Navigate and wait for the page's title to start with `wanted`.
+fn load_titled(client: &mut Client, url: &str, wanted: &str) -> String {
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the navigation is answered");
+    wait_for_title(client, wanted, Duration::from_secs(20))
+}
+
+/// How long the heavy page takes to say it is done, from the navigation.
+fn heavy_load(client: &mut Client, url: &str) -> Duration {
+    let started = Instant::now();
+    let title = load_titled(client, url, "heavy done");
+    assert_eq!(title, "heavy done");
+    started.elapsed()
+}
+
+/// The blocker as `app::boot` installs it: every page's requests paused on
+/// the pipe's reader thread and answered there, a listed host failed on
+/// every tab — the first, one opened later — while the page's own load, and
+/// the row's count is per tab. An unblocked site loads everything, and a
+/// listed site's own document fails with the engine's
+/// `ERR_BLOCKED_BY_CLIENT` until its site is unblocked.
+#[test]
+fn a_listed_host_fails_on_every_tab_an_allowed_one_loads_and_the_row_counts() {
+    if !engine_named() {
+        return;
+    }
+    let port = serve_pages(|port| {
+        let mut pages = vec![
+            ("/".to_string(), page_with_ads(port)),
+            ("/heavy".to_string(), heavy_page(port, HEAVY)),
+        ];
+        pages.extend((0..6).map(|i| (format!("/s{i}.js"), "0;".to_string())));
+        pages.extend((0..HEAVY).map(|i| (format!("/h{i}.js"), "0;".to_string())));
+        pages
+    });
+    let page = format!("http://127.0.0.1:{port}/");
+    let mut hosts = std::collections::HashSet::new();
+    block::parse("0.0.0.0 ads.test\n", &mut hosts);
+    let blocker = Arc::new(Blocker::new(hosts, Vec::new()));
+    let Booted {
+        mut engine,
+        mut browser,
+        mut tabs,
+        identity: _,
+    } = booted_blocking(Some(&blocker));
+
+    let first = tabs.active_mut().expect("the first tab");
+    let first_session = first.connection.session().expect("a page").to_string();
+    assert_eq!(
+        load_titled(&mut first.connection, &page, "done"),
+        "done ok=3 er=3"
+    );
+    assert_eq!(
+        blocker.words(Some(&first_session)).as_deref(),
+        Some("3 blocked")
+    );
+
+    // A target this program attaches to later: the hook enables it as it
+    // is attached, whichever path attached it.
+    let created = browser
+        .call(
+            "Target.createTarget",
+            Json::object(vec![("url", Json::string("about:blank"))]),
+        )
+        .expect("a second target");
+    let target = created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .expect("its id")
+        .to_string();
+    let mut second = browser
+        .attach(&target, Duration::from_secs(10))
+        .expect("a session on it");
+    second
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    let second_session = second.session().expect("a page").to_string();
+    assert_eq!(load_titled(&mut second, &page, "done"), "done ok=3 er=3");
+    assert_eq!(
+        blocker.words(Some(&second_session)).as_deref(),
+        Some("3 blocked")
+    );
+    assert_eq!(
+        blocker.words(Some(&first_session)).as_deref(),
+        Some("3 blocked"),
+        "the first tab's count is its own"
+    );
+
+    // `alt+b` on the first tab's site, then a reload: everything.
+    blocker.set_unblocked("127.0.0.1", true);
+    let first = tabs.active_mut().expect("the first tab");
+    first
+        .connection
+        .call("Page.reload", Json::empty())
+        .expect("the reload");
+    assert_eq!(
+        wait_for_title(&mut first.connection, "done", Duration::from_secs(20)),
+        "done ok=6 er=0"
+    );
+    assert_eq!(
+        blocker.words(Some(&first_session)).as_deref(),
+        Some("unblocked")
+    );
+
+    // A listed site's own document is the engine's error page, and the
+    // navigation's reply says why; unblocked, it loads.
+    let ads = format!("http://ads.test:{port}/");
+    let reply = first
+        .connection
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(&ads))]),
+        )
+        .expect("the navigation is answered");
+    assert_eq!(
+        reply.get("errorText").and_then(Json::as_str),
+        Some("net::ERR_BLOCKED_BY_CLIENT"),
+        "{reply}"
+    );
+    blocker.set_unblocked("ads.test", true);
+    assert_eq!(
+        load_titled(&mut first.connection, &ads, "done"),
+        "done ok=6 er=0"
+    );
+
+    // What every request round-tripping through the pipe costs a heavy
+    // page, printed and not asserted: a wall clock on a shared machine is
+    // not a test.
+    let heavy = format!("http://127.0.0.1:{port}/heavy");
+    let with = heavy_load(&mut second, &heavy);
+    engine.check().expect("the engine lived through all of it");
+    second.close();
+    drop(tabs);
+    browser.close();
+    engine.kill();
+
+    let Booted {
+        engine: mut plain,
+        browser: mut plain_browser,
+        tabs: mut plain_tabs,
+        identity: _,
+    } = booted_blocking(None);
+    let tab = plain_tabs.active_mut().expect("the first tab");
+    let without = heavy_load(&mut tab.connection, &heavy);
+    eprintln!(
+        "{HEAVY} scripts: {:.2} s with every request paused and answered, \
+         {:.2} s with nothing paused",
+        with.as_secs_f64(),
+        without.as_secs_f64()
+    );
+    drop(plain_tabs);
+    plain_browser.close();
+    plain.kill();
+}
+
+/// A renderer that dies keeps its session, and the session keeps `Fetch`:
+/// the page `ctrl+r` brings back has its requests paused and answered like
+/// the first, with nothing sent again. Measured before it was relied on,
+/// since a session whose `Fetch` came back off would be a page that loads
+/// its ads, and one whose pauses came back unanswered a page that hangs.
+#[test]
+fn a_page_that_crashed_is_still_blocked_after_its_reload() {
+    if !engine_named() {
+        return;
+    }
+    let port = serve_pages(|port| {
+        let mut pages = vec![("/".to_string(), page_with_ads(port))];
+        pages.extend((0..6).map(|i| (format!("/s{i}.js"), "0;".to_string())));
+        pages
+    });
+    let mut hosts = std::collections::HashSet::new();
+    block::parse("ads.test\n", &mut hosts);
+    let blocker = Arc::new(Blocker::new(hosts, Vec::new()));
+    let Booted {
+        mut engine,
+        mut browser,
+        mut tabs,
+        identity: _,
+    } = booted_blocking(Some(&blocker));
+    let tab = tabs.active_mut().expect("the first tab");
+    let page = format!("http://127.0.0.1:{port}/");
+    assert_eq!(
+        load_titled(&mut tab.connection, &page, "done"),
+        "done ok=3 er=3"
+    );
+
+    let _ = tab.connection.events();
+    let _crash = tab
+        .connection
+        .send("Page.crash", Json::empty())
+        .expect("Page.crash sent");
+    let deadline = Instant::now() + CRASH_NOTICE;
+    let mut crashed = false;
+    while !crashed && Instant::now() < deadline {
+        crashed = tab
+            .connection
+            .events()
+            .iter()
+            .any(|event| event.method == "Inspector.targetCrashed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(crashed, "the renderer did not die");
+    tab.connection
+        .call_within("Page.reload", Json::empty(), Duration::from_secs(5))
+        .expect("Page.reload answers on a crashed page");
+    assert_eq!(
+        wait_for_title(&mut tab.connection, "done", Duration::from_secs(20)),
+        "done ok=3 er=3"
+    );
+    let session = tab.connection.session().map(str::to_string);
+    assert_eq!(
+        blocker.words(session.as_deref()).as_deref(),
+        Some("3 blocked")
+    );
+    engine.check().expect("the engine lived through it");
+    drop(tabs);
+    browser.close();
+    engine.kill();
+}

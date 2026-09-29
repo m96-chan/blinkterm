@@ -435,6 +435,9 @@ pub enum Verdict {
 /// A page's session, as the blocker knows it.
 #[derive(Debug, Default)]
 struct Page {
+    /// The main frame's id, which is the page target's: what tells the
+    /// page's own document from an iframe's.
+    frame: Option<String>,
     /// The site of the document in its main frame, for the exceptions.
     site: Option<String>,
     /// Requests blocked since that document landed.
@@ -493,12 +496,13 @@ impl Blocker {
         }
     }
 
-    /// A page's session was attached, showing `url`.
-    pub fn attached(&self, session: &str, url: &str) {
+    /// A page's session was attached to `target`, showing `url`.
+    pub fn attached(&self, session: &str, target: &str, url: &str) {
         if let Ok(mut state) = self.state.lock() {
             state.sessions.insert(
                 session.to_string(),
                 Page {
+                    frame: Some(target.to_string()),
                     site: site_of(url),
                     blocked: 0,
                 },
@@ -530,12 +534,17 @@ impl Blocker {
     }
 
     /// Whether to block a request for `url` on `session`, counted if it is.
+    /// `document` is the frame a document is being loaded into, and `None`
+    /// for anything else.
     ///
     /// A listed host is blocked unless the page it is for is on a site
-    /// blocking is off for. A document is also let through when its own
-    /// site is unblocked: that is the page about to be, which is what makes
-    /// `alt+b` on a blocked site's error page and a reload bring it back.
-    pub fn decide(&self, session: &str, url: &str, document: bool) -> Verdict {
+    /// blocking is off for. The page's own document is the exception to the
+    /// exception: it is the page about to be, not the one being left, so it
+    /// is let through only when its own site is unblocked — which is what
+    /// makes `alt+b` on a blocked site's error page and a reload bring it
+    /// back, and what keeps an unblocked site's link to a listed one from
+    /// carrying the exception with it.
+    pub fn decide(&self, session: &str, url: &str, document: Option<&str>) -> Verdict {
         let Some(host) = host_of(url) else {
             return Verdict::Continue;
         };
@@ -545,19 +554,18 @@ impl Blocker {
         let Ok(mut state) = self.state.lock() else {
             return Verdict::Continue;
         };
-        if document && state.unblocked.contains(&host) {
-            return Verdict::Continue;
-        }
         let State {
             unblocked,
             sessions,
         } = &mut *state;
         let page = sessions.entry(session.to_string()).or_default();
-        if page
-            .site
-            .as_ref()
-            .is_some_and(|site| unblocked.contains(site))
-        {
+        let main = document.is_some() && document == page.frame.as_deref();
+        let site = if main {
+            Some(&host)
+        } else {
+            page.site.as_ref()
+        };
+        if site.is_some_and(|site| unblocked.contains(site)) {
             return Verdict::Continue;
         }
         page.blocked = page.blocked.saturating_add(1);
@@ -601,10 +609,12 @@ impl Intercept for Blocker {
                     .path(&["params", "request", "url"])
                     .and_then(Json::as_str)
                     .unwrap_or_default();
-                let document = message
+                let document = (message
                     .path(&["params", "resourceType"])
                     .and_then(Json::as_str)
-                    == Some("Document");
+                    == Some("Document"))
+                .then(|| message.path(&["params", "frameId"]).and_then(Json::as_str))
+                .flatten();
                 // A pause with no session would be a browser-wide `Fetch`,
                 // which nothing here enables; let it go rather than hang it.
                 let verdict = session.map_or(Verdict::Continue, |session| {
@@ -631,11 +641,13 @@ impl Intercept for Blocker {
                     .and_then(Json::as_str);
                 if let (Some("page" | "iframe"), Some(attached)) = (kind, attached) {
                     let _ = wire.on(Some(attached)).notify("Fetch.enable", patterns());
-                    let url = message
-                        .path(&["params", "targetInfo", "url"])
-                        .and_then(Json::as_str)
-                        .unwrap_or_default();
-                    self.attached(attached, url);
+                    let info = |key: &str| {
+                        message
+                            .path(&["params", "targetInfo", key])
+                            .and_then(Json::as_str)
+                            .unwrap_or_default()
+                    };
+                    self.attached(attached, info("targetId"), info("url"));
                 }
                 false
             }
@@ -825,22 +837,22 @@ fe80::1%lo0 localhost
     #[test]
     fn requests_are_counted_per_page_and_a_landing_starts_the_count_again() {
         let blocker = blocker(&[]);
-        blocker.attached("S1", "about:blank");
-        blocker.attached("S2", "about:blank");
+        blocker.attached("S1", "T1", "about:blank");
+        blocker.attached("S2", "T2", "about:blank");
         assert_eq!(blocker.words(Some("S1")), None, "nothing blocked yet");
         blocker.landed("S1", "http://news.example/");
         for _ in 0..3 {
             assert_eq!(
-                blocker.decide("S1", "http://x.ads.test/pixel.gif", false),
+                blocker.decide("S1", "http://x.ads.test/pixel.gif", None),
                 Verdict::Block
             );
         }
         assert_eq!(
-            blocker.decide("S1", "http://news.example/story.css", false),
+            blocker.decide("S1", "http://news.example/story.css", None),
             Verdict::Continue
         );
         assert_eq!(
-            blocker.decide("S2", "https://ads.test/a.js", false),
+            blocker.decide("S2", "https://ads.test/a.js", None),
             Verdict::Block
         );
         assert_eq!(blocker.words(Some("S1")).as_deref(), Some("3 blocked"));
@@ -852,7 +864,7 @@ fe80::1%lo0 localhost
         blocker.detached("S2");
         assert_eq!(blocker.words(Some("S2")), None);
         assert_eq!(
-            blocker.decide("S1", "http://ads.test/", false),
+            blocker.decide("S1", "http://ads.test/", None),
             Verdict::Block
         );
         blocker.forget_all();
@@ -862,33 +874,42 @@ fe80::1%lo0 localhost
     #[test]
     fn an_unblocked_site_is_neither_blocked_nor_counted_and_says_so() {
         let blocker = blocker(&["news.example"]);
-        blocker.attached("S1", "http://news.example/");
+        blocker.attached("S1", "T1", "http://news.example/");
         assert_eq!(
-            blocker.decide("S1", "http://x.ads.test/pixel.gif", false),
+            blocker.decide("S1", "http://x.ads.test/pixel.gif", None),
             Verdict::Continue
         );
         assert_eq!(blocker.words(Some("S1")).as_deref(), Some("unblocked"));
 
         blocker.set_unblocked("news.example", false);
         assert_eq!(
-            blocker.decide("S1", "http://x.ads.test/pixel.gif", false),
+            blocker.decide("S1", "http://x.ads.test/pixel.gif", None),
             Verdict::Block
         );
         assert_eq!(blocker.words(Some("S1")).as_deref(), Some("1 blocked"));
 
-        // A listed site's own document, once it is unblocked: its error page
-        // is where `alt+b` was pressed.
+        // The page's own document is judged by its own site, not by the one
+        // being left: an unblocked site's link to a listed one is still
+        // blocked, and unblocking the listed site — `alt+b` on its error
+        // page — lets it through.
+        blocker.set_unblocked("news.example", true);
         assert_eq!(
-            blocker.decide("S1", "http://ads.test/", true),
+            blocker.decide("S1", "http://ads.test/", Some("T1")),
             Verdict::Block
         );
+        assert_eq!(
+            blocker.decide("S1", "http://ads.test/frame.html", Some("F9")),
+            Verdict::Continue,
+            "an iframe's document is the page's to allow"
+        );
+        blocker.set_unblocked("news.example", false);
         blocker.set_unblocked("ads.test", true);
         assert_eq!(
-            blocker.decide("S1", "http://ads.test/", true),
+            blocker.decide("S1", "http://ads.test/", Some("T1")),
             Verdict::Continue
         );
         assert_eq!(
-            blocker.decide("S1", "http://ads.test/a.js", false),
+            blocker.decide("S1", "http://ads.test/a.js", None),
             Verdict::Block,
             "a subresource is the page's to allow"
         );
@@ -937,7 +958,7 @@ fe80::1%lo0 localhost
         let blocker = blocker(&[]);
 
         let attached = event(
-            r#"{"method":"Target.attachedToTarget","params":{"sessionId":"S1","targetInfo":{"type":"page","url":"about:blank"}}}"#,
+            r#"{"method":"Target.attachedToTarget","params":{"sessionId":"S1","targetInfo":{"targetId":"F","type":"page","url":"about:blank"}}}"#,
         );
         assert!(
             !blocker.intercept(&attached, &wire),
