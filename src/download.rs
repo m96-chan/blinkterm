@@ -134,7 +134,7 @@
 //!
 //! # A file this program writes itself
 //!
-//! A page saved as a PDF or a picture (`crate::save`) goes to the same
+//! A page saved as a PDF or a picture ([`crate::save`]) goes to the same
 //! directory, and is named, reserved and said on the row the same way: made
 //! 0700 if it is missing ([`Downloads::ensure`]), `(1)` when the name is
 //! taken ([`reserve`]), `saved ~/Downloads/…` or `couldn't save …` for eight

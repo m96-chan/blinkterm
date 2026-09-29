@@ -155,6 +155,7 @@ pub mod png;
 pub mod profile;
 pub mod remote;
 pub mod route;
+pub mod save;
 pub mod screen;
 pub mod scroll;
 pub mod session;

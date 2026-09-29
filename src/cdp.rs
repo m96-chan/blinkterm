@@ -97,7 +97,7 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 ///
 /// A screencast frame at a pane's size is tens of kilobytes and a still of
 /// the pane a megabyte. What sets the number is the picture of a whole page
-/// (`crate::save`), which is base64 of a PNG and so four thirds of it,
+/// ([`crate::save`]), which is base64 of a PNG and so four thirds of it,
 /// measured against `chrome-headless-shell` 153 at 1280 wide:
 ///
 /// | page | PNG | message |
@@ -108,7 +108,7 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 ///
 /// Sixteen, which this was, is exceeded by the second row, and a message too
 /// big for the ceiling is not a failed screenshot: it ends the pipe, and with
-/// it every tab. So the ceiling is sixty-four, and `crate::save::PIXELS`
+/// it every tab. So the ceiling is sixty-four, and [`crate::save::PIXELS`]
 /// bounds a capture so that the worst case measured, noise at 3.01 bytes a
 /// pixel, is 61.2 MiB on the pipe and under it. It is still a ceiling on what
 /// a confused peer can make this program allocate — sixty-four megabytes with
