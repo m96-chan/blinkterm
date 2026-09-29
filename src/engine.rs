@@ -591,12 +591,28 @@ fn is_executable(path: &Path) -> bool {
 /// `--disable-dev-shm-usage` and `--ozone-platform=headless` stay on a Mac
 /// too, where they mean nothing: Chromium ignores a switch it does not know
 /// rather than refusing it, and one list is one thing to reason about.
+///
+/// `--disable-blink-features=AutomationControlled` turns `navigator.webdriver`
+/// off ([#48](https://github.com/m96-chan/blinkterm/issues/48)). Blink sets
+/// that flag to say a program is driving the page rather than a person, and
+/// a page reads it to decide it is talking to a crawler. Here it is simply
+/// untrue: every click and every key this engine sees came from somebody at
+/// a terminal, and nothing automates it. Measured on `chrome-headless-shell`
+/// 153: `navigator.webdriver` is `true` without the switch and `false` with
+/// it, at no cost in memory or startup.
+///
+/// It is the only signal this list changes. `navigator.plugins` is still
+/// empty, `window.chrome` still missing and `Notification.permission` still
+/// `denied`, because those follow from running headless and no switch moves
+/// them; a page that reads them still sees a headless browser, which is what
+/// this is.
 pub fn flags(as_root: bool) -> Vec<&'static str> {
     let mut flags = vec![
         "--headless",
         "--disable-gpu",
         "--disable-dev-shm-usage",
         "--ozone-platform=headless",
+        "--disable-blink-features=AutomationControlled",
         "--remote-debugging-pipe",
     ];
     if as_root {
@@ -999,6 +1015,9 @@ mod tests {
             "--disable-gpu",
             "--disable-dev-shm-usage",
             "--ozone-platform=headless",
+            // A person is driving, so navigator.webdriver must not say a
+            // program is. Measured: true without this, false with it.
+            "--disable-blink-features=AutomationControlled",
             "--remote-debugging-pipe",
         ];
         // A Mac's Chromium would otherwise ask the Keychain, in a dialog.

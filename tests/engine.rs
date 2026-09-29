@@ -8549,3 +8549,33 @@ fn the_wrapped_frame_parses_once_the_tmux_model_has_unwrapped_it() {
     client.close();
     engine.kill();
 }
+
+/// A person is driving, so the page is not told a program is.
+///
+/// Blink sets `navigator.webdriver` to say the browser is under automation,
+/// and a page reads it to decide it is talking to a crawler; here it would be
+/// a false statement, and `--disable-blink-features=AutomationControlled` in
+/// [`engine::flags`] is what makes it false. Asked through the engine this
+/// program starts, rather than of the switch list, because the switch is only
+/// worth anything if it survives the launch.
+///
+/// The other headless signals are not asserted: `navigator.plugins` is empty,
+/// `window.chrome` is missing and `Notification.permission` is `denied`, and
+/// no switch changes them (#48). This one is the false claim; those are true
+/// ones about a headless browser.
+#[test]
+fn the_page_is_not_told_that_a_program_is_driving() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let webdriver = evaluate(&mut client, "navigator.webdriver");
+    eprintln!("navigator.webdriver = {webdriver:?}");
+    assert_eq!(
+        webdriver,
+        Json::Bool(false),
+        "navigator.webdriver is not false; is \
+         --disable-blink-features=AutomationControlled still in engine::flags?"
+    );
+    client.close();
+    engine.kill();
+}
