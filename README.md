@@ -438,6 +438,7 @@ nothing else, for scripts.
 | `find` | `ctrl+f` | find in the page |
 | `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
 | `block` | `alt+b` | stop blocking ads and trackers on this site, or start again |
+| `fill-login` | `alt+l` | fill the login form from your password manager |
 | `copy` | `alt+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | copy the url |
 | `save-pdf` | `alt+s` | save this page as a PDF |
@@ -665,6 +666,7 @@ ignores it until the picker exits.
 | `alt+shift+s` | save the whole page, top to bottom, as a PNG there. A page past sixteen million pixels is cut to its top, and the row says how much |
 | `alt+p` | allow this site something: the row says `allow https://site: ` and the words it is allowed now, all selected; type any of `camera` `microphone` `location` `notifications` `clipboard`, `enter` sets exactly those (an empty line takes them all back), `esc` leaves it. See [Sound, permissions and fullscreen](#sound-permissions-and-fullscreen) |
 | `alt+b` | stop blocking ads and trackers on this site, or start again: the row says `blocking off for example.com`, and `unblocked` while you are on it. Reload to get what was blocked. In the url bar `alt+b` is still a word back |
+| `alt+l` | fill the login form from your password manager: runs `password-command` for this page's host and puts what it printed into the password field and the user-name field before it, in the page or a same-origin frame; never submits; only on https or localhost. See [Filling a login from your password manager](#filling-a-login-from-your-password-manager) |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |

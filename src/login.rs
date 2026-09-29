@@ -53,7 +53,7 @@
 //! refused on the row with nothing run, so a secret is never fetched for a
 //! page that could not be trusted with it.
 //!
-//! Then in the page, by the script that fills (`SCRIPT`): it touches only
+//! Then in the page, by the script that fills ([`SCRIPT`]): it touches only
 //! a document whose own `location` passes the same rule and whose hostname
 //! is the one the secret was fetched for — the top document and the frames
 //! of the same origin it can reach. That is checked where the fields are,
@@ -77,6 +77,7 @@
 use std::os::fd::RawFd;
 use std::path::Path;
 
+use crate::json::Json;
 use crate::permissions;
 use crate::picker::{self, Command, Exit, Kind, Running};
 use crate::text;
@@ -401,6 +402,162 @@ pub fn run_terminal(command: &Command, site: &Site, dir: &Path) -> Outcome {
         WHAT,
     ))
 }
+
+/// The script that fills, as the `functionDeclaration` of a
+/// `Runtime.callFunctionOn` in the isolated world of the page's main frame
+/// ([`crate::find::WORLD`]): `function (host, user, pass)`, answering
+/// `["filled", userFilled]`, `["none"]` or `["refused"]` — never anything
+/// it was given.
+///
+/// Why an isolated world: a script there sets `value` through the engine's
+/// own setter, not through whatever the page put on the element in its own
+/// world (React replaces `value` on each input to track it), and the page's
+/// scripts cannot see the function or its arguments. The `input` and
+/// `change` events it dispatches are on the page's own nodes, so the
+/// page's listeners hear them as they hear a person typing. That is how a
+/// browser extension fills a form.
+///
+/// What it does, in order:
+///
+/// - Collects the documents: the top one and every frame's
+///   `contentDocument` under it, eight deep. A cross-origin frame's is
+///   `null` from here, by the engine's rule, and is left out.
+/// - Keeps those it may fill: `location.protocol` `https:`, or `http:` on a
+///   host that is this machine by [`is_local`]'s rule, **and**
+///   `location.hostname` equal to `host`, the host the secret was fetched
+///   for. None kept is `["refused"]`: the page is not the one it was.
+/// - Finds the password field: the one the focus is in, or the first one in
+///   the form the focus is in — the focus followed through shadow roots and
+///   frames as [`crate::hints::FOCUSED`] follows it, and only in a document
+///   it kept — else the first visible, enabled, writable
+///   `input type=password` of the kept documents in order, open shadow
+///   roots included. None is `["none"]`.
+/// - Finds the user-name field before it, in its form, or its document or
+///   shadow root when it has no form: of the visible text, email and tel
+///   inputs that come before it, the nearest whose `autocomplete` says
+///   `username` or whose name or id says user, login, email or account;
+///   else the nearest.
+/// - Sets each as a person would leave it: focus, the value, then `input`
+///   and `change`, bubbling. The user name only when the command printed
+///   one and a field was found for it.
+///
+/// It never submits, never presses Enter, never calls `requestSubmit`.
+pub const SCRIPT: &str = r#"function (host, user, pass) {
+var local = function (h) { return h === 'localhost' || /\.localhost$/.test(h) || h === '[::1]' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h); };
+var ok = function (d) { try { var l = d.location; return !!l && (l.protocol === 'https:' || (l.protocol === 'http:' && local(l.hostname))) && l.hostname === host; } catch (e) { return false; } };
+var docs = [], kept = [];
+var walk = function (d, depth) { docs.push(d); if (depth >= 8) return; var fs = d.querySelectorAll('iframe,frame'); for (var i = 0; i < fs.length; i++) { var c = null; try { c = fs[i].contentDocument; } catch (e) { } if (c) walk(c, depth + 1); } };
+walk(document, 0);
+for (var i = 0; i < docs.length; i++) if (ok(docs[i])) kept.push(docs[i]);
+if (!kept.length) return ['refused'];
+var inputs = function (root) { var out = []; var all = root.querySelectorAll('*'); for (var i = 0; i < all.length; i++) { var e = all[i]; if (e.tagName === 'INPUT') out.push(e); if (e.shadowRoot) out = out.concat(inputs(e.shadowRoot)); } return out; };
+var usable = function (e) { if (!e || e.tagName !== 'INPUT' || e.disabled || e.readOnly) return false; if (e.checkVisibility && !e.checkVisibility({ visibilityProperty: true })) return false; return e.getClientRects().length > 0; };
+var isPass = function (e) { return usable(e) && e.type === 'password'; };
+var inKept = function (e) { return kept.indexOf(e.ownerDocument) >= 0; };
+var field = null;
+var f = document.activeElement;
+for (var n = 0; n < 16 && f; n++) { if (f.shadowRoot && f.shadowRoot.activeElement) { f = f.shadowRoot.activeElement; continue; } if (f.tagName === 'IFRAME' || f.tagName === 'FRAME') { var c = null; try { c = f.contentDocument; } catch (e) { } if (c && c.activeElement) { f = c.activeElement; continue; } } break; }
+if (f && inKept(f)) { if (isPass(f)) field = f; else if (f.form) { var els = f.form.elements; for (var i = 0; i < els.length && !field; i++) if (isPass(els[i])) field = els[i]; } }
+for (var d = 0; d < kept.length && !field; d++) { var all = inputs(kept[d]); for (var i = 0; i < all.length && !field; i++) if (isPass(all[i])) field = all[i]; }
+if (!field) return ['none'];
+var set = function (e, v) { e.focus(); e.value = v; e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); };
+var filledUser = false;
+if (user != null) {
+  var scope = field.form ? Array.prototype.slice.call(field.form.elements) : inputs(field.getRootNode());
+  var before = scope.filter(function (e) { return usable(e) && /^(text|email|tel)$/.test(e.type) && !!(e.compareDocumentPosition(field) & Node.DOCUMENT_POSITION_FOLLOWING); });
+  var said = before.filter(function (e) { return /username/i.test(e.autocomplete || '') || /user|login|email|account/i.test((e.name || '') + ' ' + (e.id || '')); });
+  var u = said.length ? said[said.length - 1] : before[before.length - 1];
+  if (u) { set(u, user); filledUser = true; }
+}
+set(field, pass);
+return ['filled', filledUser];
+}"#;
+
+/// The `Runtime.callFunctionOn` parameters for [`SCRIPT`] in world
+/// `context`: the host, the user name and the password as its `arguments`
+/// — values the engine hands the function, never text in its source, so
+/// nothing a password holds can be read as script — and the answer by
+/// value. No user name is no `value` at all, which the function is given as
+/// `undefined`. `silent`, so that nothing about the call reaches the
+/// page's console.
+///
+/// The JSON built here, and the message [`crate::cdp::Client::send`] makes
+/// of it, are the copies of the secret this program cannot overwrite: both
+/// are built and freed inside one call.
+pub fn fill_params(context: i64, site: &Site, login: &Login) -> Json {
+    let value = |text: &str| Json::object(vec![("value", Json::string(text))]);
+    Json::object(vec![
+        ("functionDeclaration", Json::string(SCRIPT)),
+        ("executionContextId", Json::number(context as f64)),
+        (
+            "arguments",
+            Json::Array(vec![
+                value(&site.host),
+                match &login.user {
+                    Some(user) => value(user.as_str()),
+                    None => Json::empty(),
+                },
+                value(login.password.as_str()),
+            ]),
+        ),
+        ("returnByValue", Json::Bool(true)),
+        ("silent", Json::Bool(true)),
+    ])
+}
+
+/// What [`SCRIPT`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filled {
+    /// The password and the user name.
+    Both,
+    /// The password; no user name was printed, or no field was found for
+    /// one.
+    PasswordOnly,
+    /// No password field in any document it may fill.
+    NoField,
+    /// No document it may fill: the page is not the one the login was
+    /// fetched for.
+    Refused,
+}
+
+/// Read the answer to [`SCRIPT`]: `None` for an exception or anything not
+/// of its shape.
+pub fn filled(reply: &Json) -> Option<Filled> {
+    if reply.get("exceptionDetails").is_some() {
+        return None;
+    }
+    let answer = reply.path(&["result", "value"])?.as_array()?;
+    match (answer.first()?.as_str()?, answer.get(1)) {
+        ("filled", Some(user)) => Some(if user.as_bool()? {
+            Filled::Both
+        } else {
+            Filled::PasswordOnly
+        }),
+        ("none", None) => Some(Filled::NoField),
+        ("refused", None) => Some(Filled::Refused),
+        _ => None,
+    }
+}
+
+/// What the row says after [`SCRIPT`] answered, for the page at `host`:
+/// what was filled, never with what.
+pub fn sentence(filled: Filled, host: &str) -> String {
+    let host = text::sanitize(host);
+    match filled {
+        Filled::Both => format!("filled login for {host}"),
+        Filled::PasswordOnly => format!("filled password for {host}"),
+        Filled::NoField => "no password field on this page".to_string(),
+        Filled::Refused => CHANGED.to_string(),
+    }
+}
+
+/// What the row says when the page is no longer the one the login was
+/// fetched for.
+pub const CHANGED: &str = "the page changed; login not filled";
+
+/// What the row says when the page did not answer the fill, threw, or had
+/// no world to fill from.
+pub const NOT_TAKEN: &str = "the page did not take the login";
 
 /// What the row says while a command with a window is asked.
 pub fn asking(host: &str) -> String {
@@ -727,6 +884,102 @@ mod tests {
             Outcome::Failed(why)
                 if why == "can't start the password command blinkterm-no-such-command: no such program"
         ));
+    }
+
+    #[test]
+    fn the_secret_goes_to_the_page_as_an_argument_and_never_in_the_source() {
+        let site = site("https://example.com/login").expect("a site");
+        let login = parse_output(b"p'ass\"</script>\nlogin: me\n").expect("a login");
+        let params = fill_params(7, &site, &login);
+        assert_eq!(
+            params.get("functionDeclaration").and_then(Json::as_str),
+            Some(SCRIPT)
+        );
+        assert_eq!(
+            params.get("executionContextId").and_then(Json::as_i64),
+            Some(7)
+        );
+        assert_eq!(
+            params.get("returnByValue").and_then(Json::as_bool),
+            Some(true)
+        );
+        let arguments = params
+            .get("arguments")
+            .and_then(Json::as_array)
+            .expect("arguments");
+        let value = |i: usize| arguments[i].get("value").and_then(Json::as_str);
+        assert_eq!(value(0), Some("example.com"));
+        assert_eq!(value(1), Some("me"));
+        assert_eq!(value(2), Some("p'ass\"</script>"));
+        assert!(!SCRIPT.contains("p'ass"));
+
+        // No user name is no value: `undefined` to the function.
+        let login = parse_output(b"secret\n").expect("a login");
+        let params = fill_params(7, &site, &login);
+        let arguments = params
+            .get("arguments")
+            .and_then(Json::as_array)
+            .expect("arguments");
+        assert_eq!(arguments[1], Json::empty());
+
+        // The script is text a `callFunctionOn` takes as it is: no
+        // character a JavaScript source cannot hold, and it submits nothing.
+        assert!(SCRIPT.starts_with("function (host, user, pass)"));
+        assert!(!SCRIPT.contains(['\0', '\u{2028}', '\u{2029}', '`']));
+        for never in ["submit", "Enter", "keydown", "keypress"] {
+            assert!(!SCRIPT.contains(never), "{never}");
+        }
+    }
+
+    #[test]
+    fn what_the_script_answered_is_read() {
+        let reply = |text: &str| Json::parse(text).expect("json");
+        assert_eq!(
+            filled(&reply(
+                r#"{"result":{"type":"object","value":["filled",true]}}"#
+            )),
+            Some(Filled::Both)
+        );
+        assert_eq!(
+            filled(&reply(r#"{"result":{"value":["filled",false]}}"#)),
+            Some(Filled::PasswordOnly)
+        );
+        assert_eq!(
+            filled(&reply(r#"{"result":{"value":["none"]}}"#)),
+            Some(Filled::NoField)
+        );
+        assert_eq!(
+            filled(&reply(r#"{"result":{"value":["refused"]}}"#)),
+            Some(Filled::Refused)
+        );
+        for broken in [
+            r#"{"result":{"value":["filled"]}}"#,
+            r#"{"result":{"value":["filled","yes"]}}"#,
+            r#"{"result":{"value":"filled"}}"#,
+            r#"{"result":{"value":["other"]}}"#,
+            r#"{"result":{"value":["none",1]}}"#,
+            r#"{"result":{"value":["filled",true]},"exceptionDetails":{}}"#,
+            r#"{}"#,
+        ] {
+            assert_eq!(filled(&reply(broken)), None, "{broken}");
+        }
+        assert_eq!(
+            sentence(Filled::Both, "example.com"),
+            "filled login for example.com"
+        );
+        assert_eq!(
+            sentence(Filled::PasswordOnly, "example.com"),
+            "filled password for example.com"
+        );
+        assert_eq!(
+            sentence(Filled::NoField, "example.com"),
+            "no password field on this page"
+        );
+        assert_eq!(
+            sentence(Filled::Refused, "example.com"),
+            "the page changed; login not filled"
+        );
+        assert_eq!(NOT_TAKEN, "the page did not take the login");
     }
 
     #[test]
