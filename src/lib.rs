@@ -148,6 +148,7 @@ pub mod motion;
 pub mod normal;
 pub mod options;
 pub mod permissions;
+pub mod picker;
 pub mod png;
 pub mod profile;
 pub mod route;

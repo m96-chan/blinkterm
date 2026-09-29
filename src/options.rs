@@ -53,6 +53,7 @@ use crate::appearance;
 use crate::bindings::{Binding, Bindings};
 use crate::download;
 use crate::engine;
+use crate::picker;
 use crate::profile;
 use crate::route;
 use crate::zoom::Scale;
@@ -112,6 +113,9 @@ pub struct Options {
     /// `--tmux`, `--frames`, `--fps` and `--no-probe`: what overrides the
     /// route a run's frames take. See [`crate::route`].
     pub route: route::Choices,
+    /// `--file-picker` and its three siblings: the programs that answer a
+    /// page's file input instead of the row. See [`crate::picker`].
+    pub pickers: picker::Pickers,
 }
 
 /// What `main` was asked to do, once the command line has been read.
@@ -186,6 +190,10 @@ pub struct Settings {
     pub fps: Option<u32>,
     /// `false` with `--no-probe` or `probe = false`.
     pub probe: Option<bool>,
+    pub file_picker: Option<picker::Command>,
+    pub file_picker_multiple: Option<picker::Command>,
+    pub file_picker_terminal: Option<picker::Command>,
+    pub file_picker_terminal_multiple: Option<picker::Command>,
     /// File only: a binding is not a one-run thing.
     pub bindings: Vec<Binding>,
     /// Command line only.
@@ -226,6 +234,12 @@ impl Settings {
             frames: self.frames.or(under.frames),
             fps: self.fps.or(under.fps),
             probe: self.probe.or(under.probe),
+            file_picker: self.file_picker.or(under.file_picker),
+            file_picker_multiple: self.file_picker_multiple.or(under.file_picker_multiple),
+            file_picker_terminal: self.file_picker_terminal.or(under.file_picker_terminal),
+            file_picker_terminal_multiple: self
+                .file_picker_terminal_multiple
+                .or(under.file_picker_terminal_multiple),
             bindings,
             config: self.config.or(under.config),
             what: self.what.or(under.what),
@@ -439,6 +453,33 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             )?;
             continue;
         }
+        // Longest first, though `value_of` would not mistake one for the
+        // other: `--file-picker-terminal=x` is not `--file-picker` with a
+        // value, since what follows the name has to be `=` or nothing.
+        let pickers = [
+            "--file-picker-terminal-multiple",
+            "--file-picker-terminal",
+            "--file-picker-multiple",
+            "--file-picker",
+        ];
+        if let Some((name, text)) = pickers
+            .iter()
+            .find_map(|name| value_of(arg, name, &mut args).map(|text| (*name, text)))
+        {
+            let slot = match name {
+                "--file-picker-terminal-multiple" => &mut s.file_picker_terminal_multiple,
+                "--file-picker-terminal" => &mut s.file_picker_terminal,
+                "--file-picker-multiple" => &mut s.file_picker_multiple,
+                _ => &mut s.file_picker,
+            };
+            let text = needed(text, &format!("{name} needs a command: {name} <command>"))?;
+            once(
+                slot,
+                picker::Command::parse(name, text)?,
+                &format!("{name} once is enough"),
+            )?;
+            continue;
+        }
         if let Some(proxy) = value_of(arg, "--proxy", &mut args) {
             let proxy = needed(
                 proxy,
@@ -537,7 +578,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 19] = [
+const KEYS: [&str; 23] = [
     "home",
     "profile",
     "temp-profile",
@@ -557,6 +598,10 @@ const KEYS: [&str; 19] = [
     "frames",
     "fps",
     "probe",
+    "file-picker",
+    "file-picker-multiple",
+    "file-picker-terminal",
+    "file-picker-terminal-multiple",
 ];
 
 /// One file's text. `path` is only for the sentences, every one of which is
@@ -658,6 +703,17 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             "frames" => s.frames = Some(route::Frames::parse(value).map_err(at)?),
             "fps" => s.fps = Some(route::parse_fps(key, value).map_err(at)?),
             "probe" => s.probe = Some(parse_bool(key, value).map_err(at)?),
+            "file-picker" => s.file_picker = Some(picker::Command::parse(key, value).map_err(at)?),
+            "file-picker-multiple" => {
+                s.file_picker_multiple = Some(picker::Command::parse(key, value).map_err(at)?)
+            }
+            "file-picker-terminal" => {
+                s.file_picker_terminal = Some(picker::Command::parse(key, value).map_err(at)?)
+            }
+            "file-picker-terminal-multiple" => {
+                s.file_picker_terminal_multiple =
+                    Some(picker::Command::parse(key, value).map_err(at)?)
+            }
             _ => unreachable!("every key in KEYS has an arm"),
         }
     }
@@ -763,6 +819,12 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
             fps: s.fps,
             probe: s.probe.unwrap_or(true),
         },
+        pickers: picker::Pickers {
+            gui: s.file_picker,
+            gui_multiple: s.file_picker_multiple,
+            terminal: s.file_picker_terminal,
+            terminal_multiple: s.file_picker_terminal_multiple,
+        },
     })
 }
 
@@ -799,18 +861,33 @@ fn read_config(choice: Option<&ConfigChoice>) -> Result<(Settings, Provenance), 
         }
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    let mut settings = parse_config_bytes(&path, &bytes)?;
+    let settings = parse_config_bytes(&path, &bytes)?;
     provenance.found = true;
     provenance.settings = count_settings(&String::from_utf8_lossy(&bytes));
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let home = home.as_deref();
+    Ok((home_expanded(settings, home.as_deref()), provenance))
+}
+
+/// A file's settings with `~/` made `$HOME`'s wherever a path or a program
+/// is: see [`expand_home`]. The command line's are left alone, because the
+/// shell has already done it for them — and did not, on purpose, for one
+/// that was quoted.
+fn home_expanded(mut settings: Settings, home: Option<&Path>) -> Settings {
     settings.profile = settings.profile.map(|choice| match choice {
         profile::Choice::At(dir) => profile::Choice::At(expand_home(dir, home)),
         other => other,
     });
     settings.download_dir = settings.download_dir.map(|dir| expand_home(dir, home));
     settings.engine = settings.engine.map(|path| expand_home(path, home));
-    Ok((settings, provenance))
+    for command in [
+        &mut settings.file_picker,
+        &mut settings.file_picker_multiple,
+        &mut settings.file_picker_terminal,
+        &mut settings.file_picker_terminal_multiple,
+    ] {
+        *command = command.take().map(|command| command.expand_home(home));
+    }
+    settings
 }
 
 /// The whole thing, for `main`: parse the arguments; unless they said
@@ -1548,6 +1625,128 @@ mod tests {
         assert_eq!(
             expand_home(PathBuf::from("~/p"), None),
             PathBuf::from("~/p")
+        );
+    }
+
+    #[test]
+    fn a_file_picker_is_a_command_from_either_source_and_each_is_its_own() {
+        let words = |s: &Option<picker::Command>| s.as_ref().map(|c| c.words.clone());
+        let cli = parsed(&[
+            "--file-picker",
+            "zenity --file-selection",
+            "--file-picker-multiple=zenity --file-selection --multiple",
+            "--file-picker-terminal",
+            "yazi --chooser-file={out} '{dir}'",
+            "--file-picker-terminal-multiple=fzf -m",
+        ])
+        .expect("four settings");
+        assert_eq!(
+            words(&cli.file_picker),
+            Some(vec!["zenity".to_string(), "--file-selection".to_string()])
+        );
+        assert_eq!(words(&cli.file_picker_multiple).map(|w| w.len()), Some(3));
+        assert_eq!(
+            words(&cli.file_picker_terminal),
+            Some(vec![
+                "yazi".to_string(),
+                "--chooser-file={out}".to_string(),
+                "{dir}".to_string()
+            ])
+        );
+        assert_eq!(
+            words(&cli.file_picker_terminal_multiple).map(|w| w.len()),
+            Some(2)
+        );
+
+        assert_eq!(
+            parsed(&["--file-picker=a", "--file-picker=b"]),
+            Err("--file-picker once is enough".to_string())
+        );
+        assert_eq!(
+            parsed(&["--file-picker"]),
+            Err("--file-picker needs a command: --file-picker <command>".to_string())
+        );
+        assert_eq!(
+            parsed(&["--file-picker-terminal="]),
+            Err(
+                "--file-picker-terminal needs a command: --file-picker-terminal <command>"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            parsed(&["--file-picker", "  "]),
+            Err("--file-picker needs a command".to_string())
+        );
+        assert_eq!(
+            parsed(&["--file-picker-multiple", "pick 'x"]),
+            Err("--file-picker-multiple has a quote that is never closed".to_string())
+        );
+
+        let s = file(
+            "file-picker = osascript -e 'POSIX path of (choose file)'\n\
+             file-picker-multiple = kdialog --getopenfilename --multiple {dir}\n\
+             file-picker-terminal = kitten choose-files --write-output-to={out}\n\
+             file-picker-terminal-multiple = fzf -m",
+        )
+        .expect("a file");
+        assert_eq!(
+            words(&s.file_picker),
+            Some(vec![
+                "osascript".to_string(),
+                "-e".to_string(),
+                "POSIX path of (choose file)".to_string()
+            ])
+        );
+        assert!(s.file_picker_multiple.is_some());
+        assert!(s.file_picker_terminal.expect("set").has_out());
+        assert!(s.file_picker_terminal_multiple.is_some());
+        assert_eq!(
+            file("scale = 2\nfile-picker = pick \"x"),
+            Err("/c:2: file-picker has a quote that is never closed".to_string())
+        );
+        assert_eq!(
+            file("file-picker = a\nfile-picker = b"),
+            Err("/c:2: file-picker is already set on line 1".to_string())
+        );
+    }
+
+    #[test]
+    fn the_command_line_picker_wins_and_the_file_fills_the_others() {
+        let from_file = file("file-picker = zenity --file-selection\nfile-picker-terminal = fzf")
+            .expect("a file");
+        let cli = parsed(&["--file-picker=kdialog --getopenfilename"]).expect("cli");
+        let options = resolve(cli, Settings::default(), from_file).expect("resolves");
+        assert_eq!(
+            options.pickers.gui.map(|c| c.words),
+            Some(vec!["kdialog".to_string(), "--getopenfilename".to_string()])
+        );
+        assert_eq!(
+            options.pickers.terminal.map(|c| c.words),
+            Some(vec!["fzf".to_string()])
+        );
+        assert_eq!(options.pickers.gui_multiple, None);
+        assert!(resolved(&[]).expect("resolves").pickers.is_empty());
+    }
+
+    #[test]
+    fn a_tilde_starting_a_picker_from_the_file_is_home_and_from_the_command_line_is_not() {
+        let home = Some(Path::new("/h"));
+        let from_file = home_expanded(
+            file("file-picker-terminal = ~/bin/pick ~/x\nprofile = ~/p").expect("a file"),
+            home,
+        );
+        assert_eq!(
+            from_file.file_picker_terminal.map(|c| c.words),
+            Some(vec!["/h/bin/pick".to_string(), "~/x".to_string()])
+        );
+        assert_eq!(from_file.profile, Some(Choice::At(PathBuf::from("/h/p"))));
+        // What `invocation` does with the command line is nothing: the
+        // shell has had its chance.
+        let cli = parsed(&["--file-picker-terminal", "~/bin/pick"]).expect("cli");
+        let options = resolve(cli, Settings::default(), Settings::default()).expect("resolves");
+        assert_eq!(
+            options.pickers.terminal.map(|c| c.words),
+            Some(vec!["~/bin/pick".to_string()])
         );
     }
 

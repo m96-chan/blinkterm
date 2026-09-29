@@ -163,6 +163,24 @@ pub fn leave_sequence_with(keyboard: bool) -> Vec<u8> {
     out
 }
 
+/// What [`Pane::release`] writes to give the terminal to another program
+/// for a while: [`leave_sequence_with`], every mode this program set turned
+/// off and the shell's screen back, so that a file picker that runs in the
+/// terminal ([`crate::picker`]) starts on a terminal in the state it would
+/// find one in if it had been started from the shell.
+pub fn release_sequence(keyboard: bool) -> Vec<u8> {
+    leave_sequence_with(keyboard)
+}
+
+/// What [`Pane::resume`] writes to take it back: [`enter_sequence_with`],
+/// and none of the questions [`Pane::enter`] asks after it. Their answers
+/// are already known — a terminal does not change what it speaks while a
+/// picker runs in it — and an answer read now would arrive while the loop
+/// has already gone back to reading keys.
+pub fn resume_sequence(keyboard: bool) -> Vec<u8> {
+    enter_sequence_with(keyboard)
+}
+
 /// Tell the terminal what the pointer should look like: `OSC 22 ; name ST`.
 ///
 /// Kitty's pointer-shape protocol, which Ghostty speaks too; every terminal
@@ -258,12 +276,7 @@ impl Pane {
         if unsafe { libc::tcgetattr(input, &mut saved) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut raw = saved;
-        // SAFETY: `cfmakeraw(3)` edits the struct in place; `raw` is a live
-        // local and is the copy, so `saved` still holds what to put back.
-        unsafe { libc::cfmakeraw(&mut raw) };
-        raw.c_cc[libc::VMIN] = 0;
-        raw.c_cc[libc::VTIME] = 0;
+        let raw = raw_from(saved);
         // SAFETY: read-only through the pointer, and `raw` is a live local.
         if unsafe { libc::tcsetattr(input, libc::TCSANOW, &raw) } < 0 {
             return Err(io::Error::last_os_error());
@@ -333,6 +346,56 @@ impl Pane {
         })
     }
 
+    /// Give the terminal to another program until [`Pane::resume`]: every
+    /// mode off, the shell's screen back, the settings it had before this
+    /// program started — what [`Pane::leave`] does, and nothing forgotten.
+    ///
+    /// The saved settings are read rather than taken, so that a panic while
+    /// the other program runs still has them for [`emergency`]. What is
+    /// queued is written out first, up to [`LEAVE_DRAIN`], because the
+    /// other program writes to the same terminal straight away and would
+    /// otherwise be written over by the end of a frame. The caller clears
+    /// the picture first, if it wants it gone: a terminal that keeps images
+    /// per screen would otherwise show it again on the way back.
+    pub fn release(&mut self) -> io::Result<()> {
+        self.write(&release_sequence(self.keyboard))?;
+        self.outbox.drain(LEAVE_DRAIN);
+        let saved = SAVED.lock().ok().and_then(|saved| *saved);
+        if let Some(termios) = saved {
+            // SAFETY: read-only through a pointer to a live local, and the
+            // descriptor is the one `enter` took.
+            if unsafe { libc::tcsetattr(self.input, libc::TCSANOW, &termios) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the terminal back after [`Pane::release`]: raw again, as
+    /// [`Pane::enter`] made it, and every mode on again.
+    ///
+    /// What was typed while the other program had the terminal and it did
+    /// not read — the key that closed it, a report of the mouse let go — is
+    /// thrown away rather than read as the first keys to the page. The
+    /// screen is empty after this, and the caller draws it again.
+    pub fn resume(&mut self) -> io::Result<()> {
+        let saved = SAVED.lock().ok().and_then(|saved| *saved);
+        if let Some(saved) = saved {
+            let raw = raw_from(saved);
+            // SAFETY: read-only through the pointer, and `raw` is a live
+            // local.
+            if unsafe { libc::tcsetattr(self.input, libc::TCSANOW, &raw) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        // SAFETY: `tcflush(3)` takes a descriptor and a constant and reads
+        // no memory; the descriptor is the one `enter` took.
+        unsafe {
+            libc::tcflush(self.input, libc::TCIFLUSH);
+        }
+        self.write(&resume_sequence(self.keyboard))
+    }
+
     /// Put everything back, now.
     pub fn leave(&mut self) {
         if self.restored {
@@ -357,6 +420,19 @@ impl Drop for Pane {
     fn drop(&mut self) {
         self.leave();
     }
+}
+
+/// The raw mode this program reads the terminal in, made from the settings
+/// it found: no echo, no line discipline, no signals from keys, and a read
+/// that returns at once with whatever there is.
+fn raw_from(saved: libc::termios) -> libc::termios {
+    let mut raw = saved;
+    // SAFETY: `cfmakeraw(3)` edits the struct in place; `raw` is a live
+    // local and is the copy, so `saved` still holds what to put back.
+    unsafe { libc::cfmakeraw(&mut raw) };
+    raw.c_cc[libc::VMIN] = 0;
+    raw.c_cc[libc::VTIME] = 0;
+    raw
 }
 
 /// [`ASK_CELL_SIZE`] as the route sends it. Through tmux the bare question is
@@ -1348,6 +1424,37 @@ mod tests {
         }
         assert!(on.contains("\x1b[>23u"), "the flags are pushed: {on:?}");
         assert!(off.contains("\x1b[<u"), "and popped: {off:?}");
+    }
+
+    #[test]
+    fn a_terminal_given_away_and_taken_back_is_as_it_was_both_times() {
+        for keyboard in [true, false] {
+            assert_eq!(release_sequence(keyboard), leave_sequence_with(keyboard));
+            assert_eq!(resume_sequence(keyboard), enter_sequence_with(keyboard));
+            let resume = resume_sequence(keyboard);
+            for ask in [ASK_PIXEL_MOUSE, ASK_BACKGROUND, ASK_CELL_SIZE] {
+                assert!(
+                    !resume.windows(ask.len()).any(|w| w == ask),
+                    "{:?} is asked again",
+                    text(ask)
+                );
+            }
+        }
+        let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+        terminal.advance(&enter_sequence());
+        terminal.advance(&release_sequence(true));
+        assert!(!terminal.modes.alt_screen);
+        assert!(terminal.modes.cursor_visible);
+        assert!(!terminal.modes.bracketed_paste);
+        assert_eq!(terminal.keyboard_flags().0, 0);
+        assert_eq!(terminal.mouse().tracking, tos_term::MouseTracking::None);
+        terminal.advance(&resume_sequence(true));
+        assert!(terminal.modes.alt_screen);
+        assert!(!terminal.modes.cursor_visible);
+        assert!(terminal.modes.bracketed_paste);
+        assert_eq!(terminal.keyboard_flags().0, KEYBOARD_FLAGS);
+        assert_eq!(terminal.mouse().tracking, tos_term::MouseTracking::AnyEvent);
+        assert!(terminal.take_output().is_empty(), "nothing was asked");
     }
 
     #[test]

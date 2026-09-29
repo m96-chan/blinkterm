@@ -48,6 +48,20 @@ options:
                    --remote-debugging-pipe, --user-data-dir
   --user-agent <text>
                    what pages are told the browser is
+  --file-picker <command>
+                   a program that chooses the file for a page's file input,
+                   in a window of its own (zenity --file-selection;
+                   osascript -e 'POSIX path of (choose file)'). {dir} is the
+                   directory to start in, {out} a file it writes the paths
+                   to; without {out}, what it prints is read. Split like a
+                   shell splits it, and run without one
+  --file-picker-terminal <command>
+                   the same, for a program that needs this terminal (yazi
+                   --chooser-file={out} {dir}; fzf): blinkterm steps aside
+                   while it runs. With both set, this one is used where
+                   there is no display
+  --file-picker-multiple, --file-picker-terminal-multiple <command>
+                   used instead for an input that takes several files
   --proxy <host:port|scheme://host:port|direct://>
                    send requests through a proxy (loopback never is)
   --mute           start the engine silent (--mute-audio); pages play and

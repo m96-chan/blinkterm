@@ -4554,6 +4554,123 @@ fn a_multiple_input_takes_every_path_entered_until_an_empty_enter() {
     engine.kill();
 }
 
+use blinkterm::picker::{self, Gui, Outcome as Picked};
+
+/// A picker with a window, run as the loop runs one — spawned, polled and
+/// pumped until it has exited — against the input `chooser` names.
+fn run_picker(command: &str, dir: &std::path::Path, chooser: &Chooser) -> Picked {
+    let command = picker::Command::parse("file-picker", command).expect("a command");
+    let mut gui = Gui::spawn(&command, dir, "T", chooser).expect("the picker starts");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let readable = gui.fd().is_some_and(|fd| {
+            blinkterm::tty::poll_readable(&[fd], 50)
+                .expect("poll")
+                .contains(&fd)
+        });
+        if let Some(outcome) = gui.pump(readable) {
+            return outcome;
+        }
+        if gui.fd().is_none() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    panic!("the picker did not finish");
+}
+
+/// What a picker printed, checked and sent as `app::finish_picker` sends
+/// it.
+fn send_picked(client: &mut Client, chooser: &Chooser, picked: Picked) {
+    let Picked::Files(paths) = picked else {
+        panic!("the picker chose nothing: {picked:?}");
+    };
+    let files = picker::accept(paths, chooser.multiple, &Disk).expect("the files are good");
+    client
+        .call(
+            "DOM.setFileInputFiles",
+            blinkterm::upload::reply(chooser.backend_node_id, &files),
+        )
+        .expect("the engine takes the files");
+}
+
+/// A file input answered by a program the settings name (#58): what it
+/// prints is the file the page gets, relative to the directory it started
+/// in, name and size as the page reads them. And a picker that exits
+/// non-zero — osascript's -128, zenity's Cancel — sends nothing, and the
+/// page hears `cancel`.
+#[test]
+fn a_gui_picker_hands_the_page_the_file_it_printed() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let dir = an_upload_page(&mut client, false);
+
+    click_at(&mut client, 8, 8);
+    let chooser = wait_for_chooser(&client, Duration::from_secs(5));
+    let picked = run_picker("sh -c 'echo \"$1\"' sh {dir}/report.pdf", &dir, &chooser);
+    assert_eq!(picked, Picked::Files(vec![dir.join("report.pdf")]));
+    send_picked(&mut client, &chooser, picked);
+    let wanted = format!("files report.pdf {}", UPLOADED.len());
+    assert_eq!(
+        wait_for_title(&mut client, &wanted, Duration::from_secs(5)),
+        wanted
+    );
+
+    click_at(&mut client, 8, 8);
+    let chooser = wait_for_chooser(&client, Duration::from_secs(5));
+    assert_eq!(
+        run_picker("sh -c 'echo notes.txt; exit 1'", &dir, &chooser),
+        Picked::Cancel
+    );
+    blinkterm::app::cancel_chooser(&mut client, chooser.backend_node_id);
+    assert_eq!(
+        wait_for_title(&mut client, "cancelled", Duration::from_secs(5)),
+        "cancelled"
+    );
+    assert_eq!(
+        evaluate(&mut client, "f.files.length"),
+        Json::number(1),
+        "the file sent before is untouched"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
+/// A `multiple` input gets every line the picker printed, in order, a
+/// relative one and a `file://` one among them.
+#[test]
+fn a_multiple_input_takes_every_line_a_picker_printed() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let dir = an_upload_page(&mut client, true);
+
+    click_at(&mut client, 8, 8);
+    let chooser = wait_for_chooser(&client, Duration::from_secs(5));
+    assert!(chooser.multiple);
+    let picked = run_picker(
+        "sh -c 'printf \"%s\\n\" report.pdf \"file://$1/notes.txt\"' sh {dir}",
+        &dir,
+        &chooser,
+    );
+    assert_eq!(
+        picked,
+        Picked::Files(vec![dir.join("report.pdf"), dir.join("notes.txt")])
+    );
+    send_picked(&mut client, &chooser, picked);
+    let wanted = format!("files report.pdf {}, notes.txt 9", UPLOADED.len());
+    assert_eq!(
+        wait_for_title(&mut client, &wanted, Duration::from_secs(5)),
+        wanted
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
 use blinkterm::download::{self, Downloads};
 
 /// What `/report.pdf` sends, which is what the saved file must hold.

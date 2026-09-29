@@ -62,6 +62,7 @@ use crate::motion::{self, Motion};
 use crate::normal;
 use crate::options::Options;
 use crate::permissions::{self, Allowed, Permission};
+use crate::picker::{self, Pickers};
 use crate::profile::Profile;
 use crate::route::{self, Payload, Route, Wrap};
 use crate::screen::{self, Pane};
@@ -398,6 +399,15 @@ struct Chrome {
     /// The directory the last file was uploaded from, this run: where the
     /// next file input's prompt starts. See [`upload::start_dir`].
     upload_dir: Option<PathBuf>,
+    /// The programs the settings name to answer a file input instead of the
+    /// row; none, and the row it is. See [`crate::picker`].
+    pickers: Pickers,
+    /// Whether a picker with a window can open one here, read once at the
+    /// start: see [`picker::has_display`].
+    display: bool,
+    /// The picker with a window that is open, if one is: one at a time, for
+    /// whichever tab clicked. Dropping it ends it. See [`pump_picker`].
+    picker: Option<picker::Gui>,
     /// Where the pointer is and what is under it, for the tab in front only.
     /// See [`crate::hover`].
     hover: hover::Tracker,
@@ -538,6 +548,9 @@ impl Chrome {
             navigation: None,
             downloads: Downloads::new(downloads_dir),
             upload_dir: None,
+            pickers: options.pickers.clone(),
+            display: picker::has_display(|name| std::env::var(name).ok()),
+            picker: None,
             hover: hover::Tracker::default(),
             asking: None,
             shape: Shape::Default,
@@ -615,9 +628,12 @@ impl Chrome {
     /// route's cast and its throttle, which are about the link to the
     /// terminal and not about the engine.
     /// What was on the tabs — a dialog, a file input's half-typed path — goes
-    /// with them. Nothing is sent: this is this program's memory only, and
-    /// the pointer's shape is the caller's to give back to the terminal.
+    /// with them, and so does a file picker's window that is open for one of
+    /// them, ended as it is dropped: the input it would answer is gone.
+    /// Nothing is sent: this is this program's memory only, and the pointer's
+    /// shape is the caller's to give back to the terminal.
     fn engine_gone(&mut self, now: Instant) {
+        self.picker = None;
         self.still = None;
         self.navigation = None;
         self.asking = None;
@@ -1526,6 +1542,9 @@ fn drive(
         let wake = tabs.active().map(|tab| tab.connection.wake_fd());
         let mut watching = vec![pane.input_fd(), browser.wake_fd()];
         watching.extend(wake);
+        // A file picker's window, while it is printing its answer; see
+        // [`pump_picker`].
+        watching.extend(chrome.picker.as_ref().and_then(picker::Gui::fd));
         // A frame owed an acknowledgement is acknowledged the pass after the
         // pane has written it ([`tick_frames`]), and nothing wakes this poll
         // when the writer finishes; so while one is owed the passes come
@@ -1567,6 +1586,9 @@ fn drive(
                 return Ok(Driven::Quit);
             }
         }
+        // A file picker's window that has answered, or whose tab has gone
+        // or gone somewhere else.
+        pump_picker(pane, tabs, chrome, &ready)?;
         // Whatever the pointer did in all the reports just read, told to the
         // page and asked about once: see [`crate::hover`].
         tick_hover(pane, tabs, chrome)?;
@@ -1600,6 +1622,10 @@ fn drive(
         // and never from one that has just been left behind.
         handle_target_events(pane, tabs, browser, chrome)?;
         handle_page_events(pane, tabs, chrome)?;
+        // A click on a file input that a picker is to answer, read just now:
+        // started in the same pass, which for one that runs in the terminal
+        // means the loop stops here until it has exited.
+        start_picker(pane, tabs, chrome)?;
         // The answer to a navigation, which may have been held for as long as
         // a page's "leave this page?" was on the row. After the page's events,
         // so that a dialog which arrived on the same pass is already drawn.
@@ -2024,7 +2050,7 @@ fn activate(
     }
     // First, whether the page is stopped behind a dialog, because that
     // decides whether anything below can be waited for. See [`tell`].
-    bin_events(tab, &base);
+    bin_events(tab, &base, chrome);
     let mut stopped = tab.dialog.is_some();
     if let Err(why) = tell(
         &mut tab.connection,
@@ -2037,7 +2063,7 @@ fn activate(
         // is the one way to get here with a page that is fine. The command is
         // queued behind the dialog like everything else, so the rest is told
         // rather than asked; anything else is a page that is not answering.
-        bin_events(tab, &base);
+        bin_events(tab, &base, chrome);
         if tab.dialog.is_none() {
             return Err(why);
         }
@@ -2072,7 +2098,7 @@ fn activate(
     //
     // And not of a dormant tab, whose page is an `about:blank` that would
     // answer with no title at all, over the one the session saved.
-    bin_events(tab, &base);
+    bin_events(tab, &base, chrome);
     if tab.dialog.is_none() && !tab.dormant {
         if let Some(loaded) = page_loaded(&mut tab.connection) {
             tab.loaded(loaded);
@@ -2270,12 +2296,29 @@ pub fn revive(
 /// person clicked an input, and a prompt that went in the bin would be a
 /// click that did nothing — which is what issue #11 was. `base` is where a
 /// prompt opened here starts.
-fn bin_events(tab: &mut Tab<Client>, base: &Path) {
-    let home = upload::home();
+fn bin_events(tab: &mut Tab<Client>, base: &Path, chrome: &Chrome) {
     for event in tab.connection.events() {
         tab.dialog_event(&event);
-        tab.chooser_event(&event, base, home.as_deref());
+        chooser_opened(tab, &event, base, chrome);
     }
+}
+
+/// A `Page.fileChooserOpened` on `tab`, wherever it was read: the row
+/// prompt, or a picker wanted ([`Tab::chooser_event`]) — or, while a picker
+/// with a window is already open, `cancel` told to the page at once, which
+/// is what "one at a time" means. The one that is open is left alone, for
+/// whichever tab it is: the person is looking at it. True when the row is now
+/// out of date.
+fn chooser_opened(tab: &mut Tab<Client>, event: &Event, base: &Path, chrome: &Chrome) -> bool {
+    let use_picker = !chrome.pickers.is_empty();
+    if use_picker && chrome.picker.is_some() && event.method == "Page.fileChooserOpened" {
+        if let Some(chooser) = upload::Chooser::opening(&event.params) {
+            cancel_chooser(&mut tab.connection, chooser.backend_node_id);
+            tab.note = Some("a file picker is already open".to_string());
+            return true;
+        }
+    }
+    tab.chooser_event(event, base, upload::home().as_deref(), use_picker)
 }
 
 /// Stop a tab painting, if it is still in the list.
@@ -3363,7 +3406,7 @@ fn handle_page_events(
                     // `answer_upload`. The page is not stopped.
                     let base = chrome.upload_base();
                     let event = Event { method, params };
-                    if tab.chooser_event(&event, &base, upload::home().as_deref()) {
+                    if chooser_opened(tab, &event, &base, chrome) {
                         redraw = true;
                     }
                 }
@@ -4872,6 +4915,194 @@ pub fn cancel_chooser(client: &mut Client, backend_node_id: i64) {
         "Runtime.releaseObject",
         Json::object(vec![("objectId", Json::string(object))]),
     );
+}
+
+/// Start the picker for the first tab that has a file input waiting for
+/// one ([`Tab::picking`], set by [`Tab::chooser_event`]), as the settings
+/// say which ([`Pickers::choose`]).
+///
+/// A window is started and left to run: [`pump_picker`] hears it answer. A
+/// program that needs the terminal is run here, to the end: see
+/// [`run_terminal_picker`]. One that cannot be started says why on the row
+/// and the page is told `cancel`, so that a click on the input is never a
+/// click that did nothing and never leaves the page waiting.
+///
+/// One tab a pass. Another tab wanting one meanwhile waits for the next,
+/// and is then told `cancel` if a window is open by then — one at a time,
+/// as for a click on a second input ([`chooser_opened`]).
+fn start_picker(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+) -> Result<(), String> {
+    let Some(index) = tabs
+        .iter()
+        .position(|tab| tab.picking.as_ref().is_some_and(|picking| !picking.started))
+    else {
+        return Ok(());
+    };
+    let base = chrome.upload_base();
+    let Some(tab) = tabs.get_mut(index) else {
+        return Ok(());
+    };
+    let Some(picking) = tab.picking.as_mut() else {
+        return Ok(());
+    };
+    let chooser = picking.chooser.clone();
+    let chosen = chrome
+        .pickers
+        .choose(chooser.multiple, chrome.display)
+        .map(|(kind, command)| (kind, command.clone()));
+    match chosen {
+        Some((picker::Kind::Gui, command)) if chrome.picker.is_none() => {
+            match picker::Gui::spawn(&command, &base, &tab.target, &chooser) {
+                Ok(gui) => {
+                    picking.started = true;
+                    chrome.picker = Some(gui);
+                }
+                Err(why) => finish_picker(tabs, chrome, index, picker::Outcome::Failed(why)),
+            }
+        }
+        Some((picker::Kind::Terminal, command)) if chrome.picker.is_none() => {
+            picking.started = true;
+            run_terminal_picker(pane, tabs, chrome, index, &command, &base)?;
+        }
+        // A window already open, for this tab or another; or, which the
+        // settings cannot make, no picker at all.
+        _ => {
+            tab.picking = None;
+            cancel_chooser(&mut tab.connection, chooser.backend_node_id);
+        }
+    }
+    redraw_row(pane, tabs, chrome)
+}
+
+/// A file picker's window, once a pass: its answer read if it has printed
+/// one and handed to [`finish_picker`] once it has exited.
+///
+/// Ended without a word to anybody when there is nobody left to answer: its
+/// tab closed, or the input it was for went with a landing or a crash
+/// ([`Tab::picking`] cleared, or another input's there since). Dropping it
+/// is what ends it, and its answer, if it had one, goes nowhere: an answer
+/// sent to an input whose document has gone is taken and does nothing
+/// (measured, and said at [`Tab::landed`]), so there is nothing to wait for.
+fn pump_picker(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    ready: &[std::os::fd::RawFd],
+) -> Result<(), String> {
+    let Some(gui) = chrome.picker.as_mut() else {
+        return Ok(());
+    };
+    let index = tabs.index_of(&gui.tab).filter(|&index| {
+        tabs.iter().nth(index).is_some_and(|tab| {
+            tab.picking.as_ref().is_some_and(|picking| {
+                picking.started && picking.chooser.backend_node_id == gui.chooser.backend_node_id
+            })
+        })
+    });
+    let Some(index) = index else {
+        chrome.picker = None;
+        return redraw_row(pane, tabs, chrome);
+    };
+    let readable = gui.fd().is_some_and(|fd| ready.contains(&fd));
+    let Some(outcome) = gui.pump(readable) else {
+        return Ok(());
+    };
+    chrome.picker = None;
+    finish_picker(tabs, chrome, index, outcome);
+    redraw_row(pane, tabs, chrome)
+}
+
+/// Give the terminal to a file picker that needs it, run it to the end, and
+/// take the terminal back.
+///
+/// The picture is taken off first, the modes turned off and the settings
+/// put back ([`Pane::release`]); the picker runs on the terminal as it would
+/// from the shell, in this program's foreground group
+/// ([`picker::run_terminal`]); then everything is turned on again
+/// ([`Pane::resume`]) and the pane set up as after a resize — measured
+/// again, the page told its size, its screencast started again, the row
+/// drawn — because the terminal may well have been resized while the picker
+/// had it, and the screen is empty either way. The pointer's shape went
+/// back to the arrow with the modes, so that is what this program now
+/// thinks it is.
+///
+/// Nothing else happens meanwhile. The engine's events wait in the tabs'
+/// queues and are read on the next pass, a landing among them — so a page
+/// that went somewhere while the picker was open is sent the answer for the
+/// input it had, which the engine takes and does nothing with. A `SIGTERM`
+/// meanwhile is heard once the picker has exited.
+fn run_terminal_picker(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    index: usize,
+    command: &picker::Command,
+    base: &Path,
+) -> Result<(), String> {
+    pane.write(&chrome.painter.clear())
+        .map_err(|e| e.to_string())?;
+    pane.release()
+        .map_err(|e| format!("cannot give the terminal to the file picker: {e}"))?;
+    let outcome = picker::run_terminal(command, base, upload::home().as_deref());
+    pane.resume()
+        .map_err(|e| format!("cannot take the terminal back from the file picker: {e}"))?;
+    chrome.shape = Shape::Default;
+    RESIZED.store(true, Ordering::SeqCst);
+    finish_picker(tabs, chrome, index, outcome);
+    Ok(())
+}
+
+/// What a picker's answer does to the tab at `index`, whose input it was:
+/// the files sent, or the page told `cancel`, or why not on the row.
+///
+/// Files are checked as a path typed on the row is ([`picker::accept`]),
+/// and sent as it is — `DOM.setFileInputFiles`, the sentence on the note,
+/// the directory remembered for the next start — as [`answer_upload`] does.
+/// A refusal is said on the row and the page is told `cancel`: the picker is
+/// closed, so the question is over, and a page with a spinner up for the
+/// input should hear that it is. A picker that broke is the same, with its
+/// own sentence.
+fn finish_picker(
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    index: usize,
+    outcome: picker::Outcome,
+) {
+    let Some(tab) = tabs.get_mut(index) else {
+        return;
+    };
+    let Some(picking) = tab.picking.take() else {
+        return;
+    };
+    let node = picking.chooser.backend_node_id;
+    match outcome {
+        picker::Outcome::Files(paths) => {
+            match picker::accept(paths, picking.chooser.multiple, &upload::Disk) {
+                Ok(files) => {
+                    tab.note = Some(upload::sentence(&files));
+                    chrome.upload_dir = files
+                        .first()
+                        .and_then(|file| file.parent())
+                        .map(Path::to_path_buf);
+                    let _ = tab
+                        .connection
+                        .notify("DOM.setFileInputFiles", upload::reply(node, &files));
+                }
+                Err(refusal) => {
+                    tab.note = Some(format!("upload refused: {}", refusal.sentence()));
+                    cancel_chooser(&mut tab.connection, node);
+                }
+            }
+        }
+        picker::Outcome::Cancel => cancel_chooser(&mut tab.connection, node),
+        picker::Outcome::Failed(why) => {
+            tab.note = Some(why);
+            cancel_chooser(&mut tab.connection, node);
+        }
+    }
 }
 
 /// A page that asked before it was left and was told no.
