@@ -321,7 +321,7 @@ fn end(slot: &Slot, why: &str) {
 ///
 /// There is one thing that cannot wait for the main loop: a request the
 /// engine has paused for this program to allow or refuse
-/// (`Fetch.requestPaused`, which is how `crate::block` blocks a host). The
+/// (`Fetch.requestPaused`, which is how [`crate::block`] blocks a host). The
 /// engine holds the request until it is answered, and it holds more than it —
 /// `Page.navigate`'s own reply waits on its paused document (a pause held
 /// 1.5 s put the reply at 1.503 s, measured against chrome-headless-shell
