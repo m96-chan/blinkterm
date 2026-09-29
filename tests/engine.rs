@@ -8040,6 +8040,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &downloads,
         &appearance,
         &Allowed::in_memory(),
+        None,
     )
     .expect("the engine boots");
     let base = serve();
@@ -8123,6 +8124,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &downloads,
         &appearance,
         &Allowed::in_memory(),
+        None,
     )
     .expect("a second engine on the same profile");
     blinkterm::app::restore_tabs(
@@ -8416,6 +8418,7 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
         &downloads,
         &appearance,
         &allowed,
+        None,
     )
     .expect("the engine boots");
     let names = [
