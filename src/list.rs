@@ -1,5 +1,6 @@
 //! A list over the screen, filtered by typing, one row picked: what the tab
-//! list ([`crate::tablist`]) is made of, apart from what a tab is.
+//! list ([`crate::tablist`]) and the history list ([`crate::historylist`])
+//! share.
 //!
 //! Pure state, and it knows nothing about what the rows are: only how many
 //! match the filter now, which the owner counts and hands in with each key.

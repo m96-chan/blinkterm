@@ -135,6 +135,7 @@ pub mod fullscreen;
 pub mod graphics;
 pub mod hints;
 pub mod history;
+pub mod historylist;
 pub mod hover;
 pub mod identity;
 pub mod inflate;
