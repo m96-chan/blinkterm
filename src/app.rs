@@ -2888,7 +2888,7 @@ fn owned_row<C>(cols: u32, tabs: &Tabs<C>, owner: RowOwner<'_>) -> Vec<u8> {
         RowOwner::List(list) => typing_row_beside(
             cols,
             "tabs: ",
-            &list.line,
+            list.line(),
             &TabList::count_text(list.matches(tabs).len(), tabs.len()),
         ),
         RowOwner::Allow(allow) => typing_row_beside(
@@ -6407,7 +6407,7 @@ fn edit_list(
     let typed = chrome
         .list
         .as_ref()
-        .map(|list| list.line.text().to_string())
+        .map(|list| list.line().text().to_string())
         .unwrap_or_default();
     if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed)? {
         return Ok(going);
@@ -6545,7 +6545,7 @@ fn paste(
         }
         Some(Typing::List) => {
             if let Some(list) = chrome.list.as_mut() {
-                paste_into_line(&mut list.line, text);
+                paste_into_line(list.line_mut(), text);
             }
             return redraw_row(pane, tabs, chrome);
         }
