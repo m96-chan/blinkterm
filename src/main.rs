@@ -22,6 +22,10 @@ options:
                    (default: $XDG_DATA_HOME/blinkterm/profile, or
                    ~/.local/share/blinkterm/profile)
   --temp-profile   a profile that is thrown away when this program exits
+  --remote         open the urls as new tabs in the blinkterm already running
+                   on this profile, and exit; with none running, start as
+                   usual. For other programs to open links in it:
+                   export BROWSER='blinkterm --remote'
   --download-dir <dir>  save files a page offers in <dir>
                    (default: $XDG_DOWNLOAD_DIR, the XDG_DOWNLOAD_DIR of
                    ~/.config/user-dirs.dirs, or ~/Downloads)
@@ -108,8 +112,10 @@ one; install the one you want.
 
 A profile is made readable by you alone (0700), and one blinkterm uses it at a
 time: a second one started on the same profile is refused, and told which pid
-has it. The open tabs are saved in the profile; --restore reopens them, and
-after a crash the next start offers to. Bookmarks are one file for every
+has it. A running blinkterm takes urls from \"blinkterm --remote <url>\" over
+blinkterm.sock in its profile, so it can be $BROWSER. The open tabs are saved
+in the profile; --restore reopens them, and after a crash the next start
+offers to. Bookmarks are one file for every
 profile, $XDG_DATA_HOME/blinkterm/bookmarks, one url<TAB>title per line.
 
 A file a page offers — a link to a PDF, a Content-Disposition: attachment —
