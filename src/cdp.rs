@@ -191,6 +191,23 @@ impl Wake {
         // draining one that is already empty.
         tty::set_nonblocking(fds[0]).ok();
         tty::set_nonblocking(fds[1]).ok();
+        // And close-on-exec on both, because this program starts other
+        // programs while these are open: a relaunched engine, and the file
+        // picker a page's `<input type=file>` can be answered with (see
+        // [`crate::picker`]). A picker that inherited the writing end of a
+        // tab's wake pipe would hold it open for as long as it ran and could
+        // knock on it, and nothing it runs has any business with either end.
+        // `pipe2(2)` would say this in one call, but a Mac has no `pipe2`,
+        // so it is said afterwards with `fcntl(2)`. Every child this program
+        // starts is started from the loop's thread, which is the thread that
+        // makes these, so no `fork` falls between the two calls.
+        for fd in fds {
+            // SAFETY: `F_SETFD` takes an integer and reads no memory; `fd` was
+            // opened by the `pipe(2)` above and nothing has closed it.
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
         Ok(Wake {
             read: fds[0],
             write: fds[1],
@@ -1090,6 +1107,20 @@ mod tests {
     fn sort_text(mailbox: &mut Mailbox, text: &str) {
         if let Ok(value) = Json::parse(text) {
             sort(mailbox, &value);
+        }
+    }
+
+    #[test]
+    fn the_wake_pipe_is_not_handed_to_a_program_this_one_starts() {
+        let wake = Wake::new().expect("a pipe");
+        for fd in [wake.read, wake.write] {
+            // SAFETY: `F_GETFD` reads a descriptor's flags and no memory;
+            // `fd` is open, owned by `wake`, for the whole call.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+                "descriptor {fd} would be inherited"
+            );
         }
     }
 

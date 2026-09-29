@@ -273,7 +273,7 @@ pub fn kill_engine() {
 ///
 /// `target` is already in `kill(2)`'s own notation — negative for a group —
 /// so this is one `kill(2)` and a check, which is all a signal handler may do.
-fn signal_all(target: i32, signal: libc::c_int) {
+pub(crate) fn signal_all(target: i32, signal: libc::c_int) {
     // 0 is "this program's own group" and -1 is "every process we are allowed
     // to signal". Either would be this program killing itself, so a target
     // that was never recorded kills nothing.
@@ -298,7 +298,7 @@ fn signal_all(target: i32, signal: libc::c_int) {
 /// before the parent has got round to it — and `setpgid(2)` on a process that
 /// already leads its own group changes nothing, so doing both closes the
 /// window. The parent's call failing means the child's has already run.
-fn spawn_in_own_group(command: &mut Command) -> std::io::Result<(Child, i32)> {
+pub(crate) fn spawn_in_own_group(command: &mut Command) -> std::io::Result<(Child, i32)> {
     // SAFETY: `pre_exec` is unsafe because its closure runs in the child
     // between `fork` and `exec`, where a thread that held a lock in the parent
     // will never release it, so only async-signal-safe calls are allowed. This
