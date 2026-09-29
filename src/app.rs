@@ -4549,6 +4549,19 @@ fn handle_input(
             // not, and counting moves would mean a page nobody had scrolled
             // never got its lossless picture at all.
             if report.kind == MouseKind::Wheel {
+                // A notch with the zoom modifier held is a pinch, not a
+                // scroll: see [`zooms`]. It never reaches the page — the
+                // zoom is this program's, the same one the keys step.
+                if let Some(closer) = zooms(&report) {
+                    let now = tabs.active().map(|tab| tab.zoom).unwrap_or_default();
+                    let wanted = if closer {
+                        now.step_in()
+                    } else {
+                        now.step_out()
+                    };
+                    rezoom(pane, tabs, chrome, wanted)?;
+                    return Ok(true);
+                }
                 chrome.motion.input(Instant::now());
                 // Not an event but a curve: what puts it on the wire is
                 // [`crate::scroll::Wheel`]'s thread, on its own clock.
@@ -6563,6 +6576,36 @@ fn button_bit(button: Option<u32>) -> u32 {
     }
 }
 
+/// Whether a wheel notch is a pinch, and which way: `Some(true)` to zoom
+/// in, `Some(false)` out, `None` for an ordinary scroll.
+///
+/// A pinch never arrives as a pinch. No terminal protocol reports one — an
+/// SGR report carries a button, a motion or a notch and nothing else
+/// ([`crate::input::MouseKind`]) — so there is no sequence for "the fingers
+/// moved apart" and this program could not receive one if it wanted to. What
+/// a trackpad pinch does become, in a terminal as in every other toolkit, is
+/// a notch with a modifier held, and that is the gesture this reads. It is
+/// the same one a browser has always taken for zoom
+/// ([#47](https://github.com/m96-chan/blinkterm/issues/47)).
+///
+/// Ctrl everywhere, and Meta as well on a Mac, because a Mac browser zooms
+/// with cmd and a terminal forwarding a Mac pinch may spell it either way.
+/// Taking both costs nothing: neither combination scrolls a page in any
+/// browser, so nothing that used to reach the page stops reaching it.
+///
+/// Up is in, as a wheel has always zoomed. A horizontal notch is not a zoom
+/// and falls through to the scroll, because a pinch has no sideways.
+fn zooms(report: &MouseInput) -> Option<bool> {
+    let held = report.mods.ctrl() || (cfg!(target_os = "macos") && report.mods.meta());
+    if !held || report.kind != MouseKind::Wheel {
+        return None;
+    }
+    match report.wheel.1 {
+        0 => None,
+        notches => Some(notches < 0),
+    }
+}
+
 /// One mouse report as the page's `Input.dispatchMouseEvent`.
 ///
 /// Measured in the terminal's pixels until it goes on the wire — whether it
@@ -6780,6 +6823,82 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use crate::input::Mods;
+
+    /// The bytes a terminal actually sends for a ctrl+wheel reach [`zooms`]
+    /// as a pinch: the report is parsed here rather than built by hand, so
+    /// that the modifier bit and the wheel bit are the protocol's and not
+    /// this test's idea of them.
+    #[test]
+    fn the_bytes_a_terminal_sends_for_a_ctrl_wheel_arrive_as_a_pinch() {
+        // SGR: 64 is the wheel, 16 is ctrl, and the low bits are up and down.
+        let report = |bytes: &[u8]| {
+            let mut parser = Parser::new();
+            parser
+                .feed(bytes)
+                .into_iter()
+                .find_map(|input| match input {
+                    Input::Mouse(report) => Some(report),
+                    _ => None,
+                })
+                .expect("a mouse report")
+        };
+        let up = report(b"\x1b[<80;50;20M");
+        assert_eq!(up.kind, MouseKind::Wheel);
+        assert!(up.mods.ctrl(), "the ctrl bit is not read: {:?}", up.mods);
+        assert_eq!(zooms(&up), Some(true), "ctrl+wheel up is a zoom in");
+
+        let down = report(b"\x1b[<81;50;20M");
+        assert_eq!(zooms(&down), Some(false), "ctrl+wheel down is a zoom out");
+
+        // And the same notch without it is still a scroll.
+        let plain = report(b"\x1b[<64;50;20M");
+        assert_eq!(plain.kind, MouseKind::Wheel);
+        assert_eq!(zooms(&plain), None);
+    }
+
+    /// A notch with the zoom modifier held is a pinch; without it, a scroll.
+    #[test]
+    fn a_notch_with_the_zoom_modifier_is_a_pinch_and_up_is_in() {
+        let notch = |mods: Mods, wheel: (i32, i32)| MouseInput {
+            kind: MouseKind::Wheel,
+            button: None,
+            mods,
+            x: 1,
+            y: 1,
+            wheel,
+        };
+        let ctrl = Mods::default().with(Mods::CTRL);
+        let none = Mods::default();
+
+        // Up is in and down is out, as a wheel has always zoomed.
+        assert_eq!(zooms(&notch(ctrl, (0, -1))), Some(true), "ctrl+up is in");
+        assert_eq!(zooms(&notch(ctrl, (0, 1))), Some(false), "ctrl+down is out");
+        // Bare, it is the scroll it always was.
+        assert_eq!(zooms(&notch(none, (0, -1))), None);
+        assert_eq!(zooms(&notch(none, (0, 1))), None);
+        // A pinch has no sideways, so that falls through to the scroll.
+        assert_eq!(zooms(&notch(ctrl, (-1, 0))), None);
+        assert_eq!(zooms(&notch(ctrl, (1, 0))), None);
+
+        // A Mac browser zooms with cmd, and a terminal forwarding a Mac
+        // pinch may spell it either way; elsewhere cmd is not a zoom.
+        let cmd = Mods::default().with(Mods::SUPER);
+        assert_eq!(
+            zooms(&notch(cmd, (0, -1))),
+            cfg!(target_os = "macos").then_some(true)
+        );
+
+        // And a press with the modifier held is not a zoom: only a notch is.
+        let press = MouseInput {
+            kind: MouseKind::Press,
+            button: Some(0),
+            mods: ctrl,
+            x: 1,
+            y: 1,
+            wheel: (0, 0),
+        };
+        assert_eq!(zooms(&press), None);
+    }
 
     fn key(k: Key, mods: u32) -> KeyInput {
         KeyInput {
