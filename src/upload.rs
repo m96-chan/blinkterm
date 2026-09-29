@@ -240,31 +240,12 @@ impl Upload {
     /// absolute, in the order they were entered. Only meaningful after
     /// [`Outcome::Send`].
     pub fn reply(&self) -> Json {
-        let files = self
-            .taken
-            .iter()
-            .map(|path| Json::string(path.to_string_lossy()))
-            .collect();
-        Json::object(vec![
-            (
-                "backendNodeId",
-                Json::number(self.chooser.backend_node_id as f64),
-            ),
-            ("files", Json::Array(files)),
-        ])
+        reply(self.chooser.backend_node_id, &self.taken)
     }
 
-    /// The sentence for the tab's note once it is sent: `uploading
-    /// report.pdf`, or `uploading 3 files`. The name is the one typed, which
-    /// is plain text because the line is.
+    /// The sentence for the tab's note once it is sent: see [`sentence`].
     pub fn sentence(&self) -> String {
-        match self.taken.as_slice() {
-            [one] => {
-                let name = one.file_name().unwrap_or_default().to_string_lossy();
-                format!("uploading {name}")
-            }
-            many => format!("uploading {} files", many.len()),
-        }
+        sentence(&self.taken)
     }
 
     /// The directory the first file sent was in, for the next prompt to
@@ -343,6 +324,36 @@ impl Upload {
                 Outcome::Waiting
             }
         }
+    }
+}
+
+/// The `DOM.setFileInputFiles` params for `files`, absolute and in order,
+/// given to the input `backend_node_id`: what [`Upload::reply`] sends, and
+/// what a picker's files are sent as ([`crate::picker`]).
+pub fn reply(backend_node_id: i64, files: &[PathBuf]) -> Json {
+    let files = files
+        .iter()
+        .map(|path| Json::string(path.to_string_lossy()))
+        .collect();
+    Json::object(vec![
+        ("backendNodeId", Json::number(backend_node_id as f64)),
+        ("files", Json::Array(files)),
+    ])
+}
+
+/// The sentence for the tab's note once `files` are sent: `uploading
+/// report.pdf`, or `uploading 3 files`.
+///
+/// Made plain ([`text::sanitize`]) whoever named the file. A name typed on
+/// the row is plain already, because the line is; one a picker printed is
+/// whatever is on the disk, and a file name can hold an escape.
+pub fn sentence(files: &[PathBuf]) -> String {
+    match files {
+        [one] => {
+            let name = one.file_name().unwrap_or_default().to_string_lossy();
+            format!("uploading {}", text::sanitize(&name))
+        }
+        many => format!("uploading {} files", many.len()),
     }
 }
 
@@ -1142,6 +1153,24 @@ mod tests {
         ];
         assert_eq!(upload.sentence(), "uploading 3 files");
         assert_eq!(upload.last_dir(), Some(PathBuf::from("/")));
+    }
+
+    #[test]
+    fn the_reply_and_the_sentence_are_the_same_for_any_list_of_files() {
+        let files = [PathBuf::from("/a/report.pdf"), PathBuf::from("/b/c d.txt")];
+        assert_eq!(
+            reply(7, &files).to_string(),
+            r#"{"backendNodeId":7,"files":["/a/report.pdf","/b/c d.txt"]}"#
+        );
+        assert_eq!(sentence(&files), "uploading 2 files");
+        assert_eq!(sentence(&files[1..]), "uploading c d.txt");
+        // A name from the disk is not the row's to obey.
+        let evil = [PathBuf::from("/a/x\x1b]0;owned\x07.txt")];
+        assert!(
+            sentence(&evil).chars().all(text::is_plain),
+            "{:?}",
+            sentence(&evil)
+        );
     }
 
     #[test]

@@ -2274,7 +2274,7 @@ fn bin_events(tab: &mut Tab<Client>, base: &Path) {
     let home = upload::home();
     for event in tab.connection.events() {
         tab.dialog_event(&event);
-        tab.chooser_event(&event, base, home.as_deref());
+        tab.chooser_event(&event, base, home.as_deref(), false);
     }
 }
 
@@ -3363,7 +3363,7 @@ fn handle_page_events(
                     // `answer_upload`. The page is not stopped.
                     let base = chrome.upload_base();
                     let event = Event { method, params };
-                    if tab.chooser_event(&event, &base, upload::home().as_deref()) {
+                    if tab.chooser_event(&event, &base, upload::home().as_deref(), false) {
                         redraw = true;
                     }
                 }

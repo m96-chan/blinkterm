@@ -80,6 +80,7 @@ use crate::cdp::Event;
 use crate::dialog::Dialog;
 use crate::json::Json;
 use crate::load::{self, Landing, Loaded, Problem, Trust};
+use crate::picker::{self, Picking};
 use crate::text;
 use crate::upload::{Chooser, Upload};
 use crate::zoom::Zoom;
@@ -137,6 +138,15 @@ pub struct Tab<C> {
     /// is not in front gets the event too (measured), and the answer goes to
     /// that page's input.
     pub upload: Option<Upload>,
+    /// The file input this page asked about, while a program the settings
+    /// name is to answer it rather than the row. See [`crate::picker`].
+    ///
+    /// Beside [`Tab::upload`] and never together with it: which of the two a
+    /// click becomes is decided once, by whether a picker is set, and a new
+    /// one takes the other's place. Cleared by everything that clears the
+    /// row prompt — a landing, a crash — which is what tells the loop that a
+    /// picker still running has nobody left to answer.
+    pub picking: Option<Picking>,
     /// The main frame's id, from `Page.getFrameTree` at attach and from every
     /// landing since: what tells this tab's own `Page.frameStartedLoading`
     /// and `Page.frameStoppedLoading` from an iframe's, which the engine
@@ -198,6 +208,7 @@ impl<C> Tab<C> {
             problem: None,
             dialog: None,
             upload: None,
+            picking: None,
             frame: None,
             since: None,
             committed: true,
@@ -230,6 +241,7 @@ impl<C> Tab<C> {
         self.note = None;
         self.dialog = None;
         self.upload = None;
+        self.picking = None;
         self.committed = false;
         self.fullscreen = false;
     }
@@ -348,6 +360,9 @@ impl<C> Tab<C> {
         // answer sent to it now would be taken and do nothing (measured), but
         // a question about an input that is not there is a lie on the row.
         self.upload = None;
+        // And so has the input a picker was open for: its answer, when it
+        // comes, is thrown away.
+        self.picking = None;
         // The document is here, so the renderer answers again; and the clock
         // goes on from the departure when there was one, which a load the
         // engine began by itself — a redirect's second landing, a history
@@ -445,7 +460,12 @@ impl<C> Tab<C> {
     }
 
     /// What a `Page.fileChooserOpened` does to this tab: a prompt for a path,
-    /// starting in `base`. True when the row is now out of date.
+    /// starting in `base`, or with `picker` a program to start
+    /// ([`Tab::picking`]). True when the row is now out of date.
+    ///
+    /// With a picker, every click is a new question: the loop only lets one
+    /// picker run at a time, and cancels a click that comes while one is,
+    /// before it gets here.
     ///
     /// A second click on the input a prompt is already up for comes with the
     /// same `backendNodeId` (measured), and it is the person clicking again,
@@ -453,7 +473,13 @@ impl<C> Tab<C> {
     /// replaces it, since that is the one the person clicked last. An event
     /// with no input to give files to — `showOpenFilePicker()` — is said once
     /// on the note, so that the click did not silently do nothing.
-    pub fn chooser_event(&mut self, event: &Event, base: &Path, home: Option<&Path>) -> bool {
+    pub fn chooser_event(
+        &mut self,
+        event: &Event,
+        base: &Path,
+        home: Option<&Path>,
+        picker: bool,
+    ) -> bool {
         if event.method != "Page.fileChooserOpened" {
             return false;
         }
@@ -461,6 +487,14 @@ impl<C> Tab<C> {
             self.note = Some("this page's file picker isn't supported".to_string());
             return true;
         };
+        if picker {
+            self.upload = None;
+            self.picking = Some(Picking {
+                chooser,
+                started: false,
+            });
+            return true;
+        }
         let same = self
             .upload
             .as_ref()
@@ -476,10 +510,11 @@ impl<C> Tab<C> {
         true
     }
 
-    /// Whether the page is waiting on the person — a dialog, or a file
-    /// input's path — which is what the strip marks with a `!`.
+    /// Whether the page is waiting on the person — a dialog, a file
+    /// input's path, or the picker choosing one — which is what the strip
+    /// marks with a `!`.
     pub fn asks(&self) -> bool {
-        self.dialog.is_some() || self.upload.is_some()
+        self.dialog.is_some() || self.upload.is_some() || self.picking.is_some()
     }
 
     /// The whole row, when this is the only tab there is.
@@ -487,6 +522,11 @@ impl<C> Tab<C> {
     /// Unchanged from the browser that had no tabs, deliberately: one page in
     /// a pane is still the common case and it should look like it always did.
     pub fn line(&self) -> String {
+        // First, over any note: the click is being answered somewhere else,
+        // a window or the terminal in a moment, and the row says so.
+        if self.picking.is_some() {
+            return picker::WORDS.to_string();
+        }
         if let Some(note) = &self.note {
             return note.clone();
         }
@@ -525,6 +565,9 @@ impl<C> Tab<C> {
     /// reason are all there is to know about it. A status is not: a strip is
     /// narrow, and the title of a 404 page is usually the site saying so.
     pub fn label(&self) -> Cow<'_, str> {
+        if self.picking.is_some() {
+            return Cow::Borrowed(picker::WORDS);
+        }
         if let Some(note) = &self.note {
             return Cow::Borrowed(note);
         }
@@ -1408,7 +1451,7 @@ mod tests {
         };
         // The third tab asks while the first is in front.
         let tab = tabs.get_mut(2).expect("c");
-        assert!(tab.chooser_event(&opened(3), base, None));
+        assert!(tab.chooser_event(&opened(3), base, None, false));
         assert!(tab.asks(), "marked in the strip");
         assert_eq!(tab.upload.as_ref().expect("a prompt").line.text(), "/work/");
         assert!(tabs.active().expect("a").upload.is_none());
@@ -1420,14 +1463,14 @@ mod tests {
             .expect("a prompt")
             .line
             .insert_str("rep");
-        assert!(!tab.chooser_event(&opened(3), base, None));
+        assert!(!tab.chooser_event(&opened(3), base, None, false));
         assert_eq!(tab.upload.as_ref().expect("kept").line.text(), "/work/rep");
         // Another input is another question.
-        assert!(tab.chooser_event(&opened(7), base, None));
+        assert!(tab.chooser_event(&opened(7), base, None, false));
         assert_eq!(tab.upload.as_ref().expect("new").chooser.backend_node_id, 7);
         // Something else about the page is not about the input.
         let loaded = event("Page.loadEventFired", r#"{"timestamp":1}"#);
-        assert!(!tab.chooser_event(&loaded, base, None));
+        assert!(!tab.chooser_event(&loaded, base, None, false));
         assert!(tab.upload.is_some());
 
         // The page going somewhere takes the input, and the prompt, with it.
@@ -1440,12 +1483,56 @@ mod tests {
             "Page.fileChooserOpened",
             r#"{"frameId":"F","mode":"selectSingle"}"#,
         );
-        assert!(tab.chooser_event(&picker, base, None));
+        assert!(tab.chooser_event(&picker, base, None, false));
         assert!(tab.upload.is_none());
         assert_eq!(
             tab.note.as_deref(),
             Some("this page's file picker isn't supported")
         );
+    }
+
+    #[test]
+    fn with_a_picker_a_file_input_waits_for_it_and_says_so() {
+        let mut tabs = three();
+        let base = Path::new("/work");
+        let opened = |node: u32, mode: &str| {
+            event(
+                "Page.fileChooserOpened",
+                &format!(r#"{{"frameId":"F","mode":"{mode}","backendNodeId":{node}}}"#),
+            )
+        };
+        let tab = tabs.get_mut(1).expect("b");
+        tab.note = Some("uploading old.txt".to_string());
+        // A row prompt that was up goes: a picker is the answer now.
+        assert!(tab.chooser_event(&opened(3, "selectSingle"), base, None, false));
+        assert!(tab.upload.is_some());
+        assert!(tab.chooser_event(&opened(3, "selectMultiple"), base, None, true));
+        assert!(tab.upload.is_none());
+        let picking = tab.picking.as_ref().expect("a picker is wanted");
+        assert_eq!(picking.chooser.backend_node_id, 3);
+        assert!(picking.chooser.multiple);
+        assert!(!picking.started, "the loop starts it");
+        assert!(tab.asks(), "marked in the strip");
+        assert_eq!(tab.line(), picker::WORDS, "over the note");
+        assert_eq!(tab.label(), picker::WORDS);
+
+        // The page going somewhere takes the input and the question.
+        tab.landed(Landing::Document("https://b.example/next".to_string()));
+        assert!(tab.picking.is_none());
+        assert!(!tab.asks());
+
+        // And so does its renderer dying.
+        assert!(tab.chooser_event(&opened(4, "selectSingle"), base, None, true));
+        tab.crashed();
+        assert!(tab.picking.is_none());
+
+        // A picker with no input to fill is still said, not asked.
+        let no_input = event(
+            "Page.fileChooserOpened",
+            r#"{"frameId":"F","mode":"selectSingle"}"#,
+        );
+        assert!(tab.chooser_event(&no_input, base, None, true));
+        assert!(tab.picking.is_none());
     }
 
     #[test]
