@@ -147,6 +147,7 @@ pub mod keys;
 pub mod line;
 pub mod list;
 pub mod load;
+pub mod login;
 pub mod motion;
 pub mod normal;
 pub mod options;

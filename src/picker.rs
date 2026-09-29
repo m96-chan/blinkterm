@@ -96,7 +96,7 @@
 //! [`run_in_terminal`] start a program the settings name, collect what it
 //! prints, and end it, and say in their sentences what it is (`what`, "the
 //! file picker"). [`Gui`] and [`run_terminal`] put the file picker's
-//! placeholders and answer on top. `crate::login` is the second user, for
+//! placeholders and answer on top. [`crate::login`] is the second user, for
 //! a password manager's command, which is why what passes through here is
 //! overwritten with zeros once it has been handed on ([`scrub`]).
 
@@ -179,22 +179,35 @@ impl Command {
     }
 
     /// The words to run, with each `{name}` of `values` — given without its
-    /// braces — replaced inside the words it is in, in the order given, and
-    /// nothing split again. Any other `{…}` is left as it is written.
+    /// braces — replaced inside the words it is in, and nothing split
+    /// again. Any other `{…}` is left as it is written.
     ///
-    /// In order, one name at a time over the whole word, so that a value
-    /// that itself holds a later name is replaced again: a directory named
-    /// `{out}` would be. That is how [`Command::expand`] has always done
-    /// it, and nobody names a directory that.
+    /// In one pass over each word: a value is put in and never read again,
+    /// so a value that itself holds a `{name}` — a directory, or a page's
+    /// path for [`crate::login`] — stays as it is rather than being
+    /// replaced in turn.
     pub fn expand_with(&self, values: &[(&str, &str)]) -> Vec<String> {
         self.words
             .iter()
             .map(|word| {
-                let mut word = word.clone();
-                for (name, value) in values {
-                    word = word.replace(&format!("{{{name}}}"), value);
+                let mut out = String::with_capacity(word.len());
+                let mut rest = word.as_str();
+                'scan: while let Some(open) = rest.find('{') {
+                    out.push_str(&rest[..open]);
+                    let at = &rest[open..];
+                    for (name, value) in values {
+                        let placeholder = format!("{{{name}}}");
+                        if at.starts_with(&placeholder) {
+                            out.push_str(value);
+                            rest = &at[placeholder.len()..];
+                            continue 'scan;
+                        }
+                    }
+                    out.push('{');
+                    rest = &at[1..];
                 }
-                word
+                out.push_str(rest);
+                out
             })
             .collect()
     }
@@ -330,7 +343,7 @@ impl Pickers {
 /// Of a command with a window and one for the terminal, the one to run: the
 /// window where there is a display and the terminal where there is not, when
 /// both are set; the one there is, when only one is; `None` when neither.
-/// See [`Pickers::choose`], and `crate::login::Programs::choose`, which
+/// See [`Pickers::choose`], and [`crate::login::Programs::choose`], which
 /// has the same two kinds.
 pub fn choose_kind<'a>(
     gui: Option<&'a Command>,
@@ -576,7 +589,7 @@ fn cannot_start(what: &str, program: &str, error: &std::io::Error) -> String {
 ///
 /// For what a program printed, once it has been handed on: a password
 /// manager's output passes through the same buffers a picker's does
-/// (`crate::login`). A plain loop of stores into memory that is about to
+/// ([`crate::login`]). A plain loop of stores into memory that is about to
 /// be freed is exactly what an optimiser removes; a volatile write is not,
 /// and the fence keeps the writes from being moved past whatever frees the
 /// memory next. Done for every buffer every time, picker or not, since the
@@ -633,7 +646,7 @@ fn output_buffer() -> Vec<u8> {
 /// A program with a window of its own, or none, while it runs beside the
 /// loop: started in a process group of its own with nothing on its standard
 /// input and its errors thrown away, read without blocking, and ended when
-/// dropped. See the module for why, and [`Gui`] and `crate::login::Gui`
+/// dropped. See the module for why, and [`Gui`] and [`crate::login::Gui`]
 /// for its two users.
 pub struct Running {
     child: Child,
@@ -1018,7 +1031,7 @@ pub fn run_in_terminal(
 
 /// The signal dispositions are the process's, and the tests run on threads
 /// of one process: the tests that change them take turns, here and in
-/// `crate::login`.
+/// [`crate::login`].
 #[cfg(test)]
 pub(crate) static SIGNALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
