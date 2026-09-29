@@ -68,6 +68,12 @@ flag, a different default, a raised Rust floor all do.
 
 ### Changed
 
+- Pages are no longer told a program is driving: `navigator.webdriver` is
+  `false`. The user agent and the client hints are the engine's own without
+  `HeadlessChrome`, with `blinkterm/<version>` on the end, and the languages
+  come from the locale unless `--engine-arg --accept-lang=…` says otherwise.
+  A `--user-agent` of your own is still sent as written
+  ([#48](https://github.com/m96-chan/blinkterm/issues/48)).
 - `brew install m96-chan/tap/blinkterm` installs the tagged release; `--HEAD`
   is only needed for main.
 - `blinkterm a b` opens two tabs rather than refusing with "one page at a

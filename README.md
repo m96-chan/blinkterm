@@ -295,7 +295,8 @@ else goes through as written, and where it repeats a flag the program set,
 Chromium takes the last. `--user-agent` and `--proxy` are the two everybody
 wants and have names of their own; loopback never goes through the proxy.
 (`--lang=ja` does nothing in the headless shell; `--accept-lang=ja` is the
-one that changes what pages are told.)
+one that changes what pages are told, over the locale — see
+[What a page is told](#what-a-page-is-told).)
 
 Several urls open several tabs, the first in front:
 
@@ -361,6 +362,47 @@ program already used moves nothing else, so `key.ctrl+t = quit` leaves
 `new-tab` on no key. Normal mode's letters are not affected by `key.` lines:
 `key.ctrl+r = none` leaves `r` as reload. `blinkterm --help` lists the
 actions too.
+
+## What a page is told
+
+A person is at the terminal, so a page is not told a program is driving.
+With nothing set, on `chrome-headless-shell` 153 in a `ja_JP.UTF-8` locale:
+
+```
+navigator.webdriver   false
+navigator.userAgent   Mozilla/5.0 (…) Chrome/153.0.0.0 Safari/537.36 blinkterm/0.1.0
+userAgentData.brands  Chromium 153, blinkterm 0.1.0, and a GREASE brand
+navigator.languages   ja-JP, ja, en
+```
+
+- **`navigator.webdriver` is `false`.** Blink sets it to say the browser is
+  under automation, which is the first thing most bot checks read, and here
+  it would be untrue. `--disable-blink-features=AutomationControlled` turns it
+  off.
+- **The user agent is the engine's own, without `HeadlessChrome`,** and with
+  `blinkterm/<version>` on the end, the way a browser built on somebody
+  else's engine names itself. The client hints say the same.
+- **The languages come from the locale** — `LC_ALL`, then `LC_MESSAGES`, then
+  `LANG` — with English last, and `en-US, en` when it is unset or `C`.
+  `--engine-arg --accept-lang=…` (or `engine-arg = --accept-lang=…`) wins
+  over the locale.
+- **`--user-agent` is taken whole:** nothing is appended, and no client hints
+  are sent beside it. `navigator.userAgentData.brands` then comes back
+  empty, since nothing this program could write there would match a string it
+  did not write.
+
+Three things still say "headless", and nothing here changes them:
+`navigator.plugins` is empty, `window.chrome` is missing, and
+`Notification.permission` is `denied`. That is not something to hide. This
+is a headless browser, and a site that challenges it on those grounds will
+keep doing so. Only the one false claim is corrected. There is no
+fingerprint spoofing, and none is planned.
+
+A full Chrome (`engine = …`) reports those three the way a desktop Chrome
+does. It also costs five to six times the memory: 13 processes and 1.6 GB
+against the headless shell's 4 and 282 MB, measured on one page. That is why
+the headless shell stays first in the search. The measurements are in
+[#48](https://github.com/m96-chan/blinkterm/issues/48).
 
 ## Downloads
 
