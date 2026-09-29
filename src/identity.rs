@@ -94,10 +94,7 @@ impl Identity {
         let engine = engine_agent.unwrap_or_default();
         let major = major_version(engine);
         let user_agent = match &major {
-            Some(major) => format!(
-                "{} {PRODUCT}/{VERSION}",
-                deheadless(engine, major)
-            ),
+            Some(major) => format!("{} {PRODUCT}/{VERSION}", deheadless(engine, major)),
             // An engine whose string this could not read is left alone but
             // still named: the token is the part that is ours to say.
             None if engine.is_empty() => String::new(),
@@ -180,9 +177,14 @@ const ARCHITECTURE: &str = "x86";
 /// The engine's major version, out of `HeadlessChrome/153.0.8010.52` or
 /// `Chrome/153.0.0.0`. `None` for a string with neither.
 fn major_version(agent: &str) -> Option<String> {
-    let at = agent.find("HeadlessChrome/").map(|i| i + "HeadlessChrome/".len())
+    let at = agent
+        .find("HeadlessChrome/")
+        .map(|i| i + "HeadlessChrome/".len())
         .or_else(|| agent.find("Chrome/").map(|i| i + "Chrome/".len()))?;
-    let digits: String = agent[at..].chars().take_while(char::is_ascii_digit).collect();
+    let digits: String = agent[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
     (!digits.is_empty()).then_some(digits)
 }
 
@@ -299,7 +301,9 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["Chromium", PRODUCT, GREASE.0]);
         assert_eq!(
-            params.path(&["userAgentMetadata", "platform"]).and_then(Json::as_str),
+            params
+                .path(&["userAgentMetadata", "platform"])
+                .and_then(Json::as_str),
             Some(PLATFORM)
         );
     }

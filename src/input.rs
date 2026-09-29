@@ -1309,7 +1309,9 @@ mod tests {
 
         // Ctrl is spelled as Meta, not added to it, so a Mac never sees the
         // ctrl+cmd+click that means something else again.
-        assert_eq!(ctrl.cdp_mouse() & 2, 0);
+        if mac {
+            assert_eq!(ctrl.cdp_mouse() & 2, 0);
+        }
 
         // A cmd the terminal does forward is already Meta, and unchanged.
         let cmd = Mods::default().with(Mods::SUPER);

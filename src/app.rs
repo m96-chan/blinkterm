@@ -39,7 +39,6 @@ use tos_platform::tty::{self, ReadOutcome};
 use tos_preview::fit::Metrics;
 
 use crate::appearance::Appearance;
-use crate::identity::Identity;
 use crate::bindings::{Action, Bindings, Lookup};
 use crate::bookmarks::{Bookmarks, Toggled};
 use crate::cdp::{Client, Event, Notifier, Pending};
@@ -53,6 +52,7 @@ use crate::graphics::{Painter, Raw};
 use crate::hints;
 use crate::history::{self, History};
 use crate::hover::{self, Shape};
+use crate::identity::Identity;
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
 use crate::json::Json;
 use crate::keys;
@@ -1196,7 +1196,13 @@ fn open_first(
     let mut restored = false;
     if let Some(snapshot) = plan.restore {
         chrome.session.take_saved();
-        restore_tabs(tabs, browser, &chrome.appearance, &chrome.identity, snapshot);
+        restore_tabs(
+            tabs,
+            browser,
+            &chrome.appearance,
+            &chrome.identity,
+            snapshot,
+        );
         restored = true;
     }
     if let Some(offer) = plan.offer {
@@ -1354,7 +1360,13 @@ fn relaunch(
     // adopts it; with nothing saved — every tab was blank — it stays in
     // front as it is.
     chrome.identity = identity.clone();
-    restore_tabs(&mut tabs, &mut browser, &chrome.appearance, &identity, snapshot);
+    restore_tabs(
+        &mut tabs,
+        &mut browser,
+        &chrome.appearance,
+        &identity,
+        snapshot,
+    );
     // A failure here is put on the tab rather than returned: whether the
     // engine is gone again is for the next pass's checks to say.
     let trouble = activate(&mut tabs, &mut browser, chrome).err();
@@ -2188,7 +2200,13 @@ fn decline_or_restore(
     if yes {
         if let Some(saved) = chrome.session.take_saved() {
             let was = tabs.active_target().map(str::to_string);
-            restore_tabs(tabs, browser, &chrome.appearance, &chrome.identity, saved.snapshot);
+            restore_tabs(
+                tabs,
+                browser,
+                &chrome.appearance,
+                &chrome.identity,
+                saved.snapshot,
+            );
             switched(pane, tabs, browser, chrome, was)?;
             // The tab the program started with, adopted and still in front,
             // was not switched to and is woken here.
@@ -4352,8 +4370,13 @@ fn handle_input(
                         Some(entry) => {
                             // Dormant, and woken at once by being brought to
                             // the front: the same road as a restored tab.
-                            if let Err(why) = open_dormant(tabs, browser, &chrome.appearance, &chrome.identity, entry)
-                            {
+                            if let Err(why) = open_dormant(
+                                tabs,
+                                browser,
+                                &chrome.appearance,
+                                &chrome.identity,
+                                entry,
+                            ) {
                                 note(tabs, why);
                             }
                             switched(pane, tabs, browser, chrome, was)?;
