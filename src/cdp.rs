@@ -317,6 +317,33 @@ fn end(slot: &Slot, why: &str) {
     signal.notify_all();
 }
 
+/// Something the reader thread asks about every message before it is routed.
+///
+/// There is one thing that cannot wait for the main loop: a request the
+/// engine has paused for this program to allow or refuse
+/// (`Fetch.requestPaused`, which is how `crate::block` blocks a host). The
+/// engine holds the request until it is answered, and it holds more than it —
+/// `Page.navigate`'s own reply waits on its paused document (a pause held
+/// 1.5 s put the reply at 1.503 s, measured against chrome-headless-shell
+/// 153) — so a main loop that answered pauses would wedge whenever it sat in
+/// a [`Client::call`] on the page it was loading, until the call's deadline.
+/// And a mailbox is the wrong place for them anyway: a page of 300 images is
+/// 300 pauses, the event queue drops past 512, and a dropped pause is a
+/// request that hangs for ever. So the answer is given here, on the reader
+/// thread, in pipe order, in microseconds.
+///
+/// `intercept` is called outside every lock the reader holds, because it
+/// writes: `wire` is the browser's [`Notifier`], and [`Notifier::on`] turns
+/// it into any session's. `true` means the message was answered and is
+/// consumed — it goes into no mailbox; `false` routes it as if nothing had
+/// looked. It runs on the one thread that reads the pipe, so what it does
+/// has to be quick and must never wait on the pipe's replies: nothing it
+/// asks can be read until it returns.
+pub trait Intercept: Send + Sync {
+    /// Look at one message; `true` if it has been answered and is consumed.
+    fn intercept(&self, message: &Json, wire: &Notifier) -> bool;
+}
+
 /// Where the reader delivers: a mailbox per session, and whether the pipe has
 /// ended.
 ///
@@ -329,23 +356,21 @@ struct Routes {
     /// `sessionId`; every other key is a session a page was attached on.
     mailboxes: HashMap<Option<String>, Slot>,
     ended: Option<String>,
+    /// What looks at every message before it is routed; see [`Intercept`].
+    intercept: Option<Arc<dyn Intercept>>,
 }
 
-/// The one pipe to the engine, shared by every [`Client`] on it.
+/// The writing side of the pipe: the end commands go out on, and the id
+/// counter every command spends.
 ///
-/// It is the engine's descriptors 3 and 4 seen from this side: a writing end
-/// that every client puts its commands on, one at a time, and a reading end
-/// that one thread reads and routes by `sessionId`. What the reader thread
-/// shares with it is only the routing table and the stop flag — never the
-/// `Exchange` itself — so the thread holds nothing that keeps the exchange
-/// alive, and the exchange's own `Drop` can stop and join it.
-pub struct Exchange {
+/// Apart from the [`Exchange`] so that the reader thread can hold it — an
+/// [`Intercept`] answers on it — without holding the exchange, whose `Drop`
+/// has to be able to stop and join that thread.
+struct Wire {
     /// The end commands go out on. `None` once shut down, so that a write
     /// after the close is a sentence rather than a write to whatever
     /// descriptor the number has been given to since.
     write: Mutex<Option<RawFd>>,
-    /// The end the reader reads, closed once the reader has been joined.
-    read: Mutex<Option<RawFd>>,
     /// The id the last command went out under.
     ///
     /// One id space for every session on the pipe. The engine would accept
@@ -353,6 +378,22 @@ pub struct Exchange {
     /// an id that names one command whichever mailbox it lands in is one less
     /// thing to get wrong.
     next_id: AtomicI64,
+}
+
+/// The one pipe to the engine, shared by every [`Client`] on it.
+///
+/// It is the engine's descriptors 3 and 4 seen from this side: a writing end
+/// that every client puts its commands on, one at a time, and a reading end
+/// that one thread reads and routes by `sessionId`. What the reader thread
+/// shares with it is only the routing table, the stop flag and the writing
+/// side (`Wire`) — never the `Exchange` itself — so the thread holds
+/// nothing that keeps the exchange alive, and the exchange's own `Drop` can
+/// stop and join it.
+pub struct Exchange {
+    /// The writing end and the id counter.
+    wire: Arc<Wire>,
+    /// The end the reader reads, closed once the reader has been joined.
+    read: Mutex<Option<RawFd>>,
     routes: Arc<Mutex<Routes>>,
     stop: Arc<AtomicBool>,
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -371,13 +412,21 @@ impl Exchange {
         tty::set_nonblocking(write).ok();
         let routes = Arc::new(Mutex::new(Routes::default()));
         let stop = Arc::new(AtomicBool::new(false));
+        let wire = Arc::new(Wire {
+            write: Mutex::new(Some(write)),
+            next_id: AtomicI64::new(0),
+        });
         let thread_routes = Arc::clone(&routes);
         let thread_stop = Arc::clone(&stop);
-        let reader = std::thread::spawn(move || read_loop(read, &thread_routes, &thread_stop));
+        let thread_wire = Notifier {
+            wire: Arc::clone(&wire),
+            session: None,
+        };
+        let reader =
+            std::thread::spawn(move || read_loop(read, &thread_routes, &thread_stop, &thread_wire));
         Arc::new(Exchange {
-            write: Mutex::new(Some(write)),
+            wire,
             read: Mutex::new(Some(read)),
-            next_id: AtomicI64::new(0),
             routes,
             stop,
             reader: Mutex::new(Some(reader)),
@@ -395,7 +444,7 @@ impl Exchange {
     /// every call after this fails at once. Shutting down twice is once.
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Ok(mut write) = self.write.lock() {
+        if let Ok(mut write) = self.wire.write.lock() {
             if let Some(fd) = write.take() {
                 // SAFETY: `fd` was handed to `Exchange::over` to own, and
                 // taking it out of the `Option` under the lock is what makes
@@ -424,6 +473,62 @@ impl Exchange {
         end_all(&self.routes, "the pipe was closed from this end");
     }
 
+    /// Put a hook in front of the routing, or take it away: see
+    /// [`Intercept`]. It sees every message read from the next one on,
+    /// including the `Target.attachedToTarget` of a page attached after this,
+    /// which is why an engine is given it before its first page is.
+    pub fn intercept(&self, hook: Option<Arc<dyn Intercept>>) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.intercept = hook;
+        }
+    }
+
+    /// The id the next command goes out under.
+    fn next_id(&self) -> i64 {
+        self.wire.next_id()
+    }
+
+    /// Put one message on the pipe; see [`Wire::transmit`].
+    fn transmit(&self, message: &str) -> Result<(), String> {
+        self.wire.transmit(message)
+    }
+
+    /// Give a session a mailbox, or say why it cannot have one.
+    fn register(&self, session: Option<String>, mailbox: Mailbox) -> Result<Slot, String> {
+        let mut routes = self
+            .routes
+            .lock()
+            .map_err(|_| "the pipe is poisoned".to_string())?;
+        if let Some(ended) = &routes.ended {
+            return Err(ended.clone());
+        }
+        if routes.mailboxes.contains_key(&session) {
+            return Err(match &session {
+                None => "the browser already has a client on this pipe".to_string(),
+                Some(session) => format!("session {session} already has a client"),
+            });
+        }
+        let slot: Slot = Arc::new((Mutex::new(mailbox), Condvar::new()));
+        routes.mailboxes.insert(session, Arc::clone(&slot));
+        Ok(slot)
+    }
+
+    /// Stop delivering to a mailbox — this one, and not one registered since
+    /// under the same session.
+    fn deregister(&self, session: &Option<String>, slot: &Slot) {
+        if let Ok(mut routes) = self.routes.lock() {
+            if routes
+                .mailboxes
+                .get(session)
+                .is_some_and(|held| Arc::ptr_eq(held, slot))
+            {
+                routes.mailboxes.remove(session);
+            }
+        }
+    }
+}
+
+impl Wire {
     /// The id the next command goes out under. Every one is spent once,
     /// whichever client and whichever thread spends it.
     fn next_id(&self) -> i64 {
@@ -432,9 +537,10 @@ impl Exchange {
 
     /// Put one message on the pipe, NUL and all.
     ///
-    /// The lock is what keeps two messages from interleaving: the main loop
-    /// and [`crate::scroll`]'s animator both write, and half a `mouseWheel`
-    /// inside a `Page.navigate` is two broken commands.
+    /// The lock is what keeps two messages from interleaving: the main loop,
+    /// [`crate::scroll`]'s animator and an [`Intercept`] on the reader thread
+    /// all write, and half a `mouseWheel` inside a `Page.navigate` is two
+    /// broken commands.
     fn transmit(&self, message: &str) -> Result<(), String> {
         let mut guard = self
             .write
@@ -492,40 +598,6 @@ impl Exchange {
         }
         Ok(())
     }
-
-    /// Give a session a mailbox, or say why it cannot have one.
-    fn register(&self, session: Option<String>, mailbox: Mailbox) -> Result<Slot, String> {
-        let mut routes = self
-            .routes
-            .lock()
-            .map_err(|_| "the pipe is poisoned".to_string())?;
-        if let Some(ended) = &routes.ended {
-            return Err(ended.clone());
-        }
-        if routes.mailboxes.contains_key(&session) {
-            return Err(match &session {
-                None => "the browser already has a client on this pipe".to_string(),
-                Some(session) => format!("session {session} already has a client"),
-            });
-        }
-        let slot: Slot = Arc::new((Mutex::new(mailbox), Condvar::new()));
-        routes.mailboxes.insert(session, Arc::clone(&slot));
-        Ok(slot)
-    }
-
-    /// Stop delivering to a mailbox — this one, and not one registered since
-    /// under the same session.
-    fn deregister(&self, session: &Option<String>, slot: &Slot) {
-        if let Ok(mut routes) = self.routes.lock() {
-            if routes
-                .mailboxes
-                .get(session)
-                .is_some_and(|held| Arc::ptr_eq(held, slot))
-            {
-                routes.mailboxes.remove(session);
-            }
-        }
-    }
 }
 
 impl Drop for Exchange {
@@ -559,7 +631,17 @@ fn wait_writable(fd: RawFd, timeout: Duration) -> bool {
 }
 
 /// The reader thread: read, split, route, until the pipe ends or is stopped.
-fn read_loop(read: RawFd, routes: &Mutex<Routes>, stop: &AtomicBool) {
+///
+/// With an [`Intercept`] installed, every message of a read is shown to it
+/// first, and only what it declines is routed. The hook is taken out of the
+/// routes once per read and called with no lock held: it writes to the pipe,
+/// and a write that waits for room while holding the routes would hold every
+/// client that is registering, deregistering or being ended. All of a read
+/// is shown before any of it is routed, which keeps what the hook sends in
+/// answer to a message ahead of anything the main loop does on hearing it —
+/// the `Fetch.enable` for a page just attached goes out before the reply to
+/// the attach reaches the client that asked for it.
+fn read_loop(read: RawFd, routes: &Mutex<Routes>, stop: &AtomicBool, wire: &Notifier) {
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; CHUNK];
     let why = loop {
@@ -599,9 +681,21 @@ fn read_loop(read: RawFd, routes: &Mutex<Routes>, stop: &AtomicBool) {
         if messages.is_empty() {
             continue;
         }
+        let hook = match routes.lock() {
+            Ok(routes) => routes.intercept.clone(),
+            Err(_) => None,
+        };
+        let values: Vec<Json> = messages
+            .iter()
+            .filter_map(|text| Json::parse(text).ok())
+            .filter(|value| {
+                hook.as_ref()
+                    .is_none_or(|hook| !hook.intercept(value, wire))
+            })
+            .collect();
         if let Ok(routes) = routes.lock() {
-            for message in messages {
-                route(&routes.mailboxes, &message);
+            for value in values {
+                route(&routes.mailboxes, value);
             }
         }
     };
@@ -672,10 +766,7 @@ pub fn split_messages(buf: &mut Vec<u8>) -> Result<Vec<String>, String> {
 /// on it hears that its page is gone the way it used to hear a socket close.
 /// That is what keeps the tab list's two ways of hearing about a closed tab —
 /// its client ending, and `Target.targetDestroyed` — two ways rather than one.
-fn route(mailboxes: &HashMap<Option<String>, Slot>, text: &str) {
-    let Ok(value) = Json::parse(text) else {
-        return;
-    };
+fn route(mailboxes: &HashMap<Option<String>, Slot>, value: Json) {
     let session = value
         .get("sessionId")
         .and_then(Json::as_str)
@@ -712,14 +803,19 @@ fn route(mailboxes: &HashMap<Option<String>, Slot>, text: &str) {
 /// lurch.
 ///
 /// It is the smallest thing that works, because both pieces underneath were
-/// already shared: the pipe's writing end is behind the exchange's mutex, and
-/// the command counter is the exchange's atomic, so an id is still spent
-/// exactly once. Nothing here touches the mailbox or the reader, and a
-/// notification's id is never registered, so the reply Chromium sends all the
-/// same is dropped where it is read, exactly as before.
+/// already shared: the pipe's writing end is behind the wire's mutex, and the
+/// command counter is the wire's atomic, so an id is still spent exactly
+/// once. Nothing here touches the mailbox or the reader, and a notification's
+/// id is never registered, so the reply Chromium sends all the same is
+/// dropped where it is read, exactly as before.
+///
+/// It holds the writing side and not the exchange, which is what lets the
+/// reader thread have one to give an [`Intercept`]: after the exchange has
+/// been shut down, a notification is the sentence that says the pipe is
+/// closed.
 #[derive(Clone)]
 pub struct Notifier {
-    exchange: Arc<Exchange>,
+    wire: Arc<Wire>,
     session: Option<String>,
 }
 
@@ -727,11 +823,19 @@ impl Notifier {
     /// Send a command and do not wait for its reply. This is
     /// [`Client::notify`] without the `&mut`.
     pub fn notify(&self, method: &str, params: Json) -> Result<(), String> {
-        let id = self.exchange.next_id();
+        let id = self.wire.next_id();
         let message = message(id, self.session.as_deref(), method, params);
-        self.exchange
+        self.wire
             .transmit(&message)
             .map_err(|why| format!("cannot send {method}: {why}"))
+    }
+
+    /// The same pipe, speaking on another session: `None` for the browser's.
+    pub fn on(&self, session: Option<&str>) -> Notifier {
+        Notifier {
+            wire: Arc::clone(&self.wire),
+            session: session.map(str::to_string),
+        }
     }
 }
 
@@ -824,7 +928,7 @@ impl Client {
     /// A handle another thread may send notifications on. See [`Notifier`].
     pub fn notifier(&self) -> Notifier {
         Notifier {
-            exchange: Arc::clone(&self.exchange),
+            wire: Arc::clone(&self.exchange.wire),
             session: self.session.clone(),
         }
     }
@@ -1102,8 +1206,8 @@ fn outcome(method: &str, reply: &Json) -> Result<Json, String> {
 ///
 /// A message that is neither — an object with no `id` and no `method` — is
 /// dropped. There is nothing useful to do with it and a pipe is not worth
-/// ending over one. (Text that is not JSON never gets this far: [`route`]
-/// parses once, for the session and for this.)
+/// ending over one. (Text that is not JSON never gets this far: the reader
+/// thread parses each message once, for the hook, the session and this.)
 ///
 /// It takes the message rather than borrowing it, so that a reply is filed
 /// as it was parsed rather than copied: a picture of a whole page is a reply
@@ -1418,6 +1522,14 @@ mod tests {
         mailbox.events.iter().map(|e| e.method.clone()).collect()
     }
 
+    /// Route a message the test wrote as text, the way the reader thread
+    /// would once it had parsed it; text that is not JSON goes nowhere.
+    fn route_text(mailboxes: &HashMap<Option<String>, Slot>, text: &str) {
+        if let Ok(value) = Json::parse(text) {
+            route(mailboxes, value);
+        }
+    }
+
     fn ended_of(slot: &Slot) -> Option<String> {
         slot.0.lock().expect("a mailbox").ended.clone()
     }
@@ -1431,24 +1543,24 @@ mod tests {
         mailboxes.insert(Some("S2".to_string()), Arc::clone(&other));
         page.0.lock().expect("a mailbox").want(5);
 
-        route(
+        route_text(
             &mailboxes,
             r#"{"id":5,"sessionId":"S1","result":{"ok":true}}"#,
         );
-        route(
+        route_text(
             &mailboxes,
             r#"{"method":"Page.loadEventFired","sessionId":"S1","params":{}}"#,
         );
-        route(
+        route_text(
             &mailboxes,
             r#"{"method":"Target.targetCreated","params":{"targetInfo":{}}}"#,
         );
         // A session nobody holds, and something that is not JSON at all.
-        route(
+        route_text(
             &mailboxes,
             r#"{"method":"Page.loadEventFired","sessionId":"S9","params":{}}"#,
         );
-        route(&mailboxes, "not json at all");
+        route_text(&mailboxes, "not json at all");
 
         assert!(page.0.lock().expect("a mailbox").take(5).is_some());
         assert_eq!(methods(&page), ["Page.loadEventFired"]);
@@ -1464,7 +1576,7 @@ mod tests {
         let mut mailboxes = HashMap::new();
         mailboxes.insert(None, Arc::clone(&browser));
         mailboxes.insert(Some("S1".to_string()), Arc::clone(&page));
-        route(
+        route_text(
             &mailboxes,
             r#"{"method":"Page.screencastFrame","sessionId":"S1","params":{"sessionId":3,"data":"x"}}"#,
         );
@@ -1479,7 +1591,7 @@ mod tests {
         mailboxes.insert(None, Arc::clone(&browser));
         mailboxes.insert(Some("S1".to_string()), Arc::clone(&page));
         mailboxes.insert(Some("S2".to_string()), Arc::clone(&other));
-        route(
+        route_text(
             &mailboxes,
             r#"{"method":"Target.detachedFromTarget","params":{"sessionId":"S1","targetId":"T1"}}"#,
         );
@@ -1663,6 +1775,123 @@ mod tests {
             "the reader took {:?} to stop",
             started.elapsed()
         );
+        exchange.shutdown();
+    }
+
+    // ---------------------------------------------------------------------
+    // A hook in front of the routing
+    // ---------------------------------------------------------------------
+
+    /// Answers every paused request on its own session and consumes it, and
+    /// counts everything it was shown.
+    #[derive(Default)]
+    struct Continues {
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Intercept for Continues {
+        fn intercept(&self, message: &Json, wire: &Notifier) -> bool {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            if message.get("method").and_then(Json::as_str) != Some("Fetch.requestPaused") {
+                return false;
+            }
+            let session = message.get("sessionId").and_then(Json::as_str);
+            let request = message
+                .path(&["params", "requestId"])
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            let _ = wire.on(session).notify(
+                "Fetch.continueRequest",
+                Json::object(vec![("requestId", Json::string(request))]),
+            );
+            true
+        }
+    }
+
+    /// Wait for a client's events until one named `method` has come.
+    fn events_until(client: &Client, method: &str) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            seen.extend(client.events().into_iter().map(|event| event.method));
+            if seen.iter().any(|seen| seen == method) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        seen
+    }
+
+    #[test]
+    fn a_hook_that_answers_a_message_keeps_it_out_of_every_mailbox_and_its_answer_is_on_the_pipe() {
+        let (exchange, mut commands, mut replies) = exchange();
+        let browser = Client::browser(&exchange).expect("a browser client");
+        let page = Client::on(&exchange, Some("S1".to_string())).expect("a page client");
+        let hook = Arc::new(Continues::default());
+        exchange.intercept(Some(Arc::clone(&hook) as Arc<dyn Intercept>));
+        let paused = r#"{"method":"Fetch.requestPaused","sessionId":"S1","params":{"requestId":"interception-7"}}"#;
+        let loaded = r#"{"method":"Page.loadEventFired","sessionId":"S1","params":{}}"#;
+        replies
+            .write_all(format!("{paused}\0{loaded}\0").as_bytes())
+            .expect("the events go");
+        assert_eq!(
+            events_until(&page, "Page.loadEventFired"),
+            ["Page.loadEventFired"]
+        );
+        assert!(
+            browser.events().is_empty(),
+            "the browser heard a page's pause"
+        );
+        assert_eq!(
+            hook.seen.load(Ordering::SeqCst),
+            2,
+            "the hook sees everything"
+        );
+
+        let answer = next_command(&mut commands);
+        assert_eq!(
+            answer.get("method").and_then(Json::as_str),
+            Some("Fetch.continueRequest")
+        );
+        assert_eq!(answer.get("sessionId").and_then(Json::as_str), Some("S1"));
+        assert_eq!(
+            answer.path(&["params", "requestId"]).and_then(Json::as_str),
+            Some("interception-7")
+        );
+        drop(page);
+        drop(browser);
+        exchange.shutdown();
+    }
+
+    #[test]
+    fn a_hook_that_declines_changes_nothing_and_taking_it_away_stops_it_looking() {
+        let (exchange, _commands, mut replies) = exchange();
+        let browser = Client::browser(&exchange).expect("a browser client");
+        let hook = Arc::new(Continues::default());
+        exchange.intercept(Some(Arc::clone(&hook) as Arc<dyn Intercept>));
+        replies
+            .write_all(b"{\"method\":\"Target.targetCreated\",\"params\":{}}\0")
+            .expect("the event goes");
+        assert_eq!(
+            events_until(&browser, "Target.targetCreated"),
+            ["Target.targetCreated"]
+        );
+        assert_eq!(hook.seen.load(Ordering::SeqCst), 1);
+
+        exchange.intercept(None);
+        replies
+            .write_all(b"{\"method\":\"Target.targetDestroyed\",\"params\":{}}\0")
+            .expect("the event goes");
+        assert_eq!(
+            events_until(&browser, "Target.targetDestroyed"),
+            ["Target.targetDestroyed"]
+        );
+        assert_eq!(
+            hook.seen.load(Ordering::SeqCst),
+            1,
+            "a hook taken away still looked"
+        );
+        drop(browser);
         exchange.shutdown();
     }
 }

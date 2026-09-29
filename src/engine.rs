@@ -799,6 +799,13 @@ impl Engine {
         Client::browser(&self.process.exchange)
     }
 
+    /// Put a hook in front of everything the engine says, or take it away:
+    /// see [`crate::cdp::Intercept`]. Given before the first page is attached
+    /// ([`crate::app::boot`]), so that it sees every page this engine has.
+    pub fn intercept(&self, hook: Option<Arc<dyn crate::cdp::Intercept>>) {
+        self.process.exchange.intercept(hook);
+    }
+
     /// What the engine calls itself, as `Browser.getVersion` reported it.
     pub fn agent(&self) -> Option<&str> {
         self.agent.as_deref()
