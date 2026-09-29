@@ -123,7 +123,7 @@ impl Route {
                 Wrap::Tmux => "wrapped for tmux",
             },
             match self.transport {
-                Transport::SharedMemory => "through /dev/shm",
+                Transport::SharedMemory => crate::graphics::SHM_THROUGH,
                 Transport::Inline => "inline",
             },
             self.fps()
@@ -514,7 +514,10 @@ mod tests {
         );
         assert_eq!(
             Route::local(true).describe(),
-            "raw frames, placed at the cursor, not wrapped, through /dev/shm, 60 fps cap"
+            format!(
+                "raw frames, placed at the cursor, not wrapped, {}, 60 fps cap",
+                crate::graphics::SHM_THROUGH
+            )
         );
     }
 }

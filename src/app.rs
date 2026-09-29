@@ -52,6 +52,7 @@ use crate::graphics::{Painter, Raw};
 use crate::hints;
 use crate::history::{self, History};
 use crate::hover::{self, Shape};
+use crate::identity::Identity;
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
 use crate::json::Json;
 use crate::keys;
@@ -420,6 +421,9 @@ struct Chrome {
     /// What every page is told about light and dark, once the terminal has
     /// said. See [`crate::appearance`] and [`prepare_session`].
     appearance: Appearance,
+    /// Who this program says it is, fixed for the run. See
+    /// [`crate::identity`].
+    identity: Identity,
     /// The terminal's answer to `CSI 16 t`, for a pane whose kernel window
     /// size has no pixels in it. See [`crate::screen::ASK_CELL_SIZE`].
     cell_hint: Option<(u32, u32)>,
@@ -509,9 +513,11 @@ impl Chrome {
         profile: &Profile,
         downloads_dir: PathBuf,
         appearance: Appearance,
+        identity: Identity,
         allowed: Allowed,
     ) -> Chrome {
         Chrome {
+            identity,
             painter: Painter::new(),
             parser: Parser::new(),
             clicks: Clicks::default(),
@@ -880,6 +886,9 @@ pub struct Booted {
     pub browser: Client,
     /// The one tab the engine starts with, connected as every tab is.
     pub tabs: Tabs<Client>,
+    /// Who this program tells a page it is, worked out once from what the
+    /// engine called itself. See [`crate::identity`].
+    pub identity: Identity,
 }
 
 /// Start the engine on `profile` and set it up to its first tab: the
@@ -900,6 +909,13 @@ pub fn boot(
     allowed: &Allowed,
 ) -> Result<Booted, String> {
     let engine = Engine::launch_with(profile, ENGINE_TIMEOUT, launch)?;
+    // Before the first tab is connected, because connecting one is where a
+    // session is told who is asking.
+    let identity = Identity::new(
+        engine.agent(),
+        launch.user_agent.as_deref(),
+        &crate::identity::locale(),
+    );
     let mut browser = engine.browser()?;
     browser.call(
         "Target.setDiscoverTargets",
@@ -933,12 +949,13 @@ pub fn boot(
     // that the first page is not a tab with less known about it than the
     // rest — its main frame's id above all, which is what its loading is
     // told apart from an iframe's by. See [`connect_tab`].
-    let (client, frame) = connect_tab(&mut browser, &first, appearance)?;
+    let (client, frame) = connect_tab(&mut browser, &first, appearance, &identity)?;
     let mut first = Tab::new(first, client, "about:blank");
     first.frame = frame;
     Ok(Booted {
         engine,
         browser,
+        identity,
         tabs: Tabs::new(first),
     })
 }
@@ -1040,6 +1057,7 @@ pub fn run(options: Options) -> Result<(), String> {
                 first.engine.profile(),
                 downloads_dir.clone(),
                 appearance,
+                first.identity.clone(),
                 allowed,
             );
             chrome.cell_hint = heard.cell;
@@ -1056,6 +1074,7 @@ pub fn run(options: Options) -> Result<(), String> {
                     engine,
                     browser,
                     tabs,
+                    identity: _,
                 } = live;
                 // What the last run left and what the command line asked
                 // for are opened once, on the first engine; a relaunch opens
@@ -1120,6 +1139,7 @@ pub fn run(options: Options) -> Result<(), String> {
         mut engine,
         mut browser,
         tabs,
+        identity: _,
     }) = booted
     {
         // Dropping the tabs closes every page's session, which is all a tab
@@ -1176,7 +1196,13 @@ fn open_first(
     let mut restored = false;
     if let Some(snapshot) = plan.restore {
         chrome.session.take_saved();
-        restore_tabs(tabs, browser, &chrome.appearance, snapshot);
+        restore_tabs(
+            tabs,
+            browser,
+            &chrome.appearance,
+            &chrome.identity,
+            snapshot,
+        );
         restored = true;
     }
     if let Some(offer) = plan.offer {
@@ -1190,7 +1216,8 @@ fn open_first(
     // tab in front is the page, and the home page is not opened.
     if restored && !options.urls.is_empty() {
         let appearance = chrome.appearance;
-        match open_tab(tabs, browser, &appearance, &url) {
+        let identity = chrome.identity.clone();
+        match open_tab(tabs, browser, &appearance, &identity, &url) {
             Ok(()) => {
                 if let Some(tab) = tabs.active_mut() {
                     tab.note = Some(format!("loading {url}"));
@@ -1302,6 +1329,7 @@ fn relaunch(
         engine,
         browser,
         tabs,
+        identity: _,
     } = dead;
     drop(tabs);
     drop(browser);
@@ -1316,6 +1344,7 @@ fn relaunch(
         engine,
         mut browser,
         mut tabs,
+        identity,
     } = match boot(
         profile,
         &options.engine,
@@ -1330,7 +1359,14 @@ fn relaunch(
     // The new engine's one blank tab is untouched, so the first saved tab
     // adopts it; with nothing saved — every tab was blank — it stays in
     // front as it is.
-    restore_tabs(&mut tabs, &mut browser, &chrome.appearance, snapshot);
+    chrome.identity = identity.clone();
+    restore_tabs(
+        &mut tabs,
+        &mut browser,
+        &chrome.appearance,
+        &identity,
+        snapshot,
+    );
     // A failure here is put on the tab rather than returned: whether the
     // engine is gone again is for the next pass's checks to say.
     let trouble = activate(&mut tabs, &mut browser, chrome).err();
@@ -1346,6 +1382,7 @@ fn relaunch(
     Ok(Booted {
         engine,
         browser,
+        identity,
         tabs,
     })
 }
@@ -2066,9 +2103,10 @@ fn open_dormant(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     appearance: &Appearance,
+    identity: &Identity,
     entry: session::Entry,
 ) -> Result<(), String> {
-    open_tab(tabs, browser, appearance, "about:blank")?;
+    open_tab(tabs, browser, appearance, identity, "about:blank")?;
     if let Some(tab) = tabs.active_mut() {
         tab.url = entry.url;
         tab.title = entry.title;
@@ -2117,6 +2155,7 @@ pub fn restore_tabs(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     appearance: &Appearance,
+    identity: &Identity,
     snapshot: Snapshot,
 ) {
     let untouched = tabs.len() == 1
@@ -2138,7 +2177,7 @@ pub fn restore_tabs(
             }
             continue;
         }
-        if let Err(why) = open_dormant(tabs, browser, appearance, entry) {
+        if let Err(why) = open_dormant(tabs, browser, appearance, identity, entry) {
             note(tabs, format!("not every tab came back: {why}"));
             return;
         }
@@ -2161,7 +2200,13 @@ fn decline_or_restore(
     if yes {
         if let Some(saved) = chrome.session.take_saved() {
             let was = tabs.active_target().map(str::to_string);
-            restore_tabs(tabs, browser, &chrome.appearance, saved.snapshot);
+            restore_tabs(
+                tabs,
+                browser,
+                &chrome.appearance,
+                &chrome.identity,
+                saved.snapshot,
+            );
             switched(pane, tabs, browser, chrome, was)?;
             // The tab the program started with, adopted and still in front,
             // was not switched to and is woken here.
@@ -2201,12 +2246,13 @@ pub fn revive(
     viewport: Viewport,
     metrics: Metrics,
     cast: motion::Cast,
+    identity: &Identity,
 ) {
     let _ = client.notify(
         "Page.setInterceptFileChooserDialog",
         Json::object(vec![("enabled", Json::Bool(true))]),
     );
-    prepare_session(client, appearance);
+    prepare_session(client, appearance, identity);
     let _ = emulate(client, viewport, true);
     let _ = restart_screencast(client, Layout::default().pixels(metrics), true, cast);
 }
@@ -2352,7 +2398,7 @@ fn switched(
 fn open_the_rest(tabs: &mut Tabs<Client>, browser: &mut Client, chrome: &Chrome, urls: &[String]) {
     for url in urls.iter().skip(1) {
         let url = normalise(url);
-        if let Err(why) = open_behind(tabs, browser, &chrome.appearance, &url) {
+        if let Err(why) = open_behind(tabs, browser, &chrome.appearance, &chrome.identity, &url) {
             if let Some(first) = tabs.active_mut() {
                 first.note = Some(format!("couldn't open {url}: {why}"));
             }
@@ -2365,9 +2411,10 @@ fn open_tab(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     appearance: &Appearance,
+    identity: &Identity,
     url: &str,
 ) -> Result<(), String> {
-    create_tab(tabs, browser, appearance, url, false).map(|_| ())
+    create_tab(tabs, browser, appearance, identity, url, false).map(|_| ())
 }
 
 /// Open `url` in a tab behind the one in front, and say where it went.
@@ -2391,9 +2438,10 @@ pub fn open_behind(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     appearance: &Appearance,
+    identity: &Identity,
     url: &str,
 ) -> Result<usize, String> {
-    create_tab(tabs, browser, appearance, url, true)
+    create_tab(tabs, browser, appearance, identity, url, true)
 }
 
 /// The body of [`open_tab`] and [`open_behind`], which differ only in the
@@ -2406,6 +2454,7 @@ fn create_tab(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     appearance: &Appearance,
+    identity: &Identity,
     url: &str,
     behind: bool,
 ) -> Result<usize, String> {
@@ -2419,7 +2468,7 @@ fn create_tab(
         .and_then(Json::as_str)
         .ok_or_else(|| "the engine opened a page and did not say which".to_string())?
         .to_string();
-    let (connection, frame) = connect_tab(browser, &target, appearance)?;
+    let (connection, frame) = connect_tab(browser, &target, appearance, identity)?;
     let mut tab = Tab::new(target, connection, url);
     tab.frame = frame;
     Ok(if behind {
@@ -2466,6 +2515,7 @@ fn connect_tab(
     browser: &mut Client,
     target: &str,
     appearance: &Appearance,
+    identity: &Identity,
 ) -> Result<(Client, Option<String>), String> {
     let mut connection = browser.attach(target, CONNECT_TIMEOUT)?;
     connection.call_within("Page.enable", Json::empty(), SWITCH_TIMEOUT)?;
@@ -2474,7 +2524,7 @@ fn connect_tab(
         Json::object(vec![("enabled", Json::Bool(true))]),
         SWITCH_TIMEOUT,
     )?;
-    prepare_session(&mut connection, appearance);
+    prepare_session(&mut connection, appearance, identity);
     let frame = connection
         .call_within("Page.getFrameTree", Json::empty(), SWITCH_TIMEOUT)
         .ok()
@@ -2496,8 +2546,14 @@ fn connect_tab(
 /// Told rather than asked: a page that has just been made may already be
 /// stopped behind a dialog, and a scheme that did not take is a page that is
 /// light, which is no reason not to open it.
-pub fn prepare_session(client: &mut Client, appearance: &Appearance) {
+pub fn prepare_session(client: &mut Client, appearance: &Appearance, identity: &Identity) {
     for (method, params) in appearance.commands() {
+        let _ = client.notify(method, params);
+    }
+    // Who is asking, which is per session for the same reason the scheme is:
+    // a target attached later would otherwise be the one page in the browser
+    // still calling itself headless. See [`crate::identity`].
+    if let Some((method, params)) = identity.command() {
         let _ = client.notify(method, params);
     }
 }
@@ -2938,9 +2994,10 @@ fn handle_target_events(
             redraw = true;
         }
         let appearance = chrome.appearance;
+        let identity = chrome.identity.clone();
         let mut frame = None;
         let outcome = tabs.take(event, |target| {
-            connect_tab(browser, target, &appearance).map(|(connection, main)| {
+            connect_tab(browser, target, &appearance, &identity).map(|(connection, main)| {
                 frame = main;
                 connection
             })
@@ -3341,6 +3398,7 @@ fn handle_page_events(
                 viewport,
                 chrome.metrics,
                 chrome.cast,
+                &chrome.identity,
             );
             chrome.motion.reset(Instant::now());
             chrome.still = None;
@@ -4016,7 +4074,7 @@ fn handle_input(
                     // Not a crashed page, which is sent no `Emulation` at all
                     // ([`revive`]); its landing tells it.
                     if let Some(tab) = tabs.get_mut(index).filter(|tab| !tab.is_crashed()) {
-                        prepare_session(&mut tab.connection, &chrome.appearance);
+                        prepare_session(&mut tab.connection, &chrome.appearance, &chrome.identity);
                     }
                 }
             }
@@ -4277,7 +4335,8 @@ fn handle_input(
                 Some(Command::Forward) => go(tabs, 1),
                 Some(Command::NewTab) => {
                     let appearance = chrome.appearance;
-                    match open_tab(tabs, browser, &appearance, "about:blank") {
+                    let identity = chrome.identity.clone();
+                    match open_tab(tabs, browser, &appearance, &identity, "about:blank") {
                         Ok(()) => {
                             switched(pane, tabs, browser, chrome, was)?;
                             // A new tab is a tab somebody is about to type an
@@ -4311,8 +4370,13 @@ fn handle_input(
                         Some(entry) => {
                             // Dormant, and woken at once by being brought to
                             // the front: the same road as a restored tab.
-                            if let Err(why) = open_dormant(tabs, browser, &chrome.appearance, entry)
-                            {
+                            if let Err(why) = open_dormant(
+                                tabs,
+                                browser,
+                                &chrome.appearance,
+                                &chrome.identity,
+                                entry,
+                            ) {
                                 note(tabs, why);
                             }
                             switched(pane, tabs, browser, chrome, was)?;
@@ -4507,7 +4571,7 @@ fn handle_input(
             // the pointer leaving the page.
             if routes_to_hover(&report) {
                 if point.1 >= 0 {
-                    chrome.hover.moved(point, report.mods.cdp());
+                    chrome.hover.moved(point, report.mods.cdp_mouse());
                     return Ok(true);
                 }
                 let shown = !chrome.hover.shown().href.is_empty();
@@ -4520,7 +4584,7 @@ fn handle_input(
             // A press is where the pointer is, too, so a click's position
             // is the hover's.
             if report.kind == MouseKind::Press && point.1 >= 0 {
-                chrome.hover.moved(point, report.mods.cdp());
+                chrome.hover.moved(point, report.mods.cdp_mouse());
             }
             let Some(viewport) = tabs.active().map(|tab| viewport(chrome, tab)) else {
                 return Ok(true);
@@ -5709,7 +5773,8 @@ fn follow_hint(
 ) -> Result<(), String> {
     if new_tab && hint.kind == hints::Kind::Link && !hint.href.is_empty() {
         let appearance = chrome.appearance;
-        match open_behind(tabs, browser, &appearance, &hint.href) {
+        let identity = chrome.identity.clone();
+        match open_behind(tabs, browser, &appearance, &identity, &hint.href) {
             Ok(_) => {}
             Err(why) => note(tabs, why),
         }
@@ -6548,7 +6613,7 @@ fn send_mouse(
         ("type", Json::string(kind)),
         ("x", Json::number(x)),
         ("y", Json::number(y)),
-        ("modifiers", Json::number(report.mods.cdp())),
+        ("modifiers", Json::number(report.mods.cdp_mouse())),
         ("button", Json::string(button_name(report.button))),
         ("buttons", Json::number(*buttons)),
     ];
@@ -7440,6 +7505,7 @@ mod tests {
             &profile,
             downloads.clone(),
             Appearance::new(crate::appearance::Choice::default(), false),
+            Identity::new(None, None, "C"),
             Allowed::in_memory(),
         );
         chrome.find = Some(Find {

@@ -168,6 +168,35 @@ impl Mods {
         mask
     }
 
+    /// The mask CDP wants for a *mouse* event, where a Mac spells the
+    /// tab-opening modifier differently.
+    ///
+    /// Chromium reads "open this link in a tab behind" from Meta when it is
+    /// running on a Mac and from Ctrl everywhere else, and it is the engine's
+    /// platform that decides it, not the terminal's: a ctrl+click sent to a
+    /// Mac engine opens nothing at all. Measured against
+    /// `chrome-headless-shell` 153 on macOS 26.6, a left click at the same
+    /// point makes one new page target with Meta, and none with Ctrl.
+    ///
+    /// A terminal on a Mac is far likelier to hand us ctrl than cmd — the
+    /// window manager and the terminal each want cmd for themselves first —
+    /// so ctrl+click is the gesture a person can actually make, and this is
+    /// where it is spelled the way the engine reads it. Ctrl becomes Meta
+    /// rather than joining it, because ctrl+cmd+click is a third thing again;
+    /// a cmd the terminal does forward already arrives as [`Mods::SUPER`] and
+    /// comes through unchanged.
+    ///
+    /// Keys do not come through here. Ctrl+f is Ctrl+f on every platform, and
+    /// [`Mods::cdp`] is what sends it.
+    pub fn cdp_mouse(self) -> u32 {
+        let mask = self.cdp();
+        if cfg!(target_os = "macos") && self.ctrl() {
+            (mask & !2) | 4
+        } else {
+            mask
+        }
+    }
+
     pub fn with(self, bit: u32) -> Mods {
         Mods(self.0 | bit)
     }
@@ -1259,6 +1288,37 @@ mod tests {
         let ctrl_alt = one_mouse(b"\x1b[<24;1;1M");
         assert!(ctrl_alt.mods.ctrl() && ctrl_alt.mods.alt());
         assert_eq!(ctrl_alt.mods.cdp(), 1 | 2);
+    }
+
+    /// A ctrl+click is what a Mac's engine calls a cmd+click, and a click is
+    /// the only thing that changes: the key path is left alone, so ctrl+f is
+    /// ctrl+f wherever it is typed.
+    #[test]
+    fn a_ctrl_click_is_a_command_click_on_a_mac_and_a_ctrl_click_elsewhere() {
+        let mac = cfg!(target_os = "macos");
+        let ctrl = one_mouse(b"\x1b[<16;1;1M").mods;
+        assert!(ctrl.ctrl());
+        assert_eq!(ctrl.cdp_mouse(), if mac { 4 } else { 2 });
+        // The mask a key goes out with is the same on every platform.
+        assert_eq!(ctrl.cdp(), 2);
+
+        // Whatever else is held is held: ctrl+shift opens it in front.
+        let ctrl_shift = one_mouse(b"\x1b[<20;1;1M").mods;
+        assert!(ctrl_shift.ctrl() && ctrl_shift.shift());
+        assert_eq!(ctrl_shift.cdp_mouse(), if mac { 4 | 8 } else { 2 | 8 });
+
+        // Ctrl is spelled as Meta, not added to it, so a Mac never sees the
+        // ctrl+cmd+click that means something else again.
+        if mac {
+            assert_eq!(ctrl.cdp_mouse() & 2, 0);
+        }
+
+        // A cmd the terminal does forward is already Meta, and unchanged.
+        let cmd = Mods::default().with(Mods::SUPER);
+        assert_eq!(cmd.cdp_mouse(), 4);
+        // As is a click with nothing held, and one that is only shifted.
+        assert_eq!(Mods::default().cdp_mouse(), 0);
+        assert_eq!(Mods::default().with(Mods::SHIFT).cdp_mouse(), 8);
     }
 
     #[test]

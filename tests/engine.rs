@@ -33,6 +33,7 @@ use blinkterm::cdp::{Client, Pending};
 use blinkterm::engine::{self, Engine};
 use blinkterm::find::{self, Matches};
 use blinkterm::graphics::{Painter, Raw, IMAGE_ID};
+use blinkterm::identity::Identity;
 use blinkterm::input::{Key, KeyAction, KeyInput, Mods};
 use blinkterm::json::Json;
 use blinkterm::keys;
@@ -749,7 +750,7 @@ width:240px;height:60px;background:#3c3'>blank</a>\
 <div id=box style='position:absolute;left:0;top:200px;width:40px;height:40px;\
 background:#c33'></div>\
 <script>window.log=[];\
-for(const t of ['click','auxclick'])addEventListener(t,e=>log.push(t+':'+e.button+':'+e.ctrlKey));\
+for(const t of ['click','auxclick'])addEventListener(t,e=>log.push(t+':'+e.button+':'+e.ctrlKey+':'+e.metaKey));\
 let x=0;(function f(){x=(x+4)%600;box.style.left=x+'px';requestAnimationFrame(f)})();\
 </script></body>";
 
@@ -999,6 +1000,28 @@ fn click_with(client: &mut Client, at: (i32, i32), button: &str, bit: u32, modif
     }
 }
 
+/// The modifier mask this program sends when a terminal reports a ctrl+click.
+///
+/// Not the constant 2: on a Mac the engine reads the tab-opening modifier as
+/// Meta and a literal ctrl+click opens nothing, so the program sends 4 there.
+/// Asking [`Mods::cdp_mouse`] rather than writing the number keeps these
+/// tests measuring the gesture — a ctrl+click opens a tab behind — instead of
+/// the spelling it happens to go out with.
+fn ctrl_click() -> u32 {
+    Mods::default().with(Mods::CTRL).cdp_mouse()
+}
+
+/// What [`OPENS_PAGE`]'s log says for a left click made with [`ctrl_click`].
+///
+/// That page logs `ctrlKey` and `metaKey` both, because which of the two a
+/// ctrl+click reaches the page as is the platform's business: a Mac is told
+/// Meta, everywhere else is told Ctrl, and either way the page saw the click
+/// with the tab-opening modifier held, which is what these tests are about.
+fn ctrl_click_logged() -> String {
+    let mac = cfg!(target_os = "macos");
+    format!("click:0:{}:{}", !mac, mac)
+}
+
 /// Everything a page's session says for `within`, every screencast frame
 /// acknowledged as `handle_page_events` acknowledges them: how many frames
 /// came, and the other events.
@@ -1124,7 +1147,7 @@ fn a_middle_click_and_a_ctrl_click_on_a_link_open_a_tab_behind_the_one_in_front(
 
     // The ctrl key on the left button: the same.
     let first = &mut tabs.active_mut().expect("the first tab").connection;
-    click_with(first, (40, 30), "left", 1, 2);
+    click_with(first, (40, 30), "left", 1, ctrl_click());
     let _ = watch_page(first, Duration::from_millis(200));
     assert!(
         pump(
@@ -1138,11 +1161,11 @@ fn a_middle_click_and_a_ctrl_click_on_a_link_open_a_tab_behind_the_one_in_front(
     assert_eq!(tabs.active_index(), 0, "still behind");
     let first = &mut tabs.active_mut().expect("the first tab").connection;
     let log = page_log(first);
-    assert!(log.contains("click:0:true"), "{log}");
+    assert!(log.contains(&ctrl_click_logged()), "{log}");
 
     // A ctrl+click on something that is not a link is the page's, and opens
     // nothing.
-    click_with(first, (340, 30), "left", 1, 2);
+    click_with(first, (340, 30), "left", 1, ctrl_click());
     let _ = watch_page(first, Duration::from_millis(200));
     assert!(
         !pump(&mut browser, &mut tabs, Duration::from_secs(2), |tabs| tabs
@@ -1151,7 +1174,8 @@ fn a_middle_click_and_a_ctrl_click_on_a_link_open_a_tab_behind_the_one_in_front(
         "a ctrl+click on nothing opened a tab"
     );
     let first = &mut tabs.active_mut().expect("the first tab").connection;
-    let clicks = |log: &str| log.matches("click:0:true").count();
+    let wanted = ctrl_click_logged();
+    let clicks = |log: &str| log.matches(&wanted).count();
     let after = page_log(first);
     assert_eq!(clicks(&after), clicks(&log) + 1, "{after}");
 
@@ -1197,6 +1221,7 @@ fn a_tab_opened_behind_by_this_program_loads_without_being_looked_at() {
         &mut tabs,
         &mut browser,
         &appearance,
+        &Identity::new(None, None, "C"),
         &format!("{base}plain"),
     )
     .expect("the engine opens a page behind");
@@ -5942,6 +5967,7 @@ fn the_zoom_survives_a_navigation_and_a_new_tab_starts_at_its_hosts_level() {
     blinkterm::app::prepare_session(
         &mut second,
         &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+        &Identity::new(None, None, "C"),
     );
     let (width, _, ratio) = page_metrics(&mut second);
     eprintln!("a new session, told nothing about its size, is {width} wide");
@@ -5975,7 +6001,7 @@ fn a_dark_terminal_gets_dark_pages_and_so_does_a_tab_opened_later() {
     let mut appearance =
         blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
     assert!(appearance.learned((0x1c, 0x1c, 0x1c)));
-    blinkterm::app::prepare_session(&mut page, &appearance);
+    blinkterm::app::prepare_session(&mut page, &appearance, &Identity::new(None, None, "C"));
     assert!(
         wait_until(&mut page, true, prefers_dark),
         "told on the loaded page"
@@ -6007,7 +6033,7 @@ fn a_dark_terminal_gets_dark_pages_and_so_does_a_tab_opened_later() {
     second
         .call("Page.enable", Json::empty())
         .expect("Page.enable");
-    blinkterm::app::prepare_session(&mut second, &appearance);
+    blinkterm::app::prepare_session(&mut second, &appearance, &Identity::new(None, None, "C"));
     viewport(&mut second);
     go_to(&mut second, SCHEME);
     assert!(prefers_dark(&mut second), "a tab opened later");
@@ -6016,7 +6042,7 @@ fn a_dark_terminal_gets_dark_pages_and_so_does_a_tab_opened_later() {
     assert!(appearance.learned((0xfd, 0xf6, 0xe3)));
     let mut tabs = tabs;
     let first = &mut tabs.active_mut().expect("the first tab").connection;
-    blinkterm::app::prepare_session(first, &appearance);
+    blinkterm::app::prepare_session(first, &appearance, &Identity::new(None, None, "C"));
     assert!(!wait_until(first, false, prefers_dark), "told light");
     assert_eq!(
         evaluate(first, "window.kept").as_f64(),
@@ -6045,7 +6071,7 @@ fn forced_dark_paints_a_white_page_dark() {
     assert!(corner_luminance(&mut client) > 0.9, "white to begin with");
 
     let forced = blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, true);
-    blinkterm::app::prepare_session(&mut client, &forced);
+    blinkterm::app::prepare_session(&mut client, &forced, &Identity::new(None, None, "C"));
     let dark = |client: &mut Client| corner_luminance(client) < 0.1;
     assert!(wait_until(&mut client, true, dark), "painted dark");
     go_to(&mut client, WHITE);
@@ -6824,7 +6850,7 @@ fn a_hint_opened_in_a_new_tab_is_a_target_this_program_made() {
         };
         for (name, value) in fields.iter_mut() {
             if name == "modifiers" {
-                *value = Json::number(2);
+                *value = Json::number(ctrl_click());
             }
         }
         page.call("Input.dispatchMouseEvent", Json::Object(fields))
@@ -7207,6 +7233,7 @@ fn a_crashed_page_keeps_its_tab_and_a_reload_brings_it_back_casting() {
             cell: CELL,
         },
         motion::Cast::default(),
+        &Identity::new(None, None, "C"),
     );
     let after = frames_in(&mut tab.connection, Duration::from_secs(1));
     eprintln!("frames in a second after revive: {after}");
@@ -7580,6 +7607,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         engine,
         mut browser,
         mut tabs,
+        identity,
     } = blinkterm::app::boot(
         profile,
         &launch,
@@ -7612,6 +7640,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
             &mut tabs,
             &mut browser,
             &appearance,
+            &identity,
             &format!("{base}{name}"),
         )
         .expect("a tab behind");
@@ -7661,6 +7690,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         mut engine,
         mut browser,
         mut tabs,
+        identity,
     } = blinkterm::app::boot(
         profile,
         &launch,
@@ -7669,7 +7699,13 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &Allowed::in_memory(),
     )
     .expect("a second engine on the same profile");
-    blinkterm::app::restore_tabs(&mut tabs, &mut browser, &appearance, snapshot.clone());
+    blinkterm::app::restore_tabs(
+        &mut tabs,
+        &mut browser,
+        &appearance,
+        &identity,
+        snapshot.clone(),
+    );
     let took = started.elapsed();
     eprintln!("second engine up with the tabs back in {took:?}");
     assert!(took < Duration::from_secs(5), "{took:?}");
@@ -7947,6 +7983,7 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
         engine: _engine,
         mut browser,
         mut tabs,
+        identity: _identity,
     } = blinkterm::app::boot(
         Profile::temporary().expect("a temporary profile"),
         &engine::Launch::default(),
@@ -7980,6 +8017,7 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
         &mut tabs,
         &mut browser,
         &appearance,
+        &Identity::new(None, None, "C"),
         &format!("{origin}/fs"),
     )
     .expect("a tab behind");
@@ -8523,6 +8561,109 @@ fn the_wrapped_frame_parses_once_the_tmux_model_has_unwrapped_it() {
         "nothing under the direct route's id"
     );
     std::fs::remove_dir_all(&dir).ok();
+    client.close();
+    engine.kill();
+}
+
+/// A person is driving, so the page is not told a program is.
+///
+/// Blink sets `navigator.webdriver` to say the browser is under automation,
+/// and a page reads it to decide it is talking to a crawler; here it would be
+/// a false statement, and `--disable-blink-features=AutomationControlled` in
+/// [`engine::flags`] is what makes it false. Asked through the engine this
+/// program starts, rather than of the switch list, because the switch is only
+/// worth anything if it survives the launch.
+///
+/// The other headless signals are not asserted: `navigator.plugins` is empty,
+/// `window.chrome` is missing and `Notification.permission` is `denied`, and
+/// no switch changes them (#48). This one is the false claim; those are true
+/// ones about a headless browser.
+#[test]
+fn the_page_is_not_told_that_a_program_is_driving() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let webdriver = evaluate(&mut client, "navigator.webdriver");
+    eprintln!("navigator.webdriver = {webdriver:?}");
+    assert_eq!(
+        webdriver,
+        Json::Bool(false),
+        "navigator.webdriver is not false; is \
+         --disable-blink-features=AutomationControlled still in engine::flags?"
+    );
+    client.close();
+    engine.kill();
+}
+
+/// The page is told who is asking: Chromium, and this program by name.
+///
+/// Not the headless token the engine calls itself by — a person is driving,
+/// and what renders is the same Chromium a desktop Chrome is — and not a
+/// desktop Chrome either, because this is a terminal browser and says so.
+/// The client hints are asserted beside the string because they are the half
+/// `--user-agent=` cannot reach: they are built from the engine's own version
+/// and only `Network.setUserAgentOverride` carries them (#48).
+#[test]
+fn a_page_is_told_chromium_and_this_program_and_nothing_headless() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    blinkterm::app::prepare_session(
+        &mut client,
+        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+        &Identity::new(engine.agent(), None, "ja_JP.UTF-8"),
+    );
+    // On a page served over http from 127.0.0.1, which is a secure context:
+    // `navigator.userAgentData` is undefined on `about:blank` and on the
+    // `data:` url the other tests use, and the override is meant to survive
+    // a navigation anyway.
+    let base = serve();
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(format!("{base}plain")))]),
+        )
+        .expect("the page loads");
+    wait_for_title(&mut client, "plain", Duration::from_secs(10));
+    let agent = evaluate(&mut client, "navigator.userAgent");
+    let agent = agent.as_str().expect("a user agent");
+    eprintln!("navigator.userAgent = {agent}");
+    assert!(
+        !agent.contains("Headless"),
+        "the headless token survived: {agent}"
+    );
+    assert!(agent.contains("Chrome/"), "{agent}");
+    assert!(
+        agent.contains(&format!(
+            "{}/{}",
+            blinkterm::identity::PRODUCT,
+            blinkterm::identity::VERSION
+        )),
+        "this program is not named: {agent}"
+    );
+
+    // The hints say the same, which is what the switch could not do.
+    let brands = evaluate(
+        &mut client,
+        "navigator.userAgentData.brands.map(b=>b.brand).join(',')",
+    );
+    let brands = brands.as_str().expect("the brands");
+    eprintln!("userAgentData.brands = {brands}");
+    assert!(
+        !brands.contains("Headless"),
+        "the hints still say headless: {brands}"
+    );
+    assert!(brands.contains("Chromium"), "{brands}");
+    assert!(brands.contains(blinkterm::identity::PRODUCT), "{brands}");
+
+    // And the languages are the locale's, English last, with no q-values.
+    let langs = evaluate(&mut client, "navigator.languages.join(',')");
+    eprintln!("navigator.languages = {langs:?}");
+    assert_eq!(langs.as_str(), Some("ja-JP,ja,en"));
+
     client.close();
     engine.kill();
 }
