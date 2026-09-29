@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use blinkterm::cdp::{Client, Pending};
 use blinkterm::engine::{self, Engine};
 use blinkterm::find::{self, Matches};
+use blinkterm::fit::Cells;
 use blinkterm::graphics::{Painter, Raw, IMAGE_ID};
 use blinkterm::identity::Identity;
 use blinkterm::input::{Key, KeyAction, KeyInput, Mods};
@@ -42,8 +43,14 @@ use blinkterm::profile::{Choice, Profile};
 use blinkterm::route::{Payload, Placement, Route, Wrap};
 use blinkterm::scroll::{self, Animator, Dispatch, Step, Wheel};
 use blinkterm::tabs::{Outcome, Tab, Tabs};
-use tos_compositor::ImageFiles;
-use tos_preview::fit::Cells;
+
+// tOS's `t=s` reader, the one a real tOS pane installs, copied from
+// `tos-compositor` at `c7677bde` and kept as it is there so that the two can
+// be compared line for line — which is why this crate's lints stop here.
+#[path = "support/imagefile.rs"]
+#[allow(clippy::undocumented_unsafe_blocks)]
+mod imagefile;
+use imagefile::ImageFiles;
 
 /// The page the frames come from.
 ///
@@ -290,7 +297,7 @@ fn frames_reach_a_terminal_through_shared_memory() {
             );
 
             let at = Instant::now();
-            let image = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+            let image = blinkterm::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
             decoding += at.elapsed();
             assert_eq!((image.width, image.height), (WIDTH, HEIGHT));
 
@@ -370,7 +377,7 @@ fn frames_also_reach_a_terminal_inline() {
     let (mut frames, mut escape_bytes) = (0usize, 0usize);
     while started.elapsed() < Duration::from_secs(2) {
         for (jpeg, _) in take_frames(&mut client) {
-            let image = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+            let image = blinkterm::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
             let raw = Raw::rgb(&image.rgb, image.width, image.height);
             let sequence = blinkterm::graphics::inline_command(&raw, cells);
             terminal.advance(&sequence);
@@ -1824,7 +1831,7 @@ fn screenshot(client: &mut Client, format: &str, quality: Option<u32>) -> Vec<u8
 /// frames are only allowed to be lossy while the page is moving, and how
 /// lossy is a thing to measure rather than to trust. 35 dB is the floor and
 /// the measured figure on this page is 37; anything near the floor means
-/// either the encoder's defaults moved or `tos_term::jpeg` has a bug the
+/// either the encoder's defaults moved or `blinkterm::jpeg` has a bug the
 /// fixtures did not catch.
 ///
 /// Read the floor as being about this page. A screenful of small monospace
@@ -1848,9 +1855,9 @@ fn a_jpeg_frame_at_quality_85_is_the_png_of_the_same_frame() {
     assert_eq!(&png[..4], b"\x89PNG");
     assert_eq!(&jpeg[..2], b"\xff\xd8");
 
-    let lossless = tos_term::png::decode(&png, 64 * 1024 * 1024).expect("the PNG decodes");
+    let lossless = blinkterm::png::decode(&png, 64 * 1024 * 1024).expect("the PNG decodes");
     let at = Instant::now();
-    let lossy = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("the JPEG decodes");
+    let lossy = blinkterm::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("the JPEG decodes");
     let decoding = at.elapsed();
     assert_eq!(
         (lossy.width, lossy.height),
@@ -2032,7 +2039,7 @@ fn raw_pixels_cost_the_terminal_a_fraction_of_what_a_png_frame_did() {
                 continue;
             }
             let at = Instant::now();
-            let image = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+            let image = blinkterm::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
             decoding += at.elapsed();
             let raw = Raw::rgb(&image.rgb, image.width, image.height);
             let sequence = painter.frame(raw, cells, 2, 1);
@@ -5240,7 +5247,7 @@ fn search(client: &mut Client, context: i64, needle: &str, step: i32) -> Matches
 /// one) pixels a PNG has, within 8 of each channel, inside `area` — `(x, y,
 /// width, height)` — or everywhere.
 fn highlight_pixels(png: &[u8], area: Option<(u32, u32, u32, u32)>) -> (usize, usize) {
-    let image = tos_term::png::decode(png, 64 * 1024 * 1024).expect("the PNG decodes");
+    let image = blinkterm::png::decode(png, 64 * 1024 * 1024).expect("the PNG decodes");
     let (x0, y0, w, h) = area.unwrap_or((0, 0, image.width, image.height));
     let near = |pixel: &[u8], rgb: [u8; 3]| {
         pixel
@@ -5728,7 +5735,7 @@ fn page_metrics(client: &mut Client) -> (f64, f64, f64) {
 /// A still, decoded.
 fn still(client: &mut Client) -> (Vec<u8>, u32, u32) {
     let png = screenshot(client, "png", None);
-    let image = tos_term::png::decode(&png, 64 * 1024 * 1024).expect("a still decodes");
+    let image = blinkterm::png::decode(&png, 64 * 1024 * 1024).expect("a still decodes");
     (image.rgba, image.width, image.height)
 }
 
@@ -5820,7 +5827,7 @@ fn zoom_changes_what_the_page_sees_and_the_still_stays_the_panes_size() {
     }
     let (jpeg, _) = frame.expect("a frame");
     let _ = client.call("Page.stopScreencast", Json::empty());
-    let image = tos_term::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+    let image = blinkterm::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
     assert_eq!(
         (image.width, image.height),
         (WIDTH / 2, HEIGHT / 2),
@@ -6450,7 +6457,7 @@ fn clear(client: &mut Client, context: i64) {
 /// How many pixels of a PNG are the labels' yellow, `#ffd400`, within 8 of
 /// each channel.
 fn label_pixels(png: &[u8]) -> usize {
-    let image = tos_term::png::decode(png, 64 * 1024 * 1024).expect("the PNG decodes");
+    let image = blinkterm::png::decode(png, 64 * 1024 * 1024).expect("the PNG decodes");
     image
         .rgba
         .chunks_exact(4)
@@ -7039,8 +7046,8 @@ fn hints_on_about_blank_and_the_error_page_are_none_and_no_exception() {
 // Crashed pages, the session, and dormant tabs (#18)
 // ---------------------------------------------------------------------------
 
+use blinkterm::fit::Metrics;
 use blinkterm::session::{self, Session, Snapshot, State};
-use tos_preview::fit::Metrics;
 
 /// A page that paints every frame, so that a screencast of it is a count.
 /// No `%` and no `#` in it: this is a url, and `#` would start its fragment.

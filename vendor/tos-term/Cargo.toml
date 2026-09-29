@@ -1,0 +1,11 @@
+[package]
+name = "tos-term"
+description = "tOS terminal model, frozen at tOS c7677bde: the terminal blinkterm's tests parse its output with"
+version = "0.0.8"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+repository = "https://github.com/m96-chan/tOS"
+publish = false
+
+[dependencies]

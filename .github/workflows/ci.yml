@@ -55,10 +55,8 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      # --locked everywhere, on purpose. Every dependency here is a git
-      # revision, so Cargo.lock is the only thing recording which tree of tOS
-      # was built; without it cargo is free to re-resolve and quietly test
-      # something other than what is committed. It also makes a stale lock file
+      # --locked everywhere, on purpose. Without it cargo is free to re-resolve
+      # and quietly test something other than what is committed. It also makes a stale lock file
       # a failure rather than a diff that appears in the next person's branch.
       - run: cargo clippy --all-targets --locked -- -D warnings
       # The lint table in Cargo.toml is the same set a laptop gets; -D warnings

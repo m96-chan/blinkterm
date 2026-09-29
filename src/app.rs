@@ -35,8 +35,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tos_platform::tty::{self, ReadOutcome};
-use tos_preview::fit::Metrics;
+use crate::fit::Metrics;
+use crate::tty::{self, ReadOutcome};
 
 use crate::appearance::Appearance;
 use crate::bindings::{Action, Bindings, Lookup};
@@ -3450,7 +3450,7 @@ fn handle_page_events(
         // that looks frozen, which is what the engine test comparing the two
         // formats through both decoders exists to catch before a person meets
         // it.
-        if let Ok(image) = tos_term::jpeg::decode(&jpeg, FRAME_BUDGET) {
+        if let Ok(image) = crate::jpeg::decode(&jpeg, FRAME_BUDGET) {
             let raw = Raw::rgb(&image.rgb, image.width, image.height);
             paint(pane, tabs, chrome, raw)?;
         }
@@ -3505,7 +3505,7 @@ fn put_frame(
     pane: &mut Pane,
     tabs: &Tabs<Client>,
     chrome: &mut Chrome,
-    make: impl FnOnce(&mut Painter, tos_preview::fit::Cells, u32) -> Vec<u8>,
+    make: impl FnOnce(&mut Painter, crate::fit::Cells, u32) -> Vec<u8>,
 ) -> Result<(), String> {
     let layout = chrome.layout;
     let (cells, row) = (layout.cells(chrome.metrics), layout.page_row());
@@ -3674,7 +3674,7 @@ fn collect_still(
         .ok()
         .and_then(|reply| reply.get("data").and_then(Json::as_str).map(str::to_string))
         .and_then(|data| crate::base64::decode(data.as_bytes()).ok())
-        .and_then(|png| tos_term::png::decode(&png, FRAME_BUDGET).ok());
+        .and_then(|png| crate::png::decode(&png, FRAME_BUDGET).ok());
     let Some(image) = decoded else {
         // The tab stays marked at rest, which is what stops a page whose
         // screenshots will not decode being asked again every pass.
@@ -8115,7 +8115,7 @@ mod tests {
 
     #[test]
     fn a_page_is_the_pane_less_the_status_row() {
-        use tos_preview::fit::Cells;
+        use crate::fit::Cells;
         let metrics = Metrics {
             cols: 80,
             rows: 24,

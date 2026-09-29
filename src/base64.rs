@@ -4,7 +4,7 @@
 //! picture that arrived inside a JSON string; the graphics protocol needs an
 //! encoder for the pixels and the shared-memory names it sends the terminal.
 //!
-//! [`tos_term::graphics::decode_base64`] already decodes, and this is
+//! tOS's `tos_term::graphics::decode_base64` already decodes, and this is
 //! deliberately not it. That one is a terminal reading what an application
 //! sent: it skips whitespace and stops at the first byte outside the
 //! alphabet, because a terminal that rejected a payload would have to answer

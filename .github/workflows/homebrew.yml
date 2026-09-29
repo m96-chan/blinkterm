@@ -2,8 +2,8 @@
 #
 # A workflow of its own rather than a sixth job in ci.yml, for two reasons. It
 # needs Homebrew, which none of the other jobs do, and it is slow -- the
-# `rust` bottle and then a from-source build of this crate and the tOS crates
-# it pins, six to ten minutes -- for something that only changes when the
+# `rust` bottle and then a from-source build of this crate, several
+# minutes -- for something that only changes when the
 # formula, the lock file or this file does. So it runs on those paths and on
 # demand, not on every push, and a `paths:` filter is workflow-level.
 #

@@ -69,7 +69,7 @@ use std::io::{self, IsTerminal, Write};
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
-use tos_platform::tty::{self, RawMode, ReadOutcome};
+use crate::tty::{self, RawMode, ReadOutcome};
 
 use crate::appearance;
 use crate::download;

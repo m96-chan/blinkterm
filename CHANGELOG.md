@@ -12,6 +12,11 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- Ready for crates.io: the one dependency is `libc`. The PNG and JPEG
+  decoders, inflate, the tty helpers and the cell arithmetic that came from
+  tOS as git revisions are copied into `src/`, and the tests' copy of tOS's
+  terminal is in `vendor/`, unpublished
+  ([#33](https://github.com/m96-chan/blinkterm/issues/33)).
 - The groundwork for macOS: frames through `shm_open` shared memory,
   Chrome and Chromium found in `/Applications`, `--use-mock-keychain` for
   the engine. It builds for macOS but has not run on a Mac, so macOS is not

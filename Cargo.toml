@@ -4,12 +4,12 @@ description = "A real browser in a terminal pane: headless Chromium over the Kit
 version = "0.1.0"
 edition = "2021"
 # 1.87 is measured, not guessed: 1.86 does not build this tree and 1.87 does.
-# The floor came from the dependency closure rather than from anything written
-# here -- `fontdue`, which `tos-font` pulls in, calls `integer_sign_cast`
-# (stable in 1.87), and `tos-ime` takes a mutable reference in a `const fn`
-# (stable in 1.83). `src/` then followed it: clippy gates its suggestions on
-# this number, and once it read 1.87 it asked for `is_multiple_of` (1.87) and
-# `repeat_n` (1.82), which base64.rs and screen.rs now use.
+# The floor first came from the dependency closure -- `fontdue`, which the tOS
+# crates pulled in, calls `integer_sign_cast` (stable in 1.87). `src/` then
+# followed it: clippy gates its suggestions on this number, and once it read
+# 1.87 it asked for `is_multiple_of` (1.87) and `repeat_n` (1.82). The tOS
+# crates are gone and `fontdue` with them, and the floor is `src/`'s own now:
+# base64.rs, screen.rs, inflate.rs and jpeg.rs call `is_multiple_of`.
 #
 # This said 1.75 until it was checked, which is what an unchecked number does.
 # The `msrv` job in .github/workflows/ci.yml reads this line and builds against
@@ -17,6 +17,12 @@ edition = "2021"
 rust-version = "1.87"
 license = "MIT"
 repository = "https://github.com/m96-chan/blinkterm"
+keywords = ["browser", "terminal", "kitty", "chromium", "cli"]
+categories = ["command-line-utilities", "web-programming"]
+# The package is the program. The tests stay in the repository: they parse
+# this program's output with a copy of tOS's terminal in `vendor/`, which is
+# not published, so they would not build from the package anyway.
+include = ["/src/**/*.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md"]
 
 [[bin]]
 name = "blinkterm"
@@ -26,37 +32,27 @@ path = "src/main.rs"
 name = "blinkterm"
 path = "src/lib.rs"
 
-# The tOS crates are git revisions rather than versions because none of them is
-# published to crates.io and none of them is going to be: they are parts of an
-# operating system, versioned with it. A revision rather than a branch so that
-# a build here is the same build tomorrow — tOS's `main` moves, and a browser
-# that decodes the frames itself would notice a decoder changing underneath it.
-#
-# `rev = "c7677bde"` is tOS `main` at the commit this crate was split out of,
-# so the tests below are running against exactly the code they passed against
-# inside that repository.
-#
-# Bumping the rev is how a protocol change is taken: when tOS's terminal learns
-# a graphics format, an escape sequence or a keyboard flag this program wants,
-# the way to get it is to move these revisions forward together and run the
-# engine tests, not to vendor or reimplement it here.
+# One dependency, and it is `libc`. The PNG and JPEG decoders, inflate, the
+# tty helpers and the cell arithmetic used to come from tOS as git revisions;
+# they live in `src/` now (`png.rs`, `jpeg.rs`, `inflate.rs`, `tty.rs`,
+# `fit.rs`), copied from tOS `c7677bde`. This program runs on a Mac and in
+# Kitty, not only in a tOS pane, and a crate that crates.io will take cannot
+# have a git dependency, so the code it runs is code it owns. A fix in tOS is
+# now a fix to carry over by hand, and the other way round.
 [dependencies]
 libc = "0.2"
-# tos-term: the PNG and JPEG decoders, and the graphics-command parser the
-# tests check this program's output with. (compositor/tos-term)
-tos-term = { git = "https://github.com/m96-chan/tOS", rev = "c7677bde" }
-# tos-platform: raw mode, non-blocking descriptors, the tty odds and ends.
-# (compositor/tos-platform)
-tos-platform = { git = "https://github.com/m96-chan/tOS", rev = "c7677bde" }
-# tos-preview: cells-to-pixels arithmetic, shared with the image viewer.
-# (apps/preview)
-tos-preview = { git = "https://github.com/m96-chan/tOS", rev = "c7677bde" }
 
 [dev-dependencies]
-# tos-compositor, for `ImageFiles`: the `t=s` reader a real tOS pane installs,
-# so the engine tests exercise the shared-memory transport the way the
-# compositor does rather than a stand-in. (compositor/tos-compositor)
-tos-compositor = { git = "https://github.com/m96-chan/tOS", rev = "c7677bde" }
+# The terminal the tests parse this program's output with: tOS's `tos-term`,
+# copied into `vendor/` at the same revision and not published. It is a path
+# with no version, so `cargo publish` leaves it out of the published manifest,
+# and the tests that use it are the repository's rather than the package's.
+tos-term = { path = "vendor/tos-term" }
+
+# Not a member: a frozen copy is held to tOS's lints, not to this crate's,
+# and `cargo clippy` here treats it as the outside code it is.
+[workspace]
+exclude = ["vendor/tos-term"]
 
 # Copied from tOS's workspace profile, and `panic = "abort"` is the part that
 # matters: `engine.rs` kills the engine's process group from a panic hook
@@ -84,7 +80,7 @@ unsafe_op_in_unsafe_fn = "warn"
 unused_qualifications = "warn"
 
 [lints.clippy]
-# The reason this table exists. There are 49 `unsafe` blocks in `src/` (counted
+# The reason this table exists. There are 63 `unsafe` blocks in `src/` (counted
 # as `grep -o 'unsafe {' src/*.rs | wc -l`, so the tests' among them), nearly
 # all of them one-line `libc` calls, and every one says what makes it sound. A
 # crate that explains a 150 ms rest interval at four paragraphs should not be

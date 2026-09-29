@@ -91,9 +91,9 @@ one formula and no canonical copy elsewhere, and not before.
 
 The archive url is what Homebrew expects for a GitHub tag, and GitHub keeps
 the checksum of a tag's archive stable. The build inside `brew` runs `cargo
-install --locked` against the `Cargo.lock` in the archive and fetches the tOS
-revisions from GitHub as it goes; Homebrew allows a build network access by
-default, on Linux (Landlock) as on macOS, and the formula does not opt out.
+install --locked` against the `Cargo.lock` in the archive and fetches `libc`
+from crates.io as it goes; Homebrew allows a build network access by default,
+on Linux (Landlock) as on macOS, and the formula does not opt out.
 Once the stable block is in, the README's `brew install` line drops `--HEAD`.
 
 Step 5 is what the release workflow will do once there is one (#22): a job
@@ -102,26 +102,36 @@ copies the formula, and pushes. Until then it is two commands.
 
 ## What goes in the release notes
 
-The changelog section, and two things that are not in the repository's diff but
-are part of what the release *is*:
+The changelog section, and one thing that is not in the repository's diff but
+is part of what the release *is*:
 
-- **the tOS revision** the dependencies are pinned to — `c7677bde` at the time
-  of writing, from `Cargo.toml`. It is the PNG and JPEG decoders, the terminal
-  handling and the cell arithmetic, so it is as much of the program as `src/`.
 - **the Chromium the engine tests passed against**. The `engine` job pins a
   `chrome-headless-shell` by version and checksum and prints its `--version`;
   take it from that run's log. The program does not
   ship an engine, so "it works" is always "it worked against this one".
 
-## Not on crates.io
+## crates.io
 
-`cargo publish` will refuse this crate: every dependency but `libc` is a git
-revision, and crates.io does not accept git dependencies. That is not an
-oversight — pinning a revision is how a protocol change is taken deliberately
-rather than inherited — but it does mean the tag and its artifacts are the
-release, and `cargo install --git` is the install. Distribution beyond that is
-[#24](https://github.com/m96-chan/blinkterm/issues/24), and building binaries
-for a tag is [#22](https://github.com/m96-chan/blinkterm/issues/22).
+The one dependency is `libc`. The code that used to come from tOS as git
+revisions is in `src/` (see CONTRIBUTING.md), and the tests' copy of tOS's
+terminal is a path dev-dependency that `cargo publish` leaves out, so the crate
+publishes. `include` in `Cargo.toml` keeps the package to the program: the
+tests are not in it, because they need that terminal.
+
+After step 3 above, from the tagged commit:
+
+```sh
+# 6. what would be uploaded, built from the package rather than the tree
+cargo publish --dry-run --locked
+cargo package --list                  # src/, Cargo.*, README, LICENSE, CHANGELOG
+
+# 7. upload it; a version on crates.io cannot be replaced, only yanked
+cargo publish --locked
+```
+
+`cargo install` uses the published lock file only when `--locked` is passed.
+Once the first version is up, the README's install line becomes
+`cargo install --locked blinkterm`, with `--git` kept for `main`.
 
 ## If this gets tedious
 

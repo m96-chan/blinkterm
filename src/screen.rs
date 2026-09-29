@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use crate::route::Wrap;
 
-use tos_preview::fit::Metrics;
+use crate::fit::Metrics;
 
 /// The keyboard flags this program asks for.
 ///
@@ -242,7 +242,7 @@ pub struct Pane {
 impl Pane {
     /// Take the terminal: raw mode, alternate screen, mouse, keyboard flags.
     ///
-    /// Raw mode is done here rather than with [`tos_platform::tty::RawMode`]
+    /// Raw mode is done here rather than with [`crate::tty::RawMode`]
     /// because the settings have to be saved somewhere a panic hook can reach
     /// them, and a guard that owns its copy cannot be that place.
     ///
@@ -326,7 +326,7 @@ impl Pane {
     /// follows a font being changed.
     pub fn metrics(&self, cell_hint: Option<(u32, u32)>) -> io::Result<Metrics> {
         let metrics = Metrics::probe(self.output)?;
-        let size = tos_platform::tty::terminal_size(self.output)?;
+        let size = crate::tty::terminal_size(self.output)?;
         Ok(match cell_hint {
             Some(cell) if size.width_px == 0 || size.height_px == 0 => metrics.with_cell(cell),
             _ => metrics,
