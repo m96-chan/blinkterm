@@ -479,18 +479,18 @@ impl Job {
                     return Ok(None);
                 };
                 let reply = reply?;
-                // An engine that ignored the stream and answered with the
-                // file itself.
-                if reply.get("data").is_some() {
+                // The reply has `data` too, empty, beside the stream — 153
+                // sends both — so the stream is looked for first, and the
+                // data taken only from an engine that ignored the mode.
+                let Some(handle) = reply.get("stream").and_then(Json::as_str) else {
                     let bytes = decoded(&reply)?;
+                    if bytes.is_empty() {
+                        return Err("the engine sent no PDF".to_string());
+                    }
                     let path = self.write_whole(dir, &bytes)?;
                     return Ok(Some(Saved { path, cut: None }));
-                }
-                let handle = reply
-                    .get("stream")
-                    .and_then(Json::as_str)
-                    .ok_or("the engine sent no PDF")?
-                    .to_string();
+                };
+                let handle = handle.to_string();
                 let opened = self.reserve(dir).and_then(|path| {
                     OpenOptions::new()
                         .write(true)
