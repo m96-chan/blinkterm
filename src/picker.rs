@@ -81,7 +81,7 @@
 //! hook for.
 //!
 //! A terminal picker is run to completion ([`run_terminal`]) once the loop
-//! has given the terminal back (`Pane::release`), and
+//! has given the terminal back ([`crate::screen::Pane::release`]), and
 //! nothing else happens meanwhile: nothing could be drawn anyway. It is left
 //! in this program's own process group — the terminal's foreground group —
 //! so that it can read the terminal without being stopped for it, and while
