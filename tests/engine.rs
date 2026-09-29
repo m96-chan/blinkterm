@@ -9159,6 +9159,7 @@ fn a_url_handed_over_the_socket_becomes_the_tab_in_front() {
         &downloads,
         &appearance,
         &Allowed::in_memory(),
+        None,
     )
     .expect("the engine boots");
     let base = serve();

@@ -423,6 +423,7 @@ nothing else, for scripts.
 | `zoom-reset` | `alt+0`, `ctrl+0` | back to 100% |
 | `find` | `ctrl+f` | find in the page |
 | `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
+| `block` | `alt+b` | stop blocking ads and trackers on this site, or start again |
 | `copy` | `alt+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | copy the url |
 | `save-pdf` | `alt+s` | save this page as a PDF |

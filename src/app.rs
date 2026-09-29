@@ -526,6 +526,9 @@ struct Chrome {
     /// `None` with no `block-list`, and then nothing is ever paused. See
     /// [`crate::block`].
     blocker: Option<Arc<Blocker>>,
+    /// The sites blocking is off for, kept in the profile, or only in memory
+    /// for a temporary one; the blocker holds a copy for the reader thread.
+    unblocked: Unblocked,
     /// What the row last said about blocking on the page in front, so that
     /// it is drawn again when the count moves and not otherwise.
     blocked_words: Option<String>,
@@ -556,6 +559,7 @@ impl Chrome {
         identity: Identity,
         allowed: Allowed,
         blocker: Option<Arc<Blocker>>,
+        unblocked: Unblocked,
     ) -> Chrome {
         Chrome {
             identity,
@@ -629,6 +633,7 @@ impl Chrome {
             cast: motion::Cast::default(),
             throttle: motion::Throttle::default(),
             blocker,
+            unblocked,
             blocked_words: None,
         }
     }
@@ -1232,6 +1237,7 @@ pub fn run(options: Options) -> Result<(), String> {
                 first.identity.clone(),
                 allowed,
                 blocker,
+                unblocked,
             );
             chrome.cell_hint = heard.cell;
             chrome.take_route(route);
@@ -4651,6 +4657,10 @@ fn handle_input(
                     start_save(tabs, chrome, kind);
                     redraw_row(pane, tabs, chrome)?;
                 }
+                Some(Command::Block) => {
+                    toggle_block(tabs, chrome);
+                    redraw_row(pane, tabs, chrome)?;
+                }
                 Some(Command::ListTabs) => {
                     chrome.list = Some(Overlay::Tabs(TabList::open(tabs.active_index())));
                     chrome.list_first.set(0);
@@ -5061,6 +5071,9 @@ enum Command {
     SavePdf,
     /// `alt+shift+s`: the whole of it as a PNG there.
     SaveScreenshot,
+    /// `alt+b`: blocking off for the site in front, or on again. See
+    /// [`crate::block`].
+    Block,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -5094,7 +5107,9 @@ enum Command {
 /// is answered, and a PDF of a page with a question over it is not the page.
 ///
 /// Normal mode's toggle survives: it touches no page, and a person can leave
-/// the mode while a question waits.
+/// the mode while a question waits. So does `alt+b`: it changes what the
+/// next request is answered with and a line in the profile, and sends the
+/// page nothing.
 /// Bookmarking survives, for the reason copying the url does: it reads the
 /// tab's url and title, which this program already has. So does reopening a
 /// closed tab, which opens another tab, as a new tab does.
@@ -5123,7 +5138,8 @@ fn survives_dialog(command: Command) -> bool {
         | Command::CopyUrl
         | Command::ToggleNormal
         | Command::Bookmark
-        | Command::ReopenTab => true,
+        | Command::ReopenTab
+        | Command::Block => true,
         Command::EditUrl
         | Command::Reload
         | Command::Back
@@ -5865,6 +5881,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('s') if key.mods.shift() => Some(Command::SaveScreenshot),
             Key::Char('s') => Some(Command::SavePdf),
             Key::Char('p') => Some(Command::Permissions),
+            Key::Char('b') => Some(Command::Block),
             Key::Char('t') => Some(Command::ReopenTab),
             Key::Char('=' | '+') => Some(Command::ZoomIn),
             Key::Char('-' | '_') => Some(Command::ZoomOut),
@@ -5923,6 +5940,7 @@ fn command_of(action: Action) -> Command {
         Action::SavePdf => Command::SavePdf,
         Action::SaveScreenshot => Command::SaveScreenshot,
         Action::ToggleNormal => Command::ToggleNormal,
+        Action::Block => Command::Block,
     }
 }
 
@@ -6234,6 +6252,32 @@ fn pump_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
         }
         save::Progress::Done(Err(why)) => chrome.downloads.could_not_save(job.name(), &why, now),
     }
+}
+
+/// `alt+b`: blocking off for the site in front if it was on, on if it was
+/// off — kept in the profile, and told to the blocker, which answers the
+/// next request with it. Nothing is reloaded: what was blocked stays
+/// blocked until the page is loaded again, which is the person's to ask
+/// for, as it is in a browser with an ad blocker. The row says which, and
+/// a file that cannot be written is said too; the change stands for this
+/// run, as a zoom level does.
+fn toggle_block(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(blocker) = chrome.blocker.clone() else {
+        note(tabs, block::NO_LISTS);
+        return;
+    };
+    let Some(site) = tabs.active().and_then(|tab| block::site_of(&tab.url)) else {
+        note(tabs, block::NO_SITE);
+        return;
+    };
+    let written = chrome.unblocked.toggle(&site);
+    let now = chrome.unblocked.contains(&site);
+    blocker.set_unblocked(&site, now);
+    let sentence = match written {
+        Ok(_) => block::toggled(&site, now),
+        Err(why) => format!("{}; {why}", block::toggled(&site, now)),
+    };
+    note(tabs, sentence);
 }
 
 /// Type into the allow line. Returns `false` only if the person quit.
@@ -8521,6 +8565,7 @@ mod tests {
             Identity::new(None, None, "C"),
             Allowed::in_memory(),
             None,
+            Unblocked::in_memory(),
         );
         chrome.find = Some(Find {
             target: "a".to_string(),
@@ -8748,6 +8793,31 @@ mod tests {
         // The prompt's own next and previous are the prompt's, not commands
         // a page loses when it is closed.
         assert_eq!(command(&key(Key::Char('g'), Mods::CTRL)), None);
+    }
+
+    #[test]
+    fn alt_b_toggles_blocking_survives_a_dialog_and_leaves_the_url_bar_its_word_back() {
+        assert_eq!(
+            command(&key(Key::Char('b'), Mods::ALT)),
+            Some(Command::Block)
+        );
+        assert_eq!(command_of(Action::Block), Command::Block);
+        // It sends the page nothing, so a question on it does not stop it.
+        assert!(survives_dialog(Command::Block));
+        // `ctrl+b` and a bare `b` stay the page's.
+        assert_eq!(command(&key(Key::Char('b'), Mods::CTRL)), None);
+        assert_eq!(command(&key(Key::Char('b'), 0)), None);
+        // On the row, alt+b is the line's: a word back, as in a shell.
+        assert_eq!(
+            row_command(&Bindings::default(), &key(Key::Char('b'), Mods::ALT)),
+            None
+        );
+        for press in every_press() {
+            if command(&press) == Some(Command::Block) {
+                assert_eq!(press.key, Key::Char('b'), "{press:?}");
+                assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
+            }
+        }
     }
 
     #[test]
