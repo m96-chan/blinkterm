@@ -153,6 +153,7 @@ pub mod permissions;
 pub mod picker;
 pub mod png;
 pub mod profile;
+pub mod remote;
 pub mod route;
 pub mod screen;
 pub mod scroll;
