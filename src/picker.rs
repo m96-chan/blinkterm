@@ -1249,11 +1249,41 @@ mod tests {
         assert!(picker.reaped);
     }
 
-    /// Whether anything is left in a process group.
+    /// Whether anything is left running in a process group.
+    ///
+    /// A zombie counts as gone: it has ended and is only waiting to be
+    /// reaped. `kill(2)` still succeeds on one, and in CI's engine job it
+    /// is what the grandchild becomes — it is orphaned into a container
+    /// whose PID 1 never reaps — so asking `kill` alone failed there with
+    /// every process of the group already dead. On Linux the group is read
+    /// out of `/proc` instead; elsewhere `kill` is the only question.
     fn group_gone(target: i32) -> bool {
-        // SAFETY: signal 0 sends nothing and `kill(2)` reads no memory.
-        let alive = unsafe { libc::kill(target, 0) } == 0;
-        !alive && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        #[cfg(target_os = "linux")]
+        {
+            let group = -target;
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return false;
+            };
+            !entries.flatten().any(|entry| {
+                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                    return false;
+                };
+                // `pid (comm) state ppid pgrp …`; the name may hold spaces
+                // and parentheses, so everything is read after the last `)`.
+                let Some((_, rest)) = stat.rsplit_once(')') else {
+                    return false;
+                };
+                let fields: Vec<&str> = rest.split_whitespace().collect();
+                fields.first() != Some(&"Z")
+                    && fields.get(2).and_then(|p| p.parse::<i32>().ok()) == Some(group)
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // SAFETY: signal 0 sends nothing and `kill(2)` reads no memory.
+            let alive = unsafe { libc::kill(target, 0) } == 0;
+            !alive && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
     }
 
     #[test]
