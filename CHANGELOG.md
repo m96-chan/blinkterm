@@ -19,6 +19,13 @@ flag, a different default, a raised Rust floor all do.
   middle click in a new tab, and `shift+delete` forgets it, from the file
   too. `history` in a `key.` line
   ([#68](https://github.com/m96-chan/blinkterm/issues/68)).
+- `blinkterm --remote <url>…` opens the urls as new tabs in the `blinkterm`
+  already running on the same profile and exits, over a 0600 socket next to
+  the lock; with none running it starts as usual, so `export
+  BROWSER='blinkterm --remote'` makes it the browser `gh browse`, `git
+  web--browse` and `man -H` open. Only `http`, `https`, `file` and `about`
+  urls are taken. `packaging/blinkterm.desktop` lets `xdg-open` reach it
+  ([#60](https://github.com/m96-chan/blinkterm/issues/60)).
 - A page's file input can be answered by a program the settings name
   instead of the row: `file-picker = <command>` for one with a window of
   its own (Finder's dialog through `osascript`, `zenity`, `kdialog`),

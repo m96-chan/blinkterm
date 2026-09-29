@@ -158,7 +158,9 @@ and removes it when `blinkterm` exits, including when it panics; one left by a
 One `blinkterm` uses a profile at a time. A second one started on a profile
 that is in use is refused, and told which pid has it; it does not quietly fall
 back to a throwaway profile, because a login you thought was being kept and was
-not is worse than an error. The lock is `blinkterm`'s own — an `flock` on
+not is worse than an error. To open a url in the one that has it, say so:
+`blinkterm --remote <url>` (see
+[Opening a url from another program](#opening-a-url-from-another-program)). The lock is `blinkterm`'s own — an `flock` on
 `blinkterm.lock` in the profile — because the headless shell has no lock of its
 own and will happily run two engines on one cookie database.
 
@@ -265,6 +267,66 @@ wants the row. How a run that did not quit is known is the file's first line,
 `# blinkterm session: open` until the run quits and writes `closed`.
 `--temp-profile` keeps the session in memory, for `ctrl+shift+t`, and writes
 nothing.
+## Opening a url from another program
+
+Terminal programs open a link through `$BROWSER`: `gh browse`, `git
+web--browse`, `man -H`, a mail client. Point it at the `blinkterm` you have
+open:
+
+```sh
+export BROWSER='blinkterm --remote'
+gh browse                      # a tab in the blinkterm that is running
+man -H ls                      # the page man writes, as file:///tmp/...
+git web--browse https://example.com
+```
+
+`blinkterm --remote <url>…` hands the urls to the `blinkterm` already running
+on the same profile, which opens the first as a new tab in front and the rest
+behind it, and exits at once with 0. With none running it starts as usual,
+with those urls — so the same `$BROWSER` works whether one is open or not, as
+long as there is a terminal to start one in; with no terminal (a desktop's
+`xdg-open`) it says there is nobody to hand the url to, and exits 1.
+
+The profile decides which `blinkterm` is reached, exactly as it decides which
+profile a start takes: `blinkterm --remote --profile ~/work-profile <url>`
+reaches the one on `~/work-profile`. A `--temp-profile` run is its own and
+never listens, and `--remote --temp-profile` is refused as a contradiction.
+
+Each url is read as the url bar reads what is typed — `example.com` is
+`https://example.com`, `localhost:3000` is `http://`, a path is `file://` —
+and it must come out as an `http`, `https`, `file` or `about` url. Anything
+else (`javascript:`, `data:`, `chrome://`, `mailto:`) is refused: the sender
+prints one line per refused url on stderr and exits 1, and the urls that were
+fine are opened anyway.
+
+How it works: a running `blinkterm` listens on a Unix socket,
+`blinkterm.sock`, next to `blinkterm.lock` in its profile, made 0600 inside the
+0700 profile. It is sent one url per line and answers one line per url, `ok
+<url>` or `no <why>`; it takes nothing else — no keys, no scripts, no
+commands. The socket is made only once the profile lock is held, so one left
+by a `blinkterm` that was killed is simply replaced, and a sender that finds
+one with nobody on it starts as usual. Where the profile's path is too long
+for a socket — a Mac allows 104 bytes — or the profile is on a filesystem
+that cannot hold one, the socket goes in a fresh private directory under the
+temporary directory, and `blinkterm.sock` in the profile is a symlink to it.
+A `blinkterm` busy with a file picker in its terminal takes the url when it
+is back; the sender waits ten seconds for its answer and then says so and
+exits 0.
+
+For `xdg-open` on Linux, `packaging/blinkterm.desktop` registers
+`blinkterm --remote %u` as a web browser:
+
+```sh
+cp packaging/blinkterm.desktop ~/.local/share/applications/
+xdg-settings set default-web-browser blinkterm.desktop
+```
+
+It reaches a `blinkterm` running on the default profile, and has no terminal
+to start one in, so with none running a link says so in the journal and
+opens nothing. On macOS `gh` and `git` honour `$BROWSER`, but `open` and the
+rest of the system do not: they go to the default browser, which a program
+with no window cannot be.
+
 ## Settings
 
 Everything on the command line can also be kept in
@@ -783,6 +845,10 @@ Chromium on it did not thereby agree to have it started.
 BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
   cargo test --release -- --test-threads=1
 ```
+
+`tests/remote.rs` runs the binary itself as `blinkterm --remote`, as `gh` or
+`xdg-open` would, against a socket the test listens on; it needs no engine
+and runs with the rest of `cargo test`.
 
 `--release` because several of them assert on timings, and one at a time
 because each starts a Chromium of its own: two engines painting at once on a

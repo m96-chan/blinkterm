@@ -42,6 +42,18 @@ machine. It prints a warning when it does. Do not browse as root.
   and opens its DevTools port whatever it is told; with that engine any local
   process running as you can still attach, and the README says so.
 
+- **The `--remote` socket.** A running `blinkterm` listens on
+  `<profile>/blinkterm.sock` (0600, inside the 0700 profile; on a Mac with a
+  long profile path, or a profile on a filesystem without sockets, a symlink
+  there to a socket in a fresh 0700 directory of its own) for one url per line
+  from `blinkterm --remote`. It takes urls and nothing else: no keys, no
+  scripts, no commands, and a line that is not an `http`, `https`, `file` or
+  `about` url is answered "no" and dropped, after the same reading the url bar
+  gives what is typed. What a sender can do is what `ctrl+t` can: open a page.
+  The socket is only ever made under the profile lock, so nothing left by a
+  crash is trusted, and a temporary profile never has one
+  ([#60](https://github.com/m96-chan/blinkterm/issues/60)).
+
 - **What gets written to your terminal.** A terminal executes the bytes it is
   sent, so anything page-derived that reaches the status row is a place where a
   page could try to speak to your terminal instead of to you. The row is the
