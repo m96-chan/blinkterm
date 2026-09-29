@@ -915,7 +915,8 @@ pub fn boot(
         engine.agent(),
         launch.user_agent.as_deref(),
         &crate::identity::locale(),
-    );
+    )
+    .with_accept_language(crate::identity::accept_lang_arg(&launch.args));
     let mut browser = engine.browser()?;
     browser.call(
         "Target.setDiscoverTargets",

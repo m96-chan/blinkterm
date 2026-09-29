@@ -8674,3 +8674,35 @@ fn a_page_is_told_chromium_and_this_program_and_nothing_headless() {
     client.close();
     engine.kill();
 }
+
+/// An `--engine-arg --accept-lang=…` still chooses the languages once the
+/// session has been told who is asking. The override's `acceptLanguage`
+/// replaces what the engine was started with, so the person's switch has to
+/// be carried into it; before it was, `fr` here read as the locale's list.
+#[test]
+fn an_accept_lang_of_the_persons_own_survives_the_override() {
+    let launch = engine::Launch {
+        args: vec!["--accept-lang=fr".to_string()],
+        ..engine::Launch::default()
+    };
+    let Some((mut engine, _browser, mut page)) = launched(&launch) else {
+        return;
+    };
+    assert_eq!(
+        evaluate(&mut page, "navigator.languages.join(',')").as_str(),
+        Some("fr"),
+        "the engine did not take the switch"
+    );
+    let identity = Identity::new(engine.agent(), None, "ja_JP.UTF-8")
+        .with_accept_language(blinkterm::identity::accept_lang_arg(&launch.args));
+    blinkterm::app::prepare_session(
+        &mut page,
+        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+        &identity,
+    );
+    let languages = evaluate(&mut page, "navigator.languages.join(',')");
+    eprintln!("navigator.languages = {languages:?}");
+    assert_eq!(languages.as_str(), Some("fr"));
+    page.close();
+    engine.kill();
+}

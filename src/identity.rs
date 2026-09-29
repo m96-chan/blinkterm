@@ -107,6 +107,24 @@ impl Identity {
         }
     }
 
+    /// The languages the person asked the engine for with an
+    /// `--engine-arg --accept-lang=…`, over the locale's.
+    ///
+    /// The override's `acceptLanguage` replaces what the engine was started
+    /// with — measured, `--accept-lang=fr` reads `fr` in `navigator.languages`
+    /// until the override is sent and the locale's list after it — so a
+    /// person's own switch has to be carried into the override, or the
+    /// README's way of choosing a language quietly stops working.
+    pub fn with_accept_language(self, explicit: Option<&str>) -> Identity {
+        match explicit {
+            Some(languages) => Identity {
+                accept_language: languages.to_string(),
+                ..self
+            },
+            None => self,
+        }
+    }
+
     /// The `Network.setUserAgentOverride` this is, or `None` when there is
     /// nothing to say — an engine that named itself in a way this could not
     /// read, and no `user-agent` of the person's own.
@@ -235,6 +253,15 @@ pub fn languages(locale: &str) -> String {
     out.join(",")
 }
 
+/// The value of the last `--accept-lang=` among the engine's extra
+/// arguments, the one the engine itself would take. An empty one is none.
+pub fn accept_lang_arg(args: &[String]) -> Option<&str> {
+    args.iter()
+        .rev()
+        .find_map(|arg| arg.strip_prefix("--accept-lang="))
+        .filter(|languages| !languages.is_empty())
+}
+
 /// The person's locale, from the environment the way every POSIX program
 /// reads it: `LC_ALL`, then `LC_MESSAGES`, then `LANG`.
 pub fn locale() -> String {
@@ -322,6 +349,35 @@ mod tests {
     }
 
     /// The locale becomes the list a page reads, English last.
+    /// An `--accept-lang=` the person passed wins over the locale, the last
+    /// one when there are several, as it does in the engine.
+    #[test]
+    fn an_accept_lang_of_the_persons_own_wins_over_the_locale() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(accept_lang_arg(&args(&["--accept-lang=ja"])), Some("ja"));
+        assert_eq!(
+            accept_lang_arg(&args(&[
+                "--accept-lang=fr",
+                "--mute-audio",
+                "--accept-lang=de,en"
+            ])),
+            Some("de,en")
+        );
+        assert_eq!(accept_lang_arg(&args(&["--lang=ja"])), None);
+        assert_eq!(accept_lang_arg(&args(&["--accept-lang="])), None);
+        assert_eq!(accept_lang_arg(&[]), None);
+
+        let id = Identity::new(Some(HEADLESS), None, "ja_JP.UTF-8");
+        assert_eq!(id.clone().with_accept_language(None), id);
+        let fr = id.with_accept_language(Some("fr"));
+        assert_eq!(fr.accept_language, "fr");
+        let (_, params) = fr.command().expect("an override");
+        assert_eq!(
+            params.get("acceptLanguage").and_then(Json::as_str),
+            Some("fr")
+        );
+    }
+
     #[test]
     fn the_locale_becomes_a_language_list_with_english_on_the_end() {
         assert_eq!(languages("ja_JP.UTF-8"), "ja-JP,ja,en");
