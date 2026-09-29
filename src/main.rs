@@ -165,6 +165,8 @@ keys:
                  o the url bar, O a new tab, / find, i back to the page
   alt+p          allow this site camera, microphone, location, notifications
                  or clipboard: type the words, enter sets exactly those
+  alt+s          save this page as a PDF in the download directory
+  alt+shift+s    save the whole page as a picture (PNG) there
   esc            leave a page's fullscreen; stop a page that is loading
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no

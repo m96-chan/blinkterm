@@ -26,6 +26,14 @@ flag, a different default, a raised Rust floor all do.
   web--browse` and `man -H` open. Only `http`, `https`, `file` and `about`
   urls are taken. `packaging/blinkterm.desktop` lets `xdg-open` reach it
   ([#60](https://github.com/m96-chan/blinkterm/issues/60)).
+- `alt+s` saves the page as a PDF, and `alt+shift+s` the whole page, top
+  to bottom, as a PNG, into the download directory under the page's title,
+  `(1)` when the name is taken; the row says `saved ~/Downloads/<title>.pdf`.
+  The paper is Letter or A4 by the locale, or `pdf-paper = a4|letter` /
+  `--pdf-paper`. A picture is at most sixteen million pixels, and a taller
+  page is saved to that depth and said to be. `save-pdf` and
+  `save-screenshot` for `key.` lines
+  ([#63](https://github.com/m96-chan/blinkterm/issues/63)).
 - A page's file input can be answered by a program the settings name
   instead of the row: `file-picker = <command>` for one with a window of
   its own (Finder's dialog through `osascript`, `zenity`, `kdialog`),

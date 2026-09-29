@@ -425,6 +425,8 @@ nothing else, for scripts.
 | `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
 | `copy` | `alt+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | copy the url |
+| `save-pdf` | `alt+s` | save this page as a PDF |
+| `save-screenshot` | `alt+shift+s` | save the whole page as a picture |
 | `normal-mode` | `ctrl+.` | normal mode on or off |
 
 A chord is `ctrl`, `alt`, `shift` or `super` joined with `+` to a key — a
@@ -508,6 +510,24 @@ characters, no leading dot, at most 255 bytes.
 Quitting cancels anything still coming and leaves no partial file. A
 `blinkterm` that is killed outright can leave `<guid>.crdownload` in the
 directory, which is the engine's partial file and is safe to delete.
+
+### Saving a page
+
+`alt+s` saves the page in front as a PDF and `alt+shift+s` the whole of it,
+top to bottom, as a PNG, into the same directory:
+
+    saving Receipt #123.pdf        →        saved ~/Downloads/Receipt #123.pdf
+
+The name is the page's title with `/` made `_`, else the site's name, else
+`page`, and a name already taken becomes `(1)` as a download's does. The
+PDF is printed with the page's backgrounds, on Letter where the locale is a
+country that uses it (`en_US`, `en_CA`, `es_MX`, …) and A4 everywhere else;
+`pdf-paper = a4|letter` says which. The picture is at the tab's zoom and
+the pane's scale, as sharp as the page is on screen, and at most sixteen
+million pixels: a page taller than that is saved to that depth and the row
+says `saved …png, the top 12500 of 40000 px`. Neither touches the page —
+it stays where it was scrolled, at the size it was — and neither is opened
+afterwards.
 
 ## Uploading a file
 
@@ -626,6 +646,8 @@ ignores it until the picker exits.
 | your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
 | `alt+c` | copy the page's selection to your clipboard; with the url bar, the find prompt, a `prompt()` or a file input's path open, copy that line |
 | `alt+u` | copy the page's url to your clipboard |
+| `alt+s` | save this page as a PDF in the download directory, named after its title; the row says `saved ~/Downloads/<title>.pdf`. See [Saving a page](#saving-a-page) |
+| `alt+shift+s` | save the whole page, top to bottom, as a PNG there. A page past sixteen million pixels is cut to its top, and the row says how much |
 | `alt+p` | allow this site something: the row says `allow https://site: ` and the words it is allowed now, all selected; type any of `camera` `microphone` `location` `notifications` `clipboard`, `enter` sets exactly those (an empty line takes them all back), `esc` leaves it. See [Sound, permissions and fullscreen](#sound-permissions-and-fullscreen) |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |

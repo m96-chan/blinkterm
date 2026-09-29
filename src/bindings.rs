@@ -33,7 +33,7 @@
 //!
 //! [`Chord::matches`] wants the same key and the same four modifier bits,
 //! no more and no fewer. The built-in table reads shift only for `tab`, `t`,
-//! `a` and the page keys, and a table of rows has to be either exact or a
+//! `a`, `s` and the page keys, and a table of rows has to be either exact or a
 //! language; a row for `ctrl+tab` that also caught `ctrl+shift+tab` would
 //! take the previous-tab key away with the next-tab one. So `key.ctrl+= =
 //! none` frees `ctrl+=` and leaves `ctrl+shift+=` zooming in, as the built-in
@@ -214,6 +214,11 @@ pub enum Action {
     Permissions,
     Copy,
     CopyUrl,
+    /// `alt+s`: the page as a PDF in the downloads directory. See
+    /// [`crate::save`].
+    SavePdf,
+    /// `alt+shift+s`: the whole page as a PNG there.
+    SaveScreenshot,
     ToggleNormal,
     /// `ctrl+shift+h`: the history list. See [`crate::historylist`].
     History,
@@ -238,9 +243,9 @@ const TAB_NAMES: &str = "tab-1 .. tab-8";
 /// [`Action::every`] and [`defaults`] expand it.
 ///
 /// The keys are the documented spellings, not every press the built-in table
-/// answers: it reads shift only for `tab`, `t`, `a`, `h` and the page keys, so
+/// answers: it reads shift only for `tab`, `t`, `a`, `h`, `s` and the page keys, so
 /// `ctrl+shift+=` zooms in too, and a chord is exact.
-pub const ACTIONS: [Row; 25] = [
+pub const ACTIONS: [Row; 27] = [
     Row {
         name: "quit",
         action: Action::Quit,
@@ -384,6 +389,18 @@ pub const ACTIONS: [Row; 25] = [
         action: Action::CopyUrl,
         keys: "alt+u",
         what: "copy the url",
+    },
+    Row {
+        name: "save-pdf",
+        action: Action::SavePdf,
+        keys: "alt+s",
+        what: "save this page as a PDF",
+    },
+    Row {
+        name: "save-screenshot",
+        action: Action::SaveScreenshot,
+        keys: "alt+shift+s",
+        what: "save the whole page as a picture",
     },
     Row {
         name: "normal-mode",
@@ -761,7 +778,9 @@ mod tests {
             let why = Action::parse(wrong).expect_err(wrong);
             assert!(why.contains("is not an action"), "{why}");
             assert!(
-                why.ends_with("copy-url, normal-mode, tab-1..tab-8, or none"),
+                why.ends_with(
+                    "copy-url, save-pdf, save-screenshot, normal-mode, tab-1..tab-8, or none"
+                ),
                 "the list is in the sentence: {why}"
             );
         }
