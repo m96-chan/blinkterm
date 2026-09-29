@@ -54,6 +54,7 @@ use crate::bindings::{Binding, Bindings};
 use crate::block;
 use crate::download;
 use crate::engine;
+use crate::login;
 use crate::picker;
 use crate::profile;
 use crate::route;
@@ -128,6 +129,9 @@ pub struct Options {
     /// `--block-list` and `--no-block`: the host lists requests are blocked
     /// by, and whether to. See [`crate::block`].
     pub block: block::Lists,
+    /// `--password-command` and `--password-command-terminal`: what
+    /// `fill-login` runs. See [`crate::login`].
+    pub logins: login::Programs,
 }
 
 /// What `main` was asked to do, once the command line has been read.
@@ -212,6 +216,8 @@ pub struct Settings {
     pub block_lists: Vec<PathBuf>,
     /// `false` with `--no-block` or `block = false`.
     pub block: Option<bool>,
+    pub password_command: Option<picker::Command>,
+    pub password_command_terminal: Option<picker::Command>,
     /// File only: a binding is not a one-run thing.
     pub bindings: Vec<Binding>,
     /// Command line only.
@@ -266,6 +272,10 @@ impl Settings {
                 .or(under.file_picker_terminal_multiple),
             block_lists,
             block: self.block.or(under.block),
+            password_command: self.password_command.or(under.password_command),
+            password_command_terminal: self
+                .password_command_terminal
+                .or(under.password_command_terminal),
             bindings,
             config: self.config.or(under.config),
             what: self.what.or(under.what),
@@ -501,6 +511,8 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             "--file-picker-terminal",
             "--file-picker-multiple",
             "--file-picker",
+            "--password-command-terminal",
+            "--password-command",
         ];
         if let Some((name, text)) = pickers
             .iter()
@@ -510,6 +522,8 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
                 "--file-picker-terminal-multiple" => &mut s.file_picker_terminal_multiple,
                 "--file-picker-terminal" => &mut s.file_picker_terminal,
                 "--file-picker-multiple" => &mut s.file_picker_multiple,
+                "--password-command-terminal" => &mut s.password_command_terminal,
+                "--password-command" => &mut s.password_command,
                 _ => &mut s.file_picker,
             };
             let text = needed(text, &format!("{name} needs a command: {name} <command>"))?;
@@ -634,7 +648,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 26] = [
+const KEYS: [&str; 28] = [
     "home",
     "profile",
     "temp-profile",
@@ -661,6 +675,8 @@ const KEYS: [&str; 26] = [
     "file-picker-terminal-multiple",
     "block-list",
     "block",
+    "password-command",
+    "password-command-terminal",
 ];
 
 /// One file's text. `path` is only for the sentences, every one of which is
@@ -776,6 +792,12 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             }
             "block-list" => s.block_lists.push(PathBuf::from(value)),
             "block" => s.block = Some(parse_bool(key, value).map_err(at)?),
+            "password-command" => {
+                s.password_command = Some(picker::Command::parse(key, value).map_err(at)?)
+            }
+            "password-command-terminal" => {
+                s.password_command_terminal = Some(picker::Command::parse(key, value).map_err(at)?)
+            }
             _ => unreachable!("every key in KEYS has an arm"),
         }
     }
@@ -893,6 +915,10 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
             paths: s.block_lists,
             enabled: s.block.unwrap_or(true),
         },
+        logins: login::Programs {
+            gui: s.password_command,
+            terminal: s.password_command_terminal,
+        },
     })
 }
 
@@ -956,6 +982,8 @@ fn home_expanded(mut settings: Settings, home: Option<&Path>) -> Settings {
         &mut settings.file_picker_multiple,
         &mut settings.file_picker_terminal,
         &mut settings.file_picker_terminal_multiple,
+        &mut settings.password_command,
+        &mut settings.password_command_terminal,
     ] {
         *command = command.take().map(|command| command.expand_home(home));
     }
@@ -1867,6 +1895,80 @@ mod tests {
         );
         assert_eq!(options.pickers.gui_multiple, None);
         assert!(resolved(&[]).expect("resolves").pickers.is_empty());
+    }
+
+    #[test]
+    fn the_password_commands_are_read_from_the_line_and_the_file() {
+        let words = |c: Option<picker::Command>| c.map(|c| c.words);
+        let cli = parsed(&[
+            "--password-command",
+            "pass show web/{domain}",
+            "--password-command-terminal=sh -c 'pass ls | fzf'",
+        ])
+        .expect("cli");
+        assert_eq!(
+            words(cli.password_command.clone()),
+            Some(vec![
+                "pass".to_string(),
+                "show".to_string(),
+                "web/{domain}".to_string()
+            ])
+        );
+        assert_eq!(
+            words(cli.password_command_terminal.clone()),
+            Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "pass ls | fzf".to_string()
+            ])
+        );
+        assert_eq!(
+            parsed(&["--password-command=a", "--password-command=b"]),
+            Err("--password-command once is enough".to_string())
+        );
+        assert_eq!(
+            parsed(&["--password-command"]),
+            Err("--password-command needs a command: --password-command <command>".to_string())
+        );
+        assert_eq!(
+            parsed(&["--password-command-terminal", "x 'y"]),
+            Err("--password-command-terminal has a quote that is never closed".to_string())
+        );
+
+        let from_file = home_expanded(
+            file(
+                "password-command = ~/bin/login {host}\n\
+                 password-command-terminal = rbw get --full {host}",
+            )
+            .expect("a file"),
+            Some(Path::new("/h")),
+        );
+        assert_eq!(
+            words(from_file.password_command.clone()),
+            Some(vec!["/h/bin/login".to_string(), "{host}".to_string()])
+        );
+        assert_eq!(
+            file("password-command = a\npassword-command = b"),
+            Err("/c:2: password-command is already set on line 1".to_string())
+        );
+
+        // The line's wins, the file fills the other.
+        let options = resolve(
+            parsed(&["--password-command=rbw get {host}"]).expect("cli"),
+            Settings::default(),
+            from_file,
+        )
+        .expect("resolves");
+        assert_eq!(
+            words(options.logins.gui),
+            Some(vec![
+                "rbw".to_string(),
+                "get".to_string(),
+                "{host}".to_string()
+            ])
+        );
+        assert_eq!(words(options.logins.terminal).map(|w| w.len()), Some(4));
+        assert!(resolved(&[]).expect("resolves").logins.is_empty());
     }
 
     #[test]
