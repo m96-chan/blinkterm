@@ -340,6 +340,7 @@ nothing else, for scripts.
 | `tab-1` … `tab-8` | `alt+1` … `alt+8` | the nth tab |
 | `last-tab` | `alt+9` | the last tab |
 | `list-tabs` | `ctrl+shift+a`, `alt+a` | the tab list |
+| `history` | `ctrl+shift+h`, `alt+h` | the history list |
 | `move-tab-left` | `ctrl+shift+pageup`, `alt+shift+pageup` | move this tab left |
 | `move-tab-right` | `ctrl+shift+pagedown`, `alt+shift+pagedown` | move this tab right |
 | `zoom-in` | `alt+=`, `ctrl+=` | zoom in |

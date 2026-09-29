@@ -51,6 +51,7 @@ use crate::fullscreen::{self, Heard, Layout};
 use crate::graphics::{Painter, Raw};
 use crate::hints;
 use crate::history::{self, History};
+use crate::historylist::{self, HistoryList};
 use crate::hover::{self, Shape};
 use crate::identity::Identity;
 use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
@@ -437,11 +438,12 @@ struct Chrome {
     /// The terminal's answer to `CSI 16 t`, for a pane whose kernel window
     /// size has no pixels in it. See [`crate::screen::ASK_CELL_SIZE`].
     cell_hint: Option<(u32, u32)>,
-    /// `Some` while the tab list is open. The person's, like the bar and the
-    /// find prompt, and exclusive with them by the keyboard: whichever is
-    /// open takes every key, so the other cannot be opened until it closes.
-    /// See [`crate::tablist`].
-    list: Option<TabList>,
+    /// `Some` while the tab list or the history list is open. The person's,
+    /// like the bar and the find prompt, and exclusive with them by the
+    /// keyboard: whichever is open takes every key, so the other cannot be
+    /// opened until it closes. See [`crate::tablist`] and
+    /// [`crate::historylist`], and [`Overlay`] for why one field holds both.
+    list: Option<Overlay>,
     /// The first match on the screen while the list is open, so that the
     /// rows scroll only when the pick leaves them. See [`TabList::window`].
     ///
@@ -685,6 +687,41 @@ struct UrlBar {
 impl UrlBar {
     fn new(line: Line) -> UrlBar {
         UrlBar { line, walk: None }
+    }
+}
+
+/// The list over the screen: the tabs (`ctrl+shift+a`) or the pages visited
+/// (`ctrl+shift+h`).
+///
+/// One field on [`Chrome`] for both rather than one each, because
+/// everything about a list having the screen is the same whichever it is:
+/// the picture is taken off and the rows cleared ([`open_list_screen`]), the
+/// rows under the row are the list's, a press picks a row, a tab switch or
+/// an engine gone closes it, and it has the row and the typing in
+/// [`row_owner`]'s order at one place. Two fields would be every one of
+/// those asked twice, and a way for both to be open at once that the
+/// keyboard never allows. What differs — what a row is, what a key does,
+/// what a pick opens — is each list's own, matched on here.
+enum Overlay {
+    Tabs(TabList),
+    History(HistoryList),
+}
+
+impl Overlay {
+    /// The filter being typed.
+    fn line(&self) -> &Line {
+        match self {
+            Overlay::Tabs(list) => list.line(),
+            Overlay::History(list) => list.line(),
+        }
+    }
+
+    /// The filter being typed, to paste into.
+    fn line_mut(&mut self) -> &mut Line {
+        match self {
+            Overlay::Tabs(list) => list.line_mut(),
+            Overlay::History(list) => list.line_mut(),
+        }
     }
 }
 
@@ -2846,7 +2883,15 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
 /// As many rows as the page had, which is every row but the status row:
 /// the picture is off the screen while the list is up (see
 /// [`open_list_screen`]), and text under a placement would not be seen.
-fn list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &TabList) -> Vec<u8> {
+fn list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &Overlay) -> Vec<u8> {
+    match list {
+        Overlay::Tabs(list) => tab_list_screen(tabs, chrome, list),
+        Overlay::History(list) => history_list_screen(chrome, list),
+    }
+}
+
+/// [`list_screen`] for the tab list: each row led by the tab's number.
+fn tab_list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &TabList) -> Vec<u8> {
     let rows = chrome.metrics.usable_rows();
     let matches = list.matches(tabs);
     let window = list.window(matches.len(), rows as usize, chrome.list_first.get());
@@ -2871,6 +2916,68 @@ fn list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &TabList) -> Vec<u8> 
     screen::list_rows(chrome.metrics.cols, chrome.layout.page_row(), rows, &items)
 }
 
+/// [`list_screen`] for the history list: each row led by when the page was
+/// visited, and a `*` when it is bookmarked too.
+///
+/// The leads are padded on the left to the widest among the rows shown, so
+/// that the titles start in one column: `2 days ago` and `just now` are not
+/// the same width the way the tab list's numbers nearly are, and titles
+/// that start anywhere are hard to read down. The date is first, rather than
+/// after the url, because a row too long for the pane is cut at the right.
+/// A page that never had a title shows its url in the title's place, rather
+/// than a gap and a dash.
+fn history_list_screen(chrome: &Chrome, list: &HistoryList) -> Vec<u8> {
+    let rows = chrome.metrics.usable_rows();
+    let now = unix_now();
+    let matches = list.matches();
+    let window = list.window(matches.len(), rows as usize, chrome.list_first.get());
+    chrome.list_first.set(window.first);
+    let picked = list.picked(matches.len());
+    let shown: Vec<historylist::Entry> = matches[window.first..window.first + window.shown]
+        .iter()
+        .map(|&index| list.entry(index))
+        .collect();
+    let leads: Vec<String> = shown
+        .iter()
+        .map(|entry| {
+            let mark = if chrome.bookmarks.has(entry.url) {
+                " *"
+            } else {
+                ""
+            };
+            format!("{}{mark}", historylist::ago(entry.last, now))
+        })
+        .collect();
+    let widest = leads
+        .iter()
+        .map(|lead| lead.chars().count())
+        .max()
+        .unwrap_or(0);
+    let leads: Vec<String> = leads
+        .into_iter()
+        .map(|lead| format!("{lead:>widest$}"))
+        .collect();
+    let items: Vec<screen::ListItem> = shown
+        .iter()
+        .zip(&leads)
+        .enumerate()
+        .map(|(at, (entry, lead))| {
+            let (title, url) = if entry.title.is_empty() {
+                (entry.url, "")
+            } else {
+                (entry.title, entry.url)
+            };
+            screen::ListItem {
+                lead,
+                title,
+                url,
+                picked: picked == Some(window.first + at),
+            }
+        })
+        .collect();
+    screen::list_rows(chrome.metrics.cols, chrome.layout.page_row(), rows, &items)
+}
+
 /// The word for the keyboard's mode: the hints' count while they show,
 /// else the mode's own, else nothing — insert mode says nothing, so a person
 /// who never presses `ctrl+.` sees the row exactly as it was.
@@ -2888,11 +2995,17 @@ fn owned_row<C>(cols: u32, tabs: &Tabs<C>, owner: RowOwner<'_>) -> Vec<u8> {
         RowOwner::Find(find) => {
             typing_row_beside(cols, "find: ", &find.finder.line, &find.finder.count_text())
         }
-        RowOwner::List(list) => typing_row_beside(
+        RowOwner::List(Overlay::Tabs(list)) => typing_row_beside(
             cols,
             "tabs: ",
             list.line(),
             &TabList::count_text(list.matches(tabs).len(), tabs.len()),
+        ),
+        RowOwner::List(Overlay::History(list)) => typing_row_beside(
+            cols,
+            "history: ",
+            list.line(),
+            &list.count_text(list.matches().len()),
         ),
         RowOwner::Allow(allow) => typing_row_beside(
             cols,
@@ -2927,9 +3040,10 @@ enum RowOwner<'a> {
     Bar(&'a UrlBar),
     /// `ctrl+f`'s prompt: the person's, like the bar, and not any page's.
     Find(&'a Find),
-    /// `ctrl+shift+a`'s tab list: the person's, like the two before it, and
-    /// the one of them that has the rows under the row as well.
-    List(&'a TabList),
+    /// `ctrl+shift+a`'s tab list or `ctrl+shift+h`'s history list: the
+    /// person's, like the two before it, and the one of them that has the
+    /// rows under the row as well.
+    List(&'a Overlay),
     /// `alt+p`'s allow line: the person's, like the three before it.
     Allow(&'a Allow),
     /// Any dialog: a `prompt()` is a line with the cursor, the others are a
@@ -2972,7 +3086,7 @@ fn row_owner<'a, C>(
     tabs: &'a Tabs<C>,
     bar: Option<&'a UrlBar>,
     find: Option<&'a Find>,
-    list: Option<&'a TabList>,
+    list: Option<&'a Overlay>,
     allow: Option<&'a Allow>,
     offer: Option<&'a Offer>,
 ) -> Option<RowOwner<'a>> {
@@ -3590,7 +3704,8 @@ enum Typing {
     Url,
     /// `ctrl+f`.
     Find,
-    /// `ctrl+shift+a`'s filter.
+    /// The filter of `ctrl+shift+a`'s tab list or `ctrl+shift+h`'s history
+    /// list.
     List,
     /// `alt+p`'s words.
     Allow,
@@ -4334,9 +4449,23 @@ fn handle_input(
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(Command::ListTabs) => {
-                    chrome.list = Some(TabList::open(tabs.active_index()));
+                    chrome.list = Some(Overlay::Tabs(TabList::open(tabs.active_index())));
                     chrome.list_first.set(0);
                     open_list_screen(pane, chrome)?;
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(Command::History) => {
+                    // An empty list over the whole screen would be a page
+                    // gone for nothing to pick; a sentence on the row says
+                    // the same and leaves the page where it was.
+                    if chrome.history.entries().is_empty() {
+                        note(tabs, "nothing visited yet");
+                    } else {
+                        let list = HistoryList::open(chrome.history.entries());
+                        chrome.list = Some(Overlay::History(list));
+                        chrome.list_first.set(0);
+                        open_list_screen(pane, chrome)?;
+                    }
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(Command::Reload) => {
@@ -4721,6 +4850,9 @@ enum Command {
     /// `ctrl+shift+t` or `alt+t`: reopen the tab closed last. See
     /// [`crate::session`].
     ReopenTab,
+    /// `ctrl+shift+h` or `alt+h`: the history list. See
+    /// [`crate::historylist`].
+    History,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -4745,7 +4877,9 @@ enum Command {
 /// either, for the same reason: it asks the page.
 ///
 /// The allow line does not survive: it would take the row from the question
-/// the person is meant to be reading, which is the url bar's reason.
+/// the person is meant to be reading, which is the url bar's reason. Nor does
+/// the history list, although the tab list does: what it picks is a page to
+/// load, and here that would be a navigation queued behind the question.
 ///
 /// Normal mode's toggle survives: it touches no page, and a person can leave
 /// the mode while a question waits.
@@ -4787,7 +4921,8 @@ fn survives_dialog(command: Command) -> bool {
         | Command::Permissions
         | Command::ZoomIn
         | Command::ZoomOut
-        | Command::ZoomReset => false,
+        | Command::ZoomReset
+        | Command::History => false,
     }
 }
 
@@ -5147,7 +5282,8 @@ enum Escapes {
     UrlBar,
     /// The find prompt is open: it closes, and the highlights go with it.
     Find,
-    /// The tab list is open: it closes, and the page comes back.
+    /// The tab list or the history list is open: it closes, and the page
+    /// comes back.
     List,
     /// The allow line is open: it closes, and nothing is allowed.
     Allow,
@@ -5350,6 +5486,8 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// | `alt+9` | free | free | free | its last tab |
 /// | `alt+shift+pageup`/`pagedown` | free | free | free | free |
 /// | `alt+a` | free | free | free | free |
+/// | `ctrl+shift+h` | free | scrollback in a pager | free | free |
+/// | `alt+h` | free | free | free | free |
 ///
 /// So `ctrl+shift+pageup`/`pagedown`, which move the tab in front in Chrome,
 /// reach the pane in none of the four, and `ctrl+shift+a`, Chrome's tab
@@ -5357,7 +5495,10 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// their terminal, and each has an `alt` form that reaches the program
 /// everywhere: `alt+a` for the list, `alt+shift+pageup`/`pagedown` for the
 /// move. `ctrl+a` without shift stays the page's select-all, and `alt+shift+a`
-/// is nobody's. `alt+9` is the last tab rather than the ninth, as it is in
+/// is nobody's. The history list is the same pair on `h`: `ctrl+shift+h`
+/// after the tab list's chord, and `alt+h`, which is the one that arrives
+/// in Kitty and in a legacy terminal, where `ctrl+h` is the byte backspace
+/// sends and `ctrl+shift+h` is that byte too. `alt+9` is the last tab rather than the ninth, as it is in
 /// Chrome, Firefox and Ghostty — whose own `alt+9` means the same, so the
 /// meaning agrees even where the key does not arrive.
 ///
@@ -5392,6 +5533,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('w') => Some(Command::CloseTab),
             Key::Char('f') => Some(Command::Find),
             Key::Char('a' | 'A') if key.mods.shift() => Some(Command::ListTabs),
+            Key::Char('h' | 'H') if key.mods.shift() => Some(Command::History),
             Key::PageUp if key.mods.shift() => Some(Command::MoveTab(-1)),
             Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Tab if key.mods.shift() => Some(Command::PreviousTab),
@@ -5410,6 +5552,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('9') => Some(Command::LastTab),
             Key::Char(digit @ '1'..='8') => Some(Command::SelectTab(digit as usize - '0' as usize)),
             Key::Char('a') if !key.mods.shift() => Some(Command::ListTabs),
+            Key::Char('h') if !key.mods.shift() => Some(Command::History),
             Key::PageUp if key.mods.shift() => Some(Command::MoveTab(-1)),
             Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Char('c') => Some(Command::CopySelection),
@@ -5460,6 +5603,7 @@ fn command_of(action: Action) -> Command {
         Action::Tab(n) => Command::SelectTab(n),
         Action::LastTab => Command::LastTab,
         Action::ListTabs => Command::ListTabs,
+        Action::History => Command::History,
         Action::MoveTabLeft => Command::MoveTab(-1),
         Action::MoveTabRight => Command::MoveTab(1),
         Action::ZoomIn => Command::ZoomIn,
@@ -6374,7 +6518,7 @@ fn open_list_screen(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> 
     pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())
 }
 
-/// Close the tab list and give the page its rows back. The caller redraws
+/// Close the tab list or the history list and give the page its rows back. The caller redraws
 /// the row.
 ///
 /// The same three things a resize does: the rows are cleared, and the
@@ -6391,7 +6535,8 @@ fn close_list(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> {
     pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())
 }
 
-/// Type into the tab list. Returns `false` only if the person quit.
+/// Type into the tab list or the history list. Returns `false` only if the
+/// person quit.
 ///
 /// Every key comes here first while the list is open, as it does to the url
 /// bar and the find prompt: the program's other keys do nothing until it
@@ -6416,19 +6561,32 @@ fn edit_list(
         return Ok(going);
     }
     let page = chrome.metrics.usable_rows() as usize;
-    let Some(list) = chrome.list.as_mut() else {
-        return Ok(true);
-    };
-    let matched: Vec<usize> = list.matches(tabs).iter().map(|entry| entry.index).collect();
-    let step = match list.step(&key, &matched, page) {
-        tablist::Step::Quit if !quits(&chrome.bindings, &key) => tablist::Step::Typing,
-        step => step,
-    };
-    list_step(pane, tabs, browser, chrome, step)
+    match chrome.list.as_mut() {
+        None => Ok(true),
+        Some(Overlay::Tabs(list)) => {
+            let matched: Vec<usize> = list.matches(tabs).iter().map(|entry| entry.index).collect();
+            let step = match list.step(&key, &matched, page) {
+                tablist::Step::Quit if !quits(&chrome.bindings, &key) => tablist::Step::Typing,
+                step => step,
+            };
+            list_step(pane, tabs, browser, chrome, step)
+        }
+        Some(Overlay::History(list)) => {
+            let step = match list.step(&key, page) {
+                historylist::Step::Quit if !quits(&chrome.bindings, &key) => {
+                    historylist::Step::Typing
+                }
+                step => step,
+            };
+            history_step(pane, tabs, browser, chrome, step)
+        }
+    }
 }
 
-/// A press while the tab list is open: a row picks the tab on it, and
-/// anything else — the row itself, past the last match — is nothing.
+/// A press while a list is open: a row picks what is on it, and anything
+/// else — the row itself, past the last match — is nothing. In the history
+/// list a middle press opens the page in a new tab, as a middle click on a
+/// link does, and any other button opens it here.
 fn click_list(
     pane: &mut Pane,
     tabs: &mut Tabs<Client>,
@@ -6449,13 +6607,20 @@ fn click_list(
     let row = point.1 as usize / cell.1.max(1) as usize;
     let rows = chrome.metrics.usable_rows() as usize;
     let first = chrome.list_first.get();
-    let Some(list) = chrome.list.as_mut() else {
-        return Ok(true);
-    };
-    let matched: Vec<usize> = list.matches(tabs).iter().map(|entry| entry.index).collect();
-    let window = list.window(matched.len(), rows, first);
-    let step = list.click(row, &window, &matched);
-    list_step(pane, tabs, browser, chrome, step)
+    match chrome.list.as_mut() {
+        None => Ok(true),
+        Some(Overlay::Tabs(list)) => {
+            let matched: Vec<usize> = list.matches(tabs).iter().map(|entry| entry.index).collect();
+            let window = list.window(matched.len(), rows, first);
+            let step = list.click(row, &window, &matched);
+            list_step(pane, tabs, browser, chrome, step)
+        }
+        Some(Overlay::History(list)) => {
+            let window = list.window(list.matches().len(), rows, first);
+            let step = list.click(row, &window, report.button == Some(1));
+            history_step(pane, tabs, browser, chrome, step)
+        }
+    }
 }
 
 /// What a key or a click did to the tab list, done.
@@ -6475,6 +6640,69 @@ fn list_step(
             let was = tabs.active_target().map(str::to_string);
             if tabs.switch_to(index) {
                 switched(pane, tabs, browser, chrome, was)?;
+            }
+        }
+    }
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
+/// What a key or a click did to the history list, done.
+///
+/// Opening here is what the url bar's Enter does with a url, minus the
+/// search: a url the history has is a url. Those few lines are repeated
+/// rather than shared with [`edit_url`], since they are the whole of it and
+/// the bar's are among other things. Opening in a new tab is a tab in
+/// front, as `ctrl+t` opens one, since the list has just closed and the
+/// screen has to show something; a tab behind would leave the person
+/// looking at the page they were on, wondering whether anything happened.
+///
+/// Forgetting leaves the list open on the row after, and when the file
+/// could not be written says so where the count was: the page is gone from
+/// this run's history either way, and the next load would bring it back
+/// from the file, which is what a person who asked for it gone should know.
+fn history_step(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &mut Chrome,
+    step: historylist::Step,
+) -> Result<bool, String> {
+    match step {
+        historylist::Step::Typing => {}
+        historylist::Step::Quit => return Ok(false),
+        historylist::Step::Close => close_list(pane, chrome)?,
+        historylist::Step::Open {
+            url,
+            new_tab: false,
+        } => {
+            close_list(pane, chrome)?;
+            if let Some(tab) = tabs.active_mut() {
+                tab.url = url.clone();
+                tab.note = Some(format!("loading {url}"));
+                tab.loading = true;
+            }
+            if let Some(why) = navigate(tabs, chrome, &url) {
+                note(tabs, why);
+            }
+        }
+        historylist::Step::Open { url, new_tab: true } => {
+            close_list(pane, chrome)?;
+            let was = tabs.active_target().map(str::to_string);
+            let appearance = chrome.appearance;
+            let identity = chrome.identity.clone();
+            match open_tab(tabs, browser, &appearance, &identity, &url) {
+                Ok(()) => switched(pane, tabs, browser, chrome, was)?,
+                Err(why) => note(tabs, why),
+            }
+        }
+        historylist::Step::Forget(url) => {
+            let written = chrome.history.forget(&url);
+            if let Some(Overlay::History(list)) = chrome.list.as_mut() {
+                list.forgotten(&url);
+                if let Err(why) = written {
+                    list.notice = Some(format!("forgotten, but not from the file: {why}"));
+                }
             }
         }
     }
@@ -7389,6 +7617,22 @@ mod tests {
         ] {
             assert_eq!(command(&key(k, mods)), Some(Command::ListTabs), "{k:?}");
         }
+        // The history list: the same pair on `h`.
+        for (k, mods) in [
+            (Key::Char('h'), Mods::CTRL | Mods::SHIFT),
+            (Key::Char('H'), Mods::CTRL | Mods::SHIFT),
+            (Key::Char('h'), Mods::ALT),
+        ] {
+            assert_eq!(command(&key(k, mods)), Some(Command::History), "{k:?}");
+        }
+        // `ctrl+h` is backspace's byte in a legacy terminal, the page's
+        // anyway, and `alt+shift+h` is nobody's.
+        for (k, mods) in [
+            (Key::Char('h'), Mods::CTRL),
+            (Key::Char('h'), Mods::ALT | Mods::SHIFT),
+        ] {
+            assert_eq!(command(&key(k, mods)), None, "{k:?} {mods}");
+        }
         // `ctrl+a` is the page's select-all, and the rest are nobody's.
         for (k, mods) in [
             (Key::Char('a'), Mods::CTRL),
@@ -7495,7 +7739,7 @@ mod tests {
     ) {
         let owner_all = |tabs: &Tabs<()>,
                          bar: Option<&UrlBar>,
-                         list: Option<&TabList>,
+                         list: Option<&Overlay>,
                          allow: Option<&Allow>| match row_owner(
             tabs, bar, None, list, allow, None,
         ) {
@@ -7509,7 +7753,7 @@ mod tests {
             None => "page",
         };
         let owner_with =
-            |tabs: &Tabs<()>, bar: Option<&UrlBar>, list: Option<&TabList>| match row_owner(
+            |tabs: &Tabs<()>, bar: Option<&UrlBar>, list: Option<&Overlay>| match row_owner(
                 tabs, bar, None, list, None, None,
             ) {
                 Some(RowOwner::Bar(_)) => "bar",
@@ -7545,7 +7789,7 @@ mod tests {
         assert_eq!(owner(&tabs, Some(&bar)), "bar");
         // The list is the person's, over the dialog and the path; the bar is
         // over it, although the keyboard never has both open.
-        let list = TabList::open(0);
+        let list = Overlay::Tabs(TabList::open(0));
         assert_eq!(owner_with(&tabs, None, Some(&list)), "list");
         assert_eq!(owner_with(&tabs, Some(&bar), Some(&list)), "bar");
         // The allow line is the person's too: over the dialog, under the
@@ -7870,7 +8114,7 @@ mod tests {
             wanted: None,
             remade: false,
         });
-        chrome.list = Some(TabList::open(2));
+        chrome.list = Some(Overlay::Tabs(TabList::open(2)));
         chrome.list_first.set(3);
         chrome.strip_first.set(4);
         chrome.hinting = Some(Hinting {
@@ -8073,6 +8317,10 @@ mod tests {
         assert_eq!(command_of(Action::Permissions), Command::Permissions);
         // It takes the row from a question the person should be reading.
         assert!(!survives_dialog(Command::Permissions));
+        assert!(
+            !survives_dialog(Command::History),
+            "what it picks is a load, queued behind the question"
+        );
         // `ctrl+p` and a bare `p` stay the page's.
         assert_eq!(command(&key(Key::Char('p'), Mods::CTRL)), None);
         assert_eq!(command(&key(Key::Char('p'), 0)), None);
@@ -8560,7 +8808,7 @@ mod tests {
         // not: the answer is the first of them in `row_owner`'s order, then
         // the hints, then fullscreen, and the load only when none of them is
         // there.
-        let list = TabList::open(0);
+        let list = Overlay::Tabs(TabList::open(0));
         for mask in 0..1024u32 {
             let [open_bar, open_find, dialog, path, loading, open_list, hinting, offered, allowing, full] =
                 [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(|bit| mask & (1 << bit) != 0);
