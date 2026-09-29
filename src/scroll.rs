@@ -106,6 +106,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
+
 /// How long one step of the animation lasts.
 ///
 /// A screencast frame is 17 ms on the host the format was chosen on and 24 to
@@ -150,6 +153,80 @@ pub const D: Duration = Duration::from_millis(220);
 /// A notch wakes it, so this is only how long it takes to notice that it has
 /// been told to stop — which happens once, at the end of the program.
 const IDLE: Duration = Duration::from_millis(250);
+
+/// How early a Mac's animation thread asks the kernel for a tick.
+///
+/// macOS coalesces an ordinary condvar timeout by as much as eight
+/// milliseconds on real hardware, and even `mach_wait_until` lands about four
+/// milliseconds late. Asking four milliseconds early cuts the measured error
+/// to under two milliseconds; when the kernel does wake early, the thread only
+/// spins for the small remainder. This costs no CPU while idle and, during a
+/// scroll, much less than spinning across the whole coalescing window.
+#[cfg(target_os = "macos")]
+const MAC_EARLY: Duration = Duration::from_millis(4);
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTimebase {
+    numer: u32,
+    denom: u32,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebase) -> libc::c_int;
+    fn mach_wait_until(deadline: u64) -> libc::c_int;
+}
+
+/// Wait for one active animation tick without macOS's timer-coalescing jitter.
+///
+/// This wait is deliberately not interruptible. A new notch does not move the
+/// running animator's next tick, and a stop or a forgotten tab can wait at most
+/// one [`TICK`]. The mutex is released around it, so the loop can still add or
+/// forget a notch immediately.
+#[cfg(target_os = "macos")]
+fn wait_for_tick(duration: Duration) {
+    static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
+    let &(numer, denom) = TIMEBASE.get_or_init(|| {
+        let mut info = MachTimebase { numer: 0, denom: 0 };
+        // SAFETY: `info` is a live value of the C function's declared layout,
+        // and the function writes only that value. A zero denominator would
+        // make the conversion unusable, so the portable sleep below handles a
+        // failed or malformed answer.
+        if unsafe { mach_timebase_info(&mut info) } == 0 && info.numer != 0 && info.denom != 0 {
+            (info.numer, info.denom)
+        } else {
+            (0, 0)
+        }
+    });
+    if numer == 0 || denom == 0 {
+        std::thread::sleep(duration);
+        return;
+    }
+    let ticks = |span: Duration| {
+        let value = span.as_nanos().saturating_mul(u128::from(denom)) / u128::from(numer);
+        value.min(u128::from(u64::MAX)) as u64
+    };
+    // SAFETY: `mach_absolute_time` takes no arguments and has no preconditions.
+    let deadline = unsafe { mach_absolute_time() }.saturating_add(ticks(duration));
+    let early = deadline.saturating_sub(ticks(MAC_EARLY.min(duration)));
+    // SAFETY: `early` is in the absolute clock's own units, made from a value
+    // read from that clock and the timebase returned by the kernel.
+    if unsafe { mach_wait_until(early) } != 0 {
+        std::thread::sleep(duration);
+        return;
+    }
+    // `mach_wait_until` normally returns at or after `early`; this loop is at
+    // most MAC_EARLY and is often empty after the kernel's own coalescing.
+    loop {
+        // SAFETY: as above, this only reads the monotonic absolute clock.
+        if unsafe { mach_absolute_time() } >= deadline {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+}
 
 /// How far one notch has been delivered, as a fraction, `x` of the way through
 /// [`D`].
@@ -531,17 +608,36 @@ fn animate(shared: &Shared) {
                     return;
                 }
                 let now = Instant::now();
-                let wait = match state.animator.until(now) {
+                match state.animator.until(now) {
                     Some(left) if left.is_zero() => break,
-                    Some(left) => left,
-                    // Nothing to animate. A notch knocks, so this is only how
-                    // long it takes to notice `stop`.
-                    None => IDLE,
-                };
-                let Ok((next, _)) = shared.wake.wait_timeout(state, wait) else {
-                    return;
-                };
-                state = next;
+                    #[cfg(target_os = "macos")]
+                    Some(left) => {
+                        // A condvar timeout on macOS is coalesced too coarsely
+                        // for a 16 ms animation. Leave the state unlocked while
+                        // the precise clock keeps this tick.
+                        drop(state);
+                        wait_for_tick(left);
+                        let Ok(next) = shared.state.lock() else {
+                            return;
+                        };
+                        state = next;
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    Some(left) => {
+                        let Ok((next, _)) = shared.wake.wait_timeout(state, left) else {
+                            return;
+                        };
+                        state = next;
+                    }
+                    None => {
+                        // A notch knocks, so this is only how long it takes to
+                        // notice `stop`.
+                        let Ok((next, _)) = shared.wake.wait_timeout(state, IDLE) else {
+                            return;
+                        };
+                        state = next;
+                    }
+                }
             }
             let due = state.animator.tick(Instant::now());
             due.and_then(|step| state.to.clone().map(|to| (to, step)))

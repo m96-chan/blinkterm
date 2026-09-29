@@ -186,8 +186,9 @@ pub struct Launch {
     /// `--engine`, or `$BLINKTERM_ENGINE`, or `engine =`, already folded in
     /// that order; `None` is [`locate`]'s search.
     pub path: Option<PathBuf>,
-    /// `--engine-arg`s, in order, after [`flags`] and before the url. None
-    /// of them is one of [`RESERVED_ARGS`]; the option parser saw to that.
+    /// `--engine-arg`s, in order, after the fixed switches and before the
+    /// initial target arguments. None of them is one of [`RESERVED_ARGS`];
+    /// the option parser saw to that.
     pub args: Vec<String>,
     /// `--user-agent`: the engine's `--user-agent=`.
     pub user_agent: Option<String>,
@@ -202,13 +203,18 @@ pub struct Launch {
 impl Launch {
     /// The engine's whole argument list after `--user-data-dir`: the fixed
     /// flags, then `--user-agent=`, `--proxy-server=`, `--mute-audio`, then
-    /// `args`, then the url. The person's `args` come after everything this
-    /// program derived from an option, so that an `--engine-arg` can still
-    /// contradict one — the engine takes the last. Pure; this is what the
-    /// unit test checks.
+    /// `args`, then the initial target arguments. On macOS the last two are a
+    /// Cocoa default and its value; elsewhere the last one is the URL. The
+    /// person's `args` come after every switch this program derived from an
+    /// option, so that an `--engine-arg` can still contradict one — the engine
+    /// takes the last. Pure; this is what the unit test checks.
     pub fn arguments(&self, as_root: bool) -> Vec<String> {
         let mut fixed: Vec<String> = flags(as_root).into_iter().map(String::from).collect();
-        let url = fixed.pop();
+        let tail = fixed.split_off(fixed.len().saturating_sub(if cfg!(target_os = "macos") {
+            2
+        } else {
+            1
+        }));
         if let Some(agent) = &self.user_agent {
             fixed.push(format!("--user-agent={agent}"));
         }
@@ -219,7 +225,7 @@ impl Launch {
             fixed.push("--mute-audio".to_string());
         }
         fixed.extend(self.args.iter().cloned());
-        fixed.extend(url);
+        fixed.extend(tail);
         fixed
     }
 
@@ -588,6 +594,17 @@ fn is_executable(path: &Path) -> bool {
 /// `--user-data-dir` is always this program's own, never the person's
 /// desktop Chrome profile, so the mock key never meets a real jar.
 ///
+/// `-NSScrollViewRubberbanding NO` is also macOS-only. It is Cocoa's
+/// process-local command-line default, not a persistent `defaults write`:
+/// Chromium reads `NSScrollViewRubberbanding` to decide whether its compositor
+/// springs past a scroll boundary. That spring is right for native trackpad
+/// gestures and wrong for the synthetic wheel steps this program sends: after
+/// a `G` step of ten million pixels, it pushed every following `k` step back to
+/// the bottom. With the default off, a wheel event clamps at the boundary as it
+/// does on Linux and the next event starts there. `NO` doubles as headless
+/// shell's one initial target; a second `about:blank` would be rejected as a
+/// second target, and every real tab is navigated explicitly after launch.
+///
 /// `--disable-dev-shm-usage` and `--ozone-platform=headless` stay on a Mac
 /// too, where they mean nothing: Chromium ignores a switch it does not know
 /// rather than refusing it, and one list is one thing to reason about.
@@ -619,7 +636,15 @@ pub fn flags(as_root: bool) -> Vec<&'static str> {
         flags.push("--no-sandbox");
     }
     #[cfg(target_os = "macos")]
-    flags.push("--use-mock-keychain");
+    {
+        flags.push("--use-mock-keychain");
+        flags.push("-NSScrollViewRubberbanding");
+        // `NO` is also the one initial target headless-shell permits. Cocoa
+        // consumes the pair as a process-local default before Chromium reads
+        // it, and every real tab is navigated explicitly after launch.
+        flags.push("NO");
+    }
+    #[cfg(not(target_os = "macos"))]
     flags.push("about:blank");
     flags
 }
@@ -973,8 +998,9 @@ fn describe_tail(tail: &Arc<Mutex<Vec<String>>>) -> String {
 
 /// The first page target's id, once the engine has one.
 ///
-/// The engine starts with the `about:blank` it was given on its command line,
-/// but a browser that has only just answered `Browser.getVersion` may not
+/// The engine starts with the initial target it was given on its command line
+/// (`about:blank` off macOS and Cocoa's `NO` value on it), but a browser that
+/// has only just answered `Browser.getVersion` may not
 /// have made its page yet, so the list is asked for again every 50 ms until
 /// there is a page in it or the time is up. It is also the first command that
 /// needs the engine to have done anything, so an engine that answers the pipe
@@ -1041,11 +1067,14 @@ mod tests {
             "--disable-blink-features=AutomationControlled",
             "--remote-debugging-pipe",
         ];
-        // A Mac's Chromium would otherwise ask the Keychain, in a dialog.
+        // A Mac's Chromium would otherwise ask the Keychain in a dialog, and
+        // let an End scroll's elastic spring swallow the next wheel notch.
         if cfg!(target_os = "macos") {
             measured.push("--use-mock-keychain");
+            measured.extend(["-NSScrollViewRubberbanding", "NO"]);
+        } else {
+            measured.push("about:blank");
         }
-        measured.push("about:blank");
         assert_eq!(plain, measured);
         for flags in [flags(false), flags(true)] {
             assert!(
@@ -1065,8 +1094,12 @@ mod tests {
         assert!(flags(true).contains(&"--no-sandbox"));
         assert_eq!(
             flags(true).last(),
-            Some(&"about:blank"),
-            "the url goes last"
+            Some(if cfg!(target_os = "macos") {
+                &"NO"
+            } else {
+                &"about:blank"
+            }),
+            "the initial target goes last"
         );
     }
 
@@ -1244,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_puts_its_extras_after_the_flags_and_before_the_url() {
+    fn a_launch_puts_its_extras_after_the_flags_and_before_the_initial_target() {
         for as_root in [false, true] {
             let plain: Vec<String> = flags(as_root).into_iter().map(String::from).collect();
             assert_eq!(Launch::default().arguments(as_root), plain);
@@ -1257,14 +1290,14 @@ mod tests {
             mute: false,
         };
         let mut wanted: Vec<String> = flags(false).into_iter().map(String::from).collect();
-        let url = wanted.pop().expect("a url");
+        let tail = wanted.split_off(wanted.len() - if cfg!(target_os = "macos") { 2 } else { 1 });
         wanted.extend([
             "--user-agent=blinkterm-test/1.0 (measured)".to_string(),
             "--proxy-server=socks5://127.0.0.1:1080".to_string(),
             "--accept-lang=ja".to_string(),
             "--headless=old".to_string(),
-            url,
         ]);
+        wanted.extend(tail);
         assert_eq!(launch.arguments(false), wanted);
     }
 
@@ -1277,13 +1310,13 @@ mod tests {
             ..Launch::default()
         };
         let mut wanted: Vec<String> = flags(false).into_iter().map(String::from).collect();
-        let url = wanted.pop().expect("a url");
+        let tail = wanted.split_off(wanted.len() - if cfg!(target_os = "macos") { 2 } else { 1 });
         wanted.extend([
             "--proxy-server=127.0.0.1:1".to_string(),
             "--mute-audio".to_string(),
             "--autoplay-policy=no-user-gesture-required".to_string(),
-            url,
         ]);
+        wanted.extend(tail);
         assert_eq!(launch.arguments(false), wanted);
         assert!(!Launch::default()
             .arguments(false)

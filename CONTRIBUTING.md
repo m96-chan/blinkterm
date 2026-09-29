@@ -49,8 +49,8 @@ because several of them assert on timings, and `--test-threads=1` because each
 starts an engine of its own and two painting at once make the scroll tests
 measure the machine instead of the program.
 
-No Chromium to hand? Push the branch — the `engine` job runs it against a
-pinned bookworm image, and prints which Chromium it used.
+No Chromium to hand? Push the branch — the `engine` and `mac` jobs run it
+against pinned Linux and macOS builds, and print which Chromium they used.
 
 ## Code that came from tOS
 

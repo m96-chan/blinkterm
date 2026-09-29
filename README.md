@@ -45,7 +45,7 @@ pixels inline: correct, obviously correct, and slow.
 
 ## Where it runs
 
-On Linux, in any terminal that speaks all three of the Kitty
+On Linux and macOS, in any terminal that speaks all three of the Kitty
 graphics protocol, the Kitty keyboard protocol and SGR mouse reporting —
 Kitty, WezTerm, Ghostty — and in a [tOS](https://github.com/m96-chan/tOS)
 pane, which is where it was written.
@@ -56,10 +56,9 @@ that is the whole of what an engine wants. None of that argument is about tOS,
 so the same binary runs in the others. This repository exists because tOS's CI
 has no Chromium to test against and this program is nothing without one.
 
-macOS is not supported yet. The code for it is in — frames through
-`shm_open(3)` objects instead of `/dev/shm`, engines found in `/Applications` —
-and it builds, but it has not run on a Mac, CI's included; [#46](https://github.com/m96-chan/blinkterm/issues/46) is what is
-left before it can be called support.
+On a Mac there is no `/dev/shm`, so the frames go through `shm_open(3)`
+shared memory objects instead, which Kitty and Ghostty read; a terminal that
+does not gets the inline fallback, as anywhere else.
 
 The terminal is asked before the engine is started. One that does not
 answer the graphics query gets a sentence in the shell saying why and what
@@ -103,8 +102,9 @@ That builds from source too — the tap's formula asks Homebrew for a Rust and
 runs the same `cargo install --locked` — so it is the same binary by a shorter
 command, not a prebuilt one; prebuilt binaries are
 [#22](https://github.com/m96-chan/blinkterm/issues/22). The engine below is
-still yours to install, and `brew` says so when it is done. The formula is
-Linux-only until macOS is ([#46](https://github.com/m96-chan/blinkterm/issues/46)).
+still yours to install, and `brew` says so when it is done. On macOS, use
+`cargo install` for now: the formula's release, v0.1.0, predates macOS
+support, and the formula opens to macOS with the first release that has it.
 The formula lives
 in this repository, at `packaging/homebrew/blinkterm.rb`, and
 [m96-chan/homebrew-tap](https://github.com/m96-chan/homebrew-tap) carries a
@@ -125,11 +125,30 @@ BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell blinkt
 It wants the usual Chromium libraries (its `deb.deps` lists them) and, if you
 read any CJK, `fonts-noto-cjk`: without it every Japanese glyph is a box.
 
+On a Mac with Apple silicon, the same version's `mac-arm64` build (an Intel
+Mac wants `mac-x64` in both places):
+
+```sh
+curl -fsSLO https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.52/mac-arm64/chrome-headless-shell-mac-arm64.zip
+unzip chrome-headless-shell-mac-arm64.zip -d ~/engine
+BLINKTERM_ENGINE=~/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell blinkterm
+```
+
+The frameworks it needs are in the zip and the fonts are the system's. A zip
+fetched with `curl` runs at once; one saved by Safari or Finder is
+quarantined, and macOS refuses to start it until
+`xattr -dr com.apple.quarantine ~/engine/chrome-headless-shell-mac-arm64`
+has removed the attribute.
+
 Anything Chromium-shaped will do, with one caution. `blinkterm` looks at
 `--engine <path>` first, then `$BLINKTERM_ENGINE`, then `engine = <path>` in
 the [settings](#settings), then on `PATH` for `chrome-headless-shell`,
 `chromium`, `chromium-browser`, `google-chrome` and `chromium-shell`, in that
-order. Debian's `chromium-shell` is last because it is Chromium's
+order — and on macOS, where a browser is an app rather than a command, then
+for Google Chrome and Chromium in `/Applications` and `~/Applications`. On a
+Mac the engine is also given `--use-mock-keychain`, so that Chromium never
+asks the Keychain for its cookie key in a dialog nobody can see. Debian's
+`chromium-shell` is last because it is Chromium's
 `content_shell`, not a headless shell: it keeps a DevTools port open beside
 the pipe whatever it is told, answers a page's dialogs itself, and does not
 close when asked, so a kept profile is not flushed. It renders pages; it does
@@ -871,13 +890,14 @@ cargo test --locked
 The lint set is a `[lints]` table in `Cargo.toml` rather than a list of flags
 in the workflow, so a laptop and a runner disagree about `-D warnings` and
 nothing else. The one worth knowing about is
-`clippy::undocumented_unsafe_blocks`: there are sixty-three `unsafe` blocks in
+`clippy::undocumented_unsafe_blocks`: there are sixty-seven `unsafe` blocks in
 `src/`, nearly all of them one-line `libc` calls, and each says what makes it
 sound.
 
-The macOS code is compiled only for macOS, and a lint only sees the code
-that is built, so the `msrv` job checks it for `aarch64-apple-darwin` on the
-floor toolchain. Running it on a Mac, in CI and by hand, is [#46](https://github.com/m96-chan/blinkterm/issues/46).
+CI also runs clippy, the unit tests and the real-engine suite on macOS. That
+job exercises the `shm_open` frame path, app-bundle search and macOS scroll
+clock that no Linux job can run; the `msrv` job separately checks the same
+code for `aarch64-apple-darwin` on the floor toolchain.
 
 `--locked` throughout, so that CI tests what is committed rather than what
 cargo would resolve today, and a stale lock file is a red build.

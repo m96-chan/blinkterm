@@ -6465,8 +6465,15 @@ fn hint_frame() -> String {
 /// its frame at `/inner` and the same frame again on `localhost`, which is
 /// another origin.
 fn hint_pages(port: u16) -> Vec<(String, String)> {
+    // Explicit block metrics keep the viewport boundary independent of the
+    // platform font's line box (Helvetica on macOS, Liberation Sans in CI).
     let below: String = (0..80)
-        .map(|i| format!("<p><a href='/below/{i}'>below the fold link {i}</a></p>"))
+        .map(|i| {
+            format!(
+                "<p style='height:30px;margin:10px 0'><a href='/below/{i}'>\
+                 below the fold link {i}</a></p>"
+            )
+        })
         .collect();
     let page = format!(
         "<!doctype html><meta charset=utf-8><title>loading</title>\
