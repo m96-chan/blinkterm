@@ -59,7 +59,7 @@
 //! decoder is more code than PNG and inflate put together for a second format
 //! in a program whose one outside dependency is `libc`. It was measured and it was
 //! wrong — not about the code, which is nine hundred lines in
-//! `tos_term::jpeg`, but about what it buys.
+//! `crate::jpeg`, but about what it buys.
 //!
 //! `Page.startScreencast` is bounded by the engine's own single-threaded
 //! encode of each frame. At 1280x770 on two cores that is 33.8 frames a
@@ -105,9 +105,11 @@
 //! module with its own tests, for the reason tOS hand-rolled PNG and inflate:
 //! a browser is a large enough thing to want a crate for every part of it, and
 //! that is exactly how a one-dependency program stops being one. What is
-//! depended on is `libc` and three tOS crates that were already written for
-//! this: `tos-term` for the PNG and JPEG decoders, `tos-platform` for the
-//! terminal, `tos-preview` for the cell arithmetic.
+//! depended on is `libc`. The PNG and JPEG decoders, inflate, the tty helpers
+//! and the cell arithmetic were written for tOS and came from it as git
+//! revisions until this program ran on a Mac and wanted to be on crates.io;
+//! they are [`png`], [`jpeg`], [`inflate`], [`tty`] and [`fit`] now, copied
+//! from tOS `c7677bde`, and each says where it came from.
 //!
 //! **No port.** The engine is driven over `--remote-debugging-pipe`, on two
 //! descriptors it inherits from this program, rather than a DevTools port on
@@ -128,13 +130,16 @@ pub mod doctor;
 pub mod download;
 pub mod engine;
 pub mod find;
+pub mod fit;
 pub mod fullscreen;
 pub mod graphics;
 pub mod hints;
 pub mod history;
 pub mod hover;
 pub mod identity;
+pub mod inflate;
 pub mod input;
+pub mod jpeg;
 pub mod json;
 pub mod keys;
 pub mod line;
@@ -143,6 +148,7 @@ pub mod motion;
 pub mod normal;
 pub mod options;
 pub mod permissions;
+pub mod png;
 pub mod profile;
 pub mod route;
 pub mod screen;
@@ -151,6 +157,7 @@ pub mod session;
 pub mod tablist;
 pub mod tabs;
 pub mod text;
+pub mod tty;
 pub mod upload;
 pub mod zoom;
 

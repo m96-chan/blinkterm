@@ -86,7 +86,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use tos_platform::tty::{self, ReadOutcome};
+use crate::tty::{self, ReadOutcome};
 
 use crate::json::Json;
 

@@ -45,7 +45,7 @@
 //! size, the picture is placed from its new row, and the status row comes
 //! and goes with it.
 
-use tos_preview::fit::{Cells, Metrics};
+use crate::fit::{Cells, Metrics};
 
 use crate::json::Json;
 

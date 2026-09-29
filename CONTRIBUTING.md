@@ -11,9 +11,8 @@ cargo doc --no-deps --locked          # with RUSTDOCFLAGS=-D warnings
 cargo test --locked
 ```
 
-`--locked` everywhere is deliberate: every dependency but `libc` is a git
-revision, so `Cargo.lock` is the only record of which tree of tOS was built.
-If you change the version in `Cargo.toml`, run `cargo update -p blinkterm` so
+`--locked` everywhere is deliberate: CI tests what is committed, not what
+cargo would resolve today. If you change the version in `Cargo.toml`, run `cargo update -p blinkterm` so
 the lock file agrees, or CI will tell you it does not.
 
 The lint set is a `[lints]` table in `Cargo.toml` rather than flags in the
@@ -53,24 +52,24 @@ measure the machine instead of the program.
 No Chromium to hand? Push the branch — the `engine` job runs it against a
 pinned bookworm image, and prints which Chromium it used.
 
-## Bumping the tOS revision
+## Code that came from tOS
 
-`tos-term`, `tos-platform`, `tos-preview` and `tos-compositor` are pinned to one
-revision of [tOS](https://github.com/m96-chan/tOS), currently `c7677bde`. They
-are the decoders, the terminal handling and the cell arithmetic — as much of the
-program as `src/` is.
+`src/png.rs`, `src/jpeg.rs`, `src/inflate.rs` and `src/tty.rs` came from tOS's
+`tos-term` and `tos-platform`, and `src/fit.rs` from its image viewer, all at
+[tOS](https://github.com/m96-chan/tOS) `c7677bde`; each file's first paragraph
+says where. They were git dependencies until this program ran on a Mac and
+wanted to be on crates.io, which takes no git dependencies. They are this
+crate's code now: change them here, and a fix that tOS also needs is a fix to
+carry over by hand, in either direction.
 
-Move them **together**, never one at a time:
-
-1. Change `rev = "..."` on all four in `Cargo.toml` to the same new commit.
-2. `cargo update` — the lock file has to follow.
-3. Run the engine tests. A decoder or a graphics-command change is exactly the
-   kind of thing that compiles and then renders wrongly, and the engine tests
-   are what would notice.
-4. Say in the changelog that the revision moved and why.
-
-A protocol change — a new graphics format, an escape sequence, a keyboard flag —
-is taken by moving the pin, not by vendoring or reimplementing it here.
+`vendor/tos-term` is different. It is tOS's whole terminal, copied at the same
+revision, and the tests parse this program's output with it — the terminal the
+program was written for, as it was. It is a path dev-dependency, so it is not
+published, and it is not a workspace member, so this crate's lints do not
+apply to it. Leave it as tOS wrote it; to take a newer tOS terminal, copy
+`compositor/tos-term` over it whole, say which revision in its `Cargo.toml`,
+and run the engine tests. `tests/support/imagefile.rs` is the compositor's
+`t=s` reader, copied the same way and kept the same way.
 
 ## Style
 

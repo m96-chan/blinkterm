@@ -122,7 +122,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
-use tos_preview::fit::Cells;
+use crate::fit::Cells;
 
 use crate::base64;
 use crate::route::{Payload, Placement, Route, Wrap};
@@ -240,8 +240,8 @@ const IN_FLIGHT: usize = 16;
 ///
 /// Three channels or four, and the protocol has a format for each, so the
 /// pixels go across as they are rather than being widened or narrowed:
-/// `tos_term::jpeg` produces RGB and a JPEG has no alpha to lose,
-/// `tos_term::png` produces RGBA and a still is one frame in a hundred and
+/// `crate::jpeg` produces RGB and a JPEG has no alpha to lose,
+/// `crate::png` produces RGBA and a still is one frame in a hundred and
 /// fifty milliseconds, so neither conversion would buy anything.
 #[derive(Debug, Clone, Copy)]
 pub struct Raw<'a> {

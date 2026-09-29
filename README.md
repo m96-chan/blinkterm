@@ -87,8 +87,7 @@ ssh), and `--frames raw|png` overrides the choice.
 
 ## Installing
 
-Rust 1.87 or newer — the floor comes from the dependency closure, not from
-anything in `src/`; see [Checks](#checks):
+Rust 1.87 or newer; see [Checks](#checks):
 
 ```sh
 cargo install --git https://github.com/m96-chan/blinkterm
@@ -646,8 +645,9 @@ work in fullscreen as anywhere.
 
 `cargo test` runs the unit tests and skips everything that needs an engine.
 The tests in `tests/engine.rs` are the ones this repository is for: a real
-Chromium, real frames, and `tos_term::Terminal` with the compositor's own
-`ImageFiles` installed parsing what would go down the pane's pseudoterminal.
+Chromium, real frames, and tOS's terminal (`tos_term::Terminal`, copied into
+`vendor/tos-term` and not published) with the compositor's own `ImageFiles`
+installed parsing what would go down the pane's pseudoterminal.
 They run only when `BLINKTERM_ENGINE` names the engine to use, and they say so
 when they skip — naming the engine is the consent, because a machine with a
 Chromium on it did not thereby agree to have it started.
@@ -678,7 +678,7 @@ cargo test --locked
 The lint set is a `[lints]` table in `Cargo.toml` rather than a list of flags
 in the workflow, so a laptop and a runner disagree about `-D warnings` and
 nothing else. The one worth knowing about is
-`clippy::undocumented_unsafe_blocks`: there are forty-nine `unsafe` blocks in
+`clippy::undocumented_unsafe_blocks`: there are sixty-three `unsafe` blocks in
 `src/`, nearly all of them one-line `libc` calls, and each says what makes it
 sound.
 
@@ -686,12 +686,11 @@ The macOS code is compiled only for macOS, and a lint only sees the code
 that is built, so the `msrv` job checks it for `aarch64-apple-darwin` on the
 floor toolchain. Running it on a Mac, in CI and by hand, is [#46](https://github.com/m96-chan/blinkterm/issues/46).
 
-`--locked` throughout, because every dependency but `libc` is a git revision
-and `Cargo.lock` is the only record of which tree of tOS was built.
+`--locked` throughout, so that CI tests what is committed rather than what
+cargo would resolve today, and a stale lock file is a red build.
 
-The floor is Rust **1.87**, and it comes from the dependency closure rather
-than from anything in `src/` — `fontdue` calls `integer_sign_cast`. CI builds
-against exactly the `rust-version` in `Cargo.toml`, so the number stays true.
+The floor is Rust **1.87**: `src/` calls `is_multiple_of`. CI builds against
+exactly the `rust-version` in `Cargo.toml`, so the number stays true.
 
 `tools/` is checked too: `shellcheck --severity=warning tools/run.sh`, and
 `ruff check --select E9,F tools/` — syntax and pyflakes, not style, since
@@ -701,7 +700,7 @@ object to is deliberate.
 ## Contributing, releases, security
 
 [CONTRIBUTING.md](CONTRIBUTING.md) has the checks, how to run the engine tests,
-and how the tOS revision is moved. [RELEASING.md](RELEASING.md) says what the
+and where the code copied from tOS came from. [RELEASING.md](RELEASING.md) says what the
 version number promises — SemVer on the command-line surface, and `lib.rs` is
 not a stable API — and how a tag is cut. [CHANGELOG.md](CHANGELOG.md) is what
 changed.

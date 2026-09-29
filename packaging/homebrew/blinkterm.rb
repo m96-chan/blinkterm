@@ -27,10 +27,8 @@ class Blinkterm < Formula
 
   def install
     # std_cargo_args is `--jobs N --locked --root=#{prefix} --path=.`.
-    # --locked matters more here than in most crates: every dependency but
-    # libc is a git revision of tOS and Cargo.lock is the only record of which
-    # tree was built. cargo fetches those from github.com during the build;
-    # Homebrew allows a build network access unless a formula says otherwise,
+    # --locked, so the build is the tree CI tested. cargo fetches libc from
+    # crates.io during the build; Homebrew allows a build network access unless a formula says otherwise,
     # under Linux's Landlock sandbox as on macOS, and this one does not.
     system "cargo", "install", *std_cargo_args
   end
