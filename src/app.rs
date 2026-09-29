@@ -2852,17 +2852,20 @@ fn list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &TabList) -> Vec<u8> 
     let window = list.window(matches.len(), rows as usize, chrome.list_first.get());
     chrome.list_first.set(window.first);
     let picked = list.picked(matches.len());
-    let items: Vec<screen::ListItem> = matches
+    let shown = &matches[window.first..window.first + window.shown];
+    let leads: Vec<String> = shown
         .iter()
+        .map(|entry| format!("{}{}", entry.index + 1, if entry.asks { "!" } else { "" }))
+        .collect();
+    let items: Vec<screen::ListItem> = shown
+        .iter()
+        .zip(&leads)
         .enumerate()
-        .skip(window.first)
-        .take(window.shown)
-        .map(|(at, entry)| screen::ListItem {
-            number: entry.index + 1,
+        .map(|(at, (entry, lead))| screen::ListItem {
+            lead,
             title: &entry.label,
             url: entry.url,
-            picked: picked == Some(at),
-            asks: entry.asks,
+            picked: picked == Some(window.first + at),
         })
         .collect();
     screen::list_rows(chrome.metrics.cols, chrome.layout.page_row(), rows, &items)
