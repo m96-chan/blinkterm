@@ -61,9 +61,47 @@
 //! engine checks nothing and a directory or a missing name reaches the page
 //! as a file that is not one (see [`crate::upload`]). One that fails sends
 //! nothing, and the row says why.
+//!
+//! # A window runs beside the loop; a terminal program runs instead of it
+//!
+//! A [`Gui`] is started and left: in a process group of its own, as the
+//! engine is and for the engine's reason — `sh -c '…'` around a dialog is
+//! a wrapper, and killing the wrapper's pid would leave the dialog up — with
+//! nothing on its standard input and its errors thrown away rather than
+//! printed over the pane. The loop polls its output with everything else
+//! and reaps it when it exits ([`Gui::pump`]), so the page keeps painting
+//! and the keys keep going to it while the dialog is open, Escape included:
+//! the dialog has its own Cancel. One runs at a time; a click while it is
+//! open is told `cancel` at once. Dropping a [`Gui`] ends it — the group
+//! asked with `SIGTERM`, then told with `SIGKILL` half a second later, as
+//! the engine is — which is what happens when its tab closes or goes
+//! somewhere else, when the engine dies, and when the program quits. Not
+//! when it panics: a release build aborts, nothing is dropped, and a dialog
+//! left open is one the person closes, which is not worth a second panic
+//! hook for.
+//!
+//! A terminal picker is run to completion ([`run_terminal`]) once the loop
+//! has given the terminal back (`Pane::release`), and
+//! nothing else happens meanwhile: nothing could be drawn anyway. It is left
+//! in this program's own process group — the terminal's foreground group —
+//! so that it can read the terminal without being stopped for it, and while
+//! it runs this program ignores `SIGINT` and `SIGQUIT`, so that a `ctrl+c`
+//! that the picker's terminal mode turns into a signal ends the picker and
+//! not the browser. The picker has both put back to their defaults before
+//! it starts.
 
+use std::io::Read;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
+use crate::engine;
+use crate::text;
+use crate::tty::{self, ReadOutcome};
 use crate::upload::{self, Chooser, Dir, Refusal};
 
 /// What the row and the strip say about a tab while its picker is open, in
@@ -406,6 +444,404 @@ pub fn accept(paths: Vec<PathBuf>, multiple: bool, fs: &dyn Dir) -> Result<Vec<P
     Ok(files)
 }
 
+/// The file a picker writes its answer to, for a command with `{out}`:
+/// made empty before the picker starts, readable by this user alone, and
+/// removed when it is dropped.
+///
+/// In the temporary directory under a name of this program's and this
+/// process's, and made with `O_EXCL` so that a name somebody else put there
+/// first is never taken over — the next number is tried instead. Made empty
+/// rather than left for the picker to create, because a picker cancelled
+/// before it writes anything (yazi on `q`) leaves the file as it was, and a
+/// file that is there and empty is a cancel with no question about whose
+/// file it was.
+pub struct OutFile {
+    path: PathBuf,
+}
+
+impl OutFile {
+    /// A new empty file, `0600`.
+    pub fn create() -> std::io::Result<OutFile> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir();
+        let mut tries = 0;
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::SeqCst);
+            let path = dir.join(format!("blinkterm-pick-{}-{n}", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(_) => return Ok(OutFile { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 16 => {
+                    tries += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Where it is, for `{out}`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// What the picker wrote, up to one byte past [`MAX_OUTPUT`] so that a
+    /// file too big is seen to be; nothing if it is gone.
+    pub fn read(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if let Ok(file) = std::fs::File::open(&self.path) {
+            let _ = file.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut bytes);
+        }
+        bytes
+    }
+}
+
+impl Drop for OutFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The sentence for a picker that printed more than [`MAX_OUTPUT`].
+const TOO_MUCH: &str = "the file picker printed more than 64 KiB";
+
+/// Why a picker could not be started, for the row: the program's name, as
+/// plain text since it is the person's own words from a file, and the
+/// system's reason in a few of its own.
+fn cannot_start(program: &str, error: &std::io::Error) -> String {
+    let why = match error.kind() {
+        std::io::ErrorKind::NotFound => "no such program".to_string(),
+        kind => kind.to_string(),
+    };
+    format!(
+        "can't start the file picker {}: {why}",
+        text::sanitize(program)
+    )
+}
+
+/// A picker with a window of its own, while it runs. See the module for
+/// why it is left to run and how it is ended.
+pub struct Gui {
+    child: Child,
+    /// `kill(2)`'s argument for its group, as [`crate::engine`] keeps one.
+    target: i32,
+    /// Its standard output, non-blocking, until end of file; `None` from
+    /// the start for a command with `{out}`.
+    stdout: Option<OwnedFd>,
+    /// What it has printed so far.
+    read: Vec<u8>,
+    out: Option<OutFile>,
+    /// Where it started, which a relative line is under.
+    dir: PathBuf,
+    home: Option<PathBuf>,
+    /// Whether it has been waited for, and so has nothing left to kill.
+    reaped: bool,
+    /// The tab whose input it is answering, by target id.
+    pub tab: String,
+    /// The input it is answering.
+    pub chooser: Chooser,
+}
+
+impl Gui {
+    /// Start `command` in `dir` for `chooser`, on the tab `tab`. The
+    /// sentence for the row when it cannot be.
+    pub fn spawn(
+        command: &Command,
+        dir: &Path,
+        tab: &str,
+        chooser: &Chooser,
+    ) -> Result<Gui, String> {
+        let out = if command.has_out() {
+            Some(OutFile::create().map_err(|e| {
+                format!(
+                    "can't make a file for the file picker to write to: {}",
+                    e.kind()
+                )
+            })?)
+        } else {
+            None
+        };
+        let argv = command.expand(dir, out.as_ref().map(OutFile::path));
+        let mut process = std::process::Command::new(&argv[0]);
+        process
+            .args(&argv[1..])
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(if out.is_some() {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
+            .stderr(Stdio::null());
+        let (mut child, target) =
+            engine::spawn_in_own_group(&mut process).map_err(|e| cannot_start(&argv[0], &e))?;
+        let stdout: Option<OwnedFd> = child.stdout.take().map(OwnedFd::from);
+        if let Some(fd) = &stdout {
+            tty::set_nonblocking(fd.as_raw_fd()).ok();
+        }
+        Ok(Gui {
+            child,
+            target,
+            stdout,
+            read: Vec::new(),
+            out,
+            dir: dir.to_path_buf(),
+            home: upload::home(),
+            reaped: false,
+            tab: tab.to_string(),
+            chooser: chooser.clone(),
+        })
+    }
+
+    /// The descriptor to poll, while there is output still to come.
+    pub fn fd(&self) -> Option<RawFd> {
+        self.stdout.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    /// One pass: read what it printed if `readable`, and see whether it has
+    /// exited. `Some` once it is over, and then only once.
+    ///
+    /// The exit is asked every pass whether the output was readable or not,
+    /// because a picker with `{out}` has no output, and one whose output is
+    /// at end of file is no longer polled; a pass is at most the loop's
+    /// poll interval, and `try_wait` is one `waitpid`.
+    pub fn pump(&mut self, readable: bool) -> Option<Outcome> {
+        if self.reaped {
+            return None;
+        }
+        if readable && self.drain() {
+            self.kill_now();
+            return Some(Outcome::Failed(TOO_MUCH.to_string()));
+        }
+        let status = match self.child.try_wait() {
+            Ok(None) => return None,
+            Ok(Some(status)) => status,
+            Err(e) => {
+                self.kill_now();
+                return Some(Outcome::Failed(format!(
+                    "lost the file picker: {}",
+                    e.kind()
+                )));
+            }
+        };
+        self.reaped = true;
+        // What it printed just before it went and was not read yet: once,
+        // without waiting, since something it left behind may still hold the
+        // pipe open and would keep a blocking read here for ever.
+        let over = self.drain();
+        self.stdout = None;
+        let answer = match &self.out {
+            Some(out) => out.read(),
+            None => std::mem::take(&mut self.read),
+        };
+        if over || answer.len() > MAX_OUTPUT {
+            return Some(Outcome::Failed(TOO_MUCH.to_string()));
+        }
+        Some(outcome(
+            status.success(),
+            &answer,
+            &self.dir,
+            self.home.as_deref(),
+        ))
+    }
+
+    /// Read whatever is waiting on its output. True when it has now printed
+    /// more than [`MAX_OUTPUT`]. At end of file the descriptor is let go: a
+    /// pipe whose writer has gone is readable for ever, and polling it would
+    /// spin the loop.
+    fn drain(&mut self) -> bool {
+        let Some(fd) = self.fd() else {
+            return false;
+        };
+        let mut buf = [0u8; 8192];
+        loop {
+            match tty::read_available(fd, &mut buf) {
+                Ok(ReadOutcome::Data(n)) => {
+                    self.read.extend_from_slice(&buf[..n]);
+                    if self.read.len() > MAX_OUTPUT {
+                        return true;
+                    }
+                }
+                Ok(ReadOutcome::WouldBlock) => return false,
+                Ok(ReadOutcome::Eof) | Err(_) => {
+                    self.stdout = None;
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// End it now, with no half second of grace: it is misbehaving.
+    fn kill_now(&mut self) {
+        engine::signal_all(self.target, libc::SIGKILL);
+        let _ = self.child.wait();
+        self.reaped = true;
+        self.stdout = None;
+    }
+}
+
+impl Drop for Gui {
+    /// Asked, then told: `SIGTERM` to the group, half a second for it to go,
+    /// then `SIGKILL`, as [`crate::engine::Engine::kill`] does. A dialog
+    /// has nothing to save and goes at once; the grace is for a wrapper
+    /// that tidies up.
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        engine::signal_all(self.target, libc::SIGTERM);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                // The wrapper went. Anything it started that is still in
+                // its group did not take the hint, and is not waited for.
+                engine::signal_all(self.target, libc::SIGKILL);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        engine::signal_all(self.target, libc::SIGKILL);
+        let _ = self.child.wait();
+    }
+}
+
+/// `SIGINT` and `SIGQUIT` ignored for as long as it is held, and put back
+/// as they were — with `sigaction`, so that `SA_RESTART` stays off as
+/// [`crate::app`] set it, which `signal(3)` would not promise.
+struct QuietSignals {
+    int: libc::sigaction,
+    quit: libc::sigaction,
+}
+
+impl QuietSignals {
+    fn new() -> QuietSignals {
+        // SAFETY: `sigaction` is a C struct of a handler address, a mask
+        // and flags; all-zero is a valid value of each, and both are
+        // overwritten by `ignore` below before they are read.
+        let mut quiet: QuietSignals = unsafe { std::mem::zeroed() };
+        ignore(libc::SIGINT, &mut quiet.int);
+        ignore(libc::SIGQUIT, &mut quiet.quit);
+        quiet
+    }
+}
+
+/// Ignore `signal`, and keep what it was in `old`.
+fn ignore(signal: libc::c_int, old: &mut libc::sigaction) {
+    // SAFETY: `sigaction(2)` reads the new action through the first pointer
+    // and writes the old through the second, and both point at live values
+    // of exactly that type for the whole call; `sigemptyset(3)` writes the
+    // mask in place. `SIG_IGN` is not a function and is never called.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_IGN;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(signal, &action, old);
+    }
+}
+
+impl Drop for QuietSignals {
+    fn drop(&mut self) {
+        // SAFETY: each is read through the pointer and copied by the kernel;
+        // both are what `sigaction(2)` itself wrote in `new`, so each names
+        // the handler, mask and flags that were in place before.
+        unsafe {
+            libc::sigaction(libc::SIGINT, &self.int, std::ptr::null_mut());
+            libc::sigaction(libc::SIGQUIT, &self.quit, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Run a terminal picker to the end, on this terminal, and say how it
+/// ended. The caller has given the terminal back first and takes it again
+/// after; see the module for the process group and the signals.
+///
+/// Its output, when it has no `{out}`, is read on a thread of its own while
+/// this waits, as [`crate::engine`] reads the engine's errors: a picker that
+/// printed more than a pipe holds with nobody reading would never exit.
+/// What is past [`MAX_OUTPUT`] is read and thrown away for the same reason,
+/// and the picker is then taken as broken.
+pub fn run_terminal(command: &Command, dir: &Path, home: Option<&Path>) -> Outcome {
+    let out = if command.has_out() {
+        match OutFile::create() {
+            Ok(out) => Some(out),
+            Err(e) => {
+                return Outcome::Failed(format!(
+                    "can't make a file for the file picker to write to: {}",
+                    e.kind()
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    let argv = command.expand(dir, out.as_ref().map(OutFile::path));
+    let mut process = std::process::Command::new(&argv[0]);
+    process
+        .args(&argv[1..])
+        .current_dir(dir)
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .stdout(if out.is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        });
+    // SAFETY: the closure runs in the child between `fork` and `exec`, where
+    // only async-signal-safe calls are allowed; `signal(2)` is one, and the
+    // closure makes two calls to it and touches nothing else. An ignored
+    // signal stays ignored across `exec`, which is why they are put back.
+    unsafe {
+        process.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let quiet = QuietSignals::new();
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(e) => return Outcome::Failed(cannot_start(&argv[0], &e)),
+    };
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let mut buf = [0u8; 8192];
+            let mut over = false;
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let room = (MAX_OUTPUT + 1).saturating_sub(kept.len());
+                        kept.extend_from_slice(&buf[..n.min(room)]);
+                        over |= kept.len() > MAX_OUTPUT;
+                    }
+                }
+            }
+            (kept, over)
+        })
+    });
+    let status = child.wait();
+    let printed = reader.and_then(|reader| reader.join().ok());
+    drop(quiet);
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => return Outcome::Failed(format!("lost the file picker: {}", e.kind())),
+    };
+    let answer = match (&out, printed) {
+        (Some(out), _) => out.read(),
+        (None, Some((_, true))) => return Outcome::Failed(TOO_MUCH.to_string()),
+        (None, Some((kept, false))) => kept,
+        (None, None) => Vec::new(),
+    };
+    if answer.len() > MAX_OUTPUT {
+        return Outcome::Failed(TOO_MUCH.to_string());
+    }
+    outcome(status.success(), &answer, dir, home)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +1136,213 @@ mod tests {
         assert_eq!(
             accept(paths(&["/dev/null"]), false, &Disk),
             Err(Refusal::NotAFile)
+        );
+    }
+
+    // Running them.
+
+    /// The signal dispositions are the process's, and the tests run on
+    /// threads of one process: the tests that change them take turns.
+    static SIGNALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn chooser(multiple: bool) -> Chooser {
+        Chooser {
+            backend_node_id: 3,
+            multiple,
+            frame_id: "F".to_string(),
+        }
+    }
+
+    /// Pump `gui` as the loop does until it is over, or panic after a few
+    /// seconds.
+    fn finish(gui: &mut Gui) -> Outcome {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let readable = match gui.fd() {
+                Some(fd) => tty::poll_readable(&[fd], 50).expect("poll").contains(&fd),
+                None => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    false
+                }
+            };
+            if let Some(outcome) = gui.pump(readable) {
+                return outcome;
+            }
+        }
+        panic!("the picker did not finish");
+    }
+
+    fn gui(text: &str, dir: &Path, multiple: bool) -> Gui {
+        Gui::spawn(&command(text), dir, "T", &chooser(multiple)).expect("started")
+    }
+
+    #[test]
+    fn a_window_picker_is_read_from_what_it_prints() {
+        let dir = std::env::temp_dir();
+        let mut picker = gui("sh -c 'printf \"%s\\n\" /a/one.txt two.txt'", &dir, true);
+        assert!(picker.fd().is_some());
+        assert_eq!(
+            finish(&mut picker),
+            Outcome::Files(vec![PathBuf::from("/a/one.txt"), dir.join("two.txt")])
+        );
+        assert_eq!(picker.pump(true), None, "said once");
+        assert_eq!(picker.tab, "T");
+
+        // Its working directory is the start directory, which is what a
+        // relative line is under.
+        let mut picker = gui("sh -c pwd", Path::new("/"), false);
+        assert_eq!(
+            finish(&mut picker),
+            Outcome::Files(vec![PathBuf::from("/")])
+        );
+    }
+
+    #[test]
+    fn a_window_picker_that_fails_or_says_nothing_is_a_cancel() {
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            finish(&mut gui("sh -c 'echo /a; exit 1'", &dir, false)),
+            Outcome::Cancel
+        );
+        assert_eq!(finish(&mut gui("true", &dir, false)), Outcome::Cancel);
+    }
+
+    #[test]
+    fn a_window_picker_with_out_is_read_from_the_file() {
+        let dir = std::env::temp_dir();
+        let mut picker = gui(
+            "sh -c 'echo ignored; printf \"/b/x.txt\\n\" > \"$1\"' sh {out}",
+            &dir,
+            false,
+        );
+        assert_eq!(picker.fd(), None, "its output is not read");
+        let out = picker.out.as_ref().expect("a file").path().to_path_buf();
+        assert_eq!(
+            finish(&mut picker),
+            Outcome::Files(vec![PathBuf::from("/b/x.txt")])
+        );
+        drop(picker);
+        assert!(!out.exists(), "the file goes with the picker");
+
+        // Nothing written is nothing chosen.
+        assert_eq!(finish(&mut gui("true {out}", &dir, false)), Outcome::Cancel);
+    }
+
+    #[test]
+    fn a_window_picker_that_cannot_start_says_why() {
+        let started = Gui::spawn(
+            &command("blinkterm-no-such-picker --x"),
+            &std::env::temp_dir(),
+            "T",
+            &chooser(false),
+        );
+        assert_eq!(
+            started.err().as_deref(),
+            Some("can't start the file picker blinkterm-no-such-picker: no such program")
+        );
+    }
+
+    #[test]
+    fn a_window_picker_that_prints_too_much_is_stopped() {
+        let mut picker = gui("yes /a/path/that/goes/on", &std::env::temp_dir(), false);
+        assert_eq!(finish(&mut picker), Outcome::Failed(TOO_MUCH.to_string()));
+        assert!(picker.reaped);
+    }
+
+    /// Whether anything is left in a process group.
+    fn group_gone(target: i32) -> bool {
+        // SAFETY: signal 0 sends nothing and `kill(2)` reads no memory.
+        let alive = unsafe { libc::kill(target, 0) } == 0;
+        !alive && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn dropping_a_window_picker_ends_it_and_what_it_started() {
+        // A wrapper and the program it runs, as `sh -c` around a dialog is.
+        let picker = gui("sh -c 'sleep 30; true'", &std::env::temp_dir(), false);
+        let target = picker.target;
+        assert!(target < 0, "a group of its own");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!group_gone(target));
+        let started = Instant::now();
+        drop(picker);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !group_gone(target) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(group_gone(target), "something of the picker is left");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_out_file_is_new_empty_private_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let out = OutFile::create().expect("a file");
+        let other = OutFile::create().expect("another");
+        assert_ne!(out.path(), other.path());
+        let meta = std::fs::metadata(out.path()).expect("there");
+        assert_eq!(meta.len(), 0);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert!(out.read().is_empty());
+        let path = out.path().to_path_buf();
+        drop(out);
+        assert!(!path.exists());
+    }
+
+    /// Where `signal`'s handler is now.
+    fn handler(signal: libc::c_int) -> libc::sighandler_t {
+        // SAFETY: zeroed is a valid `sigaction`; `sigaction(2)` with a null
+        // new action only writes the current one through the pointer, which
+        // points at a live local.
+        unsafe {
+            let mut now: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &mut now);
+            now.sa_sigaction
+        }
+    }
+
+    #[test]
+    fn interrupts_are_ignored_while_held_and_put_back_after() {
+        let _turn = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = (handler(libc::SIGINT), handler(libc::SIGQUIT));
+        let quiet = QuietSignals::new();
+        assert_eq!(handler(libc::SIGINT), libc::SIG_IGN);
+        assert_eq!(handler(libc::SIGQUIT), libc::SIG_IGN);
+        drop(quiet);
+        assert_eq!((handler(libc::SIGINT), handler(libc::SIGQUIT)), before);
+    }
+
+    #[test]
+    fn a_terminal_picker_is_read_from_its_output_or_its_file() {
+        let _turn = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir();
+        let run = |text: &str| run_terminal(&command(text), &dir, None);
+        assert_eq!(
+            run("sh -c 'printf \"%s\\n\" /a/one.txt'"),
+            Outcome::Files(vec![PathBuf::from("/a/one.txt")])
+        );
+        assert_eq!(
+            run("sh -c 'printf \"file:///a/b%%20c\\n\" > \"$1\"' sh {out}"),
+            Outcome::Files(vec![PathBuf::from("/a/b c")])
+        );
+        assert_eq!(run("sh -c 'echo /a; exit 130'"), Outcome::Cancel);
+        assert_eq!(run("true {out}"), Outcome::Cancel);
+        assert_eq!(
+            run("sh -c 'head -c 70000 /dev/zero | tr \"\\0\" a'"),
+            Outcome::Failed(TOO_MUCH.to_string())
+        );
+        assert_eq!(
+            run("blinkterm-no-such-picker"),
+            Outcome::Failed(
+                "can't start the file picker blinkterm-no-such-picker: no such program".to_string()
+            )
+        );
+        // And the picker gets the interrupt back that this program
+        // ignores while it runs.
+        assert_eq!(
+            run("sh -c 'kill -INT $$; echo /not/reached'"),
+            Outcome::Cancel,
+            "killed by it, as a picker's own ctrl+c would"
         );
     }
 }
