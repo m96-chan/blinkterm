@@ -13,8 +13,10 @@
 //! owner alone (0600), because a list of the pages somebody has visited is as
 //! private as the cookies beside it. A temporary profile keeps none on disk:
 //! [`History::in_memory`] is walkable for the run and gone with it, which is
-//! what `--temp-profile` promises about everything else. Deleting the file is
-//! how it is forgotten; nothing else reads it.
+//! what `--temp-profile` promises about everything else. One page is
+//! forgotten with `shift+delete` in the history list ([`History::forget`]),
+//! which writes the log again without it; deleting the file forgets them
+//! all. Nothing else reads it.
 //!
 //! It is an append-only log, one line per visit, rather than a database or a
 //! file rewritten per visit. A crash in the middle of a write loses that one
@@ -213,6 +215,24 @@ impl History {
             .and_then(|mut file| file.write_all(log.as_bytes()))
             .and_then(|()| std::fs::rename(&fresh, path))
             .map_err(|e| format!("cannot compact {}: {e}", path.display()))
+    }
+
+    /// Forget `url`: its entry goes, and the log is written again without
+    /// it, as [`History::load`] compacts it — an append-only log folded on
+    /// load has no other way to take a line out, and one more line saying
+    /// "forgotten" would leave the page in the file for anybody reading it,
+    /// which is the thing being asked not to happen.
+    ///
+    /// `Ok(false)` when it was not there, and then nothing is written. The
+    /// error is the rewrite failing; the entry is gone from memory anyway,
+    /// so the url bar stops offering it for the rest of the run, and the
+    /// caller says the file still has it.
+    pub fn forget(&mut self, url: &str) -> Result<bool, String> {
+        let Some(at) = self.entries.iter().position(|entry| entry.url == url) else {
+            return Ok(false);
+        };
+        self.entries.remove(at);
+        self.compact().map(|()| true)
     }
 
     /// Every page, newest first.
@@ -613,6 +633,54 @@ mod tests {
         visit(&mut history, "https://example.com/", "", 1);
         assert!(history.path.is_none());
         assert_eq!(history.entries().len(), 1);
+    }
+
+    #[test]
+    fn forgetting_a_page_takes_it_out_of_the_log_for_good() {
+        let dir = scratch("forget");
+        let mut history = History::load(&dir);
+        visit(&mut history, "https://a.example/", "A", 1);
+        visit(&mut history, "https://b.example/", "B", 2);
+        visit(&mut history, "https://c.example/", "C", 3);
+        visit(&mut history, "https://b.example/", "B", 4);
+        assert_eq!(history.forget("https://b.example/"), Ok(true));
+        assert_eq!(urls(&history), ["https://c.example/", "https://a.example/"]);
+
+        // Not a line saying so, but a log without it: both of its lines went.
+        let log = std::fs::read_to_string(dir.join(FILE)).expect("a log");
+        assert_eq!(log.lines().count(), 2, "{log:?}");
+        assert!(!log.contains("b.example"), "{log:?}");
+        assert!(!dir.join("history.tmp").exists());
+        assert_eq!(
+            urls(&History::load(&dir)),
+            ["https://c.example/", "https://a.example/"],
+            "and it stays forgotten after a restart"
+        );
+
+        // A page not there is not a reason to write anything.
+        assert_eq!(history.forget("https://nowhere.example/"), Ok(false));
+        assert_eq!(std::fs::read_to_string(dir.join(FILE)).expect("a log"), log);
+        // And the log goes on being appended to after it.
+        visit(&mut history, "https://d.example/", "D", 5);
+        assert_eq!(
+            urls(&History::load(&dir)),
+            [
+                "https://d.example/",
+                "https://c.example/",
+                "https://a.example/"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_in_memory_history_forgets_without_a_file() {
+        let mut history = History::in_memory();
+        visit(&mut history, "https://a.example/", "A", 1);
+        visit(&mut history, "https://b.example/", "B", 2);
+        assert_eq!(history.forget("https://a.example/"), Ok(true));
+        assert_eq!(urls(&history), ["https://b.example/"]);
+        assert_eq!(history.forget("https://a.example/"), Ok(false));
     }
 
     #[test]
