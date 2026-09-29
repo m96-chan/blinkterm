@@ -12,6 +12,13 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- A history list: `ctrl+shift+h` (or `alt+h`) shows every page visited
+  over the screen, newest first, each row when, the title and the url, with
+  a `*` for one that is bookmarked. Words typed in any order filter it by
+  title and url; `enter` opens the pick here, `alt+enter`, `ctrl+enter` or a
+  middle click in a new tab, and `shift+delete` forgets it, from the file
+  too. `history` in a `key.` line
+  ([#68](https://github.com/m96-chan/blinkterm/issues/68)).
 - A page's file input can be answered by a program the settings name
   instead of the row: `file-picker = <command>` for one with a window of
   its own (Finder's dialog through `osascript`, `zenity`, `kdialog`),

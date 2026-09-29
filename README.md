@@ -176,7 +176,18 @@ The pages you visit are remembered in the profile, in a file called
 when last — a page that loaded, not one that failed, and not `about:` or
 `data:`. It is readable by you alone (0600), like the cookies beside it, and
 keeps the last 2000 pages. `--temp-profile` keeps it in memory for the run and
-writes none. Deleting the file is how to forget it; nothing else reads it.
+writes none. Nothing else reads it.
+
+`ctrl+shift+h` (or `alt+h`) lists it over the screen, newest first: each row
+says when — `just now`, `3 hours ago`, `2 weeks ago` — then the title and the
+url, with a `*` after the date for a page you have bookmarked too. Type
+words, in any order, and the list keeps the pages with every one of them in
+the title or the url, whatever the case: `rust release` finds the page
+titled "Rust 1.87 released" at `news.example`. `enter` opens the pick here,
+`alt+enter` or `ctrl+enter` (or a middle click on the row) in a new tab.
+`shift+delete` forgets the pick: it goes from the list, from the url bar's
+suggestions and from the file, which is written again without it, so it
+stays forgotten after a restart. Deleting the file forgets everything.
 
 A full `chromium` rather than the headless shell still writes
 `~/.config/chromium/Crash Reports` whatever profile it is given; that
@@ -360,7 +371,7 @@ bare letter is the page's, always. A chord is exact: `ctrl+tab` is not
 `ctrl+shift+tab`, and `key.ctrl+= = none` leaves `ctrl+shift+=` zooming in.
 A bound key is taken from every page — `key.ctrl+b = back` is no longer an
 editor's bold. The editing keys of the url bar, the find prompt, the tab
-list and a dialog are not remappable, and `copy`, `copy-url` and `quit` are
+list, the history list and a dialog are not remappable, and `copy`, `copy-url` and `quit` are
 the only actions that reach through them, on whatever keys they are. A
 later line for the same chord replaces an earlier one; binding a chord the
 program already used moves nothing else, so `key.ctrl+t = quit` leaves
@@ -543,6 +554,7 @@ ignores it until the picker exits.
 | `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
 | `alt+1` … `alt+8`, `alt+9` | the nth tab, the last tab |
 | `ctrl+shift+a` (or `alt+a`) | the tab list: type to filter by title or url, `↑`/`↓` to pick, `enter` to switch, `esc` to close |
+| `ctrl+shift+h` (or `alt+h`) | the history list: every page visited, newest first, `title — url` and when; type words in any order to filter by title or url, `↑`/`↓` to pick, `enter` opens it here, `alt+enter`/`ctrl+enter` (or a middle click) in a new tab, `shift+delete` forgets it, `esc` closes. See [History](#history) |
 | `ctrl+shift+pageup` / `pagedown` (or `alt+shift+pageup` / `pagedown`) | move this tab left or right |
 | middle click or `ctrl`+click on a link | open it in a tab behind this one |
 | `alt+=` / `alt+-` | zoom in and out (`ctrl+=` / `ctrl+-` where your terminal lets them through) |
@@ -582,7 +594,7 @@ OSC 52, which your terminal may need to be told to allow.
 The url bar is asked about every key first while it is open, so `alt+←`/`→`
 are back and forward only when it is closed — in the bar they move by a word —
 and `ctrl+w`, `ctrl+t` and the rest do nothing there; `esc` closes it. The
-find prompt and the tab list are the same.
+find prompt, the tab list and the history list are the same.
 
 Normal mode is for browsing without a mouse. The labels are drawn by the
 page itself, in one element this program adds to the document while they
@@ -680,8 +692,8 @@ A terminal that understands OSC 22 (Kitty, Ghostty) also gets a hand over a
 link and an I-beam over a text field; the rest ignore it. A zoom that is not
 100% is a word at the right too, `150%`, after the loading hint.
 
-The url bar, the find prompt, the tab list, the allow line (`alt+p`), a
-page's dialog and a file input's path take the whole row while they are
+The url bar, the find prompt, the tab list or the history list, the allow
+line (`alt+p`), a page's dialog and a file input's path take the whole row while they are
 open, and `esc` goes to whichever of them has it before it leaves
 fullscreen or stops a load; no link is shown while one of them is there.
 The offer to restore the last run's tabs takes it too, after all of them.
@@ -750,7 +762,7 @@ asking.
 video's button, a slide deck — the status row goes and the page gets every
 row of the pane. `esc` leaves it, as do a navigation, a reload and going to
 another tab (the page's own Escape does nothing in a headless engine).
-While something needs the row — the url bar, the find prompt, the tab list,
+While something needs the row — the url bar, the find prompt, a list,
 the allow line, a dialog the page opens, a file input's path — the row comes
 back and the page is a row shorter until it closes: a `confirm()` in a
 fullscreen video is still answered on the row. Link hints and normal mode
