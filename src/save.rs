@@ -147,9 +147,7 @@ impl Paper {
         match text.trim().to_ascii_lowercase().as_str() {
             "a4" => Ok(Paper::A4),
             "letter" => Ok(Paper::Letter),
-            _ => Err(format!(
-                "--pdf-paper: {text:?} is not a paper; a4 or letter"
-            )),
+            _ => Err(format!("--pdf-paper is a4 or letter, not {text:?}")),
         }
     }
 
@@ -660,7 +658,7 @@ mod tests {
         }
         assert_eq!(
             Paper::parse("a5"),
-            Err("--pdf-paper: \"a5\" is not a paper; a4 or letter".to_string())
+            Err("--pdf-paper is a4 or letter, not \"a5\"".to_string())
         );
         assert!(Paper::parse("").is_err());
     }

@@ -56,6 +56,7 @@ use crate::engine;
 use crate::picker;
 use crate::profile;
 use crate::route;
+use crate::save;
 use crate::zoom::Scale;
 
 /// The largest settings file that is read. Nothing here needs a tenth of
@@ -87,6 +88,9 @@ pub struct Options {
     pub profile: profile::Choice,
     /// Where a file a page offers is saved; see [`crate::download`].
     pub download: download::Choice,
+    /// `--pdf-paper`: what `alt+s` prints on, or `None` for the locale's.
+    /// See [`crate::save::Paper`].
+    pub pdf_paper: Option<save::Paper>,
     /// `--search-url`: where words typed into the url bar are sent, with
     /// `%s` where they go; or none, in which case what is typed is always a
     /// url. See [`crate::app::destination`].
@@ -176,6 +180,7 @@ pub struct Settings {
     /// `profile = <dir>` is `At`, `temp-profile = true` is `Temporary`.
     pub profile: Option<profile::Choice>,
     pub download_dir: Option<PathBuf>,
+    pub pdf_paper: Option<save::Paper>,
     pub search_url: Option<String>,
     pub scale: Option<Scale>,
     pub scheme: Option<appearance::Choice>,
@@ -226,6 +231,7 @@ impl Settings {
             home: self.home.or(under.home),
             profile: self.profile.or(under.profile),
             download_dir: self.download_dir.or(under.download_dir),
+            pdf_paper: self.pdf_paper.or(under.pdf_paper),
             search_url: self.search_url.or(under.search_url),
             scale: self.scale.or(under.scale),
             scheme: self.scheme.or(under.scheme),
@@ -385,6 +391,14 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
                 &mut s.download_dir,
                 PathBuf::from(dir),
                 "one download directory at a time",
+            )?;
+            continue;
+        }
+        if let Some(text) = value_of(arg, "--pdf-paper", &mut args) {
+            once(
+                &mut s.pdf_paper,
+                save::Paper::parse(text)?,
+                "--pdf-paper once is enough",
             )?;
             continue;
         }
@@ -601,11 +615,12 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 23] = [
+const KEYS: [&str; 24] = [
     "home",
     "profile",
     "temp-profile",
     "download-dir",
+    "pdf-paper",
     "search-url",
     "scale",
     "color-scheme",
@@ -709,6 +724,7 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
                 }
             }
             "download-dir" => s.download_dir = Some(PathBuf::from(value)),
+            "pdf-paper" => s.pdf_paper = Some(save::Paper::parse(value).map_err(at)?),
             "search-url" => s.search_url = Some(parse_search_url(key, value).map_err(at)?),
             "scale" => s.scale = Some(Scale::parse(value).map_err(at)?),
             "color-scheme" => s.scheme = Some(appearance::Choice::parse(value).map_err(at)?),
@@ -822,6 +838,7 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
         download: s
             .download_dir
             .map_or(download::Choice::Default, download::Choice::At),
+        pdf_paper: s.pdf_paper,
         search_url: s.search_url,
         scale: s.scale.unwrap_or(Scale::Auto),
         scheme: s.scheme.unwrap_or_default(),
@@ -1222,6 +1239,37 @@ mod tests {
             let why = parsed(args).expect_err("refused");
             assert!(why.contains("--download-dir"), "{args:?}: {why}");
         }
+    }
+
+    #[test]
+    fn pdf_paper_comes_from_the_flag_or_the_file_and_the_flag_wins() {
+        for args in [&["--pdf-paper", "letter"][..], &["--pdf-paper=Letter"][..]] {
+            assert_eq!(
+                resolved(args).map(|o| o.pdf_paper),
+                Ok(Some(save::Paper::Letter))
+            );
+        }
+        assert_eq!(resolved(&[]).map(|o| o.pdf_paper), Ok(None), "the locale's");
+        assert_eq!(
+            parsed(&["--pdf-paper", "a4", "--pdf-paper", "a4"]),
+            Err("--pdf-paper once is enough".to_string())
+        );
+        assert_eq!(
+            parsed(&["--pdf-paper"]),
+            Err("--pdf-paper is a4 or letter, not \"\"".to_string())
+        );
+        assert_eq!(
+            file("pdf-paper = a5"),
+            Err("/c:1: --pdf-paper is a4 or letter, not \"a5\"".to_string())
+        );
+        let from_file = file("pdf-paper = a4").expect("file");
+        assert_eq!(from_file.pdf_paper, Some(save::Paper::A4));
+        let cli = parsed(&["--pdf-paper=letter"]).expect("cli");
+        let options = resolve(cli, Settings::default(), from_file.clone()).expect("resolves");
+        assert_eq!(options.pdf_paper, Some(save::Paper::Letter));
+        let options =
+            resolve(Settings::default(), Settings::default(), from_file).expect("resolves");
+        assert_eq!(options.pdf_paper, Some(save::Paper::A4));
     }
 
     #[test]

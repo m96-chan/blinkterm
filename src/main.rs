@@ -29,6 +29,9 @@ options:
   --download-dir <dir>  save files a page offers in <dir>
                    (default: $XDG_DOWNLOAD_DIR, the XDG_DOWNLOAD_DIR of
                    ~/.config/user-dirs.dirs, or ~/Downloads)
+  --pdf-paper <a4|letter>
+                   the paper alt+s prints on (default: letter where the
+                   locale is one of the countries that use it, else a4)
   --search-url <url>
                    send what is typed in the url bar and is not a url to
                    <url>, with %s where the words go (off by default: nothing

@@ -361,6 +361,8 @@ reopens the last session's tabs (see [The session](#the-session)), and
 `file-picker-terminal-multiple` name a program that chooses a file for a
 page's file input instead of the row (see
 [Choosing it with another program](#choosing-it-with-another-program)).
+`pdf-paper = a4|letter` (or `--pdf-paper`) is the paper `alt+s` prints on
+(see [Saving a page](#saving-a-page)).
 
 `--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
 repeatable. Four are refused because they would undo something this
