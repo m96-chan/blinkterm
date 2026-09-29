@@ -73,6 +73,10 @@ options:
                    send requests through a proxy (loopback never is)
   --mute           start the engine silent (--mute-audio); pages play and
                    cannot tell
+  --block-list <path>
+                   block requests to the hosts in <path>, and to every host
+                   under them (a hosts file, or one host per line); repeatable
+  --no-block       block nothing, whatever block-list says
   --home <url>     the page opened when no url is given (default: about:blank)
   --restore        reopen the tabs the last run had
   --normal-mode    start in normal mode (ctrl+., below)
