@@ -133,6 +133,7 @@ pub mod graphics;
 pub mod hints;
 pub mod history;
 pub mod hover;
+pub mod identity;
 pub mod input;
 pub mod json;
 pub mod keys;

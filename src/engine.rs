@@ -643,6 +643,12 @@ pub struct Engine {
     /// it is dropped after it: a kept profile's lock is let go, or a temporary
     /// one's directory removed, only once the process is gone.
     profile: Profile,
+    /// What this engine calls itself, from the `Browser.getVersion` that was
+    /// asked to know it was up. Kept because the user agent a page is told
+    /// ([`crate::identity`]) is this one with the headless token taken out,
+    /// and asking again later would be a second round trip for a string that
+    /// cannot change while the process lives.
+    agent: Option<String>,
 }
 
 /// What an [`Engine`] is without its profile: everything that dies with the
@@ -761,6 +767,11 @@ impl Engine {
         let ready = Client::browser(&process.exchange).and_then(|mut browser| {
             browser.call_within("Browser.getVersion", Json::empty(), timeout)
         });
+        let agent = ready
+            .as_ref()
+            .ok()
+            .and_then(|reply| reply.get("userAgent").and_then(Json::as_str))
+            .map(str::to_string);
         if let Err(err) = ready {
             process.stop();
             // The profile goes with the error, as it always has: a temporary
@@ -775,13 +786,22 @@ impl Engine {
                 timeout.as_secs()
             ));
         }
-        Ok(Engine { process, profile })
+        Ok(Engine {
+            process,
+            profile,
+            agent,
+        })
     }
 
     /// A client for the browser's own messages: the one that opens, closes,
     /// raises and attaches to pages. One at a time; see [`Client::browser`].
     pub fn browser(&self) -> Result<Client, String> {
         Client::browser(&self.process.exchange)
+    }
+
+    /// What the engine calls itself, as `Browser.getVersion` reported it.
+    pub fn agent(&self) -> Option<&str> {
+        self.agent.as_deref()
     }
 
     /// The profile it was started with.
@@ -871,6 +891,7 @@ impl Engine {
         let Engine {
             mut process,
             profile,
+            agent: _,
         } = self;
         process.stop();
         profile
