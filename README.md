@@ -284,6 +284,10 @@ reopens the last session's tabs (see [The session](#the-session)), and
 [Sound](#sound-permissions-and-fullscreen)). `tmux = on|off|auto`,
 `frames = raw|png|auto`, `fps = <n>` and `probe = false` are `--tmux`,
 `--frames`, `--fps` and `--no-probe` (see [Where it runs](#where-it-runs)).
+`file-picker`, `file-picker-terminal`, `file-picker-multiple` and
+`file-picker-terminal-multiple` name a program that chooses a file for a
+page's file input instead of the row (see
+[Choosing it with another program](#choosing-it-with-another-program)).
 
 `--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
 repeatable. Four are refused because they would undo something this
@@ -454,6 +458,74 @@ Two things a browser has that this does not: a page that uses the newer
 file-picker API (`showOpenFilePicker()`) is told no, and the row says "this
 page's file picker isn't supported"; and there is no drag and drop, which is
 not a thing a terminal has.
+
+### Choosing it with another program
+
+The row is what you get with nothing set. To see the files you are choosing
+from — an image for an image search, say — name a program in the settings
+and the click opens that instead
+([#58](https://github.com/m96-chan/blinkterm/issues/58)):
+
+    # a window of its own: Finder's dialog on a Mac, GTK's or KDE's on Linux
+    file-picker = osascript -e 'POSIX path of (choose file)'
+    file-picker = zenity --file-selection
+    file-picker = kdialog --getopenfilename {dir}
+    # something that runs in this terminal
+    file-picker-terminal = yazi --chooser-file={out} {dir}
+    file-picker-terminal = fzf
+    file-picker-terminal = kitten choose-files --write-output-to={out}
+
+(one of each, of course). `file-picker` is a program that opens a window and
+leaves the terminal alone: the page keeps drawing and the keys keep going to
+it while the window is open. `file-picker-terminal` is one that needs the
+terminal: `blinkterm` steps aside — the picture, the mouse, the keyboard
+modes, the screen — runs it, and comes back when it exits. They are two
+settings because nothing can tell the two kinds apart from outside, and they
+need the opposite. With both set, the window is used where there is a
+display (`$DISPLAY` or `$WAYLAND_DISPLAY`, or a Mac not reached over ssh)
+and the terminal one elsewhere, so one settings file does for the desk and
+for ssh; with one set, that one. Both are options too, `--file-picker` and
+`--file-picker-terminal`.
+
+The command is split into words the way a shell splits it — quotes and
+backslashes as a shell has them — and run without one: no `$VARIABLES`, no
+globs, no `~` except at the very start of a command in the file. Write
+`sh -c '…'` for a shell. `{dir}` is where the picker should start, by the
+row's own rule (the directory of the last upload, else where `blinkterm`
+was started), and it is also the picker's working directory. `{out}` is a
+new empty file, readable by you alone and removed afterwards, that the
+picker writes its answer to; without `{out}` the answer is what it prints.
+Neither is split again, so a directory with a space in it is still one
+argument.
+
+The answer is one path per line. Blank lines are nothing, a `file://` url
+is taken, and a relative path is under `{dir}` (which is what `fzf`
+prints). A picker that exits with anything but 0, or answers nothing, was
+cancelled — `osascript` and `zenity` exit 1 on Cancel, `fzf` 130 on `esc`,
+`yazi` writes nothing on `q` — and the page is told so, as it is by `esc`
+on the row. Whatever it chose is checked as a typed path is: absolute,
+there, a regular file, readable, no directories; one that fails sends
+nothing, the row says why, and the page is told the picker was dismissed.
+An input that takes one file gets the first path.
+
+For an input that takes several files, `file-picker-multiple` and
+`file-picker-terminal-multiple` are used instead, when they are set,
+because no flag means "several" to every picker:
+
+    file-picker-multiple = sh -c 'zenity --file-selection --multiple | tr "|" "\n"'
+    file-picker-terminal-multiple = fzf -m
+
+(`zenity` puts `|` between the files it was given, and a newline cannot be
+written in a value, so `tr` makes the lines.) Each stands in for its plain
+one and the other way round: with only `file-picker` set, a `multiple`
+input gets what it chose; with only `file-picker-multiple`, a plain input
+gets the first line.
+
+One picker runs at a time; a click on a file input while a window is
+open is told no at once. Closing the tab, the page going somewhere else,
+or quitting ends the picker, and what it would have chosen goes nowhere.
+While a terminal picker runs, `ctrl+c` is the picker's: `blinkterm`
+ignores it until the picker exits.
 
 ## Keys
 

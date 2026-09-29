@@ -109,7 +109,13 @@ machine. It prints a warning when it does. Do not browse as root.
   filesystem to offer names and sends none of it; the page's only word in
   the event is a node number, so nothing it says is drawn for this. No
   record of what was uploaded is kept, in the profile or anywhere
-  ([#11](https://github.com/m96-chan/blinkterm/issues/11)).
+  ([#11](https://github.com/m96-chan/blinkterm/issues/11)). With
+  `file-picker` or `file-picker-terminal` set, the click starts that
+  program instead — the one you named, run without a shell, with nothing
+  from the page in its arguments (`{dir}` is a directory of yours, `{out}` a
+  new file only you can read) — and what it answers goes through the same
+  checks before anything is sent
+  ([#58](https://github.com/m96-chan/blinkterm/issues/58)).
 
 - **Shared memory.** Frames go through POSIX shared memory objects named
   `blinkterm-<pid>-...` and unlinked by the terminal as it reads them — a

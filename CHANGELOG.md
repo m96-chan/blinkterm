@@ -12,6 +12,17 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- A page's file input can be answered by a program the settings name
+  instead of the row: `file-picker = <command>` for one with a window of
+  its own (Finder's dialog through `osascript`, `zenity`, `kdialog`),
+  which runs while the page keeps drawing, and `file-picker-terminal =
+  <command>` for one that needs the terminal (`yazi`, `fzf`, `kitten
+  choose-files`), which `blinkterm` steps aside for. `{dir}` and `{out}` in
+  the command; one path per line back, checked as a typed one is; a
+  non-zero exit or no answer is a cancel. `file-picker-multiple` and
+  `file-picker-terminal-multiple` for an input that takes several files,
+  and every one of them as an option too
+  ([#58](https://github.com/m96-chan/blinkterm/issues/58)).
 - Ready for crates.io: the one dependency is `libc`. The PNG and JPEG
   decoders, inflate, the tty helpers and the cell arithmetic that came from
   tOS as git revisions are copied into `src/`, and the tests' copy of tOS's
