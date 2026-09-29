@@ -9499,3 +9499,338 @@ fn a_page_that_crashed_is_still_blocked_after_its_reload() {
     browser.close();
     engine.kill();
 }
+
+use blinkterm::login::{self, Filled, Login, Site};
+
+/// The password command every login test runs: a dummy password and a user
+/// name, printed the way `pass` prints them.
+const PRINTS_A_LOGIN: &str = "sh -c 'printf \"secret\\nlogin: me\\n\"'";
+
+/// A password command with a window, run as the loop runs one — spawned,
+/// polled and pumped until it has exited — for `site`: what it printed.
+fn fetch_login(site: &Site) -> Login {
+    let command = picker::Command::parse("password-command", PRINTS_A_LOGIN).expect("a command");
+    let mut gui = login::Gui::spawn(&command, site, "T", &site.url, &std::env::temp_dir())
+        .expect("the command starts");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let readable = gui.fd().is_some_and(|fd| {
+            blinkterm::tty::poll_readable(&[fd], 50)
+                .expect("poll")
+                .contains(&fd)
+        });
+        match gui.pump(readable) {
+            Some(login::Outcome::Found(login)) => return login,
+            Some(other) => panic!("the command printed no login: {other:?}"),
+            None => {}
+        }
+        if gui.fd().is_none() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    panic!("the password command did not finish");
+}
+
+/// The fill, as `app::finish_login` sends it: the script in the world the
+/// find prompt uses, the login as its arguments.
+fn fill(client: &mut Client, context: i64, site: &Site, login: &Login) -> Option<Filled> {
+    let reply = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            login::fill_params(context, site, login),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers the fill");
+    login::filled(&reply)
+}
+
+/// A login form whose own scripts, in the page's world, say what they
+/// heard: every `input` event that reaches the document is counted, the
+/// title shows what the fields hold as their listeners see it, a submit is
+/// noted and stopped, and the user field's `value` is replaced on the
+/// element itself the way React replaces it, noting every write through it.
+fn login_form(title: &str) -> String {
+    format!(
+        "<!doctype html><meta charset=utf-8><title>loading</title>\
+         <body style='margin:0;background:#fff'>\
+         <form id=f action=/done>\
+         <input id=u name=username autocomplete=username>\
+         <input id=p type=password name=password>\
+         <button>Sign in</button></form>\
+         <script>\
+         window.inputs=0;window.changes=0;window.submitted=false;window.trapped=0;\
+         var u=document.getElementById('u'),p=document.getElementById('p');\
+         var own=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');\
+         Object.defineProperty(u,'value',{{configurable:true,\
+         get:function(){{return own.get.call(this)}},\
+         set:function(v){{window.trapped++;own.set.call(this,v)}}}});\
+         document.addEventListener('input',function(){{inputs++}});\
+         document.addEventListener('change',function(){{changes++}});\
+         var show=function(){{document.title='user='+u.value+' pass='+p.value}};\
+         u.addEventListener('input',show);p.addEventListener('input',show);\
+         document.getElementById('f').addEventListener('submit',function(e){{\
+         e.preventDefault();submitted=true}});\
+         onload=function(){{document.title='{title}'}};\
+         </script></body>"
+    )
+}
+
+/// An engine on a page this test serves, sized as the pane would be.
+fn logging_in(url: &str, title: &str) -> Option<(Engine, Client)> {
+    let (engine, mut client) = connect()?;
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    open(&mut client, url, title);
+    Some((engine, client))
+}
+
+/// `fill-login` on a login form at `http://localhost` (#65): the command's
+/// first line reaches the password field and its `login:` line the user
+/// field, through the engine's own setter rather than the one the page put
+/// on the element, and the page's own listeners — on the fields and on the
+/// document — hear `input` and `change` as they hear a person typing. The
+/// form is not submitted.
+#[test]
+fn a_login_form_on_localhost_is_filled_from_what_the_command_printed() {
+    let port = serve_pages(|_| vec![("/login".to_string(), login_form("ready"))]);
+    let url = format!("http://localhost:{port}/login");
+    let Some((mut engine, mut client)) = logging_in(&url, "ready") else {
+        return;
+    };
+    let site = login::site(&url).expect("localhost may be filled");
+    assert_eq!(site.host, "localhost");
+    let login = fetch_login(&site);
+    let context = find_world(&mut client);
+
+    assert_eq!(
+        fill(&mut client, context, &site, &login),
+        Some(Filled::Both)
+    );
+    assert_eq!(
+        wait_for_title(&mut client, "user=", Duration::from_secs(5)),
+        "user=me pass=secret",
+        "the page's listeners saw both values"
+    );
+    assert_eq!(evaluate(&mut client, "inputs").as_f64(), Some(2.0));
+    assert_eq!(evaluate(&mut client, "changes").as_f64(), Some(2.0));
+    assert_eq!(
+        evaluate(&mut client, "trapped").as_f64(),
+        Some(0.0),
+        "the page's own value setter was not the one used"
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.activeElement.id").as_str(),
+        Some("p"),
+        "left in the password field, as a person would be"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(evaluate(&mut client, "submitted").as_bool(), Some(false));
+    assert_eq!(
+        evaluate(&mut client, "location.pathname").as_str(),
+        Some("/login"),
+        "nothing was submitted"
+    );
+    assert_eq!(
+        login::sentence(Filled::Both, &site.host),
+        "filled login for localhost"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// A page on plain `http` to another machine is refused before any command
+/// runs ([`login::site`]); and the script, handed a login for that host
+/// anyway, refuses it too, because it checks each document's own scheme.
+/// `example.test` is sent to this machine by the engine's resolver, so that
+/// a host that is not a local one can be served here.
+#[test]
+fn a_page_without_https_is_refused_before_any_command_runs_and_by_the_script() {
+    let port = serve_pages(|_| vec![("/login".to_string(), login_form("ready"))]);
+    let launch = engine::Launch {
+        args: vec!["--host-resolver-rules=MAP example.test 127.0.0.1".to_string()],
+        ..engine::Launch::default()
+    };
+    let Some((mut engine, browser, mut client)) = launched(&launch) else {
+        return;
+    };
+    drop(browser);
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    let url = format!("http://example.test:{port}/login");
+    open(&mut client, &url, "ready");
+
+    assert_eq!(login::site(&url), Err(login::Refused::NotSecure));
+    // What the script would be given had the check above been skipped.
+    let site = Site {
+        host: "example.test".to_string(),
+        domain: "example.test".to_string(),
+        url: url.clone(),
+    };
+    let login = fetch_login(&site);
+    let context = find_world(&mut client);
+    assert_eq!(
+        fill(&mut client, context, &site, &login),
+        Some(Filled::Refused)
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.getElementById('p').value").as_str(),
+        Some("")
+    );
+    assert_eq!(evaluate(&mut client, "inputs").as_f64(), Some(0.0));
+
+    // And a login fetched for another host is not given to this one, on
+    // a page it could otherwise fill.
+    let port = serve_pages(|_| vec![("/login".to_string(), login_form("again"))]);
+    open(
+        &mut client,
+        &format!("http://localhost:{port}/login"),
+        "again",
+    );
+    let elsewhere = login::site("http://127.0.0.1/").expect("a site");
+    let context = find_world(&mut client);
+    assert_eq!(
+        fill(&mut client, context, &elsewhere, &login),
+        Some(Filled::Refused),
+        "the host the secret was fetched for is not this page's"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// A login form inside a frame of the page's own origin is filled; one in a
+/// frame of another origin is out of reach, and the page with only that has
+/// no password field as far as the fill can tell.
+#[test]
+fn a_same_origin_frame_is_filled_and_a_cross_origin_one_is_not() {
+    let port = serve_pages(|port| {
+        vec![
+            ("/login".to_string(), login_form("inner")),
+            (
+                "/same".to_string(),
+                format!(
+                    "<!doctype html><title>loading</title><body>\
+                     <p>A page with its login in a frame.</p>\
+                     <iframe id=frame src='http://127.0.0.1:{port}/login'></iframe>\
+                     <script>onload=function(){{document.title='same'}}</script></body>"
+                ),
+            ),
+            (
+                "/cross".to_string(),
+                format!(
+                    "<!doctype html><title>loading</title><body>\
+                     <iframe id=frame src='http://localhost:{port}/login'></iframe>\
+                     <script>onload=function(){{document.title='cross'}}</script></body>"
+                ),
+            ),
+        ]
+    });
+    let url = format!("http://127.0.0.1:{port}/same");
+    let Some((mut engine, mut client)) = logging_in(&url, "same") else {
+        return;
+    };
+    let site = login::site(&url).expect("127.0.0.1 may be filled");
+    let login = fetch_login(&site);
+    let context = find_world(&mut client);
+    assert_eq!(
+        fill(&mut client, context, &site, &login),
+        Some(Filled::Both)
+    );
+    let inner = "document.getElementById('frame').contentDocument";
+    assert_eq!(
+        evaluate(&mut client, &format!("{inner}.title")).as_str(),
+        Some("user=me pass=secret")
+    );
+    assert_eq!(
+        evaluate(
+            &mut client,
+            "document.getElementById('frame').contentWindow.inputs"
+        )
+        .as_f64(),
+        Some(2.0),
+        "the frame's own listeners heard it"
+    );
+
+    let url = format!("http://127.0.0.1:{port}/cross");
+    open(&mut client, &url, "cross");
+    assert_eq!(
+        evaluate(
+            &mut client,
+            "document.getElementById('frame').contentDocument === null"
+        )
+        .as_bool(),
+        Some(true),
+        "the frame really is another origin"
+    );
+    let context = find_world(&mut client);
+    assert_eq!(
+        fill(&mut client, context, &site, &login),
+        Some(Filled::NoField)
+    );
+    assert_eq!(
+        login::sentence(Filled::NoField, &site.host),
+        "no password field on this page"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// With two login forms on a page, the one the focus is in is the one
+/// filled; with the focus nowhere, the first.
+#[test]
+fn the_form_with_the_focus_is_the_one_filled() {
+    let page = "<!doctype html><meta charset=utf-8><title>loading</title><body>\
+         <form id=a><input id=au name=email type=email><input id=ap type=password></form>\
+         <form id=b><input id=search name=q>\
+         <input id=bu name=login><input id=bx name=other><input id=bp type=password></form>\
+         <input id=hidden type=password style='display:none'>\
+         <script>onload=function(){document.title='two'}</script></body>"
+        .to_string();
+    let port = serve_pages(|_| vec![("/two".to_string(), page)]);
+    let url = format!("http://127.0.0.1:{port}/two");
+    let Some((mut engine, mut client)) = logging_in(&url, "two") else {
+        return;
+    };
+    let site = login::site(&url).expect("a site");
+    let login = fetch_login(&site);
+    let values = |client: &mut Client| {
+        evaluate(
+            client,
+            "['au','ap','search','bu','bx','bp','hidden']\
+             .map(function(id){return document.getElementById(id).value}).join(',')",
+        )
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+    };
+
+    evaluate(&mut client, "document.getElementById('bx').focus()");
+    let context = find_world(&mut client);
+    assert_eq!(
+        fill(&mut client, context, &site, &login),
+        Some(Filled::Both)
+    );
+    assert_eq!(
+        values(&mut client),
+        ",,,me,,secret,",
+        "the focused form, and its field that says login rather than the nearest"
+    );
+
+    open(&mut client, &url, "two");
+    evaluate(&mut client, "document.activeElement.blur()");
+    let context = find_world(&mut client);
+    assert_eq!(
+        fill(&mut client, context, &site, &login),
+        Some(Filled::Both)
+    );
+    assert_eq!(values(&mut client), "me,secret,,,,,");
+
+    client.close();
+    engine.kill();
+}
