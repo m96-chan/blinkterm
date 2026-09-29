@@ -632,8 +632,14 @@ impl Parser {
             }
         }
         let params_from = at;
+        // A mouse report's coordinates may be negative: in SGR-Pixels (1016)
+        // Kitty, xterm, Ghostty and foot say where a pointer that left the
+        // window is, and it is left of or above it. A `-` is an intermediate
+        // byte anywhere else, and taking it for one here cut the report at
+        // the byte after it and typed the rest into the page (#54).
+        let signed = prefix == Some(b'<');
         while let Some(&byte) = self.buf.get(at) {
-            if (0x30..=0x3b).contains(&byte) {
+            if (0x30..=0x3b).contains(&byte) || (signed && byte == b'-') {
                 at += 1;
             } else {
                 break;
@@ -822,10 +828,17 @@ fn parse_params(bytes: &[u8]) -> Vec<Vec<u32>> {
         .split(|&b| b == b';')
         .map(|part| {
             part.split(|&b| b == b':')
-                .map(|number| {
-                    number
+                .map(|number| match number.first() {
+                    // Negative, which only a mouse report lets through: less
+                    // than every coordinate there is, and [`mouse`] says what
+                    // that becomes.
+                    Some(b'-') => 0,
+                    _ => number
                         .iter()
-                        .fold(0u32, |acc, &b| acc.saturating_mul(10) + (b - b'0') as u32)
+                        .filter(|b| b.is_ascii_digit())
+                        .fold(0u32, |acc, &b| {
+                            acc.saturating_mul(10).saturating_add((b - b'0') as u32)
+                        }),
                 })
                 .collect()
         })
@@ -992,8 +1005,13 @@ fn mouse(params: &[Vec<u32>], released: bool) -> Option<MouseInput> {
         return None;
     }
     let code = number(params, 0, 0);
-    let x = number(params, 1, 0);
-    let y = number(params, 2, 0);
+    // One-based, so anything below one is outside the pane on that side: a
+    // pointer dragged out of the window, which Kitty and others report as
+    // negative in pixels. It is taken as the edge it left by. The report
+    // itself is kept, because it may be the release that ends a drag, and a
+    // release that went missing would leave the page holding the button.
+    let x = number(params, 1, 0).max(1);
+    let y = number(params, 2, 0).max(1);
 
     let mut mods = Mods::default();
     if code & 4 != 0 {
@@ -1266,6 +1284,41 @@ mod tests {
         assert_eq!(right.button, Some(2));
         let middle = one_mouse(b"\x1b[<1;1;1M");
         assert_eq!(middle.button, Some(1));
+    }
+
+    /// A pointer that left the window is reported with a negative
+    /// coordinate in pixels. It is one report, at the edge, and nothing of
+    /// it is typed: before #54 the `-` ended it and `;40M` went to the page.
+    #[test]
+    fn a_report_from_outside_the_window_is_a_report_at_its_edge() {
+        let left = one_mouse(b"\x1b[<35;-5;40M");
+        assert_eq!((left.kind, left.x, left.y), (MouseKind::Move, 1, 40));
+        let above = one_mouse(b"\x1b[<32;1200;-3M");
+        assert_eq!(
+            (above.kind, above.button, above.x, above.y),
+            (MouseKind::Move, Some(0), 1200, 1)
+        );
+
+        // The release that ends a drag outside the window still ends it.
+        let release = one_mouse(b"\x1b[<0;-1;-1m");
+        assert_eq!(
+            (release.kind, release.button, release.x, release.y),
+            (MouseKind::Release, Some(0), 1, 1)
+        );
+
+        // And what comes after it is read as what it is.
+        assert_eq!(
+            feed(b"\x1b[<35;-5;40Ma"),
+            vec![Input::Mouse(left), Input::Key(one_key(b"a"))]
+        );
+        // Split anywhere, including right after the minus.
+        let whole = b"\x1b[<35;-5;40M";
+        for cut in 1..whole.len() {
+            let mut parser = Parser::new();
+            let mut out = parser.feed(&whole[..cut]);
+            out.extend(parser.feed(&whole[cut..]));
+            assert_eq!(out, vec![Input::Mouse(left)], "cut at {cut}");
+        }
     }
 
     #[test]
