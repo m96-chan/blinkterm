@@ -10,6 +10,17 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Fixed
+
+- A page that changed while its lossless still was being taken could be
+  left showing the still from before the change, sharp and wrong, until
+  something else moved it — a script's late paint, a slow machine, a
+  Retina pane where a still takes longest. A screencast frame is now told
+  from the still's own by what it shows rather than by when it was
+  stamped: one that shows something new always gets a still of its own.
+  A page at rest still costs one still, or two at `--scale 2`, and never
+  starts the flicker loop again.
+
 ## [0.3.0] - 2026-10-01
 
 ### Added

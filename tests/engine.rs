@@ -2286,7 +2286,7 @@ fn scroll_y(client: &mut Client) -> f64 {
 /// `Page.screencastFrame` carries `metadata.scrollOffsetY`, which is the
 /// number the whole of this section is about: it is what the person sees move.
 /// Acknowledges everything it takes, as the program does.
-fn take_offsets(client: &mut Client) -> Vec<(f64, Option<f64>)> {
+fn take_offsets(client: &mut Client) -> Vec<(f64, Option<f64>, motion::Picture)> {
     let mut frames = Vec::new();
     for event in client.events() {
         if event.method != "Page.screencastFrame" {
@@ -2309,7 +2309,17 @@ fn take_offsets(client: &mut Client) -> Vec<(f64, Option<f64>)> {
             .params
             .path(&["metadata", "timestamp"])
             .and_then(Json::as_f64);
-        frames.push((offset, stamp));
+        // What the frame shows, from its bytes as they came, which is what
+        // the program tells the policy.
+        let picture = motion::Picture::of(
+            event
+                .params
+                .get("data")
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        frames.push((offset, stamp, picture));
     }
     frames
 }
@@ -2546,9 +2556,9 @@ fn roll(client: &mut Client, notches: u32, apart: Duration) -> Roll {
         if let Some(when) = wheel.activity() {
             rest.input(when);
         }
-        for (offset, stamp) in take_offsets(client) {
+        for (offset, stamp, picture) in take_offsets(client) {
             let seen = Instant::now();
-            rest.motion_frame(stamp, seen);
+            rest.motion_frame(stamp, picture, seen);
             roll.frames.push((offset - was, seen));
             was = offset;
         }
@@ -2615,10 +2625,15 @@ const EVERY: Duration = Duration::from_millis(50);
 const STEADY: u32 = 6;
 const STEADILY: Duration = Duration::from_millis(100);
 
+/// One still of [`shutter_rounds`]: when it was asked for, when its reply
+/// was taken, and every frame it provoked — its stamp, and whether it showed
+/// the same picture as the frame before it.
+type ShutterRound = (f64, f64, Vec<(f64, bool)>);
+
 /// Stills of a page nobody is touching, at a device scale of `scale`: for
 /// each, when it was asked for, when its reply was taken, and the stamps of
 /// every screencast frame it provoked, in wall-clock seconds.
-fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<(f64, f64, Vec<f64>)> {
+fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<ShutterRound> {
     prepare(client);
     article(client, WIDE, TALL);
     client
@@ -2642,8 +2657,11 @@ fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<(f64, f64, Vec<f64>)> 
     // Let the load's own frames go by, and check that a page nobody is
     // touching then produces none of its own.
     let settle = Instant::now() + Duration::from_secs(2);
+    let mut last = None;
     while Instant::now() < settle {
-        take_frames(client);
+        if let Some((bytes, _)) = take_frames(client).pop() {
+            last = Some(motion::Picture::of(&bytes));
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut idle = 0usize;
@@ -2673,11 +2691,19 @@ fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<(f64, f64, Vec<f64>)> 
             "a still with no picture in it"
         );
         // Everything the screenshot provoked, including anything that was
-        // already queued when the reply was taken.
+        // already queued when the reply was taken, and whether each showed
+        // the same picture as the frame before it — see "The picture, not
+        // the clock" in `motion`.
         let mut stamps = Vec::new();
         let until = Instant::now() + Duration::from_millis(600);
         while Instant::now() < until {
-            stamps.extend(take_frames(client).into_iter().filter_map(|(_, at)| at));
+            for (bytes, at) in take_frames(client) {
+                let picture = motion::Picture::of(&bytes);
+                let repeat = last.replace(picture) == Some(picture);
+                if let Some(at) = at {
+                    stamps.push((at, repeat));
+                }
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
         eprintln!(
@@ -2686,7 +2712,11 @@ fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<(f64, f64, Vec<f64>)> 
             stamps.len(),
             stamps
                 .iter()
-                .map(|at| format!("{:+.0}", (at - requested) * 1000.0))
+                .map(|(at, repeat)| format!(
+                    "{:+.0}{}",
+                    (at - requested) * 1000.0,
+                    if *repeat { "" } else { " new" }
+                ))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
@@ -2718,11 +2748,14 @@ fn a_still_photographs_itself_into_the_screencast_exactly_once() {
     let timed = !skip_timing_on_shared_runner("the shutter frame's stamp");
     for (requested, replied, stamps) in shutter_rounds(&mut client, 1.0) {
         assert_eq!(stamps.len(), 1, "a still provoked {} frames", stamps.len());
-        // And it is stamped inside the still's own window, which is what
-        // makes crediting the still with its reply enough to keep it off the
-        // screen.
+        let (stamp, repeat) = stamps[0];
+        // It shows, byte for byte, the frame before it, which is what the
+        // policy tells it from the page by: were it not so, every rest at
+        // scale 1 would cost two stills rather than one.
+        assert!(repeat, "the shutter frame is a new picture");
+        // And it is stamped inside the still's own window.
         assert!(
-            !timed || (stamps[0] >= requested && stamps[0] <= replied),
+            !timed || (stamp >= requested && stamp <= replied),
             "the shutter frame is stamped outside the still it belongs to"
         );
     }
@@ -2749,7 +2782,7 @@ fn at_scale_two_a_still_photographs_itself_at_most_twice_and_within_its_window()
             stamps.len()
         );
         let took = (replied - requested).max(motion::SHUTTER_GRACE.as_secs_f64());
-        for stamp in stamps {
+        for (stamp, _) in stamps {
             assert!(
                 !timed || (stamp >= requested && stamp <= replied + took),
                 "a shutter frame at {:+.0} ms, past the window",
@@ -2767,27 +2800,53 @@ const LATE_BOX: &str = "setTimeout(function(){var d=document.createElement('div'
 d.style.cssText='position:absolute;z-index:9;left:200px;top:100px;width:80px;height:50px;background:#000';\
 document.body.appendChild(d)},700)";
 
+/// The same box, 100 ms after it is asked for rather than 700.
+const SOON_BOX: &str = "setTimeout(function(){var d=document.createElement('div');\
+d.style.cssText='position:absolute;z-index:9;left:200px;top:100px;width:80px;height:50px;background:#000';\
+document.body.appendChild(d)},100)";
+
+/// How [`run_the_rest_policy`] treats its first still.
+#[derive(Clone, Copy)]
+enum FirstStill {
+    /// As the program does: its reply is read as soon as it is there.
+    Prompt,
+    /// [`SOON_BOX`] is set off as it goes out, and then nothing at all is
+    /// read for as long as given — the shared macOS VM descheduling the
+    /// loop, or a still at scale 2 taking that long — after which the reply
+    /// is read before the frames that came meanwhile. The page changes while
+    /// the still is out, after it was taken.
+    Slow(Duration),
+}
+
 /// The program's loop, cut down to what paints: frames told to the policy
 /// and painted when it says so, stills asked for when it says so and
-/// painted when it says so. What it returns is what the pane ends on — the
-/// last still, if the last thing painted was a still — and how many stills
-/// were asked for in the last `tail` of the run.
+/// painted when it says so. A reply is read before the frames of the same
+/// pass, the order that makes the policy's job the hardest.
+///
+/// It runs for at least `run`, and then until the policy has been at rest
+/// for `tail`, so that a slow machine is given the time it needs rather than
+/// the time a fast one would; a policy that never comes to rest runs until a
+/// deadline. What it returns is what the pane ends on — the last still, if
+/// the last thing painted was a still — and how many stills were asked for
+/// in the last `tail` of the run.
 fn run_the_rest_policy(
     client: &mut Client,
     run: Duration,
     tail: Duration,
+    first: FirstStill,
 ) -> (Option<Vec<u8>>, usize) {
     let started = Instant::now();
+    let give_up = started + run + Duration::from_secs(20);
     let mut rest = Motion::new(started);
     let mut in_flight: Option<Pending> = None;
     let mut on_screen: Option<Vec<u8>> = None;
     let mut asked = Vec::new();
-    while started.elapsed() < run {
+    let mut at_rest_since: Option<Instant> = None;
+    loop {
         let now = Instant::now();
-        for (_, stamp) in take_frames(client) {
-            if rest.motion_frame(stamp, Instant::now()) {
-                on_screen = None;
-            }
+        let settled = at_rest_since.is_some_and(|since| now.duration_since(since) >= tail);
+        if (started.elapsed() >= run && settled) || now >= give_up {
+            break;
         }
         if let Some(pending) = &in_flight {
             if let Some(reply) = client.take_reply(pending) {
@@ -2800,24 +2859,43 @@ fn run_the_rest_policy(
                 }
             }
         }
-        if in_flight.is_none() && rest.wants_still(now) {
+        for (bytes, stamp) in take_frames(client) {
+            let picture = motion::Picture::of(&bytes);
+            let painted = rest.motion_frame(stamp, picture, Instant::now());
+            if painted {
+                on_screen = None;
+            }
+        }
+        if in_flight.is_none() && rest.wants_still(Instant::now()) {
+            // The clock is read before the request, as the program reads it.
+            let at = motion::now_seconds();
             in_flight = Some(ask_for_a_still(client));
-            rest.still_requested(motion::now_seconds());
+            rest.still_requested(at);
             asked.push(started.elapsed());
+            if let (FirstStill::Slow(hold), 1) = (first, asked.len()) {
+                evaluate(client, SOON_BOX);
+                std::thread::sleep(hold);
+                continue;
+            }
+        }
+        if rest.at_rest() {
+            at_rest_since.get_or_insert(Instant::now());
+        } else {
+            at_rest_since = None;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let late = asked.iter().filter(|at| **at + tail >= run).count();
-    eprintln!("stills asked for at {asked:?}");
+    let ran = started.elapsed();
+    let late = asked.iter().filter(|at| **at + tail >= ran).count();
+    eprintln!("stills asked for at {asked:?}, in a run of {ran:?}");
     (on_screen, late)
 }
 
-/// After a load that paints late, at scale 1 and at 2, under forced
-/// transparency: the pane ends on a still, the still shows the late change,
-/// its forced-transparent parts are clear, and once the page is quiet no
-/// more stills are asked for.
-#[test]
-fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
+/// A page that changes once, late, at scale 1 and at 2, under forced
+/// transparency, the policy run over it as the program runs it: the pane
+/// ends on a still, the still shows the late change, its forced-transparent
+/// parts are clear, and once the page is quiet no more stills are asked for.
+fn a_late_change_at_either_scale(first: FirstStill) {
     let Some((mut engine, mut client)) = connect() else {
         return;
     };
@@ -2849,9 +2927,15 @@ fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
             wait_for_title(&mut client, "article", Duration::from_secs(15)),
             "article"
         );
-        evaluate(&mut client, LATE_BOX);
-        let (still, late) =
-            run_the_rest_policy(&mut client, Duration::from_secs(5), Duration::from_secs(2));
+        if let FirstStill::Prompt = first {
+            evaluate(&mut client, LATE_BOX);
+        }
+        let (still, late) = run_the_rest_policy(
+            &mut client,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            first,
+        );
         let _ = client.call("Page.stopScreencast", Json::empty());
         let png = still.expect("the pane ends on a still, not a moving frame");
         let image = blinkterm::png::decode(&png, 64 << 20).expect("a still decodes");
@@ -2876,6 +2960,23 @@ fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
     }
     client.close();
     engine.kill();
+}
+
+/// After a load that paints late: see [`a_late_change_at_either_scale`].
+#[test]
+fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
+    a_late_change_at_either_scale(FirstStill::Prompt);
+}
+
+/// The same, with the change made while a slow still is out, after it was
+/// taken, and the frame that shows it read only after the still's reply —
+/// which is how the shared macOS VM ended a pane at scale 2 on a still from
+/// before the change, deterministically. The still is newer by the clock of
+/// its reply and older by what it shows; see "The picture, not the clock"
+/// in [`motion`].
+#[test]
+fn a_change_while_a_slow_still_is_out_ends_on_a_still_that_shows_it() {
+    a_late_change_at_either_scale(FirstStill::Slow(Duration::from_millis(700)));
 }
 
 /// One notch is an animation that arrives and stops.
