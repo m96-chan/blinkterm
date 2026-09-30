@@ -1245,6 +1245,12 @@ pub fn boot(
         }
     }
     let mut first = Tab::new(first, client, "about:blank");
+    // Nor is it a visit. On a Mac it is that directory listing, `file:///`,
+    // loaded and committed by the time the tab first comes to the front, so
+    // [`activate`]'s direct question (#70) would write it into the history
+    // on every start. Its first navigation lands, and a landing makes the
+    // count due again for the page the person asked for.
+    first.counted = Counted::Yes;
     first.frame = frame;
     first.site_scripts = scripts;
     Ok(Booted {
