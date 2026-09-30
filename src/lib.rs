@@ -131,6 +131,8 @@ pub mod bookmarks;
 pub mod cdp;
 pub mod chroma;
 pub mod clipboard;
+pub mod console;
+pub mod consolelist;
 pub mod dialog;
 pub mod doctor;
 pub mod download;

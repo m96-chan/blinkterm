@@ -104,6 +104,7 @@ options:
                    all.css for every page (default:
                    $XDG_CONFIG_HOME/blinkterm/sites, ~/.config/blinkterm/sites)
   --no-sites       read no site styles or scripts
+  --no-console     do not listen to the page's console (ctrl+shift+j)
   --home <url>     the page opened when no url is given (default: about:blank)
   --restore        reopen the tabs the last run had
   --normal-mode    start in normal mode (ctrl+., below)
@@ -183,6 +184,9 @@ keys:
   ctrl+shift+h   the history list (alt+h too): type words to filter, enter
                  opens here, alt+enter or ctrl+enter in a new tab,
                  shift+delete forgets the page
+  ctrl+shift+j   the page's console (alt+j too): what it logged, threw and
+                 failed to fetch, newest last; type words to filter, esc
+                 closes; the row counts its errors until you look
   ctrl+shift+pageup/pagedown
                  move this tab left, right (alt+shift+pageup/pagedown too)
   middle click or ctrl+click on a link

@@ -57,6 +57,14 @@ flag, a different default, a raised Rust floor all do.
   directory, and `--no-sites` (`sites = false`) none. A file or directory
   that another user could write is refused by name
   ([#66](https://github.com/m96-chan/blinkterm/issues/66)).
+- The page's console: `ctrl+shift+j` (or `alt+j`) shows what the page in
+  front logged, threw and failed to fetch over the screen, newest last, each
+  row the level, the text and where it came from, with a `-- navigated to`
+  row between pages. Words typed in any order filter it; `esc` or `enter`
+  closes it. The row says `2 errors` until you look. The last 1000 per tab,
+  in memory only; `console = false` or `--no-console` turns it off.
+  `console` in a `key.` line
+  ([#67](https://github.com/m96-chan/blinkterm/issues/67)).
 
 ### Changed
 

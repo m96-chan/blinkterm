@@ -231,6 +231,8 @@ pub enum Action {
     ToggleNormal,
     /// `ctrl+shift+h`: the history list. See [`crate::historylist`].
     History,
+    /// `ctrl+shift+j`: the page's console. See [`crate::consolelist`].
+    Console,
     /// `alt+b`: blocking off for the site in front, or on again. See
     /// [`crate::block`].
     Block,
@@ -258,9 +260,9 @@ const TAB_NAMES: &str = "tab-1 .. tab-8";
 /// [`Action::every`] and [`defaults`] expand it.
 ///
 /// The keys are the documented spellings, not every press the built-in table
-/// answers: it reads shift only for `tab`, `t`, `a`, `h`, `r`, `s` and the page keys, so
-/// `ctrl+shift+=` zooms in too, and a chord is exact.
-pub const ACTIONS: [Row; 32] = [
+/// answers: it reads shift only for `tab`, `t`, `a`, `h`, `j`, `r`, `s` and the page keys,
+/// so `ctrl+shift+=` zooms in too, and a chord is exact.
+pub const ACTIONS: [Row; 33] = [
     Row {
         name: "quit",
         action: Action::Quit,
@@ -350,6 +352,12 @@ pub const ACTIONS: [Row; 32] = [
         action: Action::History,
         keys: "ctrl+shift+h, alt+h",
         what: "the history list",
+    },
+    Row {
+        name: "console",
+        action: Action::Console,
+        keys: "ctrl+shift+j, alt+j",
+        what: "the page's console: logs, errors and failed requests",
     },
     Row {
         name: "move-tab-left",

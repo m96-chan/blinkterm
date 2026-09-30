@@ -3400,6 +3400,18 @@ fn serve_troubles() -> (String, u16) {
                             .to_string(),
                     ),
                     "/links" => ("200 OK", String::new(), LINKS.to_string()),
+                    // Something in each of the ways a console hears.
+                    "/console" => (
+                        "200 OK",
+                        String::new(),
+                        format!(
+                            "<!doctype html><title>start</title><script>\
+                         console.log('hello',1,{{a:2}});\
+                         setTimeout(function(){{throw new Error('boom')}},0);\
+                         onload=function(){{setTimeout(function(){{document.title='done'}},100)}};\
+                         </script><img src='/404'><img src='{dead}x.png'>"
+                        ),
+                    ),
                     _ => (
                         "200 OK",
                         String::new(),
@@ -8955,6 +8967,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &Allowed::in_memory(),
         None,
         &Sites::none(),
+        None,
     )
     .expect("the engine boots");
     let base = serve();
@@ -9041,6 +9054,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &Allowed::in_memory(),
         None,
         &Sites::none(),
+        None,
     )
     .expect("a second engine on the same profile");
     blinkterm::app::restore_tabs(
@@ -9340,6 +9354,7 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
         &allowed,
         None,
         &Sites::none(),
+        None,
     )
     .expect("the engine boots");
     let names = [
@@ -10094,6 +10109,7 @@ fn a_url_handed_over_the_socket_becomes_the_tab_in_front() {
         &Allowed::in_memory(),
         None,
         &Sites::none(),
+        None,
     )
     .expect("the engine boots");
     let base = serve();
@@ -10193,6 +10209,11 @@ const HEAVY: usize = 300;
 /// The engine booted as the program boots it, with `--host-resolver-rules`
 /// sending `*.test` to this machine and the blocker given or not.
 fn booted_blocking(blocker: Option<&Arc<Blocker>>) -> Booted {
+    booted_with(blocker, None)
+}
+
+/// The same, with the console's recorder given or not.
+fn booted_with(blocker: Option<&Arc<Blocker>>, console: Option<&Arc<Recorder>>) -> Booted {
     let downloads = temp_dir("block-downloads");
     let appearance = blinkterm::appearance::Appearance::new(
         blinkterm::appearance::Choice::Auto,
@@ -10211,6 +10232,7 @@ fn booted_blocking(blocker: Option<&Arc<Blocker>>) -> Booted {
         &Allowed::in_memory(),
         blocker,
         &Sites::none(),
+        console,
     )
     .expect("the engine boots")
 }
@@ -11714,5 +11736,461 @@ fn the_reader_is_dark_when_the_page_is_told_dark_and_light_otherwise() {
     assert_eq!(wait_until(&mut client, 0, corner), 0, "and light");
 
     client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// The console
+// ---------------------------------------------------------------------------
+//
+// What `ctrl+shift+j` shows, recorded the way the program records it: a
+// `console::Recorder` in front of the routing on the pipe's reader thread,
+// and `Runtime.enable` and `Log.enable` on the page's session, as
+// `app::prepare_session` sends them.
+
+use blinkterm::console::{self as page_console, Level, Recorder, Source};
+
+/// The console's hook on this engine and its two domains on this page's
+/// session, as the program has them; the recorder, to read back.
+fn consoled(engine: &Engine, client: &mut Client) -> Arc<Recorder> {
+    let recorder = Arc::new(Recorder::new());
+    engine.intercept(Some(
+        Arc::clone(&recorder) as Arc<dyn blinkterm::cdp::Intercept>
+    ));
+    for method in ["Page.enable", "Runtime.enable", "Log.enable"] {
+        client.call(method, Json::empty()).expect(method);
+    }
+    // What the engine's own first page said, replayed by the enable, as
+    // `app::boot` forgets it.
+    recorder.forget(client.session().expect("a page's session"));
+    recorder
+}
+
+/// The entries on `session` once `count` of them are there, or whatever is
+/// there when `timeout` runs out.
+fn entries_when(
+    recorder: &Recorder,
+    session: &str,
+    count: usize,
+    timeout: Duration,
+) -> Vec<page_console::Entry> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let entries = recorder.entries(session);
+        if entries.len() >= count || Instant::now() >= deadline {
+            return entries;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The methods the console's domains send, none of which a mailbox should
+/// ever hold.
+const CONSOLE_EVENTS: [&str; 5] = [
+    "Runtime.consoleAPICalled",
+    "Runtime.exceptionThrown",
+    "Log.entryAdded",
+    "Runtime.executionContextCreated",
+    "Runtime.executionContextDestroyed",
+];
+
+/// A page that says something in each of the ways a console hears: a
+/// `console.log` of a string, a number and an object, an exception nobody
+/// caught, an image the server answers 404 for and an image on a port
+/// nobody listens on. One entry each, and none of it in the page's mailbox.
+#[test]
+fn a_page_that_logs_throws_and_404s_an_image_fills_the_console_with_one_entry_each() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let recorder = consoled(&engine, &mut client);
+    let session = client.session().expect("a page's session").to_string();
+    viewport(&mut client);
+    let (base, closed) = serve_troubles();
+    let broken = format!("{base}/404");
+    let refused = format!("http://127.0.0.1:{closed}/x.png");
+    let page = format!("{base}/console");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(&page))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(&mut client, "done", Duration::from_secs(10)),
+        "done"
+    );
+    let entries = entries_when(&recorder, &session, 4, Duration::from_secs(3));
+    // Anything late would have come by now.
+    std::thread::sleep(Duration::from_millis(300));
+    let entries = if entries.len() < recorder.entries(&session).len() {
+        recorder.entries(&session)
+    } else {
+        entries
+    };
+    for entry in &entries {
+        eprintln!(
+            "{:?} {:?} {:?} {:?}",
+            entry.level, entry.source, entry.text, entry.place
+        );
+    }
+
+    let logged: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == Source::Console)
+        .collect();
+    assert_eq!(logged.len(), 1, "{entries:?}");
+    assert_eq!(logged[0].level, Level::Log);
+    assert_eq!(logged[0].text, "hello 1 {a: 2}");
+    assert_eq!(logged[0].place, format!("{page}:1"));
+
+    let thrown: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == Source::Exception)
+        .collect();
+    assert_eq!(thrown.len(), 1, "{entries:?}");
+    assert_eq!(thrown[0].level, Level::Error);
+    assert!(
+        thrown[0].text.starts_with("Uncaught Error: boom"),
+        "{:?}",
+        thrown[0].text
+    );
+    assert_eq!(thrown[0].place, format!("{page}:1"));
+
+    let failed: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == Source::Network)
+        .collect();
+    let not_found: Vec<_> = failed
+        .iter()
+        .filter(|entry| entry.place == broken)
+        .collect();
+    assert_eq!(not_found.len(), 1, "{entries:?}");
+    assert_eq!(not_found[0].level, Level::Error);
+    assert!(not_found[0].text.contains("404"), "{:?}", not_found[0].text);
+    let refusal: Vec<_> = failed
+        .iter()
+        .filter(|entry| entry.place == refused)
+        .collect();
+    assert_eq!(refusal.len(), 1, "{entries:?}");
+    assert_eq!(refusal[0].level, Level::Error);
+    assert!(
+        refusal[0].text.contains("ERR_CONNECTION_REFUSED"),
+        "{:?}",
+        refusal[0].text
+    );
+    assert_eq!(
+        entries.len(),
+        4,
+        "one entry each and nothing twice: {entries:?}"
+    );
+
+    let heard: Vec<String> = client
+        .events()
+        .into_iter()
+        .map(|event| event.method)
+        .filter(|method| CONSOLE_EVENTS.contains(&method.as_str()))
+        .collect();
+    assert!(heard.is_empty(), "the mailbox heard {heard:?}");
+
+    assert_eq!(recorder.words(Some(&session)).as_deref(), Some("3 errors"));
+    recorder.opened(&session);
+    assert_eq!(recorder.words(Some(&session)), None);
+
+    // Told again, as a revived page or a colour re-learn tells it: nothing
+    // is reported twice.
+    for method in ["Runtime.enable", "Log.enable"] {
+        client.call(method, Json::empty()).expect(method);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(recorder.entries(&session).len(), entries.len());
+    client.close();
+    engine.kill();
+}
+
+/// Two thousand lines logged by the document's own script, between its
+/// landing and its load: without the recorder they are two thousand events
+/// in a mailbox that keeps 512, and the landing would be the first to go.
+#[test]
+fn a_burst_of_two_thousand_logs_keeps_the_newest_thousand_and_loses_no_page_event() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let recorder = consoled(&engine, &mut client);
+    let session = client.session().expect("a page's session").to_string();
+    viewport(&mut client);
+    let mut tab = Tab::new("t", client, "about:blank");
+    let page = "data:text/html,<title>burst</title><script>\
+for(var i=0;i<2000;i++){console.log('line '+i)}</script>";
+    navigate_tab(&mut tab, page);
+    let landings = follow(&mut tab, Duration::from_secs(10));
+    assert!(!landings.is_empty(), "the landing came");
+    let entries = entries_when(
+        &recorder,
+        &session,
+        page_console::CAP,
+        Duration::from_secs(3),
+    );
+    assert_eq!(entries.len(), page_console::CAP);
+    assert_eq!(entries[0].text, "line 1000");
+    assert_eq!(
+        entries.last().map(|entry| entry.text.as_str()),
+        Some("line 1999")
+    );
+    tab.connection.close();
+    engine.kill();
+}
+
+/// Whether a page can tell its console is being listened to — the checks
+/// pages use to find an open DevTools: a getter that notes it was read, on
+/// an error's `stack` (a), an element's `id` and `className` (b), a plain
+/// accessor (c), a proxy's traps (d), `Symbol.toStringTag` (e), a regexp's
+/// `toString` (f), an object's `toString` and `valueOf` under `%s` and `%d`
+/// (g). Measured with the two domains off and on; what it finds is what
+/// `docs/design.md` says. The time is printed and not held to anything: it
+/// is the one difference, and it is noise-sized.
+#[test]
+fn no_getter_a_page_sets_tells_it_the_console_is_heard() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    let page = "data:text/html,<title>start</title><script>\
+var seen='';function mark(c){if(seen.indexOf(c)<0)seen+=c}\
+var e=new Error('x');\
+Object.defineProperty(e,'stack',{get:function(){mark('a');return 'x'}});\
+console.log(e);\
+var d=document.createElement('div');\
+Object.defineProperty(d,'id',{get:function(){mark('b');return 'x'}});\
+Object.defineProperty(d,'className',{get:function(){mark('b');return 'x'}});\
+console.log(d);\
+console.log({get x(){mark('c');return 1}});\
+console.log(new Proxy({},{get:function(){mark('d')},ownKeys:function(){mark('d');return []},\
+getOwnPropertyDescriptor:function(){mark('d')},getPrototypeOf:function(){mark('d');return null}}));\
+var t={};Object.defineProperty(t,Symbol.toStringTag,{get:function(){mark('e');return 'T'}});\
+console.log(t);\
+var r=/a/;r.toString=function(){mark('f');return ''};console.log(r);\
+var o={toString:function(){mark('g');return ''},valueOf:function(){mark('g');return 1}};\
+console.log(o);console.log('%s',o);console.log('%d',o);\
+var big=[];for(var i=0;i<1000;i++){big.push({i:i,s:'text',n:[1,2,3]})}\
+var t0=performance.now();for(var j=0;j<200;j++){console.log(big)}\
+var took=Math.round(performance.now()-t0);\
+setTimeout(function(){document.title='seen ['+seen+'] '+took+' ms'},200)</script>";
+    let look = |client: &mut Client| {
+        client
+            .call(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(page))]),
+            )
+            .expect("the page loads");
+        wait_for_title(client, "seen", Duration::from_secs(10))
+    };
+    let off = look(&mut client);
+    let recorder = Arc::new(Recorder::new());
+    engine.intercept(Some(
+        Arc::clone(&recorder) as Arc<dyn blinkterm::cdp::Intercept>
+    ));
+    for method in ["Runtime.enable", "Log.enable"] {
+        client.call(method, Json::empty()).expect(method);
+    }
+    let on = look(&mut client);
+    eprintln!("the console not heard: {off:?}; heard: {on:?}");
+    let marks = |title: &str| {
+        title
+            .split(['[', ']'])
+            .nth(1)
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("the page did not finish: {title:?}"))
+    };
+    // Blink's own formatting reads these whoever is listening.
+    assert_eq!(marks(&off), "efg");
+    assert_eq!(marks(&on), marks(&off), "a getter told the page");
+    client.close();
+    engine.kill();
+}
+
+/// A message from the page with an escape sequence, a bell and a direction
+/// override in it, through the recorder and the panel's rows into the
+/// compositor's own terminal: letters, and nothing a terminal would do.
+#[test]
+fn a_console_message_with_an_escape_sequence_cannot_reach_the_terminal() {
+    use blinkterm::screen::{self, ListItem};
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let recorder = consoled(&engine, &mut client);
+    let session = client.session().expect("a page's session").to_string();
+    let page = "data:text/html,<title>start</title><script>\
+console.log(String.fromCharCode(27)+']0;pwned'+String.fromCharCode(7)\
++String.fromCharCode(0x202e)+'moc');document.title='done'</script>";
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(page))]),
+        )
+        .expect("the page loads");
+    wait_for_title(&mut client, "done", Duration::from_secs(10));
+    let entries = entries_when(&recorder, &session, 1, Duration::from_secs(3));
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].text, "]0;pwnedmoc");
+    let items = [ListItem {
+        lead: entries[0].lead(),
+        title: &entries[0].text,
+        url: &entries[0].place,
+        picked: true,
+    }];
+    let rows = screen::list_rows(80, 2, 3, &items);
+    let text = a_terminal_reads_only_text_in_rows(&rows);
+    assert!(text.starts_with("  log  ]0;pwnedmoc"), "{text:?}");
+    client.close();
+    engine.kill();
+}
+
+/// [`a_terminal_reads_only_text_in`] for the rows under the status row: no
+/// title set, no question answered, and nothing below a space between the
+/// rows' own framing. Returns what the first of them reads as.
+fn a_terminal_reads_only_text_in_rows(rows: &[u8]) -> String {
+    let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+    terminal.advance(&blinkterm::screen::enter_sequence());
+    let _ = terminal.take_output();
+    terminal.advance(rows);
+    assert_eq!(
+        terminal.title(),
+        "",
+        "the rows set the window title: {rows:?}"
+    );
+    assert!(
+        terminal.take_output().is_empty(),
+        "the rows asked the terminal something: {rows:?}"
+    );
+    let mut body = String::from_utf8_lossy(rows)
+        .replace("\x1b[7m", "")
+        .replace("\x1b[0m", "");
+    for row in 1..=24 {
+        body = body.replace(&format!("\x1b[{row};1H\x1b[K"), "");
+    }
+    assert!(body.bytes().all(|b| b >= 0x20 && b != 0x7f), "{body:?}");
+    terminal.grid().row(1).to_text()
+}
+
+/// What recording the console costs a page, from its landing to its load:
+/// a page of links and a page that logs five hundred lines, with the two
+/// domains off and on, alternately, three times each. Printed, and held to
+/// no worse than twice as slow, which is loose on purpose: the assertion is
+/// that nobody would see it, and the numbers are for the docs.
+#[test]
+fn the_console_costs_a_heavy_page_nothing_a_person_can_see() {
+    if skip_timing_on_shared_runner("the_console_costs_a_heavy_page_nothing_a_person_can_see") {
+        return;
+    }
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    let recorder = Arc::new(Recorder::new());
+    engine.intercept(Some(
+        Arc::clone(&recorder) as Arc<dyn blinkterm::cdp::Intercept>
+    ));
+    let (base, _) = serve_troubles();
+    let links = format!("{base}/links");
+    let loud = "data:text/html,<title>loud</title><script>\
+for(var i=0;i<500;i++){console.log('line',i,{i:i,s:'some text'})}</script>";
+    let mut tab = Tab::new("t", client, "about:blank");
+    let mut times = [[Duration::MAX; 2]; 2];
+    for round in 0..6 {
+        let on = round % 2 == 1;
+        for method in if on {
+            ["Runtime.enable", "Log.enable"]
+        } else {
+            ["Runtime.disable", "Log.disable"]
+        } {
+            tab.connection.call(method, Json::empty()).expect(method);
+        }
+        for (which, url) in [links.as_str(), loud].into_iter().enumerate() {
+            let started = Instant::now();
+            navigate_tab(&mut tab, url);
+            follow(&mut tab, Duration::from_secs(10));
+            let took = started.elapsed();
+            let best = &mut times[which][usize::from(on)];
+            *best = (*best).min(took);
+        }
+    }
+    for (which, name) in ["links", "500 lines"].into_iter().enumerate() {
+        let [off, on] = times[which];
+        eprintln!("{name}: {off:?} with the console off, {on:?} with it on");
+        assert!(
+            on <= off * 2 + Duration::from_millis(20),
+            "{name}: {on:?} against {off:?}"
+        );
+    }
+    tab.connection.close();
+    engine.kill();
+}
+
+/// The console as `app::boot` installs it, beside the blocker: the engine's
+/// own first page leaves nothing behind (on a Mac it is a directory listing
+/// whose script throws, and the enable replays that), a page's requests the
+/// blocker fails are in the console as what they are, and the blocker's
+/// count is untouched by the hook in front of it.
+#[test]
+fn the_console_booted_beside_the_blocker_starts_empty_and_hears_what_was_blocked() {
+    if !engine_named() {
+        return;
+    }
+    let port = serve_pages(|port| {
+        let mut pages = vec![("/".to_string(), page_with_ads(port))];
+        pages.extend((0..6).map(|i| (format!("/s{i}.js"), "0;".to_string())));
+        pages
+    });
+    let page = format!("http://127.0.0.1:{port}/");
+    let mut hosts = std::collections::HashSet::new();
+    block::parse("0.0.0.0 ads.test\n", &mut hosts);
+    let blocker = Arc::new(Blocker::new(hosts, Vec::new()));
+    let recorder = Arc::new(Recorder::new());
+    let Booted {
+        mut engine,
+        browser,
+        mut tabs,
+        identity,
+    } = booted_with(Some(&blocker), Some(&recorder));
+    assert!(identity.console, "the sessions are told to report");
+    let first = tabs.active_mut().expect("the first tab");
+    let session = first.connection.session().expect("a page").to_string();
+    assert!(
+        recorder.entries(&session).is_empty(),
+        "the engine's own page: {:?}",
+        recorder.entries(&session)
+    );
+    assert_eq!(recorder.words(Some(&session)), None);
+
+    assert_eq!(
+        load_titled(&mut first.connection, &page, "done"),
+        "done ok=3 er=3"
+    );
+    assert_eq!(blocker.words(Some(&session)).as_deref(), Some("3 blocked"));
+    let entries = entries_when(&recorder, &session, 3, Duration::from_secs(3));
+    let blocked: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == Source::Network && entry.text.contains("BLOCKED_BY_CLIENT"))
+        .collect();
+    assert_eq!(blocked.len(), 3, "{entries:?}");
+    assert!(blocked.iter().all(|entry| entry.place.contains("ads.test")));
+    assert_eq!(recorder.words(Some(&session)).as_deref(), Some("3 errors"));
+    let heard: Vec<String> = first
+        .connection
+        .events()
+        .into_iter()
+        .map(|event| event.method)
+        .filter(|method| CONSOLE_EVENTS.contains(&method.as_str()))
+        .collect();
+    assert!(heard.is_empty(), "the mailbox heard {heard:?}");
+    drop(tabs);
+    drop(browser);
     engine.kill();
 }

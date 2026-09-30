@@ -47,6 +47,8 @@ page's file input instead of the row (see
 `sites-dir = <dir>` names where site styles and scripts are read from, and
 `sites = false` (or `--no-sites`) reads none (see
 [Site styles and scripts](features.md#site-styles-and-scripts)).
+`console = false` (or `--no-console`) stops listening to the page's console,
+and `ctrl+shift+j` says so (see [The console](features.md#the-console)).
 `password-command` and `password-command-terminal` name a password
 manager's command that `alt+l` fills a login form from (see
 [Filling a login from your password manager](features.md#filling-a-login-from-your-password-manager)).
@@ -105,6 +107,7 @@ nothing else, for scripts.
 | `last-tab` | `alt+9` | the last tab |
 | `list-tabs` | `ctrl+shift+a`, `alt+a` | the tab list |
 | `history` | `ctrl+shift+h`, `alt+h` | the history list |
+| `console` | `ctrl+shift+j`, `alt+j` | the page's console: logs, errors and failed requests |
 | `move-tab-left` | `ctrl+shift+pageup`, `alt+shift+pageup` | move this tab left |
 | `move-tab-right` | `ctrl+shift+pagedown`, `alt+shift+pagedown` | move this tab right |
 | `zoom-in` | `alt+=`, `ctrl+=` | zoom in |
