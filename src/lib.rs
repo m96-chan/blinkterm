@@ -166,6 +166,7 @@ pub mod save;
 pub mod screen;
 pub mod scroll;
 pub mod session;
+pub mod sites;
 pub mod tablist;
 pub mod tabs;
 pub mod text;

@@ -44,6 +44,9 @@ page's file input instead of the row (see
 `block-list = <path>`, repeatable, names a list of hosts to block, and
 `block = false` (or `--no-block`) blocks nothing whatever the lists say
 (see [Blocking ads and trackers](features.md#blocking-ads-and-trackers)).
+`sites-dir = <dir>` names where site styles and scripts are read from, and
+`sites = false` (or `--no-sites`) reads none (see
+[Site styles and scripts](features.md#site-styles-and-scripts)).
 `password-command` and `password-command-terminal` name a password
 manager's command that `alt+l` fills a login form from (see
 [Filling a login from your password manager](features.md#filling-a-login-from-your-password-manager)).
@@ -108,6 +111,7 @@ nothing else, for scripts.
 | `find` | `ctrl+f` | find in the page |
 | `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
 | `block` | `alt+b` | stop blocking ads and trackers on this site, or start again |
+| `reload-sites` | `alt+r` | read the site styles and scripts again |
 | `fill-login` | `alt+l` | fill the login form from your password manager |
 | `copy` | `alt+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | copy the url |

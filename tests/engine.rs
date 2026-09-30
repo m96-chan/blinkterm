@@ -42,6 +42,7 @@ use blinkterm::motion::{self, Motion};
 use blinkterm::profile::{Choice, Profile};
 use blinkterm::route::{Payload, Placement, Route, Wrap};
 use blinkterm::scroll::{self, Animator, Dispatch, Step, Wheel};
+use blinkterm::sites::{self, Sites};
 use blinkterm::tabs::{Outcome, Tab, Tabs};
 
 // tOS's `t=s` reader, the one a real tOS pane installs, copied from
@@ -1257,6 +1258,7 @@ fn a_tab_opened_behind_by_this_program_loads_without_being_looked_at() {
         &mut browser,
         &appearance,
         &Identity::new(None, None, "C"),
+        &Sites::none(),
         &format!("{base}plain"),
     )
     .expect("the engine opens a page behind");
@@ -8566,6 +8568,8 @@ fn a_crashed_page_keeps_its_tab_and_a_reload_brings_it_back_casting() {
         },
         motion::Cast::default(),
         &Identity::new(None, None, "C"),
+        &Sites::none(),
+        &mut Vec::new(),
     );
     let after = frames_in(&mut tab.connection, Duration::from_secs(1));
     eprintln!("frames in a second after revive: {after}");
@@ -8950,6 +8954,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &appearance,
         &Allowed::in_memory(),
         None,
+        &Sites::none(),
     )
     .expect("the engine boots");
     let base = serve();
@@ -8977,6 +8982,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
             &mut browser,
             &appearance,
             &identity,
+            &Sites::none(),
             &format!("{base}{name}"),
         )
         .expect("a tab behind");
@@ -9034,6 +9040,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &appearance,
         &Allowed::in_memory(),
         None,
+        &Sites::none(),
     )
     .expect("a second engine on the same profile");
     blinkterm::app::restore_tabs(
@@ -9041,6 +9048,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &mut browser,
         &appearance,
         &identity,
+        &Sites::none(),
         snapshot.clone(),
     );
     let took = started.elapsed();
@@ -9331,6 +9339,7 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
         &appearance,
         &allowed,
         None,
+        &Sites::none(),
     )
     .expect("the engine boots");
     let names = [
@@ -9359,6 +9368,7 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
         &mut browser,
         &appearance,
         &Identity::new(None, None, "C"),
+        &Sites::none(),
         &format!("{origin}/fs"),
     )
     .expect("a tab behind");
@@ -10083,6 +10093,7 @@ fn a_url_handed_over_the_socket_becomes_the_tab_in_front() {
         &appearance,
         &Allowed::in_memory(),
         None,
+        &Sites::none(),
     )
     .expect("the engine boots");
     let base = serve();
@@ -10107,6 +10118,7 @@ fn a_url_handed_over_the_socket_becomes_the_tab_in_front() {
         &mut browser,
         &appearance,
         &identity,
+        &Sites::none(),
         &delivery.lines,
     );
     assert_eq!(opened[0], Ok(format!("{base}second")));
@@ -10198,6 +10210,7 @@ fn booted_blocking(blocker: Option<&Arc<Blocker>>) -> Booted {
         &appearance,
         &Allowed::in_memory(),
         blocker,
+        &Sites::none(),
     )
     .expect("the engine boots")
 }
@@ -10756,6 +10769,484 @@ fn the_form_with_the_focus_is_the_one_filled() {
         Some(Filled::Both)
     );
     assert_eq!(values(&mut client), "me,secret,,,,,");
+
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Site styles and scripts
+// ---------------------------------------------------------------------------
+
+/// A directory of site files, written afresh with the modes the program
+/// accepts: the directory 0755, each file 0644.
+fn site_files(what: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir(what);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a directory");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    write_site_files(&dir, files);
+    dir
+}
+
+/// Write (or overwrite) files in a site directory, 0644.
+fn write_site_files(dir: &std::path::Path, files: &[(&str, &str)]) {
+    use std::os::unix::fs::PermissionsExt;
+    for (name, text) in files {
+        let path = dir.join(name);
+        std::fs::write(&path, text).expect("a site file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    }
+}
+
+/// A session set up the way `connect_tab` sets one up, with the site files
+/// registered on it as a new session's are; the identifiers come back.
+fn told_sites(client: &mut Client, sites: &Sites) -> Vec<String> {
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(client);
+    let appearance = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::Off,
+    );
+    blinkterm::app::prepare_session(client, &appearance, &Identity::new(None, None, "C"));
+    sites::install(client, sites, true)
+}
+
+/// The pages the site tests are served, on 127.0.0.1: `/plain`, which says
+/// `ready`; `/sites`, whose own inline script writes what it could see into
+/// its title; `/framed`, with a `srcdoc` iframe that has a script of its
+/// own; and `/csp`, which forbids every script of its own.
+fn serve_site_pages() -> String {
+    let port = serve_pages(|_| {
+        vec![
+            (
+                "/plain".to_string(),
+                "<!doctype html><body>plain<script>document.title='ready'</script></body>"
+                    .to_string(),
+            ),
+            (
+                "/again".to_string(),
+                "<!doctype html><body>again<script>document.title='ready'</script></body>"
+                    .to_string(),
+            ),
+            (
+                "/sites".to_string(),
+                "<!doctype html><body><script>const s = sessionStorage;\
+                 document.title = 'ready ' + s.site + typeof hidden + window.fromMain + ' ' + s.order\
+                 </script></body>"
+                    .to_string(),
+            ),
+            (
+                "/framed".to_string(),
+                "<!doctype html><body style='margin:0'>\
+                 <iframe srcdoc='<body>framed<script>1</script></body>'></iframe>\
+                 <script>document.title='ready'</script></body>"
+                    .to_string(),
+            ),
+            (
+                "/csp".to_string(),
+                "<!doctype html><meta http-equiv=Content-Security-Policy content=\"script-src 'none'\">\
+                 <title>ready</title><body>csp<script>window.pageRan = 1</script></body>"
+                    .to_string(),
+            ),
+        ]
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Evaluate `expression` until it is `wanted`, for five seconds, and say
+/// what it was last.
+fn wait_for_value(client: &mut Client, expression: &str, wanted: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = evaluate(client, expression)
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if now == wanted || Instant::now() >= deadline {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+const BODY_BACKGROUND: &str = "getComputedStyle(document.body).backgroundColor";
+const ALL_MARK: &str =
+    "getComputedStyle(document.documentElement).getPropertyValue('--blinkterm-all').trim()";
+
+/// A host's style is on that host's pages from document start, through a
+/// navigation and a reload, and not on another; `all` is on every page, a
+/// `data:` one included. What the page can see of it is
+/// `adoptedStyleSheets`, and nothing else.
+#[test]
+fn a_site_style_changes_its_host_on_load_and_after_a_navigation_and_leaves_another_host_alone() {
+    let dir = site_files(
+        "sites-style",
+        &[
+            ("127.0.0.1.css", "body{background:rgb(1,2,3)!important}"),
+            ("all.css", "html{--blinkterm-all:1}"),
+        ],
+    );
+    let sites = Sites::read(&dir);
+    assert_eq!(sites.styles().len(), 2, "{:?}", sites.skipped);
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let identifiers = told_sites(&mut client, &sites);
+    assert_eq!(identifiers.len(), 1, "every style in one registration");
+    let base = serve_site_pages();
+
+    go_to(&mut client, &format!("{base}/plain"));
+    let check_host = |client: &mut Client, when: &str| {
+        assert_eq!(
+            evaluate(client, BODY_BACKGROUND).as_str(),
+            Some("rgb(1, 2, 3)"),
+            "{when}"
+        );
+        assert_eq!(evaluate(client, ALL_MARK).as_str(), Some("1"), "{when}");
+        assert_eq!(
+            evaluate(client, "document.adoptedStyleSheets.length").as_f64(),
+            Some(2.0),
+            "{when}"
+        );
+        assert_eq!(
+            evaluate(client, "document.styleSheets.length").as_f64(),
+            Some(0.0),
+            "{when}: nothing in the page's own sheets"
+        );
+        assert_eq!(
+            evaluate(client, "typeof __blinktermSiteSheets").as_str(),
+            Some("undefined"),
+            "{when}: nothing on the page's window"
+        );
+    };
+    check_host(&mut client, "on load");
+    go_to(&mut client, &format!("{base}/again"));
+    check_host(&mut client, "after a navigation");
+    evaluate(&mut client, "document.title='leaving'");
+    client
+        .call("Page.reload", Json::empty())
+        .expect("the page reloads");
+    assert_eq!(
+        wait_for_title(&mut client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+    check_host(&mut client, "after a reload");
+
+    go_to(
+        &mut client,
+        "data:text/html,<body><script>document.title='ready'</script></body>",
+    );
+    assert_eq!(
+        evaluate(&mut client, BODY_BACKGROUND).as_str(),
+        Some("rgba(0, 0, 0, 0)"),
+        "another host is left alone"
+    );
+    assert_eq!(
+        evaluate(&mut client, ALL_MARK).as_str(),
+        Some("1"),
+        "all is every page"
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(1.0)
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// A script runs before the page's own first script, in a world the page
+/// cannot see into — unless the file asked for the page's — in the order
+/// the files are ranked; and the page's CSP does not stop one in the page's
+/// world.
+///
+/// What the scripts leave for the page is in `sessionStorage`, which both
+/// worlds share, and not on `document.documentElement`: at the start of a
+/// document after the first there is no `<html>` yet, and a script that
+/// reaches for it throws. (The first document of a new session is the
+/// exception, because its context is made late; a test that used the
+/// element passed on the first page and failed on every one after it.)
+#[test]
+fn a_site_script_runs_at_document_start_in_a_world_the_page_cannot_see_unless_it_asked_for_the_page_s(
+) {
+    let dir = site_files(
+        "sites-script",
+        &[
+            (
+                "all.js",
+                "sessionStorage.site = 'yes'; sessionStorage.order = 'a'; globalThis.hidden = 1",
+            ),
+            ("*.0.0.1.js", "sessionStorage.order += 'b'"),
+            (
+                "127.0.0.1.js",
+                "// @world main\nwindow.fromMain = 2;\nsessionStorage.order += 'c'",
+            ),
+            ("example.com.js", "window.notHere = 1"),
+            ("example.org.js", "window.notHere = 1"),
+        ],
+    );
+    let sites = Sites::read(&dir);
+    assert_eq!(sites.scripts().len(), 5, "{:?}", sites.skipped);
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let started = Instant::now();
+    let identifiers = told_sites(&mut client, &sites);
+    eprintln!(
+        "{} registrations, and the session's setup, in {:?}",
+        identifiers.len(),
+        started.elapsed()
+    );
+    assert_eq!(identifiers.len(), 5);
+    let again = Instant::now();
+    let more = sites::install(&mut client, &sites, false);
+    eprintln!("five scripts registered alone: {:?}", again.elapsed());
+    sites::remove(&mut client, &more);
+    let base = serve_site_pages();
+
+    evaluate(&mut client, "document.title='leaving'");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(format!("{base}/sites")))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(&mut client, "ready ", Duration::from_secs(10)),
+        "ready yesundefined2 abc",
+        "at document start, isolated unless asked, in rank order"
+    );
+    go_to(&mut client, &format!("{base}/plain"));
+    assert_eq!(
+        evaluate(&mut client, "sessionStorage.order + window.fromMain").as_str(),
+        Some("abc2"),
+        "and on the next document"
+    );
+    assert_eq!(
+        evaluate(&mut client, "typeof notHere").as_str(),
+        Some("undefined")
+    );
+
+    go_to(&mut client, &format!("{base}/csp"));
+    assert_eq!(
+        evaluate(&mut client, "typeof pageRan").as_str(),
+        Some("undefined"),
+        "the page's own script was refused"
+    );
+    let under_csp = evaluate(&mut client, "window.fromMain");
+    eprintln!("a main-world site script under script-src 'none': fromMain = {under_csp}");
+    assert_eq!(under_csp.as_f64(), Some(2.0));
+
+    client.close();
+    engine.kill();
+}
+
+/// `reload-sites`, as the program does it: the old registrations taken back,
+/// the new ones made without running the scripts. The style changes on the
+/// document where it stands, one sheet and not two; the old script never
+/// runs again, and the new one runs from the next load.
+#[test]
+fn reload_sites_replaces_the_styles_where_the_page_stands_and_the_old_script_never_runs_again() {
+    const VERSION: &str = "sessionStorage.v = (sessionStorage.v || '') + ";
+    let dir = site_files(
+        "sites-reload",
+        &[
+            ("127.0.0.1.css", "body{background:rgb(255,0,0)!important}"),
+            ("127.0.0.1.js", &format!("{VERSION}'1'")),
+        ],
+    );
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let old = told_sites(&mut client, &Sites::read(&dir));
+    assert_eq!(old.len(), 2);
+    let base = serve_site_pages();
+    go_to(&mut client, &format!("{base}/plain"));
+    assert_eq!(
+        evaluate(&mut client, BODY_BACKGROUND).as_str(),
+        Some("rgb(255, 0, 0)")
+    );
+    assert_eq!(
+        evaluate(&mut client, "sessionStorage.v").as_str(),
+        Some("1")
+    );
+    evaluate(&mut client, "window.kept = 1");
+
+    write_site_files(
+        &dir,
+        &[
+            ("127.0.0.1.css", "body{background:rgb(0,0,255)!important}"),
+            ("127.0.0.1.js", &format!("{VERSION}'2'")),
+        ],
+    );
+    let sites = Sites::read(&dir);
+    let started = Instant::now();
+    sites::remove(&mut client, &old);
+    let new = sites::install(&mut client, &sites, false);
+    assert_eq!(new.len(), sites.params(false).len());
+    let blue = wait_for_value(&mut client, BODY_BACKGROUND, "rgb(0, 0, 255)");
+    eprintln!("the new style in place after {:?}", started.elapsed());
+    assert_eq!(blue, "rgb(0, 0, 255)", "in place");
+    assert_eq!(
+        evaluate(&mut client, "window.kept").as_f64(),
+        Some(1.0),
+        "the same document"
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(1.0),
+        "replaced, not added to"
+    );
+    assert_eq!(
+        evaluate(&mut client, "sessionStorage.v").as_str(),
+        Some("1"),
+        "the new script waits for the next document"
+    );
+
+    go_to(&mut client, &format!("{base}/plain"));
+    assert_eq!(
+        evaluate(&mut client, "sessionStorage.v").as_str(),
+        Some("12"),
+        "the new script, and the old one never again"
+    );
+    assert_eq!(
+        evaluate(&mut client, BODY_BACKGROUND).as_str(),
+        Some("rgb(0, 0, 255)")
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// A same-process iframe is a frame of the same target, so the style
+/// reaches it; and a `srcdoc` frame, whose own `location` has no host, is
+/// matched by the host of the page it inherited its base url from.
+#[test]
+fn a_site_style_reaches_a_same_process_iframe_of_the_page() {
+    let dir = site_files(
+        "sites-frame",
+        &[
+            ("all.css", "body{background:rgb(4,5,6)!important}"),
+            ("127.0.0.1.css", "body{color:rgb(7,8,9)!important}"),
+        ],
+    );
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    told_sites(&mut client, &Sites::read(&dir));
+    let base = serve_site_pages();
+
+    let inside = |what: &str| {
+        format!(
+            "(() => {{ const d = document.querySelector('iframe').contentDocument; \
+             return d && d.body ? getComputedStyle(d.body).{what} : ''; }})()"
+        )
+    };
+    go_to(&mut client, &format!("{base}/framed"));
+    assert_eq!(
+        wait_for_value(&mut client, &inside("backgroundColor"), "rgb(4, 5, 6)"),
+        "rgb(4, 5, 6)",
+        "all, in the iframe"
+    );
+    let color = wait_for_value(&mut client, &inside("color"), "rgb(7, 8, 9)");
+    eprintln!("a srcdoc iframe of 127.0.0.1, its colour: {color}");
+    assert_eq!(color, "rgb(7, 8, 9)", "the parent's host, by its base url");
+
+    go_to(&mut client, &framed(true));
+    assert_eq!(
+        wait_for_value(&mut client, &inside("backgroundColor"), "rgb(4, 5, 6)"),
+        "rgb(4, 5, 6)",
+        "a data: page's iframe too"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// One registration per script file, so a file that does not parse is that
+/// file's problem and nobody else's.
+#[test]
+fn a_syntax_error_in_one_site_script_does_not_stop_the_others() {
+    let dir = site_files(
+        "sites-syntax",
+        &[
+            ("all.js", "this is not js"),
+            ("127.0.0.1.js", "sessionStorage.ok = '1'"),
+        ],
+    );
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let identifiers = told_sites(&mut client, &Sites::read(&dir));
+    eprintln!(
+        "registrations accepted, one of them not JavaScript: {}",
+        identifiers.len()
+    );
+    let base = serve_site_pages();
+    go_to(&mut client, &format!("{base}/plain"));
+    assert_eq!(
+        evaluate(&mut client, "sessionStorage.ok").as_str(),
+        Some("1")
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// What a large style costs every document, on a page it fits and on one it
+/// does not — the table is carried into both: measured, not asserted. The
+/// page's own clock, from the start of the navigation to its
+/// `domInteractive`, averaged over five loads.
+#[test]
+fn a_large_site_style_is_measured_at_document_start() {
+    let rules: String = (0..8000)
+        .map(|i| format!(".rule-{i} {{ color: red; }}\n"))
+        .collect();
+    let fits = site_files("sites-large", &[("all.css", &rules)]);
+    let elsewhere = site_files("sites-large-elsewhere", &[("example.com.css", &rules)]);
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    let base = serve_site_pages();
+    let url = format!("{base}/plain");
+    let loads = |client: &mut Client| {
+        go_to(client, &url);
+        let mut total = 0.0;
+        for _ in 0..5 {
+            go_to(client, &url);
+            total += evaluate(
+                client,
+                "performance.getEntriesByType('navigation')[0].domInteractive",
+            )
+            .as_f64()
+            .unwrap_or(f64::NAN);
+        }
+        total / 5.0
+    };
+    let bare = loads(&mut client);
+    let registered = sites::install(&mut client, &Sites::read(&elsewhere), true);
+    let other_host = loads(&mut client);
+    sites::remove(&mut client, &registered);
+    sites::install(&mut client, &Sites::read(&fits), true);
+    let this_host = loads(&mut client);
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(1.0)
+    );
+    eprintln!(
+        "{} bytes of css; to domInteractive: {bare:.1} ms bare, {other_host:.1} ms carried \
+         to a page it does not fit, {this_host:.1} ms adopted",
+        rules.len()
+    );
 
     client.close();
     engine.kill();

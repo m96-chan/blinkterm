@@ -59,6 +59,7 @@ use crate::picker;
 use crate::profile;
 use crate::route;
 use crate::save;
+use crate::sites;
 use crate::zoom::Scale;
 
 /// The largest settings file that is read. Nothing here needs a tenth of
@@ -133,6 +134,9 @@ pub struct Options {
     /// `--block-list` and `--no-block`: the host lists requests are blocked
     /// by, and whether to. See [`crate::block`].
     pub block: block::Lists,
+    /// `--sites-dir` and `--no-sites`: where the site styles and scripts are
+    /// read from, and whether. See [`crate::sites`].
+    pub sites: sites::Location,
     /// `--password-command` and `--password-command-terminal`: what
     /// `fill-login` runs. See [`crate::login`].
     pub logins: login::Programs,
@@ -221,6 +225,10 @@ pub struct Settings {
     pub block_lists: Vec<PathBuf>,
     /// `false` with `--no-block` or `block = false`.
     pub block: Option<bool>,
+    /// `--sites-dir`, `sites-dir`.
+    pub sites_dir: Option<PathBuf>,
+    /// `false` with `--no-sites` or `sites = false`.
+    pub sites: Option<bool>,
     pub password_command: Option<picker::Command>,
     pub password_command_terminal: Option<picker::Command>,
     /// File only: a binding is not a one-run thing.
@@ -278,6 +286,8 @@ impl Settings {
                 .or(under.file_picker_terminal_multiple),
             block_lists,
             block: self.block.or(under.block),
+            sites_dir: self.sites_dir.or(under.sites_dir),
+            sites: self.sites.or(under.sites),
             password_command: self.password_command.or(under.password_command),
             password_command_terminal: self
                 .password_command_terminal
@@ -503,6 +513,15 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             s.block_lists.push(PathBuf::from(path));
             continue;
         }
+        if let Some(dir) = value_of(arg, "--sites-dir", &mut args) {
+            let dir = needed(dir, "--sites-dir needs a directory: --sites-dir <dir>")?;
+            once(
+                &mut s.sites_dir,
+                PathBuf::from(dir),
+                "one sites directory at a time",
+            )?;
+            continue;
+        }
         if let Some(agent) = value_of(arg, "--user-agent", &mut args) {
             let agent = needed(agent, "--user-agent needs text")?;
             once(
@@ -604,6 +623,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             "--normal-mode" => once(&mut s.normal_mode, true, "--normal-mode once is enough")?,
             "--no-probe" => once(&mut s.probe, false, "--no-probe once is enough")?,
             "--no-block" => once(&mut s.block, false, "--no-block once is enough")?,
+            "--no-sites" => once(&mut s.sites, false, "--no-sites once is enough")?,
             "--no-config" => config_choice(&mut s, ConfigChoice::None)?,
             "--print-engine" => what(&mut s, What::PrintEngine)?,
             "--doctor" => what(&mut s, What::Doctor)?,
@@ -684,7 +704,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 29] = [
+const KEYS: [&str; 31] = [
     "home",
     "profile",
     "temp-profile",
@@ -712,6 +732,8 @@ const KEYS: [&str; 29] = [
     "file-picker-terminal-multiple",
     "block-list",
     "block",
+    "sites-dir",
+    "sites",
     "password-command",
     "password-command-terminal",
 ];
@@ -830,6 +852,8 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             }
             "block-list" => s.block_lists.push(PathBuf::from(value)),
             "block" => s.block = Some(parse_bool(key, value).map_err(at)?),
+            "sites-dir" => s.sites_dir = Some(PathBuf::from(value)),
+            "sites" => s.sites = Some(parse_bool(key, value).map_err(at)?),
             "password-command" => {
                 s.password_command = Some(picker::Command::parse(key, value).map_err(at)?)
             }
@@ -954,6 +978,10 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
             paths: s.block_lists,
             enabled: s.block.unwrap_or(true),
         },
+        sites: sites::Location {
+            dir: s.sites_dir,
+            enabled: s.sites.unwrap_or(true),
+        },
         logins: login::Programs {
             gui: s.password_command,
             terminal: s.password_command_terminal,
@@ -1012,6 +1040,7 @@ fn home_expanded(mut settings: Settings, home: Option<&Path>) -> Settings {
     });
     settings.download_dir = settings.download_dir.map(|dir| expand_home(dir, home));
     settings.engine = settings.engine.map(|path| expand_home(path, home));
+    settings.sites_dir = settings.sites_dir.map(|dir| expand_home(dir, home));
     settings.block_lists = std::mem::take(&mut settings.block_lists)
         .into_iter()
         .map(|path| expand_home(path, home))
@@ -2150,6 +2179,69 @@ mod tests {
         let home = Some(Path::new("/h"));
         let expanded = home_expanded(file("block-list = ~/lists/hosts").expect("a file"), home);
         assert_eq!(expanded.block_lists, [PathBuf::from("/h/lists/hosts")]);
+    }
+
+    #[test]
+    fn a_sites_directory_comes_from_either_source_no_sites_turns_it_off_and_the_command_line_wins()
+    {
+        let s = parsed(&["--sites-dir", "/a"]).expect("a directory");
+        assert_eq!(s.sites_dir, Some(PathBuf::from("/a")));
+        let s = parsed(&["--sites-dir=/b"]).expect("the = spelling");
+        assert_eq!(s.sites_dir, Some(PathBuf::from("/b")));
+        assert_eq!(
+            parsed(&["--sites-dir"]),
+            Err("--sites-dir needs a directory: --sites-dir <dir>".to_string())
+        );
+        assert_eq!(
+            parsed(&["--sites-dir", "/a", "--sites-dir", "/b"]),
+            Err("one sites directory at a time".to_string())
+        );
+        let options = resolve(
+            parsed(&["--sites-dir", "/cli"]).expect("cli"),
+            Settings::default(),
+            file("sites-dir = /file").expect("a file"),
+        )
+        .expect("resolves");
+        assert_eq!(
+            options.sites,
+            sites::Location {
+                dir: Some(PathBuf::from("/cli")),
+                enabled: true,
+            },
+            "the command line's directory wins"
+        );
+
+        let off = parsed(&["--no-sites"]).expect("a flag");
+        assert_eq!(off.sites, Some(false));
+        assert_eq!(
+            parsed(&["--no-sites", "--no-sites"]),
+            Err("--no-sites once is enough".to_string())
+        );
+        let options = resolve(
+            off,
+            Settings::default(),
+            file("sites = true").expect("a file"),
+        )
+        .expect("resolves");
+        assert!(!options.sites.enabled, "the command line's word wins");
+        assert_eq!(file("sites = false").map(|s| s.sites), Ok(Some(false)));
+        let maybe = file("sites = maybe").expect_err("not a bool");
+        assert!(maybe.starts_with("/c:1: "), "{maybe}");
+        assert_eq!(
+            file("sites = true\nsites = false"),
+            Err("/c:2: sites is already set on line 1".to_string())
+        );
+        assert_eq!(
+            resolved(&[]).expect("resolves").sites,
+            sites::Location {
+                dir: None,
+                enabled: true,
+            }
+        );
+
+        let home = Some(Path::new("/h"));
+        let expanded = home_expanded(file("sites-dir = ~/my-sites").expect("a file"), home);
+        assert_eq!(expanded.sites_dir, Some(PathBuf::from("/h/my-sites")));
     }
 
     #[test]
