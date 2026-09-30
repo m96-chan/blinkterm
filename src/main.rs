@@ -316,10 +316,9 @@ fn main() -> ExitCode {
         }
     };
     let options = match invocation {
-        Invocation::Help => {
-            // The file is not read for --help, so this is the platform's
-            // keymap, not necessarily the one a run would have.
-            let keymap = Keymap::platform();
+        Invocation::Help(keymap) => {
+            // The file is not read for --help, so this is --keymap's, else
+            // the platform's: not necessarily the one a run would have.
             print!(
                 "{USAGE_HEAD}{}{USAGE_TAIL}{}",
                 keys_block(keymap),

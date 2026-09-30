@@ -90,8 +90,8 @@ With nothing set, on `chrome-headless-shell` 153 in a `ja_JP.UTF-8` locale:
 
 ```
 navigator.webdriver   false
-navigator.userAgent   Mozilla/5.0 (…) Chrome/153.0.0.0 Safari/537.36 blinkterm/0.2.0
-userAgentData.brands  Chromium 153, blinkterm 0.2.0, and a GREASE brand
+navigator.userAgent   Mozilla/5.0 (…) Chrome/153.0.0.0 Safari/537.36 blinkterm/0.3.0
+userAgentData.brands  Chromium 153, blinkterm 0.3.0, and a GREASE brand
 navigator.languages   ja-JP, ja, en
 ```
 

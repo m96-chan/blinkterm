@@ -648,6 +648,13 @@ struct Chrome {
     /// What the row last said about the console's errors on the page in
     /// front: the twin of `blocked_words`.
     console_words: Option<String>,
+    /// What [`run`] found wrong before the first page — a `key.` line on a
+    /// chord the terminal keeps, a `--remote` socket not bound — until the
+    /// first page in front has finished loading. The note goes on the tab at
+    /// once, but the first page's landing clears a tab's note, and that
+    /// landing comes after: so it is put back when the load stops, if the
+    /// row has nothing else to say by then.
+    startup: Option<String>,
 }
 
 /// A screencast frame this program has not acknowledged yet: which tab's,
@@ -762,6 +769,7 @@ impl Chrome {
             sites_location: options.sites.clone(),
             console,
             console_words: None,
+            startup: None,
         }
     }
 
@@ -1237,6 +1245,12 @@ pub fn boot(
         }
     }
     let mut first = Tab::new(first, client, "about:blank");
+    // Nor is it a visit. On a Mac it is that directory listing, `file:///`,
+    // loaded and committed by the time the tab first comes to the front, so
+    // [`activate`]'s direct question (#70) would write it into the history
+    // on every start. Its first navigation lands, and a landing makes the
+    // count due again for the page the person asked for.
+    first.counted = Counted::Yes;
     first.frame = frame;
     first.site_scripts = scripts;
     Ok(Booted {
@@ -1472,6 +1486,7 @@ pub fn run(options: Options) -> Result<(), String> {
                     open_first(&mut pane, tabs, browser, &mut chrome, &options).and_then(|()| {
                         match summary(&std::mem::take(&mut problems)) {
                             Some(said) => {
+                                chrome.startup = Some(said.clone());
                                 note(tabs, said);
                                 redraw_row(&mut pane, tabs, &chrome)
                             }
@@ -2565,6 +2580,17 @@ fn activate(
                 // left saying "loading" says it until its next navigation.
                 if tab.loading {
                     tab.stopped_loading();
+                }
+                // And the "loading <url>" a tab opened with a url was given
+                // goes with it: `stopped_loading` clears it only before the
+                // commit, and this page has committed, so the row would say
+                // it was loading a page that is on the screen.
+                if tab
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.starts_with("loading "))
+                {
+                    tab.note = None;
                 }
                 // The visit itself is owed rather than written: this runs
                 // from `handle_input`, and the tab's url is the one that was
@@ -4280,6 +4306,9 @@ fn handle_page_events(
                     // coming, so this and not that is what says it is over.
                     if load::is_main(&params, tab.frame.as_deref()) {
                         tab.stopped_loading();
+                        if index == active && tab.note.is_none() {
+                            tab.note = chrome.startup.take();
+                        }
                         redraw = true;
                     }
                 }

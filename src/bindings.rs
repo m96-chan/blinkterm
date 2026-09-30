@@ -32,8 +32,9 @@
 //! # A chord is exact
 //!
 //! [`Chord::matches`] wants the same key and the same four modifier bits,
-//! no more and no fewer. The built-in table reads shift only for `tab`, `t`,
-//! `a`, `s` and the page keys, and a table of rows has to be either exact or a
+//! no more and no fewer. The built-in table reads shift only where it
+//! changes what a key does — `tab`, `t`, `a`, `h`, `j`, `r`, `s`, `pageup`
+//! and `pagedown` — and a table of rows has to be either exact or a
 //! language; a row for `ctrl+tab` that also caught `ctrl+shift+tab` would
 //! take the previous-tab key away with the next-tab one. So `key.ctrl+= =
 //! none` frees `ctrl+=` and leaves `ctrl+shift+=` zooming in, as the built-in

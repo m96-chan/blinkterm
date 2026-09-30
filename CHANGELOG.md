@@ -10,109 +10,115 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-01
+
 ### Added
 
-- `--alpha [<1-100>]` (`alpha = true|false|<1-100>` in the config file) lets
-  the terminal's background show through a page: the engine paints nothing
-  behind it, and the page's own `html` and `body` backgrounds are forced
-  transparent, so a light page is its text and pictures over the terminal. A
-  page that paints a container of its own keeps that. With a number the whole
-  picture, text included, is sent at that opacity; `--alpha` alone is 100,
-  and `alpha = false` or `--alpha=false` turns a file's setting off. It is
-  see-through while the page moves as well as at rest: locally, where the
-  moving frames are JPEG, the page is painted on magenta and the magenta
-  keyed back out of every frame and still, so what a page shows in magenta
-  or vivid purple goes too. Over ssh and in tmux the frames are PNG with
-  real transparency, and the number is not applied there. A page's default
-  black text sits on the terminal's colour, so `--force-dark` goes with it
-  on a dark terminal
-  ([#79](https://github.com/m96-chan/blinkterm/issues/79),
-  [#84](https://github.com/m96-chan/blinkterm/issues/84)).
-- `alt+o` (`open-external`) opens the page in front in the desktop browser —
-  `open` on a Mac, `$BROWSER` or `xdg-open` on Linux, or
-  `external-browser = <command>` with `{url}` where the url goes — started
-  detached and left running when `blinkterm` quits. Only `http`, `https` and
-  `file` pages are opened, and over ssh with no display the row says so and
-  points at `alt+u`. Cookies and logins do not travel: the other browser opens
-  the url on its own profile
-  ([#61](https://github.com/m96-chan/blinkterm/issues/61)).
-- `alt+r` (the action `reader`) shows the article on the page alone: its
-  title, byline, text, pictures and links in one readable column, in the
-  page's colour scheme, with find, hints, zoom, the saves, `--alpha` and
-  `--force-dark` still working in it; `alt+r` again puts the page back where
-  it was. Nothing is reloaded: the article is shown in a frame in the page
-  itself. The row says `reader` while it is on, and
-  `no article on this page` on a page with nothing to read
+- **Reader mode.** `alt+r` (`cmd+shift+r` on a Mac; the action `reader`)
+  shows the article on the page alone — its title, byline, text, pictures
+  and links in one readable column, in the page's colour scheme — with
+  find, hints, zoom, the saves, `--alpha` and `--force-dark` still working
+  in it. `alt+r` again puts the page back where it was; nothing is
+  reloaded. The row says `reader` while it is on, and `no article on this
+  page` where there is nothing to read
   ([#64](https://github.com/m96-chan/blinkterm/issues/64)).
-- Site styles and scripts: a file `<host>.css` or `<host>.js` in
+- **The page's console.** `ctrl+shift+j` or `alt+j` (`cmd+alt+j` on a Mac;
+  the action `console`) shows what the page in front logged, threw and
+  failed to fetch, newest last, each row the level, the text and where it
+  came from, with a `-- navigated to` row between pages. Words typed in any
+  order filter it; `esc` or `enter` closes it. The row says `2 errors`
+  until you look. The last 1000 entries per tab, in memory only;
+  `--no-console` or `console = false` turns it off
+  ([#67](https://github.com/m96-chan/blinkterm/issues/67)).
+- **Site styles and scripts.** A file `<host>.css` or `<host>.js` in
   `~/.config/blinkterm/sites/` (`$XDG_CONFIG_HOME/blinkterm/sites/`) is put
   on every page of that host — `*.<host>` for a site and every host under
   it, `all` for every page — the general ones first, so the most specific
-  file has the last word. A style is adopted at document start, and is
-  nothing the page can see in its own sheets; a script runs at document
-  start in an isolated world that shares only the DOM, or in the page's own
-  when its first line is `// @world main`. `alt+shift+r` (`reload-sites`)
-  reads the directory again: styles change where the page stands, scripts
-  from the next load. `--sites-dir <dir>` (`sites-dir =`) reads another
-  directory, and `--no-sites` (`sites = false`) none. A file or directory
-  that another user could write is refused by name
+  file has the last word. Styles are adopted at document start and are
+  nothing the page can see in its own sheets; scripts run at document start
+  in an isolated world that shares only the DOM, or in the page's own when
+  the first line is `// @world main`. `alt+shift+r` (`cmd+alt+shift+r` on a
+  Mac; `reload-sites`) reads the directory again: styles change where the
+  page stands, scripts from the next load. `--sites-dir <dir>`
+  (`sites-dir =`) reads another directory, `--no-sites` (`sites = false`)
+  none. A file or directory another user could write is refused by name
   ([#66](https://github.com/m96-chan/blinkterm/issues/66)).
-- The page's console: `ctrl+shift+j` (or `alt+j`, which arrives where Kitty
-  or Ghostty keeps `ctrl+shift+j`) shows what the page in front logged,
-  threw and failed to fetch over the screen, newest last, each row the
-  level, the text and where it came from, with a `-- navigated to` row
-  between pages. Words typed in any order filter it; `esc` or `enter`
-  closes it. The row says `2 errors` until you look. The last 1000 per tab,
-  in memory only; `console = false` or `--no-console` turns it off.
-  `console` in a `key.` line
-  ([#67](https://github.com/m96-chan/blinkterm/issues/67)).
-- Keys that work on a Mac. `keymap = mac|linux` (or `--keymap`) picks the
-  built-in keys, and on macOS the default is now `mac`: a table that arrives
-  in a stock Kitty, with no change to `kitty.conf`, because Kitty on macOS
-  keeps most `cmd` chords and Option makes characters rather than `alt`.
-  `cmd+[`/`cmd+]` back and forward, `cmd+d` bookmark, `cmd+shift+t` reopen,
-  `cmd+alt+left`/`right` or `ctrl+pageup`/`pagedown` the tabs, `ctrl+1` …
-  `ctrl+9` a tab by number, `cmd+shift+a` the tab list, `cmd+y` history,
-  `cmd+c` copy, `cmd+s` save a PDF, `cmd+shift+o` the desktop browser,
-  `cmd+shift+r` reader mode, `cmd+alt+shift+r` the site files again,
-  `cmd+alt+j` the console, and `ctrl` where Kitty lets the Linux
-  chord through (`ctrl+l`, `ctrl+t`, `ctrl+w`, `ctrl+r`, `ctrl+f`, `ctrl+=`,
-  `ctrl+q`). The Linux keys still answer underneath, so `alt` chords work on a
-  Mac with `macos_option_as_alt left`. `key.<chord>` lines apply on top of
-  either keymap. `--doctor` prints a `keys:` line saying which keymap is in
-  effect, and names every `key.` line on a chord Kitty or macOS keeps by
-  default; in Kitty such a line is also named on the status row at start,
-  with the `map <chord> no_op` line for `kitty.conf` that frees it. The Linux
-  keys are unchanged
+- **Open in the desktop browser.** `alt+o` (`cmd+shift+o` on a Mac; the
+  action `open-external`) opens the page in front with `open` on a Mac,
+  `$BROWSER` or `xdg-open` on Linux, or `--external-browser <command>`
+  (`external-browser =`) with `{url}` where the url goes. It is started
+  detached and outlives `blinkterm`. Only `http`, `https` and `file` pages
+  are opened (`nothing to open here` otherwise), and over ssh with no
+  display the row says so and points at `alt+u`. Cookies and logins do not
+  travel ([#61](https://github.com/m96-chan/blinkterm/issues/61)).
+- **Transparent pages.** `--alpha [<1-100>]` (`alpha = true|false|<1-100>`)
+  lets the terminal's background show through a page: the engine paints
+  nothing behind it and the page's own `html` and `body` backgrounds are
+  forced transparent, so a light page is its text and pictures over the
+  terminal; a page that paints a container of its own keeps it. With a
+  number the whole picture, text included, is sent at that opacity. It
+  stays see-through while the page moves. Locally the page is painted on
+  magenta and the magenta keyed back out, so what a page shows in magenta
+  goes too; over ssh and in tmux the frames are PNG with real transparency
+  and the number is not applied. A page's default black text sits on the
+  terminal's colour, so `--force-dark` goes with it on a dark terminal
+  ([#79](https://github.com/m96-chan/blinkterm/issues/79),
+  [#84](https://github.com/m96-chan/blinkterm/issues/84)).
+- **Keys that work on a Mac.** `keymap = mac|linux` (or `--keymap`) picks
+  the built-in keys. The `mac` keymap arrives in a stock Kitty on macOS
+  with no change to `kitty.conf`: `cmd` where Kitty leaves it free and
+  Chrome or Safari use it, `ctrl` elsewhere — `cmd+[`/`cmd+]` back and
+  forward, `cmd+alt+left`/`right` or `ctrl+pageup`/`pagedown` the tabs,
+  `ctrl+1` … `ctrl+9` a tab by number, `cmd+d` bookmark, `cmd+shift+t`
+  reopen, `cmd+shift+a` the tab list, `cmd+y` history, `cmd+c` copy,
+  `cmd+s` save a PDF, and `ctrl+l`, `ctrl+t`, `ctrl+w`, `ctrl+r`, `ctrl+f`,
+  `ctrl+=`, `ctrl+q` as on Linux. The Linux keys still answer underneath,
+  so the `alt` chords work with `macos_option_as_alt left`, and `key.`
+  lines apply on top of either keymap. `--help` lists the keymap of the
+  platform, or the one a `--keymap` on the same line names; the full table
+  is in [docs/usage.md](docs/usage.md#on-a-mac)
+  ([#80](https://github.com/m96-chan/blinkterm/issues/80)).
+- `--doctor` prints a `keys:` line saying which keymap is in effect, and
+  names every `key.` line on a chord Kitty or macOS keeps by default; in
+  Kitty such a line is also named on the status row at start, with the
+  `map <chord> no_op` line for `kitty.conf` that frees it
   ([#80](https://github.com/m96-chan/blinkterm/issues/80),
   [#78](https://github.com/m96-chan/blinkterm/issues/78)).
 
 ### Changed
 
-- The README is short now: a screenshot, the philosophy, how to install and
-  how to build. The full manual moved to `docs/`: installing, keys and use,
-  settings and profiles, features, how it works, and development.
+- **On macOS the default keys are now the `mac` keymap** (see Added). This
+  is the change that can surprise somebody's fingers: on a Mac, `cmd+[`,
+  `cmd+]`, `cmd+d`, `cmd+c`, `cmd+s`, `cmd+p`, `cmd+b`, `cmd+u`, `cmd+y`,
+  `ctrl+1` … `ctrl+9`, `ctrl+pageup`/`pagedown` and the other chords of the
+  Mac column are now the program's where they used to reach the page, and
+  `--help` lists the Mac keys. Every Linux key still does what it did.
+  `keymap = linux` in the settings file, or `--keymap linux`, puts things
+  back as they were. Linux and other platforms are unchanged.
+- New keys are taken from the page on every platform: `alt+o`, `alt+r`,
+  `alt+shift+r`, `alt+j` and `ctrl+shift+j` (see Added). A `key.<chord> =
+  none` line gives any of them back.
+- The README is short now: a screenshot, the philosophy, how to install
+  and build, and the main keys for both keymaps. The full manual moved to
+  `docs/`: installing, keys and use, settings and profiles, features, how
+  it works, and development.
 
 ### Fixed
 
-- A file input inside a **cross-site iframe** — the shape an embedded form
-  service, a support chat or a webmail attachment button usually has — now
-  asks for a path on the row like any other. Such a frame is a target of its
-  own in a renderer of its own, and its click never reached `blinkterm` at
-  all: the engine opened its own picker, which headless does not have and
-  cancels at once, so nothing happened and the page heard `cancel`. Each
-  tab now asks the engine to attach to its frames
-  (`Target.setAutoAttach`, filtered to iframes), and the file goes back to
-  the frame that asked
+- A file input inside a **cross-site iframe** — an embedded form service,
+  a support chat, a webmail attachment button — now asks for a path on the
+  row like any other. Its click never reached `blinkterm`: the engine
+  opened its own picker, which headless does not have and cancels at once,
+  so nothing happened and the page heard `cancel`. Each tab now attaches
+  to its frames, and the file goes back to the frame that asked
   ([#57](https://github.com/m96-chan/blinkterm/issues/57)).
 - A page opened straight into a new tab — `alt+enter` in the history list,
   a url from `blinkterm --remote`, a pick opened in a new tab — is recorded
-  in the history again. A page quick enough finished loading before the
-  program was listening, or while the queue the switch puts in the bin was
-  holding the news, and neither road counted the visit; the page is now
-  asked directly whether it has finished. A page counts once per document,
-  so answering a dialog on a loaded page no longer counts it twice
-  ([#70](https://github.com/m96-chan/blinkterm/issues/70)).
+  in the history again, and its tab stops saying `loading <url>` once the
+  page is there. A page quick enough finished loading before the program
+  was listening, and nothing counted the visit. A page counts once per
+  document, so answering a dialog on a loaded page no longer counts it
+  twice ([#70](https://github.com/m96-chan/blinkterm/issues/70)).
 - A death `blinkterm` cannot catch — `SIGSEGV`, `SIGBUS`, `SIGILL`,
   `SIGFPE`, `SIGABRT` — now puts the terminal back and stops the engine on
   the way down, instead of leaving a shell with mouse reporting on and the
@@ -376,6 +382,7 @@ The first tag.
   sequence is shown as its letters and cannot set the terminal's title or
   clipboard ([#28](https://github.com/m96-chan/blinkterm/issues/28)).
 
-[Unreleased]: https://github.com/m96-chan/blinkterm/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/m96-chan/blinkterm/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/m96-chan/blinkterm/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/m96-chan/blinkterm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/m96-chan/blinkterm/commits/v0.1.0

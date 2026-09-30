@@ -108,7 +108,9 @@ so Option+= arrives as `≠` and is not `alt+=`. So the Mac keymap puts the
 keys on `cmd` where Kitty leaves it free and Chrome or Safari use it, and on
 `ctrl` elsewhere, and needs nothing in `kitty.conf`. It is the default on
 macOS and can be chosen anywhere with `keymap = mac` or `--keymap mac` — over
-ssh from a Mac, say; `keymap = linux` is the other. These are the keys that
+ssh from a Mac, say; `keymap = linux` is the other. `blinkterm --help`
+lists the keys of this platform's keymap, and `blinkterm --keymap linux
+--help` (or `--keymap mac`) those of the one named. These are the keys that
 differ:
 
 | action | linux | mac |
