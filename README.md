@@ -73,6 +73,7 @@ inside tmux (with `set -g allow-passthrough on`) and over ssh.
 | `alt+left` / `alt+right` | back / forward |
 | `ctrl+r` | reload |
 | `ctrl+f` | find in the page |
+| `alt+r` | reader mode |
 | `alt+=` / `alt+-` / `alt+0` | zoom in / out / reset |
 | `ctrl+q` | quit |
 

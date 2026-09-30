@@ -106,6 +106,7 @@ nothing else, for scripts.
 | `zoom-out` | `alt+-`, `ctrl+-` | zoom out |
 | `zoom-reset` | `alt+0`, `ctrl+0` | back to 100% |
 | `find` | `ctrl+f` | find in the page |
+| `reader` | `alt+r` | the article without the page around it |
 | `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
 | `block` | `alt+b` | stop blocking ads and trackers on this site, or start again |
 | `fill-login` | `alt+l` | fill the login form from your password manager |

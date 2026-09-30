@@ -194,6 +194,10 @@ pub struct Tab<C> {
     /// them. Only ever `true` on the tab in front: a tab that is left is
     /// told to leave fullscreen and set `false` as it goes.
     pub fullscreen: bool,
+    /// Whether the page in front is showing its article alone (see
+    /// [`crate::reader`]); `false` at every landing, crash and creation,
+    /// since the frame the reader wrote lives in the document that went.
+    pub reader: bool,
 }
 
 impl<C> Tab<C> {
@@ -217,6 +221,7 @@ impl<C> Tab<C> {
             dormant: false,
             reviving: false,
             fullscreen: false,
+            reader: false,
         }
     }
 
@@ -244,6 +249,7 @@ impl<C> Tab<C> {
         self.picking = None;
         self.committed = false;
         self.fullscreen = false;
+        self.reader = false;
     }
 
     /// Whether the renderer is dead: nothing renderer-bound may be sent to
@@ -346,8 +352,10 @@ impl<C> Tab<C> {
         }
         self.reviving = false;
         // Whatever was fullscreen was in the document that has just gone
-        // (measured: a navigation leaves fullscreen).
+        // (measured: a navigation leaves fullscreen), and so was the
+        // reader's frame.
         self.fullscreen = false;
+        self.reader = false;
         // Read before it is set below: it says whether a reason from
         // `failed_to_reach` belongs to this landing.
         let ours = self.loading;
@@ -1799,5 +1807,17 @@ mod tests {
         tab.fullscreen = true;
         tab.crashed();
         assert!(!tab.fullscreen, "and with a renderer that died");
+    }
+
+    #[test]
+    fn a_landing_and_a_crash_take_the_reader_off() {
+        let mut tab: Tab<()> = Tab::new("a", (), "https://a.example/");
+        assert!(!tab.reader, "a new tab is not in reader mode");
+        tab.reader = true;
+        tab.landed(Landing::Document("https://a.example/next".to_string()));
+        assert!(!tab.reader, "the document that held the frame has gone");
+        tab.reader = true;
+        tab.crashed();
+        assert!(!tab.reader, "and with a renderer that died");
     }
 }

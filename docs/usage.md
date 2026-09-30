@@ -28,6 +28,7 @@
 | `alt+p` | allow this site something: the row says `allow https://site: ` and the words it is allowed now, all selected; type any of `camera` `microphone` `location` `notifications` `clipboard`, `enter` sets exactly those (an empty line takes them all back), `esc` leaves it. See [Sound, permissions and fullscreen](features.md#sound-permissions-and-fullscreen) |
 | `alt+b` | stop blocking ads and trackers on this site, or start again: the row says `blocking off for example.com`, and `unblocked` while you are on it. Reload to get what was blocked. In the url bar `alt+b` is still a word back |
 | `alt+l` | fill the login form from your password manager: runs `password-command` for this page's host and puts what it printed into the password field and the user-name field before it, in the page or a same-origin frame; never submits; only on https or localhost. See [Filling a login from your password manager](features.md#filling-a-login-from-your-password-manager) |
+| `alt+r` | reader mode: the article alone — its title, byline, text, pictures and links — at a readable width, in the page's colour scheme; `alt+r` again puts the page back where it was. The row says `reader` while it is on, and a page with no article says `no article on this page`. See [Reader mode](features.md#reader-mode) |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
@@ -190,7 +191,8 @@ link and an I-beam over a text field; the rest ignore it. A zoom that is not
 100% is a word at the right too, `150%`, after the loading hint, and after
 it how many requests a [block list](features.md#blocking-ads-and-trackers) stopped on
 this page, `12 blocked` — counted from the page's last landing, per tab —
-or `unblocked` on a site you turned blocking off for.
+or `unblocked` on a site you turned blocking off for, and `reader` while
+the page is in [reader mode](features.md#reader-mode).
 
 The url bar, the find prompt, the tab list or the history list, the allow
 line (`alt+p`), a page's dialog and a file input's path take the whole row while they are

@@ -28,6 +28,14 @@ flag, a different default, a raised Rust floor all do.
   on a dark terminal
   ([#79](https://github.com/m96-chan/blinkterm/issues/79),
   [#84](https://github.com/m96-chan/blinkterm/issues/84)).
+- `alt+r` (the action `reader`) shows the article on the page alone: its
+  title, byline, text, pictures and links in one readable column, in the
+  page's colour scheme, with find, hints, zoom, the saves, `--alpha` and
+  `--force-dark` still working in it; `alt+r` again puts the page back where
+  it was. Nothing is reloaded: the article is shown in a frame in the page
+  itself. The row says `reader` while it is on, and
+  `no article on this page` on a page with nothing to read
+  ([#64](https://github.com/m96-chan/blinkterm/issues/64)).
 
 ### Changed
 

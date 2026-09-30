@@ -266,6 +266,45 @@ on the row, in the history, in the session or in any file, and what held
 it is overwritten once it has been handed over. See
 [SECURITY.md](../SECURITY.md) for the details and the limits.
 
+## Reader mode
+
+`alt+r` shows the article on the page alone
+([#64](https://github.com/m96-chan/blinkterm/issues/64)): its title, the
+byline and date when the page gives them, its text, pictures and links, in
+one column at a width a line can be read at, and `alt+r` again puts the
+page back where you were. The row says `reader` while it is on. What goes
+is everything around the article — navigation, sidebars, footers, cookie
+boxes, share buttons, comments, forms, videos and embeds — and whatever the
+page had hidden. A page with nothing to read (a login page, a search page,
+a front page of headlines) is left alone, and the row says
+`no article on this page`.
+
+The article is found by scoring the page's paragraphs and the blocks that
+hold them, in the manner of Readability, and it is shown in the page
+itself: `blinkterm` puts one frame of the page's own origin at the end of
+the page's `<body>`, writes the article into it, and hides the rest with a
+stylesheet. Nothing is reloaded and nothing navigates, so the url, the
+history, the cookies and whatever you had typed into the page stay as they
+were, and the pictures load as they did for the page. A separate page
+(a `data:` url) would have been a history entry you never visited, a url
+that is not the page's, and pictures without the site's cookies. A page can
+see the frame and the stylesheet while the mode is on; it cannot see the
+script that made them, which runs apart from the page's own, as find's
+does.
+
+Inside it everything still works: find, link hints, the pointer over a
+link, zoom (the reader's text size), saving as a PDF or a picture,
+`--alpha` and `--force-dark`. Its colours follow what the page is told —
+`--color-scheme`, or the terminal's own — light or dark. A link followed
+from it loads in the tab, and the new page, like a reload or a crash,
+arrives without the reader.
+
+The limits: a page whose scripts rebuild the whole page can take the
+reader away while the row still says `reader` (`alt+r` twice brings it
+back); an article inside a frame from another site cannot be read; video
+is not kept. The article is looked for when you press `alt+r` and not on
+the next page.
+
 ## Sound, permissions and fullscreen
 
 **Sound** comes out of the machine `blinkterm` runs on, through the

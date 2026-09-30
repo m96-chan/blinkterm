@@ -68,6 +68,7 @@ use crate::options::Options;
 use crate::permissions::{self, Allowed, Permission};
 use crate::picker::{self, Pickers};
 use crate::profile::Profile;
+use crate::reader::{self, Answered};
 use crate::remote::{self, Delivered, Listener};
 use crate::route::{self, Payload, Route, Wrap};
 use crate::save;
@@ -206,6 +207,11 @@ const HINT_TIMEOUT: Duration = Duration::from_secs(5);
 /// the page's own `input` listeners, which are the page's. Five, like the
 /// hints'.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the reader's answer is waited for. The walk is find's kind of
+/// cost: milliseconds on an article, longer on a page nobody reads (see
+/// [`crate::reader`] for the numbers). Five, like the hints'.
+const READER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the question after a click in normal mode — did focus land in
 /// something editable? — may be out. The hover ask's, which it is the same
@@ -498,6 +504,8 @@ struct Chrome {
     hinting: Option<Hinting>,
     /// The question out after a click in normal mode.
     focus: Option<Focus>,
+    /// The reader's question out with the page in front.
+    reader: Option<Reading>,
     /// The person's bookmarks, one file for every profile; see
     /// [`crate::bookmarks`].
     bookmarks: Bookmarks,
@@ -627,6 +635,7 @@ impl Chrome {
             bindings: options.bindings.clone(),
             hinting: None,
             focus: None,
+            reader: None,
             // The same file under every profile, a temporary one
             // included: a bookmark is the person's, not the engine's.
             bookmarks: match Profile::data_dir() {
@@ -847,6 +856,14 @@ struct Hinting {
     hints: Option<hints::Hints>,
     /// Whether a stale world has been remade once already.
     remade: bool,
+}
+
+/// The reader's question out with the engine: which tab, the reply, and
+/// when it went. One at a time; see [`toggle_reader`].
+struct Reading {
+    target: String,
+    pending: Pending,
+    sent: Instant,
 }
 
 /// The one question asked after a click in normal mode: did focus land in
@@ -1864,7 +1881,8 @@ fn drive(
         }
         // The same for the hints' collect, and for the question after a
         // click in normal mode: whether it landed in a field.
-        if pump_hints(tabs, chrome) | pump_focus(tabs, chrome) {
+        // And for the reader's toggle.
+        if pump_hints(tabs, chrome) | pump_focus(tabs, chrome) | pump_reader(tabs, chrome) {
             redraw_row(pane, tabs, chrome)?;
         }
         // The fullscreen watch on the page in front: its answer, and the
@@ -3006,6 +3024,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         .then(|| load::loading_hint(active.loading_for(now)));
     let marker = active.zoom.marker();
     let blocked = blocked_words(tabs, chrome);
+    let reader = active.reader.then_some("reader");
     let mode = mode_words(&chrome.mode, chrome.hinting.as_ref());
     let owner = row_owner(
         tabs,
@@ -3031,6 +3050,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
             downloading.or(loading).as_deref(),
             marker.as_deref(),
             blocked.as_deref(),
+            reader,
             mode.as_deref(),
         ]) {
             Some(right) => screen::split_line(cols, &left, &right),
@@ -3060,12 +3080,14 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
                 Some(&news),
                 marker.as_deref(),
                 blocked.as_deref(),
+                reader,
                 mode.as_deref(),
             ]),
             None => words(&[
                 mode.as_deref(),
                 marker.as_deref(),
                 blocked.as_deref(),
+                reader,
                 active.trust.words(),
                 Some(&active.url),
             ]),
@@ -3656,6 +3678,16 @@ fn handle_page_events(
                         }
                         if chrome.unwatched.as_deref() == Some(tab.target.as_str()) {
                             chrome.unwatched = None;
+                        }
+                        // The reader's frame went with the document
+                        // ([`Tab::landed`] has said it is off), and an
+                        // answer about it would be about a page not there.
+                        if chrome
+                            .reader
+                            .as_ref()
+                            .is_some_and(|reading| reading.target == tab.target)
+                        {
+                            chrome.reader = None;
                         }
                         // A page lands at its host's level, as it would in a
                         // browser: a link from a zoomed site to another lands
@@ -4698,6 +4730,7 @@ fn handle_input(
                 Some(
                     Command::CopySelection
                     | Command::Find
+                    | Command::Reader
                     | Command::SavePdf
                     | Command::SaveScreenshot,
                 ) if tabs.active().is_some_and(Tab::is_crashed) => {
@@ -4735,6 +4768,10 @@ fn handle_input(
                 }
                 Some(Command::FillLogin) => {
                     start_login(pane, tabs, chrome)?;
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(Command::Reader) => {
+                    toggle_reader(tabs, chrome);
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(Command::ListTabs) => {
@@ -5153,6 +5190,9 @@ enum Command {
     /// `alt+l`: the login form filled from the password command. See
     /// [`crate::login`].
     FillLogin,
+    /// `alt+r`: the article without the page around it. See
+    /// [`crate::reader`].
+    Reader,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -5180,6 +5220,9 @@ enum Command {
 /// the person is meant to be reading, which is the url bar's reason. Nor does
 /// the history list, although the tab list does: what it picks is a page to
 /// load, and here that would be a navigation queued behind the question.
+///
+/// Reader mode does not survive: it asks the page, and a page stopped
+/// behind a dialog would hold its answer until the deadline.
 ///
 /// Saving the page does not survive either: a page stopped behind a dialog
 /// answers neither `Page.printToPDF` nor `Page.getLayoutMetrics` until it
@@ -5227,6 +5270,7 @@ fn survives_dialog(command: Command) -> bool {
         | Command::Find
         | Command::Permissions
         | Command::FillLogin
+        | Command::Reader
         | Command::ZoomIn
         | Command::ZoomOut
         | Command::ZoomReset
@@ -6191,6 +6235,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('p') => Some(Command::Permissions),
             Key::Char('b') => Some(Command::Block),
             Key::Char('l') => Some(Command::FillLogin),
+            Key::Char('r') => Some(Command::Reader),
             Key::Char('t') => Some(Command::ReopenTab),
             Key::Char('=' | '+') => Some(Command::ZoomIn),
             Key::Char('-' | '_') => Some(Command::ZoomOut),
@@ -6245,6 +6290,7 @@ fn command_of(action: Action) -> Command {
         Action::Find => Command::Find,
         Action::Permissions => Command::Permissions,
         Action::FillLogin => Command::FillLogin,
+        Action::Reader => Command::Reader,
         Action::Copy => Command::CopySelection,
         Action::CopyUrl => Command::CopyUrl,
         Action::SavePdf => Command::SavePdf,
@@ -6588,6 +6634,95 @@ fn toggle_block(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
         Err(why) => format!("{}; {why}", block::toggled(&site, now)),
     };
     note(tabs, sentence);
+}
+
+/// `alt+r`: the article in front alone, or the page back
+/// ([`crate::reader`]).
+///
+/// Sent like the hints' collect, into the shared world, and heard by
+/// [`pump_reader`]; one question at a time, and none to a page that has not
+/// come, to a dead renderer, or to a page with nothing in it to read. The
+/// tab says whether it is on, so the key asks for the other; the page's own
+/// state decides what that does, so a key pressed twice is two toggles.
+fn toggle_reader(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    if chrome.reader.is_some() {
+        return;
+    }
+    // Not a dead renderer or a dormant tab, which are sent nothing; the key
+    // that asks says why ([`handle_input`]).
+    let Some(tab) = tabs.active_mut().filter(|tab| accepts_input(tab)) else {
+        return;
+    };
+    if tab.loading && !tab.committed {
+        tab.note = Some(reader::NOT_YET.to_string());
+        return;
+    }
+    if tab.url.is_empty()
+        || tab.url == "about:blank"
+        || matches!(tab.problem, Some(Problem::Unreachable { .. }))
+    {
+        tab.note = Some(reader::NOTHING.to_string());
+        return;
+    }
+    let on = !tab.reader;
+    let alpha = chrome.appearance.alpha.on();
+    let pending = make_world(&mut tab.connection).and_then(|context| {
+        tab.connection
+            .send(
+                "Runtime.callFunctionOn",
+                reader::call_params(context, on, alpha),
+            )
+            .ok()
+    });
+    let Some(pending) = pending else {
+        tab.note = Some(reader::NOT_ANSWERED.to_string());
+        return;
+    };
+    chrome.reader = Some(Reading {
+        target: tab.target.clone(),
+        pending,
+        sent: Instant::now(),
+    });
+}
+
+/// Take the reader's answer, once a pass: on, off, or no article. A
+/// question for a tab no longer in front is dropped, as the hints' is; so is
+/// one to a renderer that died. No answer in [`READER_TIMEOUT`], an
+/// exception, or a world gone with its document is "the page did not answer
+/// the reader", and the person presses again on the new document. Returns
+/// whether the row should be drawn again.
+fn pump_reader(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
+    let Some(reading) = chrome.reader.as_ref() else {
+        return false;
+    };
+    let Some(tab) = tabs.active_mut().filter(|tab| tab.target == reading.target) else {
+        chrome.reader = None;
+        return false;
+    };
+    if tab.is_crashed() {
+        chrome.reader = None;
+        return true;
+    }
+    let answer = match tab.connection.take_reply(&reading.pending) {
+        None if reading.sent.elapsed() < READER_TIMEOUT => return false,
+        None | Some(Err(_)) => None,
+        Some(Ok(reply)) => reader::answered(&reply),
+    };
+    chrome.reader = None;
+    match answer {
+        Some(Answered::On) => tab.reader = true,
+        Some(Answered::Off) => tab.reader = false,
+        Some(Answered::Nothing) => {
+            tab.reader = false;
+            tab.note = Some(reader::NOTHING.to_string());
+        }
+        None => {
+            // What the page is showing is not known; the tab keeps what it
+            // said, so the next press asks for the same thing again.
+            tab.note = Some(reader::NOT_ANSWERED.to_string());
+        }
+    }
+    true
 }
 
 /// Type into the allow line. Returns `false` only if the person quit.
@@ -9143,6 +9278,22 @@ mod tests {
             words(&[Some("150%"), Some("https://example.com")]).as_deref(),
             Some("150%  https://example.com")
         );
+        // Reader mode's word comes after the blocked count and before the
+        // mode, whatever of them there is.
+        assert_eq!(
+            words(&[
+                Some("150%"),
+                Some("12 blocked"),
+                Some("reader"),
+                Some("normal")
+            ])
+            .as_deref(),
+            Some("150%  12 blocked  reader  normal")
+        );
+        assert_eq!(
+            words(&[None, None, Some("reader"), None]).as_deref(),
+            Some("reader")
+        );
     }
 
     #[test]
@@ -9280,6 +9431,29 @@ mod tests {
         for press in every_press() {
             if command(&press) == Some(Command::FillLogin) {
                 assert_eq!(press.key, Key::Char('l'), "{press:?}");
+                assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn alt_r_toggles_the_reader_and_waits_for_a_dialog_like_the_other_page_questions() {
+        assert_eq!(
+            command(&key(Key::Char('r'), Mods::ALT)),
+            Some(Command::Reader)
+        );
+        assert_eq!(command_of(Action::Reader), Command::Reader);
+        // It asks the page, which a dialog has stopped.
+        assert!(!survives_dialog(Command::Reader));
+        // `ctrl+r` is still reload, and a bare `r` the page's.
+        assert_eq!(
+            command(&key(Key::Char('r'), Mods::CTRL)),
+            Some(Command::Reload)
+        );
+        assert_eq!(command(&key(Key::Char('r'), 0)), None);
+        for press in every_press() {
+            if command(&press) == Some(Command::Reader) {
+                assert_eq!(press.key, Key::Char('r'), "{press:?}");
                 assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
             }
         }
