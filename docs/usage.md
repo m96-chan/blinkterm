@@ -19,6 +19,7 @@
 | `ctrl+shift+j` (or `alt+j`) | the page's console: `console.*` calls, uncaught exceptions and requests that failed (status 400 and up, or a network error), newest last, each row `level  text — url:line`; type words in any order to filter, `↑`/`↓` scroll, `esc` or `enter` closes. Kept per tab, the last 1000, across navigations with a `-- navigated to …` row between. `ctrl+shift+j` is Kitty's and Ghostty's own by default; `alt+j` reaches every terminal. See [The console](features.md#the-console) |
 | `ctrl+shift+pageup` / `pagedown` (or `alt+shift+pageup` / `pagedown`) | move this tab left or right |
 | middle click or `ctrl`+click on a link | open it in a tab behind this one |
+| a click on the status row | on a tab, switch to it; a middle click closes it; on `+N` at either end, the nearest tab past that end; on the url (or anywhere with one tab), the url bar, as `ctrl+l` |
 | `alt+=` / `alt+-` | zoom in and out (`ctrl+=` / `ctrl+-` where your terminal lets them through) |
 | `alt+0` / `ctrl+0` | back to 100% |
 | your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
@@ -48,7 +49,9 @@ new window gets a new tab, and the tab is switched to.
 
 With more tabs than the row can name, the strip shows a run of them around
 the one in front and `+N` at either end for how many are past it; it scrolls
-when the tab in front reaches an edge. The list (`ctrl+shift+a`) shows all of
+when the tab in front reaches an edge. Clicking a tab in the strip switches
+to it, a middle click closes it, and clicking `+N` brings the tab past that
+end into view. The list (`ctrl+shift+a`) shows all of
 them. Kitty and Ghostty keep `ctrl+shift+a` and `ctrl+shift+j` (the
 console) for themselves and every terminal keeps
 `ctrl+shift+pageup`/`pagedown` — Kitty and tOS for the scrollback,
@@ -315,6 +318,12 @@ line (`alt+p`), a page's dialog and a file input's path take the whole row while
 open, and `esc` goes to whichever of them has it before it leaves
 fullscreen or stops a load; no link is shown while one of them is there.
 The offer to restore the last run's tabs takes it too, after all of them.
+
+The row answers the mouse only while the strip, or the title and url, is on
+it: a click on a tab, a `+N` or the url does what the keys would (see
+[Keys](#keys)), and a click while anything else has the row does nothing. A
+press on the row is never the page's, and neither is its release — a drag
+that began on the page and ended on the row still ends on the page.
 
 A page whose renderer crashes stays in its tab: the picture goes, and the row
 says `this page crashed; ctrl+r reloads it` — a tab behind that crashed says

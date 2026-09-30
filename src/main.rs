@@ -206,6 +206,9 @@ keys (keymap linux; --keymap mac or keymap = mac for the other):
                  move this tab left, right (alt+shift+pageup/pagedown too)
   middle click or ctrl+click on a link
                  open it in a tab behind this one
+  a click on the row
+                 a tab switches to it, a middle click closes it, +N the
+                 nearest tab past that end, the url the url bar
   alt+= / alt+-  zoom in, out (ctrl+= / ctrl+- where the terminal lets them
                  through); alt+0 / ctrl+0 back to 100%
   ctrl+.         normal mode on or off; in it the letters are keys: f labels
@@ -263,6 +266,9 @@ keys (keymap mac; --keymap linux or keymap = linux for the other):
                  move this tab left, right
   middle click or ctrl+click on a link
                  open it in a tab behind this one
+  a click on the row
+                 a tab switches to it, a middle click closes it, +N the
+                 nearest tab past that end, the url the url bar
   ctrl+= / ctrl+- zoom in, out; ctrl+0 back to 100%
   ctrl+.         normal mode on or off; in it the letters are keys: f labels
                  what can be clicked and typing a label clicks it (F opens a
