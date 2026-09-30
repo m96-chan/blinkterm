@@ -107,18 +107,20 @@ jobs:
       # an MSRV regression there independently of the stable-toolchain Mac job.
       - run: rustup target add aarch64-apple-darwin
       - run: cargo check --target aarch64-apple-darwin --all-targets --locked
-      # The README tells people which Rust to install, and it said 1.75 for as
-      # long as Cargo.toml did. Fixing one and not the other is the same bug
-      # again, so every "Rust <x>.<y>" in the README has to be this job's
-      # version. Cheap, and it runs next to the thing it is comparing against.
-      - name: The README agrees about the floor
+      # The README and docs/install.md tell people which Rust to install, and
+      # the README said 1.75 for as long as Cargo.toml did. Fixing one and not
+      # the other is the same bug again, so every "Rust <x>.<y>" in either has
+      # to be this job's version. Cheap, and it runs next to the thing it is
+      # comparing against.
+      - name: The README and the install doc agree about the floor
         run: |
           version=${{ steps.msrv.outputs.version }}
           bad=0
-          for found in $(grep -oE 'Rust \*{0,2}[0-9]+\.[0-9]+' README.md \
+          for found in $(cat README.md docs/install.md \
+                         | grep -oE 'Rust \*{0,2}[0-9]+\.[0-9]+' \
                          | grep -oE '[0-9]+\.[0-9]+' | sort -u); do
             if [ "$found" != "$version" ]; then
-              echo "README.md says Rust $found; Cargo.toml says $version" >&2
+              echo "README.md or docs/install.md says Rust $found; Cargo.toml says $version" >&2
               bad=1
             fi
           done

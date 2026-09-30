@@ -21,6 +21,12 @@ flag, a different default, a raised Rust floor all do.
   colour, so `--force-dark` goes with it on a dark terminal
   ([#79](https://github.com/m96-chan/blinkterm/issues/79)).
 
+### Changed
+
+- The README is short now: a screenshot, the philosophy, how to install and
+  how to build. The full manual moved to `docs/`: installing, keys and use,
+  settings and profiles, features, how it works, and development.
+
 ## [0.2.0] - 2026-09-30
 
 ### Added

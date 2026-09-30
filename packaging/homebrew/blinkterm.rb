@@ -48,7 +48,7 @@ class Blinkterm < Formula
 
       A Google Chrome or Chromium in /Applications is found without that.
 
-      The README's "Installing" section has the exact download and the
+      docs/install.md in the repository has the exact download and the
       libraries it wants. Debian's chromium-shell package is Chromium's
       content_shell, not a headless shell: it keeps a DevTools port open beside
       the pipe and does not close when asked, so a profile is never flushed.
