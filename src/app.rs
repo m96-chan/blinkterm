@@ -1201,7 +1201,7 @@ pub fn run(options: Options) -> Result<(), String> {
     };
     // What pages are told about light and dark, before there is a page to
     // tell: the flags now, the terminal's answer when it comes.
-    let appearance = Appearance::new(options.scheme, options.force_dark);
+    let appearance = Appearance::new(options.scheme, options.force_dark, options.alpha);
     // Once for the run, and before the pane is taken, so that a directory
     // which is a file is a sentence in the shell. Every engine is told it.
     let downloads_dir = download::prepare(options.download.clone())?;
@@ -8803,6 +8803,43 @@ mod tests {
     }
 
     #[test]
+    fn alpha_leaves_the_cast_as_the_route_has_it_and_only_the_still_is_transparent() {
+        let options = crate::options::resolve(
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+        )
+        .expect("the defaults");
+        let profile = Profile::temporary().expect("a temporary profile");
+        let downloads =
+            std::env::temp_dir().join(format!("blinkterm-app-alpha-{}", std::process::id()));
+        let mut chrome = Chrome::new(
+            Metrics {
+                cols: 80,
+                rows: 24,
+                cell: (8, 16),
+            },
+            &options,
+            &profile,
+            downloads.clone(),
+            Appearance::new(crate::appearance::Choice::default(), false, true),
+            Identity::new(None, None, "C"),
+            Allowed::in_memory(),
+            None,
+            Unblocked::in_memory(),
+        );
+        let local = Route::local(true);
+        chrome.take_route(local);
+        assert!(!chrome.cast.png, "JPEG while the page moves, alpha or not");
+        chrome.take_route(Route {
+            payload: Payload::Png,
+            ..local
+        });
+        assert!(chrome.cast.png, "the PNG route's frames, as without it");
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
     fn when_the_engine_goes_the_pages_prompts_and_the_watch_go_and_the_persons_typing_and_the_allow_line_stay(
     ) {
         let metrics = Metrics {
@@ -8824,7 +8861,7 @@ mod tests {
             &options,
             &profile,
             downloads.clone(),
-            Appearance::new(crate::appearance::Choice::default(), false),
+            Appearance::new(crate::appearance::Choice::default(), false, false),
             Identity::new(None, None, "C"),
             Allowed::in_memory(),
             None,

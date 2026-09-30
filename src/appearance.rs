@@ -36,6 +36,52 @@
 //! `--force-dark-mode`, left the same page at 255 — and it is off unless
 //! asked for, because Chromium's auto dark inverts pages that were designed
 //! light, and a person has to have wanted that.
+//!
+//! # No background at all
+//!
+//! Where a page paints no background of its own, the engine paints white:
+//! the canvas's default, which a desktop browser has a window behind and a
+//! terminal does not need. `--alpha` has it paint nothing there instead, with
+//! `Emulation.setDefaultBackgroundColorOverride` to black at alpha 0
+//! ([`transparent_params`]), so the pixels come back transparent and the
+//! terminal's own background — its colour, its opacity, its blur — shows
+//! through. A page that paints a background keeps it; only the canvas under
+//! it changes.
+//!
+//! It is sent from [`Appearance::commands`], after the scheme and the
+//! forcing, and for the same reason they are there: it is per session, and
+//! every session is made through the one function that sends those
+//! (`app::prepare_session`) — the first tab, a new one, one the page opened,
+//! every tab of a relaunched engine, a renderer brought back from a crash —
+//! so no path can make a page that was not told. It is a per-run setting, as
+//! `--force-dark` is; there is no key that turns it off.
+//!
+//! Measured against `chrome-headless-shell` 153 with a page that paints
+//! nothing, the pixel read from a PNG `Page.captureScreenshot`:
+//!
+//! | step | the canvas's pixel, RGBA |
+//! | --- | --- |
+//! | the engine's default | 255, 255, 255, 255 |
+//! | the override, on the loaded page | 0, 0, 0, 0 — no reload, within 170 ms |
+//! | `Page.navigate` to a page with `background: #fff` | alpha 255, the page's own |
+//! | `Page.navigate` back | 0, 0, 0, 0 |
+//! | `Page.reload` | 0, 0, 0, 0 |
+//! | a page saying `color-scheme: dark` | 0, 0, 0, 0, its text white |
+//! | `--force-dark` as well | 0, 0, 0, 0, the black text made white |
+//!
+//! So it survives what happens on the session, as the emulated media does,
+//! and is never sent again on a navigation. Neither a page's own dark canvas
+//! nor auto dark's `#121212` is painted under it: each changes the text and
+//! leaves the canvas transparent. That is the catch — a page that says
+//! nothing about its colours is black text on whatever the terminal is, and on
+//! a dark terminal that is unreadable. `--force-dark` makes the text light and
+//! keeps the transparency, and a light terminal needs nothing.
+//!
+//! The screencast honours it too, but only in PNG: a JPEG frame of the same
+//! page is 0, 0, 0 where the PNG is transparent. The moving frames stay JPEG
+//! on the local route all the same, so there a page with no background is
+//! black while it moves and transparent once it rests and the lossless still
+//! arrives; see [`crate::motion`] for why that is the choice.
 
 use crate::json::Json;
 
@@ -87,14 +133,17 @@ pub struct Appearance {
     terminal: Option<Scheme>,
     /// `--force-dark`.
     pub force_dark: bool,
+    /// `--alpha`: no default background, so the terminal's shows through.
+    pub alpha: bool,
 }
 
 impl Appearance {
-    pub fn new(choice: Choice, force_dark: bool) -> Appearance {
+    pub fn new(choice: Choice, force_dark: bool, alpha: bool) -> Appearance {
         Appearance {
             choice,
             terminal: None,
             force_dark,
+            alpha,
         }
     }
 
@@ -121,9 +170,10 @@ impl Appearance {
     }
 
     /// The commands for one session, in order: `setEmulatedMedia` when there
-    /// is a scheme to say, `setAutoDarkModeOverride` when forcing. Nothing at
-    /// all for a session that has nothing to be told, which is a session the
-    /// engine's defaults already describe.
+    /// is a scheme to say, `setAutoDarkModeOverride` when forcing,
+    /// `setDefaultBackgroundColorOverride` to transparent under `--alpha`.
+    /// Nothing at all for a session that has nothing to be told, which is a
+    /// session the engine's defaults already describe.
     pub fn commands(&self) -> Vec<(&'static str, Json)> {
         let mut out = Vec::new();
         if let Some(scheme) = self.scheme() {
@@ -131,6 +181,12 @@ impl Appearance {
         }
         if self.force_dark {
             out.push(("Emulation.setAutoDarkModeOverride", auto_dark_params(true)));
+        }
+        if self.alpha {
+            out.push((
+                "Emulation.setDefaultBackgroundColorOverride",
+                transparent_params(),
+            ));
         }
         out
     }
@@ -176,6 +232,20 @@ pub fn auto_dark_params(enabled: bool) -> Json {
     Json::object(vec![("enabled", Json::Bool(enabled))])
 }
 
+/// `Emulation.setDefaultBackgroundColorOverride`'s parameters for no
+/// background at all: black with nothing of it showing.
+pub fn transparent_params() -> Json {
+    Json::object(vec![(
+        "color",
+        Json::object(vec![
+            ("r", Json::number(0)),
+            ("g", Json::number(0)),
+            ("b", Json::number(0)),
+            ("a", Json::number(0)),
+        ]),
+    )])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,25 +273,36 @@ mod tests {
 
     #[test]
     fn the_flag_beats_the_terminal_and_auto_without_an_answer_says_nothing() {
-        let mut auto = Appearance::new(Choice::Auto, false);
+        let mut auto = Appearance::new(Choice::Auto, false, false);
         assert_eq!(auto.scheme(), None);
         assert!(auto.commands().is_empty(), "the engine's default, unsaid");
+        assert_eq!(
+            Appearance::new(Choice::Auto, false, true)
+                .commands()
+                .into_iter()
+                .map(|(method, params)| format!("{method} {params}"))
+                .collect::<Vec<_>>(),
+            [
+                "Emulation.setDefaultBackgroundColorOverride {\"color\":{\"r\":0,\"g\":0,\"b\":0,\"a\":0}}"
+            ],
+            "the override alone, with no answer yet"
+        );
         assert!(auto.learned((0, 0, 0)));
         assert_eq!(auto.scheme(), Some(Scheme::Dark));
 
-        let mut light = Appearance::new(Choice::Light, false);
+        let mut light = Appearance::new(Choice::Light, false, false);
         assert_eq!(light.scheme(), Some(Scheme::Light));
         assert!(!light.learned((0, 0, 0)), "the flag was not asking");
         assert_eq!(light.scheme(), Some(Scheme::Light));
 
-        let mut dark = Appearance::new(Choice::Dark, false);
+        let mut dark = Appearance::new(Choice::Dark, false, false);
         assert!(!dark.learned((255, 255, 255)));
         assert_eq!(dark.scheme(), Some(Scheme::Dark));
     }
 
     #[test]
     fn learning_the_same_answer_twice_changes_nothing() {
-        let mut appearance = Appearance::new(Choice::Auto, false);
+        let mut appearance = Appearance::new(Choice::Auto, false, false);
         assert!(appearance.learned((0x1c, 0x1c, 0x1c)));
         assert!(!appearance.learned((0x28, 0x28, 0x28)), "still dark");
         assert!(appearance.learned((0xfd, 0xf6, 0xe3)), "now light");
@@ -230,7 +311,7 @@ mod tests {
 
     #[test]
     fn the_commands_name_the_scheme_and_the_forcing() {
-        let mut appearance = Appearance::new(Choice::Auto, true);
+        let mut appearance = Appearance::new(Choice::Auto, true, false);
         let text = |appearance: &Appearance| {
             appearance
                 .commands()
@@ -255,6 +336,21 @@ mod tests {
             r#"{"features":[{"name":"prefers-color-scheme","value":"light"}]}"#
         );
         assert_eq!(auto_dark_params(false).to_string(), r#"{"enabled":false}"#);
+
+        appearance.alpha = true;
+        assert_eq!(
+            text(&appearance),
+            [
+                "Emulation.setEmulatedMedia {\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":\"dark\"}]}",
+                "Emulation.setAutoDarkModeOverride {\"enabled\":true}",
+                "Emulation.setDefaultBackgroundColorOverride {\"color\":{\"r\":0,\"g\":0,\"b\":0,\"a\":0}}",
+            ],
+            "the override comes last"
+        );
+        assert_eq!(
+            transparent_params().to_string(),
+            r#"{"color":{"r":0,"g":0,"b":0,"a":0}}"#
+        );
     }
 
     #[test]

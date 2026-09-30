@@ -1247,7 +1247,7 @@ fn a_tab_opened_behind_by_this_program_loads_without_being_looked_at() {
     let base = serve();
     let (mut browser, mut tabs) = tabbed(&engine, page, target);
     let appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
 
     let index = blinkterm::app::open_behind(
         &mut tabs,
@@ -2008,9 +2008,14 @@ fn raw_pixels_cost_the_terminal_a_fraction_of_what_a_png_frame_did() {
     cast(&mut client, "png", None, WIDE, TALL);
     let started = Instant::now();
     let (mut before_frames, mut before_bytes) = (0usize, 0usize);
-    let mut before_terminal = Duration::ZERO;
+    let (mut before_terminal, mut png_decoding) = (Duration::ZERO, Duration::ZERO);
     while started.elapsed() < run_for {
         for (png, _) in take_frames(&mut client) {
+            // What a PNG moving frame would cost this process to decode,
+            // printed and not asserted: the number `--alpha` was weighed on.
+            let at = Instant::now();
+            let _ = blinkterm::png::decode(&png, 64 * 1024 * 1024).expect("a frame decodes");
+            png_decoding += at.elapsed();
             let sequence = png_through_the_terminal(&before_dir, &mut counter, &png, cells);
             let at = Instant::now();
             terminal.advance(&sequence);
@@ -2099,11 +2104,13 @@ fn raw_pixels_cost_the_terminal_a_fraction_of_what_a_png_frame_did() {
     eprintln!(
         "{WIDE}x{TALL} end to end:\n  \
          before  png  decoded by the terminal: {before_fps:.1} fps, \
-         {} kB a frame, {before_each:?} in the terminal\n  \
+         {} kB a frame, {before_each:?} in the terminal, \
+         {:?} if decoded here\n  \
          after   jpeg q{} decoded here:        {after_fps:.1} fps, \
          {} kB a frame, {:?} decoding, {after_each:?} in the terminal\n  \
          the terminal's share is {:.1}x smaller",
         before_bytes / before_frames / 1024,
+        png_decoding / before_frames as u32,
         motion::QUALITY,
         after_bytes / after_frames / 1024,
         decoding / after_frames as u32,
@@ -6438,7 +6445,7 @@ fn the_zoom_survives_a_navigation_and_a_new_tab_starts_at_its_hosts_level() {
         .expect("Page.enable");
     blinkterm::app::prepare_session(
         &mut second,
-        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false),
         &Identity::new(None, None, "C"),
     );
     let (width, _, ratio) = page_metrics(&mut second);
@@ -6471,7 +6478,7 @@ fn a_dark_terminal_gets_dark_pages_and_so_does_a_tab_opened_later() {
     assert!(corner_luminance(&mut page) > 0.9);
 
     let mut appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
     assert!(appearance.learned((0x1c, 0x1c, 0x1c)));
     blinkterm::app::prepare_session(&mut page, &appearance, &Identity::new(None, None, "C"));
     assert!(
@@ -6542,7 +6549,8 @@ fn forced_dark_paints_a_white_page_dark() {
     go_to(&mut client, WHITE);
     assert!(corner_luminance(&mut client) > 0.9, "white to begin with");
 
-    let forced = blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, true);
+    let forced =
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, true, false);
     blinkterm::app::prepare_session(&mut client, &forced, &Identity::new(None, None, "C"));
     let dark = |client: &mut Client| corner_luminance(client) < 0.1;
     assert!(wait_until(&mut client, true, dark), "painted dark");
@@ -6551,6 +6559,200 @@ fn forced_dark_paints_a_white_page_dark() {
         wait_until(&mut client, true, dark),
         "and after a navigation"
     );
+
+    client.close();
+    engine.kill();
+}
+
+/// A page that paints no background of its own: a line of text, and a small
+/// block moving in the top corner so that a screencast has frames to send.
+/// Everything below and to the right of them is the canvas, which is what
+/// `--alpha` is about.
+const CLEAR: &str = "data:text/html,<body style='margin:0'><p>Some text on no background.</p>\
+<div id=b style='position:absolute;left:0;top:40px;width:20px;height:20px;background:%23c33'></div>\
+<script>var b=document.getElementById('b'),n=0;\
+function f(){n=n>80?0:n+2;b.style.left=n+'px';requestAnimationFrame(f)}f();\
+document.title='ready'</script></body>";
+
+/// The still's pixel near the bottom right, where [`CLEAR`] has nothing, as
+/// red, green, blue and alpha.
+fn far_corner(client: &mut Client) -> [u8; 4] {
+    let (rgba, width, height) = still(client);
+    let at = (((height - 5) * width + width - 5) * 4) as usize;
+    [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]]
+}
+
+/// The appearance `--alpha` gives a session, told the way the program tells
+/// one.
+fn transparent(client: &mut Client, force_dark: bool) {
+    let alpha = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        force_dark,
+        true,
+    );
+    blinkterm::app::prepare_session(client, &alpha, &Identity::new(None, None, "C"));
+}
+
+/// `--alpha`: the override is per session and lives through what happens on
+/// it, like the scheme — so it is sent once, from `Appearance::commands`, and
+/// never again on a navigation.
+#[test]
+fn a_page_with_no_background_is_transparent_under_the_override_and_stays_so_across_a_navigation() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    go_to(&mut client, CLEAR);
+    let before = far_corner(&mut client);
+    eprintln!("no override: {before:?}");
+    assert_eq!(before, [255, 255, 255, 255], "the engine's white, opaque");
+
+    transparent(&mut client, false);
+    let alpha = |client: &mut Client| far_corner(client)[3];
+    let started = Instant::now();
+    assert_eq!(wait_until(&mut client, 0, alpha), 0, "transparent in place");
+    eprintln!(
+        "the override on the loaded page: {:?} after {:?}",
+        far_corner(&mut client),
+        started.elapsed()
+    );
+
+    go_to(&mut client, PAGE);
+    assert_eq!(
+        wait_until(&mut client, 255, alpha),
+        255,
+        "a page with a background of its own keeps it"
+    );
+    go_to(&mut client, CLEAR);
+    let navigated = far_corner(&mut client);
+    eprintln!("Page.navigate back: {navigated:?}");
+    assert_eq!(navigated[3], 0, "still transparent after a navigation");
+
+    evaluate(&mut client, "document.title='leaving'");
+    client
+        .call("Page.reload", Json::empty())
+        .expect("the page reloads");
+    assert_eq!(
+        wait_for_title(&mut client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+    let reloaded = far_corner(&mut client);
+    eprintln!("Page.reload: {reloaded:?}");
+    assert_eq!(reloaded[3], 0, "and after a reload");
+
+    client.close();
+    engine.kill();
+}
+
+/// Why a bare page is black while it moves under `--alpha`: the screencast
+/// keeps the transparency in a PNG, and a JPEG — the local route's moving
+/// frame — has nowhere to put it and paints it black.
+#[test]
+fn the_screencast_carries_the_alpha_as_png_and_paints_it_black_as_jpeg() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    go_to(&mut client, CLEAR);
+    transparent(&mut client, false);
+    let alpha = |client: &mut Client| far_corner(client)[3];
+    assert_eq!(wait_until(&mut client, 0, alpha), 0, "transparent");
+
+    let first = |client: &mut Client, png: bool| -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let signature: &[u8] = if png { b"\x89PNG" } else { b"\xff\xd8" };
+            if let Some((frame, _)) = take_frames(client)
+                .into_iter()
+                .find(|(frame, _)| frame.starts_with(signature))
+            {
+                return frame;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("no frame in five seconds");
+    };
+
+    cast(&mut client, "png", None, WIDTH, HEIGHT);
+    let png = first(&mut client, true);
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    let image = blinkterm::png::decode(&png, 64 * 1024 * 1024).expect("a frame decodes");
+    let at = (((image.height - 5) * image.width + image.width - 5) * 4) as usize;
+    let pixel = &image.rgba[at..at + 4];
+    eprintln!("png cast {}x{}: {pixel:?}", image.width, image.height);
+    assert_eq!(pixel[3], 0, "the PNG cast keeps the transparency");
+
+    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDTH, HEIGHT);
+    let jpeg = first(&mut client, false);
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    let image = blinkterm::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+    let at = (((image.height - 5) * image.width + image.width - 5) * 3) as usize;
+    let pixel = &image.rgb[at..at + 3];
+    eprintln!("jpeg cast {}x{}: {pixel:?}", image.width, image.height);
+    assert!(
+        pixel.iter().all(|&c| c < 8),
+        "the JPEG cast paints the transparency black: {pixel:?}"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// What the override does beside `--force-dark` and beside a page that asks
+/// for a dark canvas itself — measured here, not decided in the design: the
+/// canvas stays transparent in both, and only the text changes.
+#[test]
+fn the_override_beside_forced_dark_and_beside_a_page_that_says_it_is_dark() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    go_to(&mut client, CLEAR);
+    transparent(&mut client, false);
+    let alpha = |client: &mut Client| far_corner(client)[3];
+    assert_eq!(wait_until(&mut client, 0, alpha), 0, "transparent");
+    // The brightest of the text's pixels: the first line, above the block,
+    // wherever something opaque was painted.
+    let text = |client: &mut Client| {
+        let (rgba, width, _) = still(client);
+        rgba[..(38 * width * 4) as usize]
+            .chunks_exact(4)
+            .filter(|p| p[3] >= 128)
+            .map(|p| blinkterm::appearance::luminance((p[0], p[1], p[2])))
+            .fold(0.0, f64::max)
+    };
+    let black_text = text(&mut client);
+    eprintln!("the override alone: text at most {black_text:.3}");
+    assert!(black_text < 0.1, "black text on nothing");
+
+    let dark_page = "data:text/html,<html style='color-scheme:dark'><body style='margin:0'>\
+<p>Some text</p><script>document.title='ready'</script></body></html>";
+    go_to(&mut client, dark_page);
+    let dark = far_corner(&mut client);
+    let dark_text = text(&mut client);
+    eprintln!("color-scheme: dark, under the override: {dark:?}, text at most {dark_text:.3}");
+    assert_eq!(dark[3], 0, "the override, not Blink's dark canvas");
+    assert!(dark_text > 0.9, "the page's own light text");
+
+    go_to(&mut client, CLEAR);
+    transparent(&mut client, true);
+    let light = |client: &mut Client| text(client) > 0.5;
+    assert!(wait_until(&mut client, true, light), "the text made light");
+    let forced = far_corner(&mut client);
+    eprintln!(
+        "--force-dark and the override: {forced:?}, text at most {:.3}",
+        text(&mut client)
+    );
+    assert_eq!(forced[3], 0, "auto dark leaves the canvas transparent");
 
     client.close();
     engine.kill();
@@ -7704,7 +7906,7 @@ fn a_crashed_page_keeps_its_tab_and_a_reload_brings_it_back_casting() {
     eprintln!("frames in a second after the reload, the cast untouched: {unstarted}");
     blinkterm::app::revive(
         &mut tab.connection,
-        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false),
         blinkterm::zoom::Viewport::fit((WIDTH, HEIGHT), 1.0),
         Metrics {
             cols: WIDTH / CELL.0,
@@ -8079,7 +8281,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
     let downloads = root.join("downloads");
     std::fs::create_dir_all(&downloads).expect("a download directory");
     let appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
     let launch = engine::Launch::default();
     let profile = Profile::take(Choice::At(dir.clone())).expect("a kept profile");
     let Booted {
@@ -8451,7 +8653,7 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
     let downloads = root.join("downloads");
     std::fs::create_dir_all(&downloads).expect("a download directory");
     let appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
     let mut allowed = Allowed::in_memory();
     allowed
         .set(&origin, &[Permission::Camera])
@@ -9092,7 +9294,7 @@ fn a_page_is_told_chromium_and_this_program_and_nothing_headless() {
     };
     blinkterm::app::prepare_session(
         &mut client,
-        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false),
         &Identity::new(engine.agent(), None, "ja_JP.UTF-8"),
     );
     // On a page served over http from 127.0.0.1, which is a secure context:
@@ -9172,7 +9374,7 @@ fn an_accept_lang_of_the_persons_own_survives_the_override() {
         .with_accept_language(blinkterm::identity::accept_lang_arg(&launch.args));
     blinkterm::app::prepare_session(
         &mut page,
-        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false),
+        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false),
         &identity,
     );
     let languages = evaluate(&mut page, "navigator.languages.join(',')");
@@ -9197,7 +9399,7 @@ fn a_url_handed_over_the_socket_becomes_the_tab_in_front() {
     let downloads = root.join("downloads");
     std::fs::create_dir_all(&downloads).expect("a download directory");
     let appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
     let profile = Profile::take(Choice::At(dir.clone())).expect("a kept profile");
     // Bound where the program binds it: under the lock, before the engine.
     let mut listener = Listener::bind(&dir).expect("listening");
@@ -9313,7 +9515,7 @@ const HEAVY: usize = 300;
 fn booted_blocking(blocker: Option<&Arc<Blocker>>) -> Booted {
     let downloads = temp_dir("block-downloads");
     let appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
     let launch = engine::Launch {
         args: vec!["--host-resolver-rules=MAP *.test 127.0.0.1".to_string()],
         ..engine::Launch::default()

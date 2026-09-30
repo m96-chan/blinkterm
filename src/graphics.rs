@@ -17,6 +17,12 @@
 //! in the pane — and hands over pixels, which is the protocol's own raw
 //! format and needs no compositor change at all.
 //!
+//! Under `--alpha` the still is what carries the transparency: RGBA, sent as
+//! `f=32` with the alpha the page left, straight, as the protocol takes it —
+//! the terminal blends it over its own background, and nothing here converts
+//! it. A JPEG frame has no alpha, so a bare page is black while it moves
+//! (see [`crate::motion`]).
+//!
 //! It costs bytes: 2.9 MB of RGB where the JPEG was 185 kB. Through `t=s`
 //! that is a `write` into tmpfs and a `read` out of it, which is a memcpy at
 //! memory speed and cheaper than the decode it replaces. Through the inline
@@ -242,7 +248,8 @@ const IN_FLIGHT: usize = 16;
 /// pixels go across as they are rather than being widened or narrowed:
 /// `crate::jpeg` produces RGB and a JPEG has no alpha to lose,
 /// `crate::png` produces RGBA and a still is one frame in a hundred and
-/// fifty milliseconds, so neither conversion would buy anything.
+/// fifty milliseconds, so neither conversion would buy anything. Under
+/// `--alpha` the still's alpha is the point.
 #[derive(Debug, Clone, Copy)]
 pub struct Raw<'a> {
     pub pixels: &'a [u8],
@@ -1246,6 +1253,40 @@ pub(crate) mod tests {
         assert_eq!(placement.image_id, IMAGE_ID);
         assert_eq!(placement.placement_id, PLACEMENT_ID);
         assert_eq!((placement.cols, placement.rows), (8, 4));
+    }
+
+    #[test]
+    fn an_rgba_frame_keeps_its_alpha_through_the_store() {
+        // `--alpha`: the still is RGBA, and what the page left transparent
+        // has to reach the terminal's store as it was — straight alpha, not
+        // flattened, not made opaque.
+        let see_through = vec![
+            10, 20, 30, 0, 40, 50, 60, 128, //
+            70, 80, 90, 255, 100, 110, 120, 0,
+        ];
+        let raw = Raw::rgba(&see_through, 2, 2);
+
+        let mut terminal = tos_term::Terminal::new(40, 12, tos_term::TerminalConfig::default());
+        terminal.advance(&inline_command(&raw, cells(8, 4)));
+        let image = terminal.graphics().image(IMAGE_ID).expect("the image");
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(image.data, see_through, "every alpha as it was sent");
+        assert_eq!((image.data[3], image.data[7]), (0, 128));
+
+        // And through the file store: the file holds the four bytes a pixel,
+        // and the command says `f=32`.
+        let dir = temp_dir("alpha");
+        let mut painter = Painter::at(&dir);
+        assert_eq!(painter.transport(), Transport::SharedMemory);
+        let bytes = painter.frame(raw, cells(8, 4), 2, 1);
+        let body = apc_bodies(&bytes).remove(0);
+        let cmd = GraphicsCommand::parse(&body).expect("parses");
+        assert_eq!(cmd.format, Format::Rgba);
+        let name = String::from_utf8(cmd.payload).expect("a name");
+        let path = dir.join(name.trim_start_matches('/'));
+        assert_eq!(std::fs::read(&path).expect("the frame"), see_through);
+        std::fs::remove_file(&path).expect("consume");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

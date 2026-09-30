@@ -44,6 +44,12 @@ options:
                    auto (the default) asks the terminal its background
   --force-dark     paint every page dark, even one with no dark style
                    (Chromium's auto dark mode)
+  --alpha          paint nothing behind a page: where the page paints no
+                   background the terminal's own shows through (a page with
+                   a background is unchanged). Only at rest: while the page
+                   moves that is black, and turns clear when it stops. Black
+                   text over a dark terminal is yours to read: --force-dark
+                   helps
   --engine <path>  the Chromium to run (default: $BLINKTERM_ENGINE, else
                    the first of chrome-headless-shell, chromium,
                    chromium-browser, google-chrome, chromium-shell on PATH)
