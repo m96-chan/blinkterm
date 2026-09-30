@@ -1404,6 +1404,7 @@ fn a_tab_whose_queued_events_went_in_the_bin_still_says_its_page_finished() {
         &mut browser,
         &appearance,
         &Identity::new(None, None, "C"),
+        &Sites::none(),
         "data:text/html,<title>plain</title><body>plain",
     )
     .expect("the engine opens a page");
@@ -5005,6 +5006,7 @@ fn a_file_typed_on_the_row_reaches_an_input_in_a_cross_site_iframe() {
         &mut browser,
         &appearance,
         &Identity::new(None, None, "C"),
+        &Sites::none(),
         &[Ok(format!("http://holder.test:{port}/holder"))],
     );
     assert!(opened.iter().all(Result::is_ok), "{opened:?}");
