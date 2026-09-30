@@ -156,6 +156,10 @@ pub struct Env {
     pub ssh: bool,
     /// `$TERM`, for the sentence.
     pub term: String,
+    /// `$TERM` is `xterm-kitty`, or `$KITTY_WINDOW_ID` is set: the terminal
+    /// is Kitty, whose own keys [`crate::taken`] knows. Over ssh without
+    /// Kitty's terminfo `$TERM` may say otherwise, and then nothing is said.
+    pub kitty: bool,
 }
 
 impl Env {
@@ -169,6 +173,7 @@ impl Env {
                 .iter()
                 .any(|name| set(name)),
             term: var("TERM").unwrap_or_default(),
+            kitty: var("TERM").as_deref() == Some("xterm-kitty") || set("KITTY_WINDOW_ID"),
         }
     }
 
@@ -336,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn the_environment_is_read_from_its_six_variables_and_nothing_else() {
+    fn the_environment_is_read_from_its_seven_variables_and_nothing_else() {
         let e = env(&[
             ("TMUX", "/tmp/tmux-0/default,1,0"),
             ("STY", "1234.pts-0.host"),
@@ -351,7 +356,8 @@ mod tests {
                 tmux: true,
                 screen: true,
                 ssh: true,
-                term: "tmux-256color".to_string()
+                term: "tmux-256color".to_string(),
+                kitty: true,
             }
         );
         for name in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
@@ -362,6 +368,15 @@ mod tests {
             Env::default(),
             "an empty variable says nothing, as it would to a shell"
         );
+    }
+
+    #[test]
+    fn kitty_is_read_from_term_or_kitty_window_id() {
+        assert!(env(&[("TERM", "xterm-kitty")]).kitty);
+        assert!(env(&[("KITTY_WINDOW_ID", "3"), ("TERM", "tmux-256color")]).kitty);
+        assert!(!env(&[("KITTY_WINDOW_ID", "")]).kitty, "empty says nothing");
+        assert!(!env(&[("TERM", "xterm-ghostty")]).kitty);
+        assert!(!env(&[]).kitty);
     }
 
     #[test]

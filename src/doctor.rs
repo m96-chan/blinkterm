@@ -72,6 +72,7 @@ use std::time::{Duration, Instant};
 use crate::tty::{self, RawMode, ReadOutcome};
 
 use crate::appearance;
+use crate::bindings::Keymap;
 use crate::download;
 use crate::engine::{self, Engine};
 use crate::graphics;
@@ -409,6 +410,14 @@ pub fn print_engine(options: &Options) -> bool {
 pub fn report(options: &Options, provenance: &Provenance) -> bool {
     println!("blinkterm {}", env!("CARGO_PKG_VERSION"));
     config_line(provenance);
+    let keys = keys_facts(options, provenance, cfg!(target_os = "macos"));
+    let mut keys = keys.iter();
+    if let Some(first) = keys.next() {
+        say("keys", first);
+    }
+    for fact in keys {
+        more(fact);
+    }
     let engine_ok = engine_lines(options, provenance);
     profile_line(&options.profile);
     match download::prepare(options.download.clone()) {
@@ -434,6 +443,43 @@ fn config_line(provenance: &Provenance) {
         (Some(path), false) => say("config", &format!("none (looked at {})", path.display())),
         (None, _) => say("config", "none read"),
     }
+}
+
+/// The `keys:` lines: which keymap, and where that came from; then one
+/// sentence per `key.` line on a chord Kitty or macOS keeps by default
+/// ([`crate::taken::conflicts`]), or that there is none. Printed whatever
+/// the terminal is: every sentence names Kitty or macOS itself. Pure, with
+/// `macos` for the platform, so that it is a test.
+pub fn keys_facts(options: &Options, provenance: &Provenance, macos: bool) -> Vec<String> {
+    let keymap = options.keymap;
+    let other = match keymap {
+        Keymap::Mac => Keymap::Linux,
+        Keymap::Linux => Keymap::Mac,
+    };
+    let first = match provenance.keymap_from {
+        Some(source) => format!("keymap {} (from {source})", keymap.name()),
+        None => format!(
+            "keymap {} (the default {}; keymap = {} in the settings file, or --keymap {}, for the other)",
+            keymap.name(),
+            if keymap == Keymap::Mac {
+                "on macOS"
+            } else {
+                "off macOS"
+            },
+            other.name(),
+            other.name()
+        ),
+    };
+    let mut facts = vec![first];
+    let conflicts = crate::taken::conflicts(&options.bindings, macos);
+    let lines = options.bindings.iter().count();
+    if conflicts.is_empty() && lines > 0 {
+        facts.push(format!(
+            "key. lines: {lines}, none on a chord Kitty or macOS keeps"
+        ));
+    }
+    facts.extend(conflicts);
+    facts
 }
 
 fn engine_lines(options: &Options, provenance: &Provenance) -> bool {
@@ -854,6 +900,47 @@ mod tests {
         assert!(
             !silent[0].contains("tmux"),
             "tmux answers; it is not the silent one"
+        );
+    }
+
+    #[test]
+    fn the_keys_lines_say_the_keymap_and_each_conflict() {
+        use crate::options::{parse_config, resolve, Settings};
+        let from = |text: &str| {
+            let file = parse_config(std::path::Path::new("/c"), text).expect("a file");
+            resolve(Settings::default(), Settings::default(), file).expect("resolves")
+        };
+        let provenance = |keymap_from| Provenance {
+            config: None,
+            found: false,
+            settings: 0,
+            engine_from: None,
+            keymap_from,
+        };
+        let options = from("keymap = mac");
+        assert_eq!(
+            keys_facts(&options, &provenance(Some("config")), true),
+            ["keymap mac (from config)"]
+        );
+        let options = from("keymap = linux");
+        let said = keys_facts(&options, &provenance(None), false);
+        assert_eq!(said.len(), 1);
+        assert!(
+            said[0].starts_with("keymap linux (the default off macOS; keymap = mac"),
+            "{}",
+            said[0]
+        );
+        let options =
+            from("keymap = mac\nkey.cmd+t = new-tab\nkey.ctrl+left = back\nkey.cmd+w = none");
+        let said = keys_facts(&options, &provenance(Some("config")), true);
+        assert_eq!(said.len(), 3, "{said:?}");
+        assert!(said[1].contains("Kitty keeps cmd+t"), "{}", said[1]);
+        assert!(said[2].contains("macOS keeps ctrl+left"), "{}", said[2]);
+        let options = from("key.cmd+d = bookmark");
+        let said = keys_facts(&options, &provenance(None), true);
+        assert_eq!(
+            said[1],
+            "key. lines: 1, none on a chord Kitty or macOS keeps"
         );
     }
 }

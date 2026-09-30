@@ -44,6 +44,28 @@
 //! and a space cannot be written at the end of a line that is trimmed, so it
 //! is `space`. Everything else that is one character is itself: `alt+=`,
 //! `ctrl+-`, `ctrl+/`.
+//!
+//! # Two keymaps, one table
+//!
+//! The keys above were chosen against Linux terminals, and on a Mac most of
+//! them do not arrive. Kitty on macOS keeps `cmd+t`, `cmd+w`, `cmd+l`,
+//! `cmd+r`, `cmd+f`, `cmd+1`…`cmd+9` and a dozen more for itself; and Option
+//! is not alt there — with Kitty's default `macos_option_as_alt no` it
+//! composes, so Option+= arrives as the text `≠`, and `input::key_event`
+//! names a key by the codepoint the terminal reports, never by the
+//! base-layout alternate. So a Mac gets a keymap of its own, [`Keymap::Mac`]:
+//! the `mac` column of [`ACTIONS`], made into rows by [`Keymap::rows`] and
+//! asked after the file's `key.` lines and before `app::command`, which still
+//! answers underneath with the Linux chords for a person who set
+//! `macos_option_as_alt` or unmapped Kitty's keys. [`Keymap::Linux`] has no
+//! rows: it is the `match`, unchanged.
+//!
+//! The Mac column has no `alt+<printable>`, for the reason above, and every
+//! `cmd` chord in it was chosen against [`crate::taken::KITTY_MACOS`] and
+//! [`crate::taken::MACOS_SYSTEM`], which a test holds it to. Where the Linux
+//! chord is ctrl and reaches a Kitty pane on a Mac anyway (`ctrl+l`,
+//! `ctrl+r`, `ctrl+t`, `ctrl+w`, `ctrl+f`, `ctrl+q`, the zoom keys,
+//! `ctrl+.`), the Mac column keeps it.
 
 use crate::input::{Key, KeyAction, KeyInput, Mods};
 
@@ -243,13 +265,88 @@ pub enum Action {
 
 /// One row of [`ACTIONS`]: the name a `key.` line gives, the action, the
 /// chords the built-in table answers it on (comma-separated, as
-/// [`Chord::parse`] reads them), and the half-line the README's table says.
+/// [`Chord::parse`] reads them), the chords the Mac keymap puts it on, and
+/// the half-line the rebinding table says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Row {
     pub name: &'static str,
     pub action: Action,
+    /// The Linux keymap's chords: what `app::command` answers.
     pub keys: &'static str,
+    /// The Mac keymap's chords, `cmd` for super: see [`Keymap::Mac`].
+    pub mac: &'static str,
     pub what: &'static str,
+}
+
+/// `keymap = mac | linux`: which set of built-in keys a run answers.
+///
+/// Linux is `app::command` alone, as it always was. Mac is the `mac` column
+/// of [`ACTIONS`] made into rows ([`Keymap::rows`]) and asked after the
+/// file's `key.` lines and before that `match`, which still answers
+/// underneath: see the module's section on the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Keymap {
+    #[default]
+    Linux,
+    Mac,
+}
+
+impl Keymap {
+    /// `mac` or `linux`, in any case. The error names both, in the shape
+    /// the other settings' errors have.
+    pub fn parse(text: &str) -> Result<Keymap, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "mac" => Ok(Keymap::Mac),
+            "linux" => Ok(Keymap::Linux),
+            _ => Err(format!("keymap is mac or linux, not {:?}", text.trim())),
+        }
+    }
+
+    /// The word `parse` reads.
+    pub fn name(self) -> &'static str {
+        match self {
+            Keymap::Linux => "linux",
+            Keymap::Mac => "mac",
+        }
+    }
+
+    /// The keymap a run has when nothing says which: mac on macOS, where the
+    /// terminal keeps most of what the Linux one needs, and linux elsewhere.
+    pub fn platform() -> Keymap {
+        if cfg!(target_os = "macos") {
+            Keymap::Mac
+        } else {
+            Keymap::Linux
+        }
+    }
+
+    /// This keymap's chords in `row`, as written.
+    pub fn column(self, row: &Row) -> &'static str {
+        match self {
+            Keymap::Linux => row.keys,
+            Keymap::Mac => row.mac,
+        }
+    }
+
+    /// The rows this keymap puts in front of `app::command`: none for Linux,
+    /// whose keys are that `match`; for Mac every chord of the `mac` column,
+    /// `ctrl+1`…`ctrl+8` expanded.
+    pub fn rows(self) -> Vec<Binding> {
+        if self == Keymap::Linux {
+            return Vec::new();
+        }
+        Action::every()
+            .into_iter()
+            .flat_map(|action| {
+                defaults_on(self, action)
+                    .into_iter()
+                    .map(move |chord| Binding {
+                        chord,
+                        action: Some(action),
+                    })
+            })
+            .collect()
+    }
 }
 
 /// The name of the one row that stands for eight actions.
@@ -262,203 +359,257 @@ const TAB_NAMES: &str = "tab-1 .. tab-8";
 /// The keys are the documented spellings, not every press the built-in table
 /// answers: it reads shift only for `tab`, `t`, `a`, `h`, `j`, `r`, `s` and the page keys,
 /// so `ctrl+shift+=` zooms in too, and a chord is exact.
+///
+/// The `mac` column, one reason each:
+///
+/// - `cmd` where Kitty on macOS leaves it free and Chrome or Safari use it:
+///   `cmd+[`/`cmd+]` back and forward, `cmd+d` bookmark, `cmd+shift+t`
+///   reopen, `cmd+shift+a` Chrome's tab search, `cmd+y` Chrome's history,
+///   `cmd+alt+left`/`right` Chrome's tab switch.
+/// - `ctrl` where the Linux ctrl chord already reaches a Kitty pane on a
+///   Mac: `ctrl+l`, `ctrl+r`, `ctrl+t`, `ctrl+w`, `ctrl+f`, `ctrl+q`, `ctrl+=`,
+///   `ctrl+-`, `ctrl+0`, `ctrl+.`.
+/// - `ctrl+1`…`ctrl+9` for the tabs, because `cmd+1`…`cmd+9` are Kitty's
+///   windows and Option composes.
+/// - `cmd+c` for copy: Kitty's `cmd+c` is `copy_or_noop`, which with no
+///   terminal selection passes the key on — and with the mouse reported to
+///   this program, Kitty has none. `cmd+shift+c` as well, for the case it
+///   does.
+/// - `ctrl+pageup`/`ctrl+pagedown` as the second spelling of the tab keys,
+///   which needs no Option and works from an external keyboard.
+/// - The rest are `cmd` or `cmd+shift` on the letter the Linux alt chord
+///   has, where that is free: `cmd+p`, `cmd+b`, `cmd+u`, `cmd+s`,
+///   `cmd+shift+s`, and `cmd+shift+l` because `cmd+l` is Kitty's.
 pub const ACTIONS: [Row; 33] = [
     Row {
         name: "quit",
         action: Action::Quit,
         keys: "ctrl+q",
+        mac: "ctrl+q",
         what: "quit",
     },
     Row {
         name: "url",
         action: Action::EditUrl,
         keys: "ctrl+l",
+        mac: "ctrl+l",
         what: "type a url",
     },
     Row {
         name: "reload",
         action: Action::Reload,
         keys: "ctrl+r",
+        mac: "ctrl+r",
         what: "reload",
     },
     Row {
         name: "back",
         action: Action::Back,
         keys: "alt+left",
+        mac: "cmd+[",
         what: "back",
     },
     Row {
         name: "forward",
         action: Action::Forward,
         keys: "alt+right",
+        mac: "cmd+]",
         what: "forward",
     },
     Row {
         name: "new-tab",
         action: Action::NewTab,
         keys: "ctrl+t",
+        mac: "ctrl+t",
         what: "a new tab",
     },
     Row {
         name: "close-tab",
         action: Action::CloseTab,
         keys: "ctrl+w",
+        mac: "ctrl+w",
         what: "close this tab",
     },
     Row {
         name: "reopen-tab",
         action: Action::ReopenTab,
         keys: "ctrl+shift+t, alt+t",
+        mac: "cmd+shift+t",
         what: "reopen the tab closed last",
     },
     Row {
         name: "bookmark",
         action: Action::Bookmark,
         keys: "ctrl+d",
+        mac: "cmd+d",
         what: "bookmark this page, or remove the bookmark",
     },
     Row {
         name: "next-tab",
         action: Action::NextTab,
         keys: "ctrl+tab",
+        mac: "cmd+alt+right, ctrl+pagedown",
         what: "the next tab",
     },
     Row {
         name: "previous-tab",
         action: Action::PreviousTab,
         keys: "ctrl+shift+tab",
+        mac: "cmd+alt+left, ctrl+pageup",
         what: "the tab before",
     },
     Row {
         name: TAB_NAMES,
         action: Action::Tab(1),
         keys: "alt+1 .. alt+8",
+        mac: "ctrl+1 .. ctrl+8",
         what: "the nth tab",
     },
     Row {
         name: "last-tab",
         action: Action::LastTab,
         keys: "alt+9",
+        mac: "ctrl+9",
         what: "the last tab",
     },
     Row {
         name: "list-tabs",
         action: Action::ListTabs,
         keys: "ctrl+shift+a, alt+a",
+        mac: "cmd+shift+a",
         what: "the tab list",
     },
     Row {
         name: "history",
         action: Action::History,
         keys: "ctrl+shift+h, alt+h",
+        mac: "cmd+y",
         what: "the history list",
     },
     Row {
         name: "console",
         action: Action::Console,
         keys: "ctrl+shift+j, alt+j",
+        mac: "ctrl+shift+j, alt+j",
         what: "the page's console: logs, errors and failed requests",
     },
     Row {
         name: "move-tab-left",
         action: Action::MoveTabLeft,
         keys: "ctrl+shift+pageup, alt+shift+pageup",
+        mac: "cmd+shift+pageup",
         what: "move this tab left",
     },
     Row {
         name: "move-tab-right",
         action: Action::MoveTabRight,
         keys: "ctrl+shift+pagedown, alt+shift+pagedown",
+        mac: "cmd+shift+pagedown",
         what: "move this tab right",
     },
     Row {
         name: "zoom-in",
         action: Action::ZoomIn,
         keys: "alt+=, ctrl+=",
+        mac: "ctrl+=",
         what: "zoom in",
     },
     Row {
         name: "zoom-out",
         action: Action::ZoomOut,
         keys: "alt+-, ctrl+-",
+        mac: "ctrl+-",
         what: "zoom out",
     },
     Row {
         name: "zoom-reset",
         action: Action::ZoomReset,
         keys: "alt+0, ctrl+0",
+        mac: "ctrl+0",
         what: "back to 100%",
     },
     Row {
         name: "find",
         action: Action::Find,
         keys: "ctrl+f",
+        mac: "ctrl+f",
         what: "find in the page",
     },
     Row {
         name: "reader",
         action: Action::Reader,
         keys: "alt+r",
+        mac: "alt+r",
         what: "the article without the page around it",
     },
     Row {
         name: "permissions",
         action: Action::Permissions,
         keys: "alt+p",
+        mac: "cmd+p",
         what: "allow this site the camera, microphone, location, notifications or clipboard",
     },
     Row {
         name: "block",
         action: Action::Block,
         keys: "alt+b",
+        mac: "cmd+b",
         what: "stop blocking ads and trackers on this site, or start again",
     },
     Row {
         name: "reload-sites",
         action: Action::ReloadSites,
         keys: "alt+shift+r",
+        mac: "alt+shift+r",
         what: "read the site styles and scripts again",
     },
     Row {
         name: "fill-login",
         action: Action::FillLogin,
         keys: "alt+l",
+        mac: "cmd+shift+l",
         what: "fill the login form from your password manager",
     },
     Row {
         name: "copy",
         action: Action::Copy,
         keys: "alt+c",
+        mac: "cmd+c, cmd+shift+c",
         what: "copy the selection, or the line being typed",
     },
     Row {
         name: "copy-url",
         action: Action::CopyUrl,
         keys: "alt+u",
+        mac: "cmd+u",
         what: "copy the url",
     },
     Row {
         name: "open-external",
         action: Action::OpenExternal,
         keys: "alt+o",
+        mac: "alt+o",
         what: "open this page in the desktop browser",
     },
     Row {
         name: "save-pdf",
         action: Action::SavePdf,
         keys: "alt+s",
+        mac: "cmd+s",
         what: "save this page as a PDF",
     },
     Row {
         name: "save-screenshot",
         action: Action::SaveScreenshot,
         keys: "alt+shift+s",
+        mac: "cmd+shift+s",
         what: "save the whole page as a picture",
     },
     Row {
         name: "normal-mode",
         action: Action::ToggleNormal,
         keys: "ctrl+.",
+        mac: "ctrl+.",
         what: "normal mode on or off",
     },
 ];
@@ -520,34 +671,47 @@ impl Action {
 }
 
 /// The chords the built-in table answers `action` on, as [`ACTIONS`] lists
-/// them: its row's `keys` parsed, and `alt+n` for `tab-n`.
+/// them: its row's `keys` parsed, and `alt+n` for `tab-n`. The Linux
+/// keymap's; [`defaults_on`] is either.
 ///
 /// Nothing in the program asks this — the built-in table is `app::command`,
 /// which is a `match` — but the tests on both sides do, `docs/configuration.md`'s
 /// table here and `command` itself in `app.rs`, and it is one function for both.
 pub fn defaults(action: Action) -> Vec<Chord> {
+    defaults_on(Keymap::Linux, action)
+}
+
+/// The chords `keymap` puts `action` on: its row's column parsed, and
+/// `alt+n` (Linux) or `ctrl+n` (Mac) for `tab-n`.
+pub fn defaults_on(keymap: Keymap, action: Action) -> Vec<Chord> {
     if let Action::Tab(n) = action {
-        return Chord::parse(&format!("alt+{n}")).into_iter().collect();
+        let held = match keymap {
+            Keymap::Linux => "alt",
+            Keymap::Mac => "ctrl",
+        };
+        return Chord::parse(&format!("{held}+{n}")).into_iter().collect();
     }
     ACTIONS
         .iter()
         .filter(|row| row.action == action)
-        .flat_map(|row| row.keys.split(','))
+        .flat_map(|row| keymap.column(row).split(','))
         .filter_map(|spelled| Chord::parse(spelled).ok())
         .collect()
 }
 
-/// The `actions:` block `--help` prints after its `keys:`: a name and its
-/// default chords per row, and what a chord may be.
+/// The `actions:` block `--help` prints after its `keys:`: a name and
+/// `keymap`'s chords per row, and what a chord may be.
 ///
 /// What each does is not printed: the `keys:` block above it has already
 /// said, in more words than half a line.
-pub fn help() -> String {
+pub fn help(keymap: Keymap) -> String {
     let width = ACTIONS.iter().map(|row| row.name.len()).max().unwrap_or(0);
-    let mut out =
-        String::from("\nactions (key.<chord> = <action> in the settings file; none unbinds):\n");
+    let mut out = format!(
+        "\nactions, keymap {} (key.<chord> = <action> in the settings file; none unbinds):\n",
+        keymap.name()
+    );
     for row in &ACTIONS {
-        out.push_str(&format!("  {:<width$}  {}\n", row.name, row.keys));
+        out.push_str(&format!("  {:<width$}  {}\n", row.name, keymap.column(row)));
     }
     out.push_str(
         "A chord is ctrl, alt, shift or super joined with + to a key: a character,\n\
@@ -588,12 +752,15 @@ impl Binding {
     }
 }
 
-/// Every `key.` line, in file order.
+/// Every `key.` line, in file order, over the keymap's own rows.
 ///
 /// A later line for the same chord replaces an earlier one, so that a file
-/// can be appended to, and that is not a duplicate the parser refuses.
+/// can be appended to, and that is not a duplicate the parser refuses. The
+/// keymap's rows ([`Keymap::rows`]) are asked only when no line of the file
+/// matched, and the built-in `match` only when neither did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Bindings {
+    keymap: Vec<Binding>,
     rows: Vec<Binding>,
 }
 
@@ -610,18 +777,33 @@ pub enum Lookup {
 }
 
 impl Bindings {
-    pub fn from_rows(rows: Vec<Binding>) -> Bindings {
-        Bindings { rows }
+    /// The file's `rows` over `keymap`'s.
+    pub fn on(keymap: Keymap, rows: Vec<Binding>) -> Bindings {
+        Bindings {
+            keymap: keymap.rows(),
+            rows,
+        }
     }
 
-    /// What the rows say about `input`. A release is never a command, as the
-    /// built-in table never makes one of it, so it is `Default` before any
-    /// row is looked at.
+    /// The file's `rows` over the Linux keymap, which has none of its own.
+    pub fn from_rows(rows: Vec<Binding>) -> Bindings {
+        Bindings::on(Keymap::Linux, rows)
+    }
+
+    /// What the rows say about `input`: the file's, last first, then the
+    /// keymap's. A release is never a command, as the built-in table never
+    /// makes one of it, so it is `Default` before any row is looked at.
     pub fn lookup(&self, input: &KeyInput) -> Lookup {
         if input.action == KeyAction::Release {
             return Lookup::Default;
         }
-        match self.rows.iter().rev().find(|row| row.chord.matches(input)) {
+        let found = self
+            .rows
+            .iter()
+            .rev()
+            .chain(self.keymap.iter().rev())
+            .find(|row| row.chord.matches(input));
+        match found {
             Some(Binding {
                 action: Some(action),
                 ..
@@ -631,10 +813,12 @@ impl Bindings {
         }
     }
 
+    /// Whether the file had no `key.` lines; the keymap's rows do not count.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
+    /// The file's `key.` lines, in file order; not the keymap's rows.
     pub fn iter(&self) -> impl Iterator<Item = &Binding> {
         self.rows.iter()
     }
@@ -653,22 +837,44 @@ mod tests {
         }
     }
 
+    /// `written`'s chords, parsed; `cmd` and `super` are one modifier.
+    fn chords_of(written: &str) -> Vec<Chord> {
+        written
+            .split(',')
+            .map(|chord| Chord::parse(chord).expect(chord))
+            .collect()
+    }
+
     #[test]
-    fn every_default_chord_in_the_table_parses_and_spells_back_the_same() {
-        for row in &ACTIONS {
-            if matches!(row.action, Action::Tab(_)) {
-                continue;
-            }
-            let spelled: Vec<&str> = row.keys.split(',').map(str::trim).collect();
-            let chords = defaults(row.action);
-            assert_eq!(chords.len(), spelled.len(), "{}: {}", row.name, row.keys);
-            for (chord, spelled) in chords.iter().zip(spelled) {
-                assert_eq!(chord.spell(), spelled, "{}", row.name);
+    fn every_default_chord_in_both_columns_parses_and_spells_back_the_same() {
+        for keymap in [Keymap::Linux, Keymap::Mac] {
+            for row in &ACTIONS {
+                if matches!(row.action, Action::Tab(_)) {
+                    continue;
+                }
+                let column = keymap.column(row);
+                let spelled: Vec<&str> = column.split(',').map(str::trim).collect();
+                let chords = defaults_on(keymap, row.action);
+                assert_eq!(chords.len(), spelled.len(), "{}: {column}", row.name);
+                for (chord, spelled) in chords.iter().zip(spelled) {
+                    assert_eq!(Chord::parse(&chord.spell()), Ok(*chord), "{}", row.name);
+                    if keymap == Keymap::Linux {
+                        assert_eq!(chord.spell(), spelled, "{}", row.name);
+                    } else {
+                        // The Mac column writes `cmd` first, as a Mac does.
+                        assert_eq!(Chord::parse(spelled), Ok(*chord), "{}", row.name);
+                    }
+                }
             }
         }
         for n in 1..=8 {
             let spelled: Vec<String> = defaults(Action::Tab(n)).iter().map(Chord::spell).collect();
             assert_eq!(spelled, [format!("alt+{n}")]);
+            let spelled: Vec<String> = defaults_on(Keymap::Mac, Action::Tab(n))
+                .iter()
+                .map(Chord::spell)
+                .collect();
+            assert_eq!(spelled, [format!("ctrl+{n}")]);
         }
         for spelled in ["ctrl+plus", "ctrl+_"] {
             assert_eq!(Chord::parse(spelled).expect(spelled).spell(), spelled);
@@ -683,40 +889,152 @@ mod tests {
     }
 
     #[test]
-    fn the_help_lists_every_action_once_with_its_default_chords() {
-        let help = help();
-        let lines: Vec<&str> = help
-            .lines()
-            .skip_while(|line| !line.starts_with("actions"))
-            .skip(1)
-            .take(ACTIONS.len())
-            .collect();
-        assert_eq!(lines.len(), ACTIONS.len());
-        for (line, row) in lines.iter().zip(&ACTIONS) {
-            let line = line.trim();
-            assert!(line.starts_with(row.name), "{line} for {}", row.name);
-            assert!(line.ends_with(row.keys), "{line} for {}", row.name);
-        }
+    fn every_mac_chord_is_a_binding_a_file_could_write() {
         for row in &ACTIONS {
-            let named = help
-                .lines()
-                .filter(|line| line.trim().split("  ").next() == Some(row.name))
-                .count();
-            assert_eq!(named, 1, "{}", row.name);
+            let name = if matches!(row.action, Action::Tab(_)) {
+                "tab-1"
+            } else {
+                row.name
+            };
+            for chord in row.mac.split(',') {
+                let chord = chord.split(" .. ").next().unwrap_or(chord);
+                assert!(
+                    Binding::parse(chord, name).is_ok(),
+                    "{chord} for {}",
+                    row.name
+                );
+            }
         }
-        assert!(
-            help.trim_end()
-                .ends_with("it needs ctrl, alt or super\nunless it is an f-key."),
-            "{help}"
-        );
+        let rows = Keymap::Mac.rows();
+        for (i, row) in rows.iter().enumerate() {
+            assert!(
+                rows[..i].iter().all(|before| before.chord != row.chord),
+                "{} twice",
+                row.chord.spell()
+            );
+        }
     }
 
-    /// The rows of `docs/configuration.md`'s `### Rebinding keys` table, each cell with
-    /// its backticks gone and `…` written `..`, as [`ACTIONS`] writes a range.
-    fn readme_rows() -> Vec<Vec<String>> {
-        include_str!("../docs/configuration.md")
-            .lines()
-            .skip_while(|line| *line != "### Rebinding keys")
+    #[test]
+    fn no_mac_chord_is_one_kitty_or_macos_keeps() {
+        for row in Keymap::Mac.rows() {
+            assert_eq!(
+                crate::taken::keeper(&row.chord, true),
+                None,
+                "{} for {:?}",
+                row.chord.spell(),
+                row.action
+            );
+        }
+    }
+
+    #[test]
+    fn the_linux_chords_kitty_keeps_are_exactly_the_seven_the_docs_give_a_twin_for() {
+        let wanted = [
+            ("reopen-tab", "ctrl+shift+t"),
+            ("next-tab", "ctrl+tab"),
+            ("previous-tab", "ctrl+shift+tab"),
+            ("list-tabs", "ctrl+shift+a"),
+            ("history", "ctrl+shift+h"),
+            ("move-tab-left", "ctrl+shift+pageup"),
+            ("move-tab-right", "ctrl+shift+pagedown"),
+        ];
+        for macos in [false, true] {
+            let mut kept: Vec<(String, String)> = Vec::new();
+            for action in Action::every() {
+                for chord in defaults(action) {
+                    if crate::taken::keeper(&chord, macos).is_some() {
+                        kept.push((action.name(), chord.spell()));
+                    }
+                }
+            }
+            let wanted: Vec<(String, String)> = wanted
+                .iter()
+                .map(|(name, chord)| (name.to_string(), chord.to_string()))
+                .collect();
+            assert_eq!(kept, wanted, "macos {macos}");
+        }
+    }
+
+    #[test]
+    fn keymap_parses_mac_and_linux_case_insensitively_and_nothing_else() {
+        for (text, wanted) in [
+            ("mac", Keymap::Mac),
+            ("MAC", Keymap::Mac),
+            (" Linux ", Keymap::Linux),
+        ] {
+            assert_eq!(Keymap::parse(text), Ok(wanted), "{text}");
+        }
+        for keymap in [Keymap::Mac, Keymap::Linux] {
+            assert_eq!(Keymap::parse(keymap.name()), Ok(keymap));
+        }
+        assert_eq!(
+            Keymap::parse("windows"),
+            Err("keymap is mac or linux, not \"windows\"".to_string())
+        );
+        assert!(Keymap::parse("macos").is_err());
+        assert!(Keymap::parse("").is_err());
+    }
+
+    #[test]
+    fn the_platform_s_keymap_is_mac_on_macos_and_linux_elsewhere() {
+        let wanted = if cfg!(target_os = "macos") {
+            Keymap::Mac
+        } else {
+            Keymap::Linux
+        };
+        assert_eq!(Keymap::platform(), wanted);
+        assert_eq!(Keymap::default(), Keymap::Linux, "a table with no keymap");
+    }
+
+    #[test]
+    fn help_prints_the_column_of_the_keymap_it_is_given_and_names_it() {
+        for keymap in [Keymap::Linux, Keymap::Mac] {
+            let help = help(keymap);
+            let header = help
+                .lines()
+                .find(|line| line.starts_with("actions"))
+                .expect("a header");
+            assert!(
+                header.contains(&format!("keymap {}", keymap.name())),
+                "{header}"
+            );
+            let lines: Vec<&str> = help
+                .lines()
+                .skip_while(|line| !line.starts_with("actions"))
+                .skip(1)
+                .take(ACTIONS.len())
+                .collect();
+            assert_eq!(lines.len(), ACTIONS.len());
+            for (line, row) in lines.iter().zip(&ACTIONS) {
+                let line = line.trim();
+                assert!(line.starts_with(row.name), "{line} for {}", row.name);
+                assert!(
+                    line.ends_with(keymap.column(row)),
+                    "{line} for {}",
+                    row.name
+                );
+            }
+            for row in &ACTIONS {
+                let named = help
+                    .lines()
+                    .filter(|line| line.trim().split("  ").next() == Some(row.name))
+                    .count();
+                assert_eq!(named, 1, "{}", row.name);
+            }
+            assert!(
+                help.trim_end()
+                    .ends_with("it needs ctrl, alt or super\nunless it is an f-key."),
+                "{help}"
+            );
+        }
+    }
+
+    /// The rows of the table under `heading` in `doc`, each cell with its
+    /// backticks gone and `…` written `..`, as [`ACTIONS`] writes a range.
+    fn table_rows(doc: &str, heading: &str) -> Vec<Vec<String>> {
+        doc.lines()
+            .skip_while(|line| *line != heading)
             .skip(1)
             .take_while(|line| !line.starts_with('#'))
             .filter(|line| line.starts_with("| `"))
@@ -729,25 +1047,106 @@ mod tests {
             .collect()
     }
 
+    /// Whether a doc's cell says what `column` says: a range as written,
+    /// else the same chords, `cmd` and `super` being one.
+    fn same_chords(cell: &str, column: &str, action: Action) -> bool {
+        if matches!(action, Action::Tab(_)) {
+            return cell == column;
+        }
+        chords_of(cell) == chords_of(column)
+    }
+
     #[test]
     fn the_readme_s_rebinding_table_is_the_action_table() {
-        let rows = readme_rows();
+        let rows = table_rows(
+            include_str!("../docs/configuration.md"),
+            "### Rebinding keys",
+        );
         let names: Vec<&str> = rows.iter().map(|cells| cells[0].as_str()).collect();
         let wanted: Vec<&str> = ACTIONS.iter().map(|row| row.name).collect();
         assert_eq!(names, wanted);
         for (cells, row) in rows.iter().zip(&ACTIONS) {
-            if matches!(row.action, Action::Tab(_)) {
-                assert_eq!(cells[1], row.keys);
-                continue;
-            }
-            let written: Vec<String> = cells[1]
-                .split(',')
-                .map(|chord| Chord::parse(chord).expect(chord).spell())
-                .collect();
-            let wanted: Vec<String> = defaults(row.action).iter().map(Chord::spell).collect();
-            assert_eq!(written, wanted, "{}", row.name);
-            assert_eq!(cells[2], row.what, "{}", row.name);
+            assert!(
+                same_chords(&cells[1], row.keys, row.action),
+                "{}: linux {}",
+                row.name,
+                cells[1]
+            );
+            assert!(
+                same_chords(&cells[2], row.mac, row.action),
+                "{}: mac {}",
+                row.name,
+                cells[2]
+            );
+            assert_eq!(cells[3], row.what, "{}", row.name);
         }
+    }
+
+    #[test]
+    fn docs_usage_s_mac_table_lists_exactly_the_rows_whose_mac_chord_differs() {
+        let rows = table_rows(include_str!("../docs/usage.md"), "### On a Mac");
+        let differing: Vec<&Row> = ACTIONS
+            .iter()
+            .filter(|row| {
+                if matches!(row.action, Action::Tab(_)) {
+                    return row.keys != row.mac;
+                }
+                chords_of(row.keys) != chords_of(row.mac)
+            })
+            .collect();
+        let names: Vec<&str> = rows.iter().map(|cells| cells[0].as_str()).collect();
+        let wanted: Vec<&str> = differing.iter().map(|row| row.name).collect();
+        assert_eq!(names, wanted);
+        for (cells, row) in rows.iter().zip(differing) {
+            assert!(same_chords(&cells[1], row.keys, row.action), "{}", row.name);
+            assert!(same_chords(&cells[2], row.mac, row.action), "{}", row.name);
+        }
+    }
+
+    #[test]
+    fn a_keymap_row_is_under_the_file_s_rows_and_over_the_built_in_table() {
+        let table = Bindings::on(Keymap::Mac, vec![row("cmd+d", None)]);
+        assert_eq!(
+            table.lookup(&key(Key::Char('d'), Mods::SUPER)),
+            Lookup::Unbound
+        );
+        assert_eq!(
+            table.lookup(&key(Key::Char('['), Mods::SUPER)),
+            Lookup::Bound(Action::Back)
+        );
+        assert_eq!(
+            table.lookup(&key(Key::Char('1'), Mods::CTRL)),
+            Lookup::Bound(Action::Tab(1))
+        );
+        assert_eq!(
+            table.lookup(&key(Key::Char('w'), Mods::CTRL)),
+            Lookup::Bound(Action::CloseTab)
+        );
+        assert_eq!(
+            table.lookup(&key(Key::Char('b'), Mods::ALT)),
+            Lookup::Default,
+            "the built-in table's, underneath"
+        );
+        let linux = Bindings::on(Keymap::Linux, vec![]);
+        assert_eq!(
+            linux.lookup(&key(Key::Char('['), Mods::SUPER)),
+            Lookup::Default
+        );
+        let mut released = key(Key::Char('['), Mods::SUPER);
+        released.action = KeyAction::Release;
+        assert_eq!(table.lookup(&released), Lookup::Default);
+    }
+
+    #[test]
+    fn is_empty_and_iter_are_about_the_file_s_rows_not_the_keymap_s() {
+        let mac = Bindings::on(Keymap::Mac, vec![]);
+        assert!(mac.is_empty());
+        assert_eq!(mac.iter().count(), 0);
+        let one = Bindings::on(Keymap::Mac, vec![row("f5", Some(Action::Reload))]);
+        assert!(!one.is_empty());
+        assert_eq!(one.iter().count(), 1);
+        assert!(!Keymap::Mac.rows().is_empty());
+        assert!(Keymap::Linux.rows().is_empty());
     }
 
     #[test]

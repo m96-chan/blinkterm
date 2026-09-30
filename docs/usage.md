@@ -38,6 +38,10 @@
 | `esc` | while a page is fullscreen and nothing else has the row, leave fullscreen; while a page is loading, stop it |
 | `ctrl+.` | normal mode on or off. In normal mode the letters are keys of their own and the row says `normal`: `f` labels everything clickable on the screen and typing a label clicks it (`F` opens a link in a tab behind this one); `j`/`k` scroll a notch, `d`/`u` half a screen, `gg`/`G` to the top and bottom; `H`/`L` back and forward, `r` reload, `o` the url bar, `O` a new tab, `/` find; `i` goes back to typing into the page, as does clicking into a field. Off by default: nothing changes until you press it |
 
+These are the keys of `keymap = linux`, the default everywhere but macOS;
+on a Mac the default is `keymap = mac`, whose keys are in
+[On a Mac](#on-a-mac) below.
+
 Everything else goes to the page, including the mouse, unless a `key.` line
 in the [settings](configuration.md#rebinding-keys) takes it. A link that asks for a
 new window gets a new tab, and the tab is switched to.
@@ -49,7 +53,9 @@ them. Kitty and Ghostty keep `ctrl+shift+a` for themselves and every terminal
 keeps `ctrl+shift+pageup`/`pagedown` — Kitty and tOS for the scrollback,
 WezTerm and Ghostty for their own tabs — so each has an `alt` form that
 reaches the program everywhere. Ghostty also keeps `alt+1`..`alt+9` for its
-tabs; its `alt+9` is its last tab, as it is here. A middle or `ctrl` click
+tabs; its `alt+9` is its last tab, as it is here. Kitty on macOS keeps far
+more, and Option is not `alt` there, which is what [On a Mac](#on-a-mac) is
+about. A middle or `ctrl` click
 opens a link behind the current tab, as a desktop browser does; a link that
 asks for a window (`target=_blank`) still comes to the front.
 
@@ -86,6 +92,98 @@ page: the highlights are the CSS Custom Highlight API from a world of their
 own, and the page's selection is left alone. A page that navigates closes the
 prompt.
 
+### On a Mac
+
+On macOS the built-in keys are `keymap = mac`, because the Linux ones mostly
+never arrive there. Kitty on macOS keeps `cmd+t`, `cmd+w`, `cmd+l` (clear
+the last command), `cmd+r` (resize the window), `cmd+f` (search the
+scrollback), `cmd+1` … `cmd+9` (its windows), `cmd+=`, `cmd+-`, `cmd+0`,
+`cmd+k`, `cmd+n`, `cmd+m`, `cmd+h`, `cmd+q`, `cmd+enter`, `cmd+,`, the
+`cmd` arrows and page keys, `` cmd+` ``, `shift+cmd+[`/`]`, and on every
+platform `ctrl+tab`, `ctrl+shift+tab` and its `ctrl+shift` keys — a key that
+hits one of Kitty's mappings never reaches the program. And Option is not
+`alt`: with Kitty's default `macos_option_as_alt no` it makes a character,
+so Option+= arrives as `≠` and is not `alt+=`. So the Mac keymap puts the
+keys on `cmd` where Kitty leaves it free and Chrome or Safari use it, and on
+`ctrl` elsewhere, and needs nothing in `kitty.conf`. It is the default on
+macOS and can be chosen anywhere with `keymap = mac` or `--keymap mac` — over
+ssh from a Mac, say; `keymap = linux` is the other. These are the keys that
+differ:
+
+| action | linux | mac |
+| --- | --- | --- |
+| `back` | `alt+left` | `cmd+[` |
+| `forward` | `alt+right` | `cmd+]` |
+| `reopen-tab` | `ctrl+shift+t`, `alt+t` | `cmd+shift+t` |
+| `bookmark` | `ctrl+d` | `cmd+d` |
+| `next-tab` | `ctrl+tab` | `cmd+alt+right`, `ctrl+pagedown` |
+| `previous-tab` | `ctrl+shift+tab` | `cmd+alt+left`, `ctrl+pageup` |
+| `tab-1` … `tab-8` | `alt+1` … `alt+8` | `ctrl+1` … `ctrl+8` |
+| `last-tab` | `alt+9` | `ctrl+9` |
+| `list-tabs` | `ctrl+shift+a`, `alt+a` | `cmd+shift+a` |
+| `history` | `ctrl+shift+h`, `alt+h` | `cmd+y` |
+| `move-tab-left` | `ctrl+shift+pageup`, `alt+shift+pageup` | `cmd+shift+pageup` |
+| `move-tab-right` | `ctrl+shift+pagedown`, `alt+shift+pagedown` | `cmd+shift+pagedown` |
+| `zoom-in` | `alt+=`, `ctrl+=` | `ctrl+=` |
+| `zoom-out` | `alt+-`, `ctrl+-` | `ctrl+-` |
+| `zoom-reset` | `alt+0`, `ctrl+0` | `ctrl+0` |
+| `permissions` | `alt+p` | `cmd+p` |
+| `block` | `alt+b` | `cmd+b` |
+| `fill-login` | `alt+l` | `cmd+shift+l` |
+| `copy` | `alt+c` | `cmd+c`, `cmd+shift+c` |
+| `copy-url` | `alt+u` | `cmd+u` |
+| `save-pdf` | `alt+s` | `cmd+s` |
+| `save-screenshot` | `alt+shift+s` | `cmd+shift+s` |
+
+`ctrl+q`, `ctrl+l`, `ctrl+r`, `ctrl+t`, `ctrl+w`, `ctrl+f` and `ctrl+.` are
+the same on both. `cmd+c` copies because Kitty's own `cmd+c` copies only a
+selection Kitty made and passes the key on when there is none — and with the
+mouse given to the page, there is none. The Linux keys still answer under
+the Mac ones, so with `macos_option_as_alt left` in `kitty.conf` the `alt`
+chords above work too. `ctrl+1` … `ctrl+9`, `ctrl+=` and the other `ctrl`
+chords need a terminal speaking the Kitty keyboard protocol, which Kitty,
+WezTerm and Ghostty do; without it they arrive as the bare key.
+
+A `key.` line on a chord Kitty keeps would do nothing, so in Kitty the
+status row says so at start, with the `kitty.conf` line that frees it, and
+`blinkterm --doctor` lists every such line in any terminal, with the ones
+on a chord macOS keeps for itself (Mission Control's `ctrl+←`/`→`, Spotlight's
+`cmd+space`). For the browser's own keys anyway, give them back to the
+program in `kitty.conf` and bind them in blinkterm's settings:
+
+```
+# kitty.conf
+macos_option_as_alt left
+map cmd+t no_op
+map cmd+w no_op
+map cmd+l no_op
+map cmd+r no_op
+map cmd+f no_op
+map cmd+1 no_op   # … cmd+9
+map cmd+equal no_op
+map cmd+minus no_op
+map cmd+0 no_op
+map ctrl+tab no_op
+map ctrl+shift+tab no_op
+```
+
+```
+# ~/.config/blinkterm/config
+key.cmd+t = new-tab
+key.cmd+w = close-tab
+key.cmd+l = url
+key.cmd+r = reload
+key.cmd+f = find
+key.cmd+1 = tab-1
+# … key.cmd+8 = tab-8, key.cmd+9 = last-tab
+key.cmd+= = zoom-in
+key.cmd+- = zoom-out
+key.cmd+0 = zoom-reset
+```
+
+`ctrl+tab` and `ctrl+shift+tab` need no `key.` line once Kitty lets them
+through: they are the Linux keys, which still answer.
+
 ### Searching
 
 Nothing you type in the url bar is sent anywhere but where it names. With
@@ -121,7 +219,9 @@ answered.
 `alt+=` and `alt+-` zoom the page in and out through Chrome's own steps
 (25% to 300%), `alt+0` puts it back; `ctrl+=`, `ctrl+-` and `ctrl+0` do the
 same where your terminal lets them through — Kitty and tOS do, WezTerm and
-Ghostty keep them for their own font size. The level is remembered per
+Ghostty keep them for their own font size. On a Mac the zoom keys are the
+`ctrl` ones, since Option does not make `alt` (see [On a Mac](#on-a-mac)).
+The level is remembered per
 site, in the profile's `zoom` file (0600, a list of hosts; `--temp-profile`
 keeps none), and shows on the row as `150%` while it is not 100%. Zooming
 reflows the page as a browser's zoom does — `devicePixelRatio` and

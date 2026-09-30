@@ -1263,6 +1263,17 @@ pub fn run(options: Options) -> Result<(), String> {
         return Err(why);
     }
     let route = route::choose(&env, options.route, verdict, Painter::shm_usable());
+    // What the row says once the first page is up: a `key.` line on a chord
+    // Kitty keeps, which would otherwise do nothing and say nothing, and a
+    // `--remote` socket that could not be bound, below. See
+    // [`crate::taken`].
+    let mut problems: Vec<String> = Vec::new();
+    if env.kitty {
+        problems.extend(crate::taken::conflicts(
+            &options.bindings,
+            cfg!(target_os = "macos"),
+        ));
+    }
     install_signals();
     std::panic::set_hook(Box::new(|info| {
         // A release build aborts here, so this is the only chance to put the
@@ -1283,12 +1294,17 @@ pub fn run(options: Options) -> Result<(), String> {
     // the lock. Not being able to listen is not a reason not to browse: it is
     // a note on the row. A temporary profile is this run's alone and never
     // listens.
-    let (mut listener, mut remote_problem) = if profile.is_temporary() {
-        (None, None)
+    let mut listener = if profile.is_temporary() {
+        None
     } else {
         match Listener::bind(profile.dir()) {
-            Ok(listener) => (Some(listener), None),
-            Err(why) => (None, Some(format!("not listening for --remote: {why}"))),
+            Ok(listener) => Some(listener),
+            Err(why) => {
+                // First, so that the "more" after it are the key lines,
+                // which are what `--doctor` lists.
+                problems.insert(0, format!("not listening for --remote: {why}"));
+                None
+            }
         }
     };
     // What pages are told about light and dark, before there is a page to
@@ -1387,9 +1403,9 @@ pub fn run(options: Options) -> Result<(), String> {
                 // the tabs that were there when it died.
                 let opened = if std::mem::take(&mut opening) {
                     open_first(&mut pane, tabs, browser, &mut chrome, &options).and_then(|()| {
-                        match remote_problem.take() {
-                            Some(why) => {
-                                note(tabs, why);
+                        match summary(&std::mem::take(&mut problems)) {
+                            Some(said) => {
+                                note(tabs, said);
                                 redraw_row(&mut pane, tabs, &chrome)
                             }
                             None => Ok(()),
@@ -6402,6 +6418,17 @@ pub fn stop(tab: &mut Tab<Client>) {
     }
 }
 
+/// What the row says for the problems `run` found before the first page:
+/// the first sentence, and how many more there are, which `--doctor` lists.
+/// `None` for none.
+fn summary(problems: &[String]) -> Option<String> {
+    let first = problems.first()?;
+    Some(match problems.len() {
+        1 => first.clone(),
+        n => format!("{first}; {} more (--doctor lists them)", n - 1),
+    })
+}
+
 /// Which keys this program answers, and which it hands to the page.
 ///
 /// The tab keys are the ones a browser has taught everybody — `ctrl+t`,
@@ -6514,9 +6541,13 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// its default table, and what it shadows is an `accesskey` on `o`. Normal
 /// mode's bare `o`, the url bar, is another key and is unaffected.
 ///
-/// This is the built-in table, and the one the README documents; the settings
-/// file's `key.` lines are asked before it, by [`keyed`], and every caller
-/// goes through that. What the file may name is [`crate::bindings::ACTIONS`],
+/// This is the built-in table — the Linux keymap — and the one the docs
+/// document first; the settings file's `key.` lines are asked before it, by
+/// [`keyed`], and every caller goes through that. The Mac keymap is not
+/// another `match`: it is [`crate::bindings::Keymap::Mac`]'s rows, which
+/// `Bindings` asks after the file's lines and before this, because Kitty on
+/// macOS keeps most `cmd` chords and Option composes rather than being alt,
+/// so that most of the alt chords here never arrive there. What the file may name is [`crate::bindings::ACTIONS`],
 /// which the tests hold to this `match` in both directions.
 fn command(key: &KeyInput) -> Option<Command> {
     if key.action == KeyAction::Release {
@@ -8622,6 +8653,7 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::Keymap;
     use crate::input::Mods;
 
     /// The bytes a terminal actually sends for a ctrl+wheel reach [`zooms`]
@@ -8793,20 +8825,68 @@ mod tests {
     #[test]
     fn every_chord_the_built_in_table_answers_has_a_name_and_the_name_answers_it() {
         let every = Action::every();
+        let mac = Bindings::on(Keymap::Mac, vec![]);
         for press in every_press() {
-            let Some(wanted) = command(&press) else {
-                continue;
-            };
-            let named = every.iter().find(|action| command_of(**action) == wanted);
-            let Some(action) = named else {
-                panic!("{wanted:?}, on {press:?}, has no name in bindings::ACTIONS");
-            };
-            assert_eq!(
-                Action::parse(&action.name()).map(command_of),
-                Ok(wanted),
-                "{press:?}"
-            );
+            for wanted in [command(&press), keyed(&mac, &press)].into_iter().flatten() {
+                let named = every.iter().find(|action| command_of(**action) == wanted);
+                let Some(action) = named else {
+                    panic!("{wanted:?}, on {press:?}, has no name in bindings::ACTIONS");
+                };
+                assert_eq!(
+                    Action::parse(&action.name()).map(command_of),
+                    Ok(wanted),
+                    "{press:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn on_the_mac_keymap_every_action_s_documented_chords_are_answered() {
+        let mac = Bindings::on(Keymap::Mac, vec![]);
+        for action in Action::every() {
+            let chords = crate::bindings::defaults_on(Keymap::Mac, action);
+            assert!(!chords.is_empty(), "{action:?} has a Mac key");
+            for chord in chords {
+                let press = KeyInput {
+                    key: chord.key,
+                    mods: chord.mods,
+                    action: KeyAction::Press,
+                    text: None,
+                };
+                assert_eq!(
+                    keyed(&mac, &press),
+                    Some(command_of(action)),
+                    "{} for {action:?}",
+                    chord.spell()
+                );
+            }
+        }
+        // The Linux chords still answer underneath.
+        assert_eq!(keyed(&mac, &key(Key::Left, Mods::ALT)), Some(Command::Back));
+    }
+
+    #[test]
+    fn ctrl_q_still_quits_from_a_line_on_the_mac_keymap() {
+        let ctrl_q = key(Key::Char('q'), Mods::CTRL);
+        let mac = Bindings::on(Keymap::Mac, vec![]);
+        assert!(quits(&mac, &ctrl_q));
+        assert_eq!(row_command(&mac, &ctrl_q), Some(Command::Quit));
+        assert_eq!(
+            row_command(&mac, &key(Key::Char('c'), Mods::SUPER)),
+            Some(Command::CopySelection),
+            "cmd+c copies from the url bar too"
+        );
+    }
+
+    #[test]
+    fn the_row_says_the_first_problem_and_counts_the_rest() {
+        assert_eq!(summary(&[]), None);
+        assert_eq!(summary(&["a".to_string()]), Some("a".to_string()));
+        assert_eq!(
+            summary(&["a".to_string(), "b".to_string(), "c".to_string()]),
+            Some("a; 2 more (--doctor lists them)".to_string())
+        );
     }
 
     #[test]

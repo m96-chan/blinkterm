@@ -34,7 +34,9 @@
 //! the option names without their `--`, so `--help` documents the file too.
 //! The one family that is not an option is `key.<chord> = <action>`
 //! (`key.f5 = reload`), which rebinds one of the program's keys and may be
-//! written as often as there are keys; see [`crate::bindings`].
+//! written as often as there are keys; see [`crate::bindings`]. Which keys
+//! they apply on top of is `keymap = mac | linux`, whose default is the
+//! platform's ([`Keymap::platform`]).
 //!
 //! TOML was the alternative, and it is a dependency or a second parser the
 //! size of `json.rs` for a file of ten lines. `key value` without the `=`
@@ -50,7 +52,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::appearance;
-use crate::bindings::{Binding, Bindings};
+use crate::bindings::{Binding, Bindings, Keymap};
 use crate::block;
 use crate::download;
 use crate::engine;
@@ -118,8 +120,12 @@ pub struct Options {
     /// `--normal-mode`: start in normal mode rather than insert: the letters
     /// are the program's keys from the first one. See [`crate::normal`].
     pub normal_mode: bool,
-    /// `key.<chord> = <action>` lines from the file, in file order; the loop
-    /// asks them before its own table. See [`crate::bindings`].
+    /// `--keymap`: which built-in keys the run answers, mac or linux. Kept
+    /// for `--doctor`; the loop asks [`Options::bindings`], which has it.
+    pub keymap: Keymap,
+    /// The keymap's rows under the file's `key.<chord> = <action>` lines,
+    /// in file order; the loop asks them before its own table. See
+    /// [`crate::bindings`].
     pub bindings: Bindings,
     /// `--tmux`, `--frames`, `--fps` and `--no-probe`: what overrides the
     /// route a run's frames take. See [`crate::route`].
@@ -174,6 +180,9 @@ pub struct Provenance {
     /// Which source named the engine: `--engine`, `$BLINKTERM_ENGINE`,
     /// `config`, or `None` for the `PATH` search.
     pub engine_from: Option<&'static str>,
+    /// Which source said the keymap: `--keymap`, `config`, or `None` for
+    /// the platform's.
+    pub keymap_from: Option<&'static str>,
 }
 
 /// `--help`, `--version`, `--print-engine` or `--doctor`: the command-line
@@ -218,6 +227,7 @@ pub struct Settings {
     pub mute: Option<bool>,
     pub restore: Option<bool>,
     pub normal_mode: Option<bool>,
+    pub keymap: Option<Keymap>,
     pub tmux: Option<route::Choice>,
     pub frames: Option<route::Frames>,
     pub fps: Option<u32>,
@@ -284,6 +294,7 @@ impl Settings {
             mute: self.mute.or(under.mute),
             restore: self.restore.or(under.restore),
             normal_mode: self.normal_mode.or(under.normal_mode),
+            keymap: self.keymap.or(under.keymap),
             tmux: self.tmux.or(under.tmux),
             frames: self.frames.or(under.frames),
             fps: self.fps.or(under.fps),
@@ -474,6 +485,14 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
                 &mut s.tmux,
                 route::Choice::parse(text)?,
                 "--tmux once is enough",
+            )?;
+            continue;
+        }
+        if let Some(text) = value_of(arg, "--keymap", &mut args) {
+            once(
+                &mut s.keymap,
+                Keymap::parse(text).map_err(|why| format!("--{why}"))?,
+                "--keymap once is enough",
             )?;
             continue;
         }
@@ -719,7 +738,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 33] = [
+const KEYS: [&str; 34] = [
     "home",
     "profile",
     "temp-profile",
@@ -737,6 +756,7 @@ const KEYS: [&str; 33] = [
     "mute",
     "restore",
     "normal-mode",
+    "keymap",
     "tmux",
     "frames",
     "fps",
@@ -852,6 +872,7 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             "mute" => s.mute = Some(parse_bool(key, value).map_err(at)?),
             "restore" => s.restore = Some(parse_bool(key, value).map_err(at)?),
             "normal-mode" => s.normal_mode = Some(parse_bool(key, value).map_err(at)?),
+            "keymap" => s.keymap = Some(Keymap::parse(value).map_err(at)?),
             "tmux" => s.tmux = Some(route::Choice::parse(value).map_err(at)?),
             "frames" => s.frames = Some(route::Frames::parse(value).map_err(at)?),
             "fps" => s.fps = Some(route::parse_fps(key, value).map_err(at)?),
@@ -959,6 +980,7 @@ pub fn from_env(engine: Option<&OsStr>) -> Settings {
 /// and the function the precedence tests call.
 pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, String> {
     let s = cli.over(env).over(file);
+    let keymap = s.keymap.unwrap_or_else(Keymap::platform);
     Ok(Options {
         urls: s.urls,
         home: s.home.unwrap_or_else(|| "about:blank".to_string()),
@@ -981,7 +1003,8 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
         },
         restore: s.restore.unwrap_or(false),
         normal_mode: s.normal_mode.unwrap_or(false),
-        bindings: Bindings::from_rows(s.bindings),
+        keymap,
+        bindings: Bindings::on(keymap, s.bindings),
         route: route::Choices {
             tmux: s.tmux.unwrap_or_default(),
             frames: s.frames.unwrap_or_default(),
@@ -1019,6 +1042,7 @@ fn read_config(choice: Option<&ConfigChoice>) -> Result<(Settings, Provenance), 
         found: false,
         settings: 0,
         engine_from: None,
+        keymap_from: None,
     };
     let (path, named) = match choice {
         Some(ConfigChoice::None) => return Ok((Settings::default(), provenance)),
@@ -1101,6 +1125,13 @@ pub fn invocation(args: &[String]) -> Result<Invocation, String> {
     } else if env.engine.is_some() {
         Some("$BLINKTERM_ENGINE")
     } else if file.engine.is_some() {
+        Some("config")
+    } else {
+        None
+    };
+    provenance.keymap_from = if cli.keymap.is_some() {
+        Some("--keymap")
+    } else if file.keymap.is_some() {
         Some("config")
     } else {
         None
@@ -2496,7 +2527,10 @@ mod tests {
         };
         let options =
             resolve(Settings::default(), Settings::default(), from_file).expect("resolves");
-        assert_eq!(options.bindings, Bindings::from_rows(vec![row]));
+        assert_eq!(
+            options.bindings,
+            Bindings::on(Keymap::platform(), vec![row])
+        );
         assert!(parsed(&["--key.alt+b=back"]).is_err(), "not an option");
     }
 
@@ -2556,6 +2590,111 @@ mod tests {
         assert_eq!(
             resolved(&[]).expect("defaults").route,
             route::Choices::default()
+        );
+    }
+
+    #[test]
+    fn keymap_is_read_from_the_file_and_the_command_line_and_the_command_line_wins() {
+        assert_eq!(
+            parsed(&["--keymap", "mac"]).expect("mac").keymap,
+            Some(Keymap::Mac)
+        );
+        assert_eq!(
+            parsed(&["--keymap=Linux"]).expect("linux").keymap,
+            Some(Keymap::Linux)
+        );
+        assert_eq!(
+            file("keymap = mac").expect("file").keymap,
+            Some(Keymap::Mac)
+        );
+        let options = resolve(
+            parsed(&["--keymap", "linux"]).expect("cli"),
+            Settings::default(),
+            file("keymap = mac").expect("file"),
+        )
+        .expect("folded");
+        assert_eq!(options.keymap, Keymap::Linux, "the line wins");
+        let options = resolve(
+            Settings::default(),
+            Settings::default(),
+            file("keymap = mac").expect("file"),
+        )
+        .expect("folded");
+        assert_eq!(options.keymap, Keymap::Mac, "the file over the platform");
+    }
+
+    #[test]
+    fn keymap_refuses_anything_but_mac_and_linux_and_names_both() {
+        assert_eq!(
+            parsed(&["--keymap", "windows"]),
+            Err("--keymap is mac or linux, not \"windows\"".to_string())
+        );
+        assert_eq!(
+            file("keymap = windows"),
+            Err("/c:1: keymap is mac or linux, not \"windows\"".to_string())
+        );
+        assert!(parsed(&["--keymap"]).is_err());
+    }
+
+    #[test]
+    fn keymap_twice_is_refused_on_the_line_and_in_the_file() {
+        assert_eq!(
+            parsed(&["--keymap", "mac", "--keymap=linux"]),
+            Err("--keymap once is enough".to_string())
+        );
+        assert_eq!(
+            file("keymap = mac\nkeymap = linux"),
+            Err("/c:2: keymap is already set on line 1".to_string())
+        );
+    }
+
+    #[test]
+    fn with_no_keymap_said_the_platform_s_is_used() {
+        let options = resolved(&[]).expect("defaults");
+        assert_eq!(options.keymap, Keymap::platform());
+        assert_eq!(options.bindings, Bindings::on(Keymap::platform(), vec![]));
+        assert!(
+            options.bindings.is_empty(),
+            "the keymap's rows are not the file's"
+        );
+    }
+
+    #[test]
+    fn the_keymap_s_rows_sit_under_the_file_s_key_lines() {
+        use crate::bindings::Lookup;
+        use crate::input::{Key, KeyAction, KeyInput, Mods};
+        let press = |key, mods| KeyInput {
+            key,
+            mods: Mods(mods),
+            action: KeyAction::Press,
+            text: None,
+        };
+        let options = resolve(
+            parsed(&["--keymap", "mac"]).expect("cli"),
+            Settings::default(),
+            file("key.cmd+d = none\nkey.cmd+y = find").expect("file"),
+        )
+        .expect("folded");
+        let lookup = |key, mods| options.bindings.lookup(&press(key, mods));
+        assert_eq!(lookup(Key::Char('d'), Mods::SUPER), Lookup::Unbound);
+        assert_eq!(
+            lookup(Key::Char('y'), Mods::SUPER),
+            Lookup::Bound(Action::Find)
+        );
+        assert_eq!(
+            lookup(Key::Char('['), Mods::SUPER),
+            Lookup::Bound(Action::Back)
+        );
+        assert_eq!(options.bindings.iter().count(), 2);
+        let options = resolve(
+            parsed(&["--keymap", "linux"]).expect("cli"),
+            Settings::default(),
+            Settings::default(),
+        )
+        .expect("folded");
+        assert_eq!(
+            options.bindings.lookup(&press(Key::Char('['), Mods::SUPER)),
+            Lookup::Default
         );
     }
 }

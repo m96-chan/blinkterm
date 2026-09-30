@@ -173,6 +173,7 @@ pub mod session;
 pub mod sites;
 pub mod tablist;
 pub mod tabs;
+pub mod taken;
 pub mod text;
 pub mod tty;
 pub mod upload;

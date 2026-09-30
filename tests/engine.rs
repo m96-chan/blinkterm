@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use blinkterm::bindings::{Bindings, Keymap, Lookup};
 use blinkterm::cdp::{Client, Pending};
 use blinkterm::engine::{self, Engine};
 use blinkterm::find::{self, Matches};
@@ -506,6 +507,51 @@ fn a_key_arrives_as_the_key_the_page_expects() {
         let seen = wait_for_title(&mut client, "key ", Duration::from_secs(5));
         assert_eq!(&seen, expected, "for {input:?}");
     }
+
+    client.close();
+    engine.kill();
+}
+
+/// A `cmd` chord the Mac keymap leaves alone reaches the page as the key
+/// with Meta held, and types nothing: the contract the Mac keymap depends
+/// on for every `cmd` chord it does not take — `cmd+a`, `cmd+z`, `cmd+x` —
+/// which a page's editor expects to see as `metaKey`.
+#[test]
+fn a_cmd_chord_the_mac_keymap_leaves_alone_reaches_the_page_with_meta_held() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    form(&mut client);
+    evaluate(
+        &mut client,
+        "window.seen=[];t.addEventListener('keydown',function(e){\
+         seen.push([e.key,e.metaKey,e.ctrlKey,e.altKey].join(' '))});t.focus()",
+    );
+    let press = KeyInput {
+        key: Key::Char('a'),
+        mods: Mods(Mods::SUPER),
+        action: KeyAction::Press,
+        text: None,
+    };
+    let bindings = Bindings::on(Keymap::Mac, vec![]);
+    assert_eq!(
+        bindings.lookup(&press),
+        Lookup::Default,
+        "cmd+a is not the Mac keymap's"
+    );
+    let params = keys::dispatch(&press).expect("a key with a name");
+    client
+        .call("Input.dispatchKeyEvent", params)
+        .expect("the key is dispatched");
+    assert_eq!(
+        evaluate(&mut client, "seen.join(',')").as_str(),
+        Some("a true false false")
+    );
+    assert_eq!(
+        evaluate(&mut client, "t.value").as_str(),
+        Some(""),
+        "a chord with meta held types nothing"
+    );
 
     client.close();
     engine.kill();

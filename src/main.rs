@@ -6,11 +6,13 @@
 use std::process::ExitCode;
 
 use blinkterm::app;
+use blinkterm::bindings::{self, Keymap};
 use blinkterm::doctor;
 use blinkterm::engine;
 use blinkterm::options::{self, Invocation};
 
-const USAGE: &str = "\
+/// `--help` up to its keys: the same whatever the keymap.
+const USAGE_HEAD: &str = "\
 blinkterm, a real browser in a terminal pane
 
 usage: blinkterm [options] [url ...]
@@ -30,8 +32,9 @@ options:
                    (default: $XDG_DOWNLOAD_DIR, the XDG_DOWNLOAD_DIR of
                    ~/.config/user-dirs.dirs, or ~/Downloads)
   --pdf-paper <a4|letter>
-                   the paper alt+s prints on (default: letter where the
-                   locale is one of the countries that use it, else a4)
+                   the paper save-pdf (alt+s; cmd+s on a Mac) prints on
+                   (default: letter where the locale is one of the
+                   countries that use it, else a4)
   --search-url <url>
                    send what is typed in the url bar and is not a url to
                    <url>, with %s where the words go (off by default: nothing
@@ -83,7 +86,8 @@ options:
                    a program that prints the login for a site: the password
                    on the first line, `login: <user>` on another (pass show
                    web/{domain}; rbw get --full {host}). {host}, {domain},
-                   {url}. Run by alt+l, never by itself
+                   {url}. Run by fill-login (alt+l; cmd+shift+l on a Mac),
+                   never by itself
   --password-command-terminal <command>
                    the same, for one that needs this terminal
   --external-browser <command>
@@ -108,6 +112,10 @@ options:
   --home <url>     the page opened when no url is given (default: about:blank)
   --restore        reopen the tabs the last run had
   --normal-mode    start in normal mode (ctrl+., below)
+  --keymap <mac|linux>
+                   the built-in keys: mac is cmd where Kitty leaves it free and
+                   ctrl elsewhere (default on macOS); linux is ctrl and alt
+                   (default elsewhere). key.<chord> lines apply on top
   --config <path>  read settings from <path> instead of
                    $XDG_CONFIG_HOME/blinkterm/config (~/.config/blinkterm/config)
   --no-config      read no settings file
@@ -165,11 +173,17 @@ is told so in the shell. Inside tmux, set allow-passthrough on; keys then
 come in tmux's own encoding. Over ssh, frames go as PNG and come as fast as
 the link carries them.
 
-keys:
+";
+
+/// The keys of `keymap = linux`: `app::command`.
+const KEYS_LINUX: &str = "\
+keys (keymap linux; --keymap mac or keymap = mac for the other):
   ctrl+l         type a url; in the url bar, left/right, home/end, ctrl+a/e
                  and alt+b/f move, ctrl+w and alt+d delete a word, ctrl+u/k
                  to either end, up/down walk the pages visited, and tab takes
                  the suggestion
+  ctrl+f         find in the page: enter or down the next match, shift+enter
+                 or up the one before, esc closes
   ctrl+r         reload
   alt+left/right back and forward
   ctrl+t         a new tab, with the cursor in the url bar
@@ -198,8 +212,11 @@ keys:
                  link in a tab behind), j/k scroll a notch, d/u half a
                  screen, gg/G to the ends, H/L back and forward, r reload,
                  o the url bar, O a new tab, / find, i back to the page
+  alt+c          copy the selection, or the line being typed; alt+u copies
+                 the url
   alt+p          allow this site camera, microphone, location, notifications
                  or clipboard: type the words, enter sets exactly those
+  alt+l          fill the login form from --password-command
   alt+s          save this page as a PDF in the download directory
   alt+shift+s    save the whole page as a picture (PNG) there
   alt+b          stop blocking ads and trackers on this site, or start again
@@ -212,9 +229,68 @@ keys:
   esc            leave a page's fullscreen; stop a page that is loading
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no
+";
+
+/// The keys of `keymap = mac`: [`bindings::Keymap::Mac`]'s rows. Option
+/// composes on a Mac, so the url bar's word keys are the arrows there.
+const KEYS_MAC: &str = "\
+keys (keymap mac; --keymap linux or keymap = linux for the other):
+  ctrl+l         type a url; in the url bar, left/right, home/end, ctrl+a/e
+                 and alt+left/right move, ctrl+w and alt+backspace delete a
+                 word, ctrl+u/k to either end, up/down walk the pages
+                 visited, and tab takes the suggestion
+  ctrl+f         find in the page: enter or down the next match, shift+enter
+                 or up the one before, esc closes
+  ctrl+r         reload
+  cmd+[ / cmd+]  back and forward
+  ctrl+t         a new tab, with the cursor in the url bar
+  ctrl+w         close this tab; closing the last one quits
+  cmd+shift+t    reopen the last tab closed
+  cmd+d          bookmark this page, or remove the bookmark
+  cmd+alt+right  the next tab, cmd+alt+left the one before (ctrl+pagedown,
+                 ctrl+pageup too)
+  ctrl+1 .. ctrl+8 the nth tab; ctrl+9 the last tab
+  cmd+shift+a    the tab list: type to filter, up/down to pick, enter to
+                 switch, esc to close
+  cmd+y          the history list: type words to filter, enter opens here,
+                 alt+enter or ctrl+enter in a new tab, shift+delete forgets
+                 the page
+  cmd+shift+pageup/pagedown
+                 move this tab left, right
+  middle click or ctrl+click on a link
+                 open it in a tab behind this one
+  ctrl+= / ctrl+- zoom in, out; ctrl+0 back to 100%
+  ctrl+.         normal mode on or off; in it the letters are keys: f labels
+                 what can be clicked and typing a label clicks it (F opens a
+                 link in a tab behind), j/k scroll a notch, d/u half a
+                 screen, gg/G to the ends, H/L back and forward, r reload,
+                 o the url bar, O a new tab, / find, i back to the page
+  cmd+c          copy the selection, or the line being typed (cmd+shift+c
+                 too); cmd+u copies the url
+  cmd+p          allow this site camera, microphone, location, notifications
+                 or clipboard: type the words, enter sets exactly those
+  cmd+shift+l    fill the login form from --password-command
+  cmd+s          save this page as a PDF in the download directory
+  cmd+shift+s    save the whole page as a picture (PNG) there
+  cmd+b          stop blocking ads and trackers on this site, or start again
+  esc            leave a page's fullscreen; stop a page that is loading
+  ctrl+q         quit
+  a dialog       takes the top row: any key, y/n, or type and enter; esc is no
+";
+
+/// After the keys, whichever they are.
+const USAGE_TAIL: &str = "\
 Everything else goes to the page. A link that asks for a new window gets a
 new tab, and the tab is switched to.
 ";
+
+/// The `keys:` block of `keymap`.
+fn keys_block(keymap: Keymap) -> &'static str {
+    match keymap {
+        Keymap::Linux => KEYS_LINUX,
+        Keymap::Mac => KEYS_MAC,
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -231,7 +307,14 @@ fn main() -> ExitCode {
     };
     let options = match invocation {
         Invocation::Help => {
-            print!("{USAGE}{}", blinkterm::bindings::help());
+            // The file is not read for --help, so this is the platform's
+            // keymap, not necessarily the one a run would have.
+            let keymap = Keymap::platform();
+            print!(
+                "{USAGE_HEAD}{}{USAGE_TAIL}{}",
+                keys_block(keymap),
+                bindings::help(keymap)
+            );
             return ExitCode::SUCCESS;
         }
         Invocation::Version => {
@@ -271,5 +354,52 @@ fn exit(fine: bool) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether `block` names `chord`: as written, or as the second half of a
+    /// pair on one line — `alt+left/right` names `alt+right`.
+    fn names(block: &str, chord: &str) -> bool {
+        if block.contains(chord) {
+            return true;
+        }
+        let Some((held, key)) = chord.rsplit_once('+') else {
+            return false;
+        };
+        block
+            .lines()
+            .any(|line| line.contains(&format!("{held}+")) && line.contains(&format!("/{key}")))
+    }
+
+    #[test]
+    fn the_keys_block_of_each_keymap_names_the_first_chord_of_every_action() {
+        for keymap in [Keymap::Linux, Keymap::Mac] {
+            let block = keys_block(keymap);
+            assert!(
+                block.starts_with(&format!("keys (keymap {}", keymap.name())),
+                "{block}"
+            );
+            for row in &bindings::ACTIONS {
+                let first = keymap.column(row).split(',').next().unwrap_or_default();
+                let first = first.split(" .. ").next().unwrap_or(first).trim();
+                assert!(
+                    names(block, first),
+                    "{} for {} in the {} keys",
+                    first,
+                    row.name,
+                    keymap.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_options_list_names_keymap() {
+        assert!(USAGE_HEAD.contains("  --keymap <mac|linux>\n"));
+        assert!(USAGE_TAIL.starts_with("Everything else goes to the page."));
     }
 }
