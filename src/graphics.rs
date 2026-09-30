@@ -17,19 +17,17 @@
 //! in the pane — and hands over pixels, which is the protocol's own raw
 //! format and needs no compositor change at all.
 //!
-//! Under `--alpha` the still is what carries the transparency: RGBA, sent as
-//! `f=32` with the alpha the page left, straight, as the protocol takes it —
-//! the terminal blends it over its own background, and nothing here converts
-//! it. A JPEG frame has no alpha, so a bare page is black while it moves
-//! (see [`crate::motion`]).
+//! Under `--alpha` every picture is RGBA, sent as `f=32` with straight alpha,
+//! as the protocol takes it — the terminal blends it over its own
+//! background. The page is painted on a key colour, and the JPEG frame is
+//! keyed back to transparency as it is decoded, in the one allocation the
+//! decode makes anyway ([`crate::chroma`], [`crate::jpeg::decode_rgba_with`]);
+//! the still is keyed the same way once it is fitted. That is a third more
+//! bytes than `f=24`: 3.9 MB a 1280x770 frame where RGB is 2.9 MB.
 //!
-//! With an amount — `--alpha 70` — the whole picture is sent at that opacity.
-//! The still's alpha is scaled in place by [`scale_alpha`], after the fit and
-//! with no copy. The JPEG frame is decoded straight to RGBA with the amount
-//! as every pixel's alpha ([`crate::jpeg::decode_rgba`], in the one
-//! allocation the decode makes anyway) and goes as `f=32`, a third more bytes
-//! than `f=24`: 3.9 MB a 1280x770 frame where RGB is 2.9 MB. At 100 nothing
-//! is scaled and the JPEG frame stays `f=24`.
+//! With an amount — `--alpha 70` — the whole picture is sent at that opacity:
+//! its alpha scaled in place by [`scale_alpha`], after the key and with no
+//! copy. At 100 nothing is scaled.
 //!
 //! It costs bytes: 2.9 MB of RGB where the JPEG was 185 kB. Through `t=s`
 //! that is a `write` into tmpfs and a `read` out of it, which is a memcpy at
@@ -257,8 +255,8 @@ const IN_FLIGHT: usize = 16;
 /// `crate::jpeg` produces RGB and a JPEG has no alpha to lose,
 /// `crate::png` produces RGBA and a still is one frame in a hundred and
 /// fifty milliseconds, so neither conversion would buy anything. Under
-/// `--alpha` the still's alpha is the point, and under an amount the JPEG
-/// frame is decoded to RGBA in the first place, so it is four here too.
+/// `--alpha` the alpha is the point, and the JPEG frame is decoded to RGBA
+/// in the first place to be keyed, so it is four there too.
 #[derive(Debug, Clone, Copy)]
 pub struct Raw<'a> {
     pub pixels: &'a [u8],

@@ -19,11 +19,13 @@ flag, a different default, a raised Rust floor all do.
   page that paints a container of its own keeps that. With a number the whole
   picture, text included, is sent at that opacity; `--alpha` alone is 100,
   and `alpha = false` or `--alpha=false` turns a file's setting off. It is
-  transparent at rest: while a page moves its JPEG frames show the
-  see-through parts black (a tint, under a number), until the still arrives
-  (over ssh and in tmux, where the frames are PNG, it stays transparent, but
-  the number is not applied there). A page's default black text sits on the
-  terminal's colour, so `--force-dark` goes with it on a dark terminal
+  see-through while the page moves as well as at rest: locally, where the
+  moving frames are JPEG, the page is painted on magenta and the magenta
+  keyed back out of every frame and still, so what a page shows in magenta
+  or vivid purple goes too. Over ssh and in tmux the frames are PNG with
+  real transparency, and the number is not applied there. A page's default
+  black text sits on the terminal's colour, so `--force-dark` goes with it
+  on a dark terminal
   ([#79](https://github.com/m96-chan/blinkterm/issues/79),
   [#84](https://github.com/m96-chan/blinkterm/issues/84)).
 

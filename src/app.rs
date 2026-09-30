@@ -43,6 +43,7 @@ use crate::bindings::{Action, Bindings, Lookup};
 use crate::block::{self, Blocker, Unblocked};
 use crate::bookmarks::{Bookmarks, Toggled};
 use crate::cdp::{Client, Event, Notifier, Pending};
+use crate::chroma;
 use crate::clipboard;
 use crate::dialog::{Answer, Dialog, Kind};
 use crate::download::{self, Downloads};
@@ -1201,7 +1202,11 @@ pub fn run(options: Options) -> Result<(), String> {
     };
     // What pages are told about light and dark, before there is a page to
     // tell: the flags now, the terminal's answer when it comes.
-    let appearance = Appearance::new(options.scheme, options.force_dark, options.alpha);
+    let mut appearance = Appearance::new(options.scheme, options.force_dark, options.alpha);
+    // Under `--alpha`, a page painted on the key where this program decodes
+    // the frames and so can take it back out; on nothing where the engine's
+    // PNG goes to the terminal as it came. See [`crate::chroma`].
+    appearance.keyed = route.payload == Payload::Raw;
     // Once for the run, and before the pane is taken, so that a directory
     // which is a file is a sentence in the shell. Every engine is told it.
     let downloads_dir = download::prepare(options.download.clone())?;
@@ -3838,21 +3843,22 @@ fn handle_page_events(
         // formats through both decoders exists to catch before a person meets
         // it.
         //
-        // Under `--alpha` with an amount the frame goes at that opacity: RGBA,
-        // the alpha written by the decoder as it writes the colour.
-        match chrome.appearance.alpha.scaling() {
-            Some(alpha) => {
-                if let Ok(image) = crate::jpeg::decode_rgba(&jpeg, FRAME_BUDGET, alpha) {
-                    let raw = Raw::rgba(&image.rgba, image.width, image.height);
-                    paint(pane, tabs, chrome, raw)?;
+        // Under `--alpha` the page was painted on the key, and the frame is
+        // keyed as it is decoded — RGBA, the alpha written with the colour —
+        // then despilled and taken to the amount. See [`crate::chroma`].
+        if chrome.appearance.keys() {
+            let keyed = crate::jpeg::decode_rgba_with(&jpeg, FRAME_BUDGET, chroma::key_pixel);
+            if let Ok(mut image) = keyed {
+                chroma::despill(&mut image.rgba, image.width, image.height);
+                if let Some(alpha) = chrome.appearance.alpha.scaling() {
+                    graphics::scale_alpha(&mut image.rgba, alpha);
                 }
+                let raw = Raw::rgba(&image.rgba, image.width, image.height);
+                paint(pane, tabs, chrome, raw)?;
             }
-            None => {
-                if let Ok(image) = crate::jpeg::decode(&jpeg, FRAME_BUDGET) {
-                    let raw = Raw::rgb(&image.rgb, image.width, image.height);
-                    paint(pane, tabs, chrome, raw)?;
-                }
-            }
+        } else if let Ok(image) = crate::jpeg::decode(&jpeg, FRAME_BUDGET) {
+            let raw = Raw::rgb(&image.rgb, image.width, image.height);
+            paint(pane, tabs, chrome, raw)?;
         }
     }
     Ok(())
@@ -4084,27 +4090,34 @@ fn collect_still(
     };
     let pane_pixels = chrome.layout.pixels(chrome.metrics);
     let scaling = chrome.appearance.alpha.scaling();
-    let (pixels, (width, height)) = fitted_still(image, pane_pixels, scaling);
+    let keyed = chrome.appearance.keys();
+    let (pixels, (width, height)) = fitted_still(image, pane_pixels, keyed, scaling);
     paint(pane, tabs, chrome, Raw::rgba(&pixels, width, height))
 }
 
-/// A decoded still made ready to send: fitted to the pane, and its alpha
-/// scaled under `--alpha` with an amount.
+/// A decoded still made ready to send: fitted to the pane, keyed if the page
+/// was painted on the key, and its alpha scaled under `--alpha` with an
+/// amount.
 ///
 /// At a fractional level the engine's rounding leaves the still a pixel or
 /// two off the pane, and a picture that is not the pane's size is one the
-/// terminal resamples until the text goes soft. See [`zoom::fit`]. The
-/// scaling is done on whichever buffer comes out of that, in place, so an
-/// amount costs one pass over the pixels and no allocation.
+/// terminal resamples until the text goes soft. See [`zoom::fit`]. The key
+/// and the scaling are done on whichever buffer comes out of that, in place,
+/// with no allocation; the key the same way as a moving frame's, so a page
+/// looks the same stopped as moving ([`crate::chroma`]).
 fn fitted_still(
     image: crate::png::PngImage,
     pane: (u32, u32),
+    keyed: bool,
     scaling: Option<u8>,
 ) -> (Vec<u8>, (u32, u32)) {
     let (mut pixels, size) = match zoom::fit(&image.rgba, image.width, image.height, 4, pane) {
         Some(fitted) => (fitted, pane),
         None => (image.rgba, (image.width, image.height)),
     };
+    if keyed {
+        chroma::key(&mut pixels, size.0, size.1);
+    }
     if let Some(alpha) = scaling {
         graphics::scale_alpha(&mut pixels, alpha);
     }
@@ -6505,7 +6518,7 @@ fn start_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome, kind: save::Kind) {
                 screen::clip_to(job.name(), download::NAME_CELLS)
             );
             chrome.downloads.announce(words, now);
-            chrome.save = Some(job);
+            chrome.save = Some(job.keyed(chrome.appearance.keys()));
         }
         Err(why) => {
             let name = save::file_name(&title, &url, kind);
@@ -8893,11 +8906,11 @@ mod tests {
         };
         let alphas = |pixels: &[u8]| pixels.chunks(4).map(|p| p[3]).collect::<Vec<_>>();
 
-        let (pixels, size) = fitted_still(still(), (4, 4), None);
+        let (pixels, size) = fitted_still(still(), (4, 4), false, None);
         assert_eq!(size, (4, 4));
         assert_eq!(pixels, rgba, "at 100 nothing is touched");
 
-        let (pixels, size) = fitted_still(still(), (4, 4), Some(179));
+        let (pixels, size) = fitted_still(still(), (4, 4), false, Some(179));
         assert_eq!(size, (4, 4));
         let mut expected = vec![179; 16];
         expected[0] = 0;
@@ -8908,7 +8921,7 @@ mod tests {
         }
 
         // A pane one pixel wider: zoom::fit's own buffer, scaled the same.
-        let (pixels, size) = fitted_still(still(), (5, 4), Some(179));
+        let (pixels, size) = fitted_still(still(), (5, 4), false, Some(179));
         assert_eq!(size, (5, 4));
         assert_eq!(pixels.len(), 5 * 4 * 4);
         let alphas = alphas(&pixels);
@@ -8917,6 +8930,24 @@ mod tests {
         assert!(
             alphas[5..].iter().all(|&a| a == 179),
             "every other pixel opaque, at the amount: {alphas:?}"
+        );
+    }
+
+    #[test]
+    fn a_keyed_still_clears_the_key_and_then_takes_the_amount() {
+        // A row of four: the key, black, white, the key.
+        let still = crate::png::PngImage {
+            width: 4,
+            height: 1,
+            rgba: vec![
+                255, 0, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255, 255, 0, 255, 255,
+            ],
+        };
+        let (pixels, _) = fitted_still(still, (4, 1), true, Some(179));
+        assert_eq!(
+            pixels,
+            [0, 0, 0, 0, 0, 0, 0, 179, 255, 255, 255, 179, 0, 0, 0, 0],
+            "the key clear, the page at the amount"
         );
     }
 

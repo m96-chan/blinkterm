@@ -74,15 +74,14 @@ three-eighths, of the pane until the link catches up, and the still of a
 page at rest is always full size. `--fps <n>` caps it (15 by default over
 ssh), and `--frames raw|png` overrides the choice.
 
-Under `--alpha` (see [Transparent pages](usage.md#transparent-pages)) the frames stay
-as they are: locally the JPEG frames of a moving page cannot carry the
-transparency and show it black, while the PNG frames over ssh and in tmux do
-carry it. Under an amount (`--alpha 70`) the local frames go as raw RGBA
-instead: the still with its alpha scaled, the JPEG frame decoded with the
-amount as every pixel's alpha, `f=32` where it was `f=24` — 3.9 MB a
-1280x770 frame rather than 2.9, and no slower to decode. The PNG frames over
-ssh and in tmux go as the engine made them, so the amount is not applied
-there.
+Under `--alpha` (see [Transparent pages](usage.md#transparent-pages)) the
+cast stays what the route makes it. Locally the JPEG frames of a moving page
+cannot carry transparency, so the page is painted on a key colour, magenta,
+and every frame and still is keyed back to transparency as it is decoded —
+RGBA, `f=32` where it was `f=24`, 3.9 MB a 1280x770 frame rather than 2.9,
+and 0.9 ms of keying on a 3.5 ms decode. The PNG frames over ssh and in tmux
+carry real transparency and go as the engine made them, so there is no key
+there, and `--alpha`'s number is not applied.
 
 ## What a page is told
 

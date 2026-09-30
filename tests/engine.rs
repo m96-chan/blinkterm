@@ -6850,9 +6850,11 @@ fn a_page_with_no_background_is_transparent_under_the_override_and_stays_so_acro
     engine.kill();
 }
 
-/// Why a bare page is black while it moves under `--alpha`: the screencast
-/// keeps the transparency in a PNG, and a JPEG — the local route's moving
-/// frame — has nowhere to put it and paints it black.
+/// Why the local route's frames are keyed under `--alpha` rather than asked
+/// for transparent: the screencast keeps real transparency in a PNG, and a
+/// JPEG — the local route's moving frame — has nowhere to put it and paints
+/// it black. Over ssh and in tmux the frames are PNG, and this is what they
+/// carry.
 #[test]
 fn the_screencast_carries_the_alpha_as_png_and_paints_it_black_as_jpeg() {
     let Some((mut engine, mut client)) = connect() else {
@@ -6913,30 +6915,6 @@ fn the_screencast_carries_the_alpha_as_png_and_paints_it_black_as_jpeg() {
             pixel.iter().all(|&c| c < 8),
             "{name}: the JPEG cast paints the transparency black: {pixel:?}"
         );
-
-        // What `--alpha 70` costs a moving frame: the same decode, four
-        // bytes a pixel with the alpha written alongside.
-        let runs = 50;
-        let started = Instant::now();
-        for _ in 0..runs {
-            let _ = blinkterm::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("decodes");
-        }
-        let rgb = started.elapsed() / runs;
-        let started = Instant::now();
-        let mut rgba = None;
-        for _ in 0..runs {
-            rgba =
-                Some(blinkterm::jpeg::decode_rgba(&jpeg, 64 * 1024 * 1024, 179).expect("decodes"));
-        }
-        let four = started.elapsed() / runs;
-        let rgba = rgba.expect("decoded");
-        eprintln!(
-            "{name}: {}x{} decode {rgb:?}, decode_rgba {four:?}",
-            rgba.width, rgba.height
-        );
-        let at = (((rgba.height - 5) * rgba.width + rgba.width - 5) * 4) as usize;
-        assert_eq!(&rgba.rgba[at..at + 3], pixel, "{name}: the same colour");
-        assert_eq!(rgba.rgba[at + 3], 179, "{name}: at the amount");
     }
 
     client.close();
@@ -7169,6 +7147,252 @@ fn a_saved_picture_under_forced_transparency_keeps_it() {
     let corner = &image.rgba[at..at + 4];
     eprintln!("the saved picture's corner: {corner:?}");
     assert_eq!(corner[3], 0, "the file keeps the transparency");
+
+    client.close();
+    engine.kill();
+}
+
+/// The appearance `--alpha` gives a session on the local route, where the
+/// frames are keyed: the backgrounds painted [`blinkterm::chroma::KEY`].
+fn keyed(client: &mut Client) {
+    let mut alpha = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::On(100),
+    );
+    alpha.keyed = true;
+    blinkterm::app::prepare_session(client, &alpha, &Identity::new(None, None, "C"));
+}
+
+/// Black text, a photograph, a green button, a box of vivid purple and a
+/// half-black overlay, on a white page: what a key costs, in one place.
+const MIXED: &str = "data:text/html,<body style='margin:0;background:%23fff;font:16px sans-serif'>\
+<h1 style='margin:8px'>Black text, a heading</h1>\
+<p style='margin:8px'>Body text in black on a white page, and \
+<a href='%23' style='color:%231a0dab'>a blue link</a>.</p>\
+<button style='position:absolute;left:8px;top:120px;width:120px;height:32px;background:%2334a853;color:%23fff;border:0'>Green</button>\
+<div style='position:absolute;left:160px;top:120px;width:120px;height:32px;background:%23d500f9'></div>\
+<canvas id=c width=320 height=200 style='position:absolute;left:20px;top:220px'></canvas>\
+<div style='position:absolute;left:420px;top:240px;width:240px;height:120px;background:rgba(0,0,0,0.5)'></div>\
+<script>var c=document.getElementById('c').getContext('2d');\
+var g=c.createLinearGradient(0,0,320,200);g.addColorStop(0,'%2387ceeb');\
+g.addColorStop(0.5,'%23228b22');g.addColorStop(1,'%23ffd700');c.fillStyle=g;c.fillRect(0,0,320,200);\
+for(var i=0;i<400;i++){c.fillStyle='hsla('+(i*37%25360)+',70%25,'+(30+i%2540)+'%25,0.5)';\
+c.beginPath();c.arc((i*53)%25320,(i*29)%25200,4+i%256,0,7);c.fill()}\
+document.title='ready'</script></body>";
+
+/// RGBA, its width and its height.
+type Picture = (Vec<u8>, u32, u32);
+
+/// A keyed JPEG frame of `page` at 1280x768 and the keyed still of the same
+/// moment, as the program makes them, and how long the frame took to decode
+/// plain and keyed.
+fn keyed_frame_and_still(
+    client: &mut Client,
+    page: &str,
+) -> (Picture, Picture, (Duration, Duration)) {
+    go_to(client, page);
+    let is_key = |client: &mut Client| {
+        let (rgba, width, height) = still(client);
+        let at = (((height - 5) * width + width - 5) * 4) as usize;
+        rgba[at..at + 3] == [255, 0, 255]
+    };
+    assert!(wait_until(client, true, is_key), "painted on the key");
+    cast(client, "jpeg", Some(motion::QUALITY), WIDE, TALL);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let jpeg = loop {
+        if let Some((frame, _)) = take_frames(client).pop() {
+            break frame;
+        }
+        assert!(Instant::now() < deadline, "no frame");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = client.call("Page.stopScreencast", Json::empty());
+
+    let runs = 30;
+    let started = Instant::now();
+    for _ in 0..runs {
+        let _ = blinkterm::jpeg::decode(&jpeg, 64 << 20).expect("decodes");
+    }
+    let plain = started.elapsed() / runs;
+    let started = Instant::now();
+    let mut frame = None;
+    for _ in 0..runs {
+        let mut image =
+            blinkterm::jpeg::decode_rgba_with(&jpeg, 64 << 20, blinkterm::chroma::key_pixel)
+                .expect("decodes");
+        blinkterm::chroma::despill(&mut image.rgba, image.width, image.height);
+        frame = Some(image);
+    }
+    let keyed = started.elapsed() / runs;
+    let frame = frame.expect("a frame");
+
+    let (mut rgba, width, height) = still(client);
+    blinkterm::chroma::key(&mut rgba, width, height);
+    (
+        (frame.rgba, frame.width, frame.height),
+        (rgba, width, height),
+        (plain, keyed),
+    )
+}
+
+/// The share of the pixels of `rgba` inside `rect` (CSS pixels at scale 1)
+/// that `keep` says yes to.
+fn share(rgba: &[u8], width: u32, rect: (u32, u32, u32, u32), keep: impl Fn(&[u8]) -> bool) -> f64 {
+    let (x0, y0, w, h) = rect;
+    let mut yes = 0;
+    for y in y0..y0 + h {
+        for x in x0..x0 + w {
+            let at = ((y * width + x) * 4) as usize;
+            if keep(&rgba[at..at + 4]) {
+                yes += 1;
+            }
+        }
+    }
+    f64::from(yes) / f64::from(w * h)
+}
+
+/// `--alpha` on the local route: the page painted on the key, a JPEG frame
+/// keyed as it is decoded, and the still keyed the same way — so the page is
+/// see-through while it moves as well as at rest, and looks the same in
+/// both. What is measured: the bare page cleared, the text left opaque and
+/// without a magenta fringe, and what the key costs in content and time.
+#[test]
+fn under_a_key_a_moving_frame_is_as_see_through_as_the_still() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(WIDE)),
+                ("height", Json::number(TALL)),
+                ("deviceScaleFactor", Json::number(1)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("the size");
+    go_to(&mut client, PAINTED);
+    keyed(&mut client);
+
+    let ((frame, width, _), (still, still_width, _), (plain, keyed)) =
+        keyed_frame_and_still(&mut client, PAINTED);
+    assert_eq!(width, WIDE);
+    assert_eq!(still_width, WIDE);
+    let clear = |p: &[u8]| p[3] == 0;
+    // Everything below the line of text is the bare page.
+    let bare = (0, 60, WIDE, TALL - 60);
+    let (frame_bare, still_bare) = (
+        share(&frame, width, bare, clear),
+        share(&still, width, bare, clear),
+    );
+    // The text: opaque, dark, and no key left in it.
+    let text = (0, 0, 400, 40);
+    let opaque = |p: &[u8]| p[3] >= 128;
+    let fringe = frame
+        .chunks_exact(4)
+        .take((40 * width) as usize)
+        .filter(|p| p[3] == 255)
+        .map(|p| i32::from(p[0].min(p[2])) - i32::from(p[1]))
+        .max()
+        .unwrap_or(0);
+    eprintln!(
+        "keyed, white page: bare page clear {:.4} moving, {:.4} at rest; text opaque {:.4}; \
+         the most key left in an opaque pixel {fringe}; decode {plain:?}, decode and key {keyed:?}",
+        frame_bare,
+        still_bare,
+        share(&frame, width, text, opaque),
+    );
+    assert!(frame_bare > 0.99, "the moving frame is see-through");
+    assert_eq!(still_bare, 1.0, "and the still");
+    assert!(share(&frame, width, text, opaque) > 0.02, "the text stays");
+    assert!(fringe < 32, "no magenta fringe: {fringe}");
+
+    let ((frame, width, _), (still, _, _), _) = keyed_frame_and_still(&mut client, MIXED);
+    let green = (8, 120, 120, 32);
+    let purple = (160, 120, 120, 32);
+    let photo = (20, 220, 320, 200);
+    let overlay = (420, 240, 240, 120);
+    let alpha_mean = |rgba: &[u8], rect: (u32, u32, u32, u32)| {
+        let (x0, y0, w, h) = rect;
+        let mut sum = 0u64;
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                sum += u64::from(rgba[((y * width + x) * 4 + 3) as usize]);
+            }
+        }
+        sum as f64 / f64::from(w * h) / 255.0
+    };
+    eprintln!(
+        "keyed, mixed page, moving / at rest: green button opaque {:.3} / {:.3}, \
+         vivid purple box opaque {:.3} / {:.3}, photo opaque {:.3} / {:.3}, \
+         50% overlay alpha {:.2} / {:.2}, bare page clear {:.4} / {:.4}",
+        share(&frame, width, green, |p| p[3] == 255),
+        share(&still, width, green, |p| p[3] == 255),
+        share(&frame, width, purple, |p| p[3] == 255),
+        share(&still, width, purple, |p| p[3] == 255),
+        share(&frame, width, photo, |p| p[3] == 255),
+        share(&still, width, photo, |p| p[3] == 255),
+        alpha_mean(&frame, overlay),
+        alpha_mean(&still, overlay),
+        share(&frame, width, (700, 400, 500, 300), clear),
+        share(&still, width, (700, 400, 500, 300), clear),
+    );
+    assert!(
+        share(&frame, width, green, |p| p[3] == 255) > 0.95,
+        "green stays"
+    );
+    assert!(
+        share(&still, width, photo, |p| p[3] == 255) > 0.95,
+        "a photo stays"
+    );
+    assert!(
+        share(&still, width, purple, |p| p[3] == 255) < 0.1,
+        "the key's own hue goes: the cost of the colour"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// alt+shift+s under a key: the engine's PNG is of the page on magenta, and
+/// the file written is keyed, transparent where the page is.
+#[test]
+fn a_saved_picture_under_a_key_is_keyed_before_it_is_written() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    go_to(&mut client, PAINTED);
+    keyed(&mut client);
+    let magenta = |client: &mut Client| far_corner(client) == [255, 0, 255, 255];
+    assert!(wait_until(&mut client, true, magenta), "on the key");
+
+    let answer = client
+        .call(
+            "Page.captureScreenshot",
+            save::capture_params(WIDTH, HEIGHT),
+        )
+        .expect("a capture");
+    let data = answer.get("data").and_then(Json::as_str).expect("data");
+    let png = blinkterm::base64::decode(data.as_bytes()).expect("base64");
+    let file = save::key_png(&png).expect("keyed");
+    let image = blinkterm::png::decode(&file, 64 * 1024 * 1024).expect("a PNG");
+    let at = (((image.height - 5) * image.width + image.width - 5) * 4) as usize;
+    let corner = &image.rgba[at..at + 4];
+    eprintln!(
+        "the saved picture's corner: {corner:?}; {} bytes from the engine, {} written",
+        png.len(),
+        file.len()
+    );
+    assert_eq!(corner[3], 0, "the file is clear where the page is");
 
     client.close();
     engine.kill();

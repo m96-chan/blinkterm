@@ -198,15 +198,23 @@ fn an_image_larger_than_the_budget_is_refused_from_its_header() {
     assert!(jpeg::decode(&data, 48 * 32 * 3).is_ok(), "exactly enough");
 }
 
-/// `--alpha 70`'s moving frame: the same colours as [`jpeg::decode`]'s, to
-/// the byte, with the one alpha as every fourth.
+/// `--alpha`'s moving frame: the same colours as [`jpeg::decode`]'s, to the
+/// byte, every pixel handed over once with an alpha of 255 — here set to
+/// 179, as a key would set its own.
 #[test]
-fn decoding_to_rgba_is_the_rgb_picture_with_the_alpha_interleaved() {
+fn decoding_to_rgba_hands_every_pixel_over_once_with_the_rgb_pictures_colour() {
     for name in ["420.jpg", "gray.jpg"] {
         let data = fixture(name);
         let rgb = jpeg::decode(&data, usize::MAX).expect("decodes");
-        let rgba = jpeg::decode_rgba(&data, usize::MAX, 179).expect("decodes");
+        let mut seen = 0usize;
+        let rgba = jpeg::decode_rgba_with(&data, usize::MAX, |pixel| {
+            assert_eq!(pixel[3], 255, "opaque until told otherwise");
+            pixel[3] = 179;
+            seen += 1;
+        })
+        .expect("decodes");
         assert_eq!((rgba.width, rgba.height), (rgb.width, rgb.height), "{name}");
+        assert_eq!(seen, (rgb.width * rgb.height) as usize, "{name}");
         let expected: Vec<u8> = rgb
             .rgb
             .chunks_exact(3)
@@ -221,11 +229,11 @@ fn decoding_to_rgba_is_the_rgb_picture_with_the_alpha_interleaved() {
 fn the_rgba_budget_counts_four_bytes_a_pixel() {
     let data = fixture("restart.jpg");
     assert_eq!(
-        jpeg::decode_rgba(&data, 48 * 32 * 4 - 1, 255),
+        jpeg::decode_rgba_with(&data, 48 * 32 * 4 - 1, |_| {}),
         Err(JpegError::TooLarge)
     );
     assert!(
-        jpeg::decode_rgba(&data, 48 * 32 * 4, 255).is_ok(),
+        jpeg::decode_rgba_with(&data, 48 * 32 * 4, |_| {}).is_ok(),
         "exactly enough"
     );
 }

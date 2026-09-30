@@ -677,10 +677,175 @@ fn scale(value: u16, depth: u8) -> u8 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Encoding
+// ---------------------------------------------------------------------------
+
+/// Encode RGBA8 as a PNG: colour type 6, no filter, and one deflate block of
+/// fixed Huffman codes.
+///
+/// For the picture `alt+shift+s` saves under a chroma-keyed `--alpha`
+/// ([`crate::chroma`]), which the engine sends painted on the key and this
+/// program has to write back out transparent. The compression is the least
+/// that is worth having: a byte is a literal, or a run of the pixel before
+/// it — distance four — which is what a keyed-out background and a page's
+/// flat colours are. A page of text comes out a few times the engine's own
+/// PNG; the bare parts cost next to nothing.
+pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let row = width as usize * 4;
+    let mut raw = Vec::with_capacity((row + 1) * height as usize);
+    for line in rgba.chunks_exact(row.max(1)).take(height as usize) {
+        raw.push(0);
+        raw.extend_from_slice(line);
+    }
+    let mut zlib = vec![0x78, 0x01];
+    zlib.extend_from_slice(&deflate_fixed(&raw));
+    zlib.extend_from_slice(&inflate::adler32(&raw).to_be_bytes());
+
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]);
+    let mut out = SIGNATURE.to_vec();
+    for (kind, body) in [
+        (b"IHDR", &header[..]),
+        (b"IDAT", &zlib[..]),
+        (b"IEND", &[][..]),
+    ] {
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        let mut crc = Crc::new();
+        crc.update(kind);
+        crc.update(body);
+        out.extend_from_slice(&crc.finish().to_be_bytes());
+    }
+    out
+}
+
+/// Bits out least significant first, as deflate packs them.
+struct Bits {
+    out: Vec<u8>,
+    word: u64,
+    count: u32,
+}
+
+impl Bits {
+    fn put(&mut self, value: u32, bits: u32) {
+        self.word |= u64::from(value) << self.count;
+        self.count += bits;
+        while self.count >= 8 {
+            self.out.push(self.word as u8);
+            self.word >>= 8;
+            self.count -= 8;
+        }
+    }
+
+    /// A Huffman code, which deflate stores most significant bit first.
+    fn code(&mut self, code: u32, bits: u32) {
+        let reversed = code.reverse_bits() >> (32 - bits);
+        self.put(reversed, bits);
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.count > 0 {
+            self.out.push(self.word as u8);
+        }
+        self.out
+    }
+}
+
+/// A literal or length symbol in the fixed code (RFC 1951 3.2.6).
+fn fixed_symbol(bits: &mut Bits, symbol: u32) {
+    match symbol {
+        0..=143 => bits.code(0x30 + symbol, 8),
+        144..=255 => bits.code(0x190 + symbol - 144, 9),
+        256..=279 => bits.code(symbol - 256, 7),
+        _ => bits.code(0xc0 + symbol - 280, 8),
+    }
+}
+
+/// One final block of fixed Huffman codes: literals, and runs of the byte
+/// four back.
+fn deflate_fixed(data: &[u8]) -> Vec<u8> {
+    const BASE: [u32; 29] = [
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
+        131, 163, 195, 227, 258,
+    ];
+    const EXTRA: [u32; 29] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+    ];
+    let mut bits = Bits {
+        out: Vec::with_capacity(data.len() / 4),
+        word: 0,
+        count: 0,
+    };
+    bits.put(1, 1); // the final block
+    bits.put(1, 2); // fixed Huffman
+    let mut i = 0;
+    while i < data.len() {
+        let mut run = 0;
+        if i >= 4 {
+            while run < 258 && i + run < data.len() && data[i + run] == data[i + run - 4] {
+                run += 1;
+            }
+        }
+        if run >= 3 {
+            let code = BASE
+                .iter()
+                .rposition(|&base| base as usize <= run)
+                .unwrap_or(0);
+            fixed_symbol(&mut bits, 257 + code as u32);
+            bits.put(run as u32 - BASE[code], EXTRA[code]);
+            // Distance four is code 3, five bits, no extra.
+            bits.code(3, 5);
+            i += run;
+        } else {
+            fixed_symbol(&mut bits, u32::from(data[i]));
+            i += 1;
+        }
+    }
+    fixed_symbol(&mut bits, 256);
+    bits.finish()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::inflate::tests::zlib_stored;
+
+    #[test]
+    fn an_encoded_picture_decodes_to_the_same_pixels() {
+        // Runs, a clear stretch, a gradient, and a width that is not a
+        // multiple of anything in particular.
+        let (w, h) = (37u32, 9u32);
+        let mut rgba = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let pixel = match x {
+                    0..=9 => [0, 0, 0, 0],
+                    10..=19 => [255, 255, 255, 255],
+                    _ => [(x * 7) as u8, (y * 29) as u8, (x * y) as u8, (x * 13) as u8],
+                };
+                rgba.extend_from_slice(&pixel);
+            }
+        }
+        let png = encode_rgba(w, h, &rgba);
+        let image = decode(&png, usize::MAX).expect("our own PNG decodes");
+        assert_eq!((image.width, image.height), (w, h));
+        assert_eq!(image.rgba, rgba);
+        assert!(
+            png.len() < rgba.len(),
+            "{} bytes for {}",
+            png.len(),
+            rgba.len()
+        );
+
+        let clear = vec![0u8; 640 * 360 * 4];
+        let png = encode_rgba(640, 360, &clear);
+        assert_eq!(decode(&png, usize::MAX).expect("decodes").rgba, clear);
+        assert!(png.len() < clear.len() / 50, "{} bytes", png.len());
+    }
 
     /// Wrap a chunk body in its length, type and CRC.
     pub(crate) fn chunk(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {

@@ -77,8 +77,9 @@
 //! reason quality 85 rather than 70 or 95, and the rule that decides which of
 //! two frames arriving out of order is the one to keep. `--alpha`, which lets
 //! the terminal's background show through a page, leaves that as it is: the
-//! still is transparent, and a JPEG frame, which cannot be, shows a bare page
-//! black while it moves — a tint under `--alpha 70`, whose frames go RGBA.
+//! page is painted on a key colour and every frame keyed back to
+//! transparency as it is decoded ([`chroma`]), so a JPEG frame, which has no
+//! alpha, is see-through all the same.
 //!
 //! The frames are decoded here rather than by the terminal, which is the
 //! other half of the change and the reason the compositor needed none: the
@@ -128,6 +129,7 @@ pub mod bindings;
 pub mod block;
 pub mod bookmarks;
 pub mod cdp;
+pub mod chroma;
 pub mod clipboard;
 pub mod dialog;
 pub mod doctor;

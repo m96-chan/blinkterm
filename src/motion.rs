@@ -36,41 +36,34 @@
 //! same reason. A page that never moves costs one still and then nothing at
 //! all — no screencast frames, no polling, no repainting.
 //!
-//! # Still JPEG while it moves, in alpha mode
+//! # Still JPEG while it moves, in alpha mode — keyed
 //!
-//! Under `--alpha` the engine paints no default background
-//! ([`crate::appearance`]), and what the page leaves bare is transparent — in
-//! a PNG. A JPEG has nowhere to keep that. Chromium encodes the screencast
-//! from a premultiplied bitmap and drops the alpha, so a transparent pixel
-//! comes out 0, 0, 0: measured, the same pixel that is 0, 0, 0, 0 in a PNG
-//! frame of the same page. **So on the local route a page with no background
-//! is black while it moves, and turns transparent when it rests**, with the
-//! lossless still.
+//! Under `--alpha` what the page leaves bare is to be transparent, and a JPEG
+//! has nowhere to keep that. Chromium encodes the screencast from a
+//! premultiplied bitmap and drops the alpha, so a transparent pixel comes out
+//! 0, 0, 0: measured, the same pixel that is 0, 0, 0, 0 in a PNG frame of the
+//! same page. With the page's own `html` and `body` backgrounds forced
+//! transparent that is most of a real page, and asking for real transparency
+//! made a light page moving its dark text on black.
 //!
-//! With the page's own `html` and `body` backgrounds forced transparent as
-//! well, that is most of a real page, not only a bare one: a light page
-//! moving is its dark text on black, and sharp and see-through once it
-//! stops. `--force-dark` makes the moving text light. Under an amount —
-//! `--alpha 70` — the JPEG frame is decoded to RGBA at that alpha and sent
-//! as `f=32` ([`crate::graphics`]), so the black is a 70% tint over the
-//! terminal rather than a solid one, and the text is at 70% too.
+//! That was first taken to be a fair trade — the frames that pass while a
+//! page moves are the ones somebody is driving past — and it was not,
+//! because a page moves without anybody driving it: a text box's caret
+//! blinking is a frame every half second, and Google's front page, with its
+//! caret in the search box, flickered black and clear for as long as it was
+//! open. The PNG cast keeps the alpha and was measured and set aside for what
+//! it costs: on an Apple M3 at 1280x768, the scrolling article of the engine
+//! tests, 55.2 fps at 292 kB a frame against JPEG's 59.7 at 234 kB, with
+//! 8.3 ms to decode a frame here against 6.1 — and 33.8 against 57.8 on two
+//! cores, per the table above.
 //!
-//! That is chosen, not overlooked. A page that is moving is a page somebody
-//! is driving — a hand on the wheel or a key held — and the frames that pass
-//! while they do are the lossy ones nobody reads, the same argument as the
-//! JPEG itself above; many programs drop their transparency while they are
-//! being operated for the same reason. The cast stays what the route makes it
-//! ([`Cast::for_route`]), so the option costs a moving page nothing. The
-//! alternative was measured and set aside: a PNG cast keeps the alpha, and on
-//! an Apple M3 at 1280x768, the scrolling article of the engine tests, it was
-//! 55.2 fps at 292 kB a frame against JPEG's 59.7 at 234 kB, with 8.3 ms to
-//! decode a frame here against 6.1 — but 33.8 against 57.8 on two cores, per
-//! the table above, and 3.9 MB of RGBA a frame through `/dev/shm` rather than
-//! 2.9 of RGB.
-//!
-//! On a route whose frames are already the engine's PNG — over ssh, inside
-//! tmux ([`crate::route::Payload::Png`]) — the moving frames carry the alpha
-//! anyway, and nothing turns black.
+//! **So the cast stays JPEG, and the page is painted on a key colour that the
+//! decoder takes back out** ([`crate::chroma`]): see-through while it moves as
+//! well as at rest, at 0.9 ms a 1280x768 frame, and the still keyed the same
+//! way so that the two look alike. The cast stays what the route makes it
+//! ([`Cast::for_route`]). On a route whose frames are already the engine's
+//! PNG — over ssh, inside tmux ([`crate::route::Payload::Png`]) — the frames
+//! carry real transparency, and there is no key.
 //!
 //! # When a still is worth asking for
 //!

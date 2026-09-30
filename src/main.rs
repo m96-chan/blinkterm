@@ -49,11 +49,11 @@ options:
                    nothing behind it and the page's own html/body background
                    is made transparent (text and pictures stay). With a
                    number the whole picture is sent at that opacity, text
-                   included; --alpha alone is 100. While the page moves the
-                   see-through parts are black (a tint, under a number) and
-                   clear when it stops. Black text over a dark terminal is
-                   yours to read: --force-dark helps. Over ssh and in tmux
-                   the number is not applied
+                   included; --alpha alone is 100. Locally the page is
+                   painted on magenta and the magenta taken back out, so
+                   what the page itself shows in magenta goes too. Black
+                   text over a dark terminal is yours to read: --force-dark
+                   helps. Over ssh and in tmux the number is not applied
   --engine <path>  the Chromium to run (default: $BLINKTERM_ENGINE, else
                    the first of chrome-headless-shell, chromium,
                    chromium-browser, google-chrome, chromium-shell on PATH)

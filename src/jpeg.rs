@@ -211,7 +211,7 @@ pub fn dimensions(data: &[u8]) -> Result<(u32, u32), JpegError> {
 /// `limit` is the largest RGB output accepted, in bytes; an image whose frame
 /// header asks for more is refused before anything is allocated.
 pub fn decode(data: &[u8], limit: usize) -> Result<Image, JpegError> {
-    let (frame, rgb) = Reader::new(data).decode(limit, 3, 0)?;
+    let (frame, rgb) = Reader::new(data).decode(limit, 3, &mut |_: &mut [u8]| {})?;
     Ok(Image {
         width: frame.width,
         height: frame.height,
@@ -219,12 +219,12 @@ pub fn decode(data: &[u8], limit: usize) -> Result<Image, JpegError> {
     })
 }
 
-/// A decoded image with one alpha for every pixel: RGBA8, four bytes a
-/// pixel, top row first.
+/// A decoded image with an alpha for every pixel: RGBA8, four bytes a pixel,
+/// top row first.
 ///
-/// For `--alpha` with an amount, where the moving frame goes to the terminal
-/// as `f=32` at that opacity: the fourth byte is written as the colour is, in
-/// the allocation [`decode`] makes anyway, rather than widened afterwards.
+/// For `--alpha`, where the moving frame is chroma-keyed
+/// ([`crate::chroma`]): the fourth byte is written as the colour is, in the
+/// allocation [`decode`] makes anyway, rather than widened afterwards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rgba {
     pub width: u32,
@@ -232,12 +232,19 @@ pub struct Rgba {
     pub rgba: Vec<u8>,
 }
 
-/// Decode a baseline JPEG into RGBA8, every pixel's alpha `alpha`.
+/// Decode a baseline JPEG into RGBA8, handing each pixel to `each` the
+/// moment its colour is written, its alpha 255 — so a key, or anything else
+/// that is a function of the pixel alone, costs no second pass over the
+/// picture.
 ///
 /// `limit` is the largest RGBA output accepted, in bytes — four a pixel, so
 /// the same limit takes a smaller picture than [`decode`] does.
-pub fn decode_rgba(data: &[u8], limit: usize, alpha: u8) -> Result<Rgba, JpegError> {
-    let (frame, rgba) = Reader::new(data).decode(limit, 4, alpha)?;
+pub fn decode_rgba_with(
+    data: &[u8],
+    limit: usize,
+    mut each: impl FnMut(&mut [u8]),
+) -> Result<Rgba, JpegError> {
+    let (frame, rgba) = Reader::new(data).decode(limit, 4, &mut each)?;
     Ok(Rgba {
         width: frame.width,
         height: frame.height,
@@ -849,13 +856,13 @@ impl<'a> Reader<'a> {
     // The scan
     // -----------------------------------------------------------------------
 
-    /// The pixels, `channels` bytes each — three, or four with `alpha` in
-    /// the fourth — and the frame they came from.
+    /// The pixels, `channels` bytes each — three, or four with each pixel
+    /// handed to `each` once written — and the frame they came from.
     fn decode(
         mut self,
         limit: usize,
         channels: usize,
-        alpha: u8,
+        each: &mut impl FnMut(&mut [u8]),
     ) -> Result<(Frame, Vec<u8>), JpegError> {
         self.read_until_scan(true)?;
         let frame = self.frame.take().ok_or(JpegError::BadScan)?;
@@ -910,7 +917,7 @@ impl<'a> Reader<'a> {
         }
 
         self.scan(&frame, &order, &mut planes)?;
-        let pixels = to_pixels(&frame, &planes, channels, alpha);
+        let pixels = to_pixels(&frame, &planes, channels, each);
         Ok((frame, pixels))
     }
 
@@ -1260,8 +1267,14 @@ fn sample_row(
 
 /// Planes to pixels: upsample the chroma, apply the colour transform, and cut
 /// the MCU padding off the right and bottom edges. `channels` bytes a pixel,
-/// three or four, and with four the fourth is `alpha`.
-fn to_pixels(frame: &Frame, planes: &[Vec<u8>], channels: usize, alpha: u8) -> Vec<u8> {
+/// three or four, and with four each pixel is handed to `each` with its alpha
+/// 255 once its colour is written.
+fn to_pixels(
+    frame: &Frame,
+    planes: &[Vec<u8>],
+    channels: usize,
+    each: &mut impl FnMut(&mut [u8]),
+) -> Vec<u8> {
     let width = frame.width as usize;
     let height = frame.height as usize;
     let mut out = vec![0u8; width * height * channels];
@@ -1277,7 +1290,8 @@ fn to_pixels(frame: &Frame, planes: &[Vec<u8>], channels: usize, alpha: u8) -> V
                 pixel[1] = grey;
                 pixel[2] = grey;
                 if channels == 4 {
-                    pixel[3] = alpha;
+                    pixel[3] = 255;
+                    each(pixel);
                 }
             }
         }
@@ -1317,7 +1331,8 @@ fn to_pixels(frame: &Frame, planes: &[Vec<u8>], channels: usize, alpha: u8) -> V
             pixel[1] = green.clamp(0, 255) as u8;
             pixel[2] = (y + colour.b_cb[cb as usize]).clamp(0, 255) as u8;
             if channels == 4 {
-                pixel[3] = alpha;
+                pixel[3] = 255;
+                each(pixel);
             }
         }
     }
