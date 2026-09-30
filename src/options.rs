@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 
 use crate::appearance;
 use crate::bindings::{Binding, Bindings};
+use crate::block;
 use crate::download;
 use crate::engine;
 use crate::picker;
@@ -124,6 +125,9 @@ pub struct Options {
     /// profile and exit, starting as usual only when none is. Command line
     /// only. See [`crate::remote`].
     pub remote: bool,
+    /// `--block-list` and `--no-block`: the host lists requests are blocked
+    /// by, and whether to. See [`crate::block`].
+    pub block: block::Lists,
 }
 
 /// What `main` was asked to do, once the command line has been read.
@@ -203,6 +207,11 @@ pub struct Settings {
     pub file_picker_multiple: Option<picker::Command>,
     pub file_picker_terminal: Option<picker::Command>,
     pub file_picker_terminal_multiple: Option<picker::Command>,
+    /// `--block-list`, `block-list`: appended across sources, never
+    /// replaced, the file's first.
+    pub block_lists: Vec<PathBuf>,
+    /// `false` with `--no-block` or `block = false`.
+    pub block: Option<bool>,
     /// File only: a binding is not a one-run thing.
     pub bindings: Vec<Binding>,
     /// Command line only.
@@ -226,6 +235,8 @@ impl Settings {
         bindings.extend(self.bindings);
         let mut urls = under.urls;
         urls.extend(self.urls);
+        let mut block_lists = under.block_lists;
+        block_lists.extend(self.block_lists);
         Settings {
             urls,
             home: self.home.or(under.home),
@@ -253,6 +264,8 @@ impl Settings {
             file_picker_terminal_multiple: self
                 .file_picker_terminal_multiple
                 .or(under.file_picker_terminal_multiple),
+            block_lists,
+            block: self.block.or(under.block),
             bindings,
             config: self.config.or(under.config),
             what: self.what.or(under.what),
@@ -466,6 +479,11 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             s.engine_args.push(parse_engine_arg("--engine-arg", flag)?);
             continue;
         }
+        if let Some(path) = value_of(arg, "--block-list", &mut args) {
+            let path = needed(path, "--block-list needs a path: --block-list <path>")?;
+            s.block_lists.push(PathBuf::from(path));
+            continue;
+        }
         if let Some(agent) = value_of(arg, "--user-agent", &mut args) {
             let agent = needed(agent, "--user-agent needs text")?;
             once(
@@ -535,6 +553,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             "--mute" => once(&mut s.mute, true, "--mute once is enough")?,
             "--normal-mode" => once(&mut s.normal_mode, true, "--normal-mode once is enough")?,
             "--no-probe" => once(&mut s.probe, false, "--no-probe once is enough")?,
+            "--no-block" => once(&mut s.block, false, "--no-block once is enough")?,
             "--no-config" => config_choice(&mut s, ConfigChoice::None)?,
             "--print-engine" => what(&mut s, What::PrintEngine)?,
             "--doctor" => what(&mut s, What::Doctor)?,
@@ -615,7 +634,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 24] = [
+const KEYS: [&str; 26] = [
     "home",
     "profile",
     "temp-profile",
@@ -640,6 +659,8 @@ const KEYS: [&str; 24] = [
     "file-picker-multiple",
     "file-picker-terminal",
     "file-picker-terminal-multiple",
+    "block-list",
+    "block",
 ];
 
 /// One file's text. `path` is only for the sentences, every one of which is
@@ -690,7 +711,7 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
                 "unknown setting {key:?}; the settings are the options in --help without their --"
             )));
         };
-        if key != "engine-arg" {
+        if key != "engine-arg" && key != "block-list" {
             if let Some((_, first)) = seen.iter().find(|(name, _)| *name == key) {
                 return Err(at(format!("{key} is already set on line {first}")));
             }
@@ -753,6 +774,8 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
                 s.file_picker_terminal_multiple =
                     Some(picker::Command::parse(key, value).map_err(at)?)
             }
+            "block-list" => s.block_lists.push(PathBuf::from(value)),
+            "block" => s.block = Some(parse_bool(key, value).map_err(at)?),
             _ => unreachable!("every key in KEYS has an arm"),
         }
     }
@@ -866,6 +889,10 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
             terminal_multiple: s.file_picker_terminal_multiple,
         },
         remote: s.remote.unwrap_or(false),
+        block: block::Lists {
+            paths: s.block_lists,
+            enabled: s.block.unwrap_or(true),
+        },
     })
 }
 
@@ -920,6 +947,10 @@ fn home_expanded(mut settings: Settings, home: Option<&Path>) -> Settings {
     });
     settings.download_dir = settings.download_dir.map(|dir| expand_home(dir, home));
     settings.engine = settings.engine.map(|path| expand_home(path, home));
+    settings.block_lists = std::mem::take(&mut settings.block_lists)
+        .into_iter()
+        .map(|path| expand_home(path, home))
+        .collect();
     for command in [
         &mut settings.file_picker,
         &mut settings.file_picker_multiple,
@@ -1858,6 +1889,49 @@ mod tests {
             options.pickers.terminal.map(|c| c.words),
             Some(vec!["~/bin/pick".to_string()])
         );
+    }
+
+    #[test]
+    fn block_lists_accumulate_the_files_first_and_no_block_turns_them_off() {
+        let s = parsed(&["--block-list", "/a", "--block-list=/b"]).expect("repeatable");
+        assert_eq!(s.block_lists, [PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(
+            parsed(&["--block-list"]),
+            Err("--block-list needs a path: --block-list <path>".to_string())
+        );
+        let from_file = file("block-list = /f1\nblock-list = /f2").expect("repeatable");
+        let options = resolve(s, Settings::default(), from_file).expect("resolves");
+        assert_eq!(
+            options.block,
+            block::Lists {
+                paths: ["/f1", "/f2", "/a", "/b"].map(PathBuf::from).to_vec(),
+                enabled: true,
+            }
+        );
+
+        let off = parsed(&["--no-block"]).expect("a flag");
+        assert_eq!(off.block, Some(false));
+        assert_eq!(
+            parsed(&["--no-block", "--no-block"]),
+            Err("--no-block once is enough".to_string())
+        );
+        let options = resolve(
+            off,
+            Settings::default(),
+            file("block = true").expect("a file"),
+        )
+        .expect("resolves");
+        assert!(!options.block.enabled, "the command line's word wins");
+        assert!(resolved(&[]).expect("resolves").block.enabled);
+        assert_eq!(file("block = false").map(|s| s.block), Ok(Some(false)));
+        assert_eq!(
+            file("block = true\nblock = false"),
+            Err("/c:2: block is already set on line 1".to_string())
+        );
+
+        let home = Some(Path::new("/h"));
+        let expanded = home_expanded(file("block-list = ~/lists/hosts").expect("a file"), home);
+        assert_eq!(expanded.block_lists, [PathBuf::from("/h/lists/hosts")]);
     }
 
     #[test]

@@ -34,6 +34,15 @@ flag, a different default, a raised Rust floor all do.
   page is saved to that depth and said to be. `save-pdf` and
   `save-screenshot` for `key.` lines
   ([#63](https://github.com/m96-chan/blinkterm/issues/63)).
+- Ads and trackers blocked by host: `block-list = <path>` (or
+  `--block-list`, repeatable) reads a hosts file or one host per line, and a
+  request to a listed host or any host under it fails before it leaves the
+  engine; the row says `12 blocked`. `alt+b` (the action `block`) turns it
+  off for the site in front and on again, kept in the profile's `unblocked`
+  file; `block = false` or `--no-block` turns every list off. Answered on
+  the pipe's reader thread through `Fetch`, which cost a 300-image page
+  2.12 s against 2.10 s unblocked
+  ([#62](https://github.com/m96-chan/blinkterm/issues/62)).
 - A page's file input can be answered by a program the settings name
   instead of the row: `file-picker = <command>` for one with a window of
   its own (Finder's dialog through `osascript`, `zenity`, `kdialog`),

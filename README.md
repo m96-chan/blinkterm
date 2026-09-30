@@ -217,6 +217,17 @@ origins. Every engine started on the profile is told it as it starts;
 hand if you like — a line that is not one of these is skipped — or delete
 it to take every allowance back.
 
+### Blocked hosts
+
+The sites you turned blocking off for with `alt+b` are remembered by host
+in a file called `unblocked` beside the permissions: one line per change,
+the host, a tab, `off` or `on`, the last line for a host being the one that
+counts. It is a list of sites you have visited, so it is readable by you
+alone (0600), and keeps the last 500. `--temp-profile` keeps it in memory
+for the run and writes none; deleting it turns blocking back on everywhere.
+The lists themselves are yours and are only read (see
+[Blocking ads and trackers](#blocking-ads-and-trackers)).
+
 ### Bookmarks
 
 `ctrl+d` bookmarks the page in front, and `ctrl+d` again removes the
@@ -363,6 +374,9 @@ page's file input instead of the row (see
 [Choosing it with another program](#choosing-it-with-another-program)).
 `pdf-paper = a4|letter` (or `--pdf-paper`) is the paper `alt+s` prints on
 (see [Saving a page](#saving-a-page)).
+`block-list = <path>`, repeatable, names a list of hosts to block, and
+`block = false` (or `--no-block`) blocks nothing whatever the lists say
+(see [Blocking ads and trackers](#blocking-ads-and-trackers)).
 
 `--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
 repeatable. Four are refused because they would undo something this
@@ -423,6 +437,7 @@ nothing else, for scripts.
 | `zoom-reset` | `alt+0`, `ctrl+0` | back to 100% |
 | `find` | `ctrl+f` | find in the page |
 | `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
+| `block` | `alt+b` | stop blocking ads and trackers on this site, or start again |
 | `copy` | `alt+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | copy the url |
 | `save-pdf` | `alt+s` | save this page as a PDF |
@@ -649,6 +664,7 @@ ignores it until the picker exits.
 | `alt+s` | save this page as a PDF in the download directory, named after its title; the row says `saved ~/Downloads/<title>.pdf`. See [Saving a page](#saving-a-page) |
 | `alt+shift+s` | save the whole page, top to bottom, as a PNG there. A page past sixteen million pixels is cut to its top, and the row says how much |
 | `alt+p` | allow this site something: the row says `allow https://site: ` and the words it is allowed now, all selected; type any of `camera` `microphone` `location` `notifications` `clipboard`, `enter` sets exactly those (an empty line takes them all back), `esc` leaves it. See [Sound, permissions and fullscreen](#sound-permissions-and-fullscreen) |
+| `alt+b` | stop blocking ads and trackers on this site, or start again: the row says `blocking off for example.com`, and `unblocked` while you are on it. Reload to get what was blocked. In the url bar `alt+b` is still a word back |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
@@ -776,7 +792,10 @@ numbers). `esc` stops the load and leaves the page where it was: the
 previous page if nothing had arrived, the half-loaded page if something had.
 A terminal that understands OSC 22 (Kitty, Ghostty) also gets a hand over a
 link and an I-beam over a text field; the rest ignore it. A zoom that is not
-100% is a word at the right too, `150%`, after the loading hint.
+100% is a word at the right too, `150%`, after the loading hint, and after
+it how many requests a [block list](#blocking-ads-and-trackers) stopped on
+this page, `12 blocked` — counted from the page's last landing, per tab —
+or `unblocked` on a site you turned blocking off for.
 
 The url bar, the find prompt, the tab list or the history list, the allow
 line (`alt+p`), a page's dialog and a file input's path take the whole row while they are
@@ -803,6 +822,68 @@ mouse movement, not only presses (`?1003h`), so the page now sees the
 pointer move — hover styling and tooltips work — at the cost of one small
 command to the engine per screen refresh while it moves and nothing while
 it rests.
+
+## Blocking ads and trackers
+
+Every frame costs something here — bandwidth over ssh, decoding, the
+terminal's parse loop — and an animated ad keeps the screencast running on a
+page nobody is scrolling. So `blinkterm` can block requests to the hosts on
+the lists most people use already:
+
+    block-list = ~/.config/blinkterm/hosts
+    block-list = ~/.config/blinkterm/more-hosts
+
+or `--block-list <path>` on the command line, as many as you like; the
+file's come first and the command line's are added. Two forms are read,
+which between them are what public lists come in: a hosts file
+(`0.0.0.0 ads.example.com`, several names after one address allowed) and one
+host per line. `#` starts a comment, on its own line or after the names;
+blank lines, addresses, `localhost` and names with no dot are skipped. A
+list in another syntax — EasyList's `||host^` rules, element hiding — is
+not read, and a file with nothing readable in it is refused at start with a
+sentence rather than blocking nothing in silence. Nothing is bundled; for
+example, [StevenBlack/hosts](https://github.com/StevenBlack/hosts):
+
+    curl -o ~/.config/blinkterm/hosts \
+      https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+
+A listed host blocks itself and every host under it: `ads.example.com`
+blocks `x.ads.example.com`, and not `notads.example.com` or `example.com`,
+as uBlock Origin and AdGuard read a host list. A request to one fails before
+it leaves the engine, and the page carries on without it; a page of a listed
+site itself is the engine's error page with `net::ERR_BLOCKED_BY_CLIENT` on
+the row. `alt+b` turns blocking off for the site in front — the page's host
+— and on again, remembered in the profile (see
+[Blocked hosts](#blocked-hosts)); on the error page of a blocked site it
+unblocks that site, and a reload brings it. `block = false` or `--no-block`
+turns every list off for a run without removing them. With no list nothing
+is intercepted at all.
+
+How: every page's session is given `Fetch.enable`, every request is paused
+before it is sent, and the pause is answered at once on the thread that
+reads the engine's pipe — failed for a listed host, let go for the rest.
+Measured against chrome-headless-shell 153 over the pipe, with a list of
+100 000 hosts and a local page of 300 images:
+
+| | |
+| --- | --- |
+| the page, nothing blocked | 2.10 s |
+| the page, every request paused and answered | 2.12 s |
+| deciding one request | 6 µs |
+| on the pipe, per request | about 800 bytes |
+| `Network.setBlockedURLs` instead: the command | 5.8 MB, 16.3 s to be acknowledged |
+| `Network.setBlockedURLs` instead: the page | 7.3 s |
+
+Reading 100 000 hosts takes tens of milliseconds and 6 to 10 MB, once at
+start.
+
+What is not blocked: requests made by an iframe the engine runs in a process
+of its own — on chrome-headless-shell's defaults a cross-site iframe runs in
+the page's process and is covered, but a full Chromium, or
+`--site-per-process`, isolates it, and its requests go through until
+`blinkterm` attaches to frames — requests a service worker makes, and
+anything that is not a host: no element hiding, no cosmetic filters, no
+paths.
 
 ## Sound, permissions and fullscreen
 

@@ -222,6 +222,9 @@ pub enum Action {
     ToggleNormal,
     /// `ctrl+shift+h`: the history list. See [`crate::historylist`].
     History,
+    /// `alt+b`: blocking off for the site in front, or on again. See
+    /// [`crate::block`].
+    Block,
 }
 
 /// One row of [`ACTIONS`]: the name a `key.` line gives, the action, the
@@ -245,7 +248,7 @@ const TAB_NAMES: &str = "tab-1 .. tab-8";
 /// The keys are the documented spellings, not every press the built-in table
 /// answers: it reads shift only for `tab`, `t`, `a`, `h`, `s` and the page keys, so
 /// `ctrl+shift+=` zooms in too, and a chord is exact.
-pub const ACTIONS: [Row; 27] = [
+pub const ACTIONS: [Row; 28] = [
     Row {
         name: "quit",
         action: Action::Quit,
@@ -377,6 +380,12 @@ pub const ACTIONS: [Row; 27] = [
         action: Action::Permissions,
         keys: "alt+p",
         what: "allow this site the camera, microphone, location, notifications or clipboard",
+    },
+    Row {
+        name: "block",
+        action: Action::Block,
+        keys: "alt+b",
+        what: "stop blocking ads and trackers on this site, or start again",
     },
     Row {
         name: "copy",

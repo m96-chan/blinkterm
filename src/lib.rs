@@ -122,6 +122,7 @@ pub mod app;
 pub mod appearance;
 pub mod base64;
 pub mod bindings;
+pub mod block;
 pub mod bookmarks;
 pub mod cdp;
 pub mod clipboard;

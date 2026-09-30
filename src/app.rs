@@ -40,6 +40,7 @@ use crate::tty::{self, ReadOutcome};
 
 use crate::appearance::Appearance;
 use crate::bindings::{Action, Bindings, Lookup};
+use crate::block::{self, Blocker, Unblocked};
 use crate::bookmarks::{Bookmarks, Toggled};
 use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::clipboard;
@@ -520,6 +521,17 @@ struct Chrome {
     cast: motion::Cast,
     /// Steps the cast's size down when frames wait on the link.
     throttle: motion::Throttle,
+    /// The host lists and what they blocked on which page, shared with the
+    /// pipe's reader thread, which answers every paused request with it;
+    /// `None` with no `block-list`, and then nothing is ever paused. See
+    /// [`crate::block`].
+    blocker: Option<Arc<Blocker>>,
+    /// The sites blocking is off for, kept in the profile, or only in memory
+    /// for a temporary one; the blocker holds a copy for the reader thread.
+    unblocked: Unblocked,
+    /// What the row last said about blocking on the page in front, so that
+    /// it is drawn again when the count moves and not otherwise.
+    blocked_words: Option<String>,
 }
 
 /// A screencast frame this program has not acknowledged yet: which tab's,
@@ -535,7 +547,9 @@ impl Chrome {
     /// engine, and what is kept in the profile read from `profile` — or kept
     /// only in memory, for a temporary one. The allowances come in already
     /// read, because the engine was told them before there was a `Chrome`
-    /// ([`boot`]).
+    /// ([`boot`]), and so do the blocker and its exceptions, for the same
+    /// reason.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         metrics: Metrics,
         options: &Options,
@@ -544,6 +558,8 @@ impl Chrome {
         appearance: Appearance,
         identity: Identity,
         allowed: Allowed,
+        blocker: Option<Arc<Blocker>>,
+        unblocked: Unblocked,
     ) -> Chrome {
         Chrome {
             identity,
@@ -616,6 +632,9 @@ impl Chrome {
             unacked: None,
             cast: motion::Cast::default(),
             throttle: motion::Throttle::default(),
+            blocker,
+            unblocked,
+            blocked_words: None,
         }
     }
 
@@ -974,7 +993,9 @@ pub struct Booted {
 /// Start the engine on `profile` and set it up to its first tab: the
 /// browser's client with target discovery on, every page told no to every
 /// permission and yes to what `allowed` holds, the download directory told,
-/// the first page found and connected as every tab is.
+/// the first page found and connected as every tab is. With a `blocker`,
+/// it answers the engine's paused requests from before the first page is
+/// attached; see [`crate::block`].
 ///
 /// Called once by [`run`] and again by `relaunch` for each engine that
 /// dies, with the same [`engine::Launch`](crate::engine::Launch) — path,
@@ -987,8 +1008,16 @@ pub fn boot(
     downloads_dir: &Path,
     appearance: &Appearance,
     allowed: &Allowed,
+    blocker: Option<&Arc<Blocker>>,
 ) -> Result<Booted, String> {
     let engine = Engine::launch_with(profile, ENGINE_TIMEOUT, launch)?;
+    // Before anything is attached, because the hook is what gives every
+    // page's session `Fetch.enable` as it is attached, the first included;
+    // and it forgets the dead engine's pages, whose counts meant nothing now.
+    if let Some(blocker) = blocker {
+        blocker.forget_all();
+        engine.intercept(Some(Arc::clone(blocker) as Arc<dyn crate::cdp::Intercept>));
+    }
     // Before the first tab is connected, because connecting one is where a
     // session is told who is asking.
     let identity = Identity::new(
@@ -1166,12 +1195,22 @@ pub fn run(options: Options) -> Result<(), String> {
     } else {
         Allowed::load(profile.dir())
     };
+    // The host lists, read once and before the pane is taken, so that a list
+    // that cannot be read is a sentence in the shell; with the sites the
+    // person unblocked, which the blocker is made knowing.
+    let unblocked = if profile.is_temporary() {
+        Unblocked::in_memory()
+    } else {
+        Unblocked::load(profile.dir())
+    };
+    let blocker = block::load(&options.block, &unblocked)?;
     let first = boot(
         profile,
         &options.engine,
         &downloads_dir,
         &appearance,
         &allowed,
+        blocker.as_ref(),
     )?;
 
     let mut pane = Pane::enter(0, 1, route.wrap == Wrap::None, route.wrap)
@@ -1197,6 +1236,8 @@ pub fn run(options: Options) -> Result<(), String> {
                 appearance,
                 first.identity.clone(),
                 allowed,
+                blocker,
+                unblocked,
             );
             chrome.cell_hint = heard.cell;
             chrome.take_route(route);
@@ -1501,6 +1542,7 @@ fn relaunch(
         downloads_dir,
         &chrome.appearance,
         &chrome.allowed,
+        chrome.blocker.as_ref(),
     ) {
         Ok(booted) => booted,
         Err(failure) => return Err(died(could_not_restart(why, failure), &chrome.session)),
@@ -1619,6 +1661,15 @@ fn drive(
             .map(|tab| load::loading_hint(tab.loading_for(Instant::now())));
         if hint != chrome.hint {
             chrome.hint = hint;
+            redraw_row(pane, tabs, chrome)?;
+        }
+        // What was blocked on the page in front. The reader thread counts
+        // it and does not wake this loop — a paused request is answered and
+        // consumed there — so it is read here, a pass late at most: 50 ms
+        // ([`POLL_MS`]), which a count on the row does not need to beat.
+        let blocked = blocked_words(tabs, chrome);
+        if blocked != chrome.blocked_words {
+            chrome.blocked_words = blocked;
             redraw_row(pane, tabs, chrome)?;
         }
         // The whole pane for a page that is fullscreen, unless something
@@ -2696,6 +2747,14 @@ fn create_tab(
 /// be one whose file inputs cancel themselves, so a refusal there is the
 /// tab's failure, as `Page.enable`'s is.
 ///
+/// What is not here is `Fetch.enable`, which blocking needs on every page:
+/// [`crate::block::Blocker`] sends it from the pipe's reader thread on the
+/// `Target.attachedToTarget` that the attach produces, which arrives before
+/// the attach's reply and so goes out before anything here does. That is
+/// the one place it is sent, on purpose — a session with `Fetch` on and
+/// nothing answering its paused requests is a page whose every request
+/// hangs — and it covers a target attached by any path, not only this one.
+///
 /// Every tab is made here, the first one included: a session made any other
 /// way would be a page that was never told what the rest were.
 fn connect_tab(
@@ -2912,6 +2971,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         .loading
         .then(|| load::loading_hint(active.loading_for(now)));
     let marker = active.zoom.marker();
+    let blocked = blocked_words(tabs, chrome);
     let mode = mode_words(&chrome.mode, chrome.hinting.as_ref());
     let owner = row_owner(
         tabs,
@@ -2936,6 +2996,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         match words(&[
             downloading.or(loading).as_deref(),
             marker.as_deref(),
+            blocked.as_deref(),
             mode.as_deref(),
         ]) {
             Some(right) => screen::split_line(cols, &left, &right),
@@ -2961,10 +3022,16 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         // place and the level after it; or the level, the transport's warning
         // and the url, which is the one to run out of room.
         let right = match downloading.or(pointing).or(loading) {
-            Some(news) => words(&[Some(&news), marker.as_deref(), mode.as_deref()]),
+            Some(news) => words(&[
+                Some(&news),
+                marker.as_deref(),
+                blocked.as_deref(),
+                mode.as_deref(),
+            ]),
             None => words(&[
                 mode.as_deref(),
                 marker.as_deref(),
+                blocked.as_deref(),
                 active.trust.words(),
                 Some(&active.url),
             ]),
@@ -2981,6 +3048,13 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         bytes
     };
     pane.write(&bytes).map_err(|e| e.to_string())
+}
+
+/// What the row says about blocking on the page in front: `12 blocked`,
+/// `unblocked`, or nothing. See [`Blocker::words`].
+fn blocked_words(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<String> {
+    let session = tabs.active()?.connection.session();
+    chrome.blocker.as_ref()?.words(session)
 }
 
 /// The tab list's rows under the status row, for the list as it is now,
@@ -4583,6 +4657,10 @@ fn handle_input(
                     start_save(tabs, chrome, kind);
                     redraw_row(pane, tabs, chrome)?;
                 }
+                Some(Command::Block) => {
+                    toggle_block(tabs, chrome);
+                    redraw_row(pane, tabs, chrome)?;
+                }
                 Some(Command::ListTabs) => {
                     chrome.list = Some(Overlay::Tabs(TabList::open(tabs.active_index())));
                     chrome.list_first.set(0);
@@ -4993,6 +5071,9 @@ enum Command {
     SavePdf,
     /// `alt+shift+s`: the whole of it as a PNG there.
     SaveScreenshot,
+    /// `alt+b`: blocking off for the site in front, or on again. See
+    /// [`crate::block`].
+    Block,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -5026,7 +5107,9 @@ enum Command {
 /// is answered, and a PDF of a page with a question over it is not the page.
 ///
 /// Normal mode's toggle survives: it touches no page, and a person can leave
-/// the mode while a question waits.
+/// the mode while a question waits. So does `alt+b`: it changes what the
+/// next request is answered with and a line in the profile, and sends the
+/// page nothing.
 /// Bookmarking survives, for the reason copying the url does: it reads the
 /// tab's url and title, which this program already has. So does reopening a
 /// closed tab, which opens another tab, as a new tab does.
@@ -5055,7 +5138,8 @@ fn survives_dialog(command: Command) -> bool {
         | Command::CopyUrl
         | Command::ToggleNormal
         | Command::Bookmark
-        | Command::ReopenTab => true,
+        | Command::ReopenTab
+        | Command::Block => true,
         Command::EditUrl
         | Command::Reload
         | Command::Back
@@ -5797,6 +5881,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('s') if key.mods.shift() => Some(Command::SaveScreenshot),
             Key::Char('s') => Some(Command::SavePdf),
             Key::Char('p') => Some(Command::Permissions),
+            Key::Char('b') => Some(Command::Block),
             Key::Char('t') => Some(Command::ReopenTab),
             Key::Char('=' | '+') => Some(Command::ZoomIn),
             Key::Char('-' | '_') => Some(Command::ZoomOut),
@@ -5855,6 +5940,7 @@ fn command_of(action: Action) -> Command {
         Action::SavePdf => Command::SavePdf,
         Action::SaveScreenshot => Command::SaveScreenshot,
         Action::ToggleNormal => Command::ToggleNormal,
+        Action::Block => Command::Block,
     }
 }
 
@@ -6166,6 +6252,32 @@ fn pump_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
         }
         save::Progress::Done(Err(why)) => chrome.downloads.could_not_save(job.name(), &why, now),
     }
+}
+
+/// `alt+b`: blocking off for the site in front if it was on, on if it was
+/// off — kept in the profile, and told to the blocker, which answers the
+/// next request with it. Nothing is reloaded: what was blocked stays
+/// blocked until the page is loaded again, which is the person's to ask
+/// for, as it is in a browser with an ad blocker. The row says which, and
+/// a file that cannot be written is said too; the change stands for this
+/// run, as a zoom level does.
+fn toggle_block(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(blocker) = chrome.blocker.clone() else {
+        note(tabs, block::NO_LISTS);
+        return;
+    };
+    let Some(site) = tabs.active().and_then(|tab| block::site_of(&tab.url)) else {
+        note(tabs, block::NO_SITE);
+        return;
+    };
+    let written = chrome.unblocked.toggle(&site);
+    let now = chrome.unblocked.contains(&site);
+    blocker.set_unblocked(&site, now);
+    let sentence = match written {
+        Ok(_) => block::toggled(&site, now),
+        Err(why) => format!("{}; {why}", block::toggled(&site, now)),
+    };
+    note(tabs, sentence);
 }
 
 /// Type into the allow line. Returns `false` only if the person quit.
@@ -8452,6 +8564,8 @@ mod tests {
             Appearance::new(crate::appearance::Choice::default(), false),
             Identity::new(None, None, "C"),
             Allowed::in_memory(),
+            None,
+            Unblocked::in_memory(),
         );
         chrome.find = Some(Find {
             target: "a".to_string(),
@@ -8679,6 +8793,31 @@ mod tests {
         // The prompt's own next and previous are the prompt's, not commands
         // a page loses when it is closed.
         assert_eq!(command(&key(Key::Char('g'), Mods::CTRL)), None);
+    }
+
+    #[test]
+    fn alt_b_toggles_blocking_survives_a_dialog_and_leaves_the_url_bar_its_word_back() {
+        assert_eq!(
+            command(&key(Key::Char('b'), Mods::ALT)),
+            Some(Command::Block)
+        );
+        assert_eq!(command_of(Action::Block), Command::Block);
+        // It sends the page nothing, so a question on it does not stop it.
+        assert!(survives_dialog(Command::Block));
+        // `ctrl+b` and a bare `b` stay the page's.
+        assert_eq!(command(&key(Key::Char('b'), Mods::CTRL)), None);
+        assert_eq!(command(&key(Key::Char('b'), 0)), None);
+        // On the row, alt+b is the line's: a word back, as in a shell.
+        assert_eq!(
+            row_command(&Bindings::default(), &key(Key::Char('b'), Mods::ALT)),
+            None
+        );
+        for press in every_press() {
+            if command(&press) == Some(Command::Block) {
+                assert_eq!(press.key, Key::Char('b'), "{press:?}");
+                assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
+            }
+        }
     }
 
     #[test]
