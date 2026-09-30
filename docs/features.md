@@ -103,7 +103,10 @@ the pane's scale, as sharp as the page is on screen, and at most sixteen
 million pixels: a page taller than that is saved to that depth and the row
 says `saved …png, the top 12500 of 40000 px`. Neither touches the page —
 it stays where it was scrolled, at the size it was — and neither is opened
-afterwards. Under `--alpha` the PNG is transparent wherever the page is.
+afterwards. Under `--alpha` the PNG is transparent wherever the page is,
+its forced-transparent backgrounds included — keyed, locally, the way the
+screen is, so the file is not magenta; a number after `--alpha` is not
+applied to it, so the file is the page at full opacity.
 
 ## Uploading a file
 

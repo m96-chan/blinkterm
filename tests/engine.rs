@@ -1246,8 +1246,11 @@ fn a_tab_opened_behind_by_this_program_loads_without_being_looked_at() {
     };
     let base = serve();
     let (mut browser, mut tabs) = tabbed(&engine, page, target);
-    let appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
+    let appearance = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::Off,
+    );
 
     let index = blinkterm::app::open_behind(
         &mut tabs,
@@ -2439,7 +2442,7 @@ fn roll(client: &mut Client, notches: u32, apart: Duration) -> Roll {
             // Nothing is ever sent for it; what is recorded is that the policy
             // would have, which is what `app::rest_shot` asks every pass.
             roll.wanted.push(Instant::now());
-            rest.still_requested();
+            rest.still_requested(motion::now_seconds());
             rest.still_failed();
         }
         if sent == notches && wheel.owed() == (0.0, 0.0) && !roll.wanted.is_empty() {
@@ -2498,43 +2501,49 @@ const EVERY: Duration = Duration::from_millis(50);
 const STEADY: u32 = 6;
 const STEADILY: Duration = Duration::from_millis(100);
 
-/// A still photographs itself into the screencast, exactly once.
-///
-/// `motion::SHUTTER_FRAMES` is the number the whole rest policy is built on,
-/// and it is a property of the engine rather than of this crate: a
-/// `Page.captureScreenshot` forces a capture of the page's surface, and the
-/// screencast is watching that same surface. Taking it for granted is what
-/// made the first version of the policy loop — the frame the still provoked
-/// was read as the page moving, which cleared the rest, which asked for
-/// another still. So it is asserted here, on a page nothing at all is
-/// happening to, along with where in the still's window the frame lands.
-#[test]
-fn a_still_photographs_itself_into_the_screencast_exactly_once() {
-    let Some((mut engine, mut client)) = connect() else {
-        return;
-    };
-    prepare(&mut client);
-    article(&mut client, WIDE, TALL);
-    let _ = screenshot(&mut client, "png", None);
-    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDE, TALL);
+/// Stills of a page nobody is touching, at a device scale of `scale`: for
+/// each, when it was asked for, when its reply was taken, and the stamps of
+/// every screencast frame it provoked, in wall-clock seconds.
+fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<(f64, f64, Vec<f64>)> {
+    prepare(client);
+    article(client, WIDE, TALL);
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(WIDE as f64 / scale)),
+                ("height", Json::number(TALL as f64 / scale)),
+                ("deviceScaleFactor", Json::number(scale)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("the scale");
+    let _ = screenshot(client, "png", None);
+    // The cast at the page's CSS size, as the program asks for it.
+    let css = (
+        (f64::from(WIDE) / scale) as u32,
+        (f64::from(TALL) / scale) as u32,
+    );
+    cast(client, "jpeg", Some(motion::QUALITY), css.0, css.1);
     // Let the load's own frames go by, and check that a page nobody is
     // touching then produces none of its own.
     let settle = Instant::now() + Duration::from_secs(2);
     while Instant::now() < settle {
-        take_frames(&mut client);
+        take_frames(client);
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut idle = 0usize;
     let quiet = Instant::now() + Duration::from_secs(2);
     while Instant::now() < quiet {
-        idle += take_frames(&mut client).len();
+        idle += take_frames(client).len();
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(idle, 0, "the page moved on its own, so this proves nothing");
 
+    let mut rounds = Vec::new();
     for round in 0..5 {
         let requested = motion::now_seconds();
-        let pending = ask_for_a_still(&mut client);
+        let pending = ask_for_a_still(client);
         let mut answer = None;
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -2554,15 +2563,11 @@ fn a_still_photographs_itself_into_the_screencast_exactly_once() {
         let mut stamps = Vec::new();
         let until = Instant::now() + Duration::from_millis(600);
         while Instant::now() < until {
-            stamps.extend(
-                take_frames(&mut client)
-                    .into_iter()
-                    .filter_map(|(_, at)| at),
-            );
+            stamps.extend(take_frames(client).into_iter().filter_map(|(_, at)| at));
             std::thread::sleep(Duration::from_millis(5));
         }
         eprintln!(
-            "still {round}: {:.0} ms to the reply, {} frame(s) at [{}] ms from the request",
+            "scale {scale}, still {round}: {:.0} ms to the reply, {} frame(s) at [{}] ms from the request",
             (replied - requested) * 1000.0,
             stamps.len(),
             stamps
@@ -2571,22 +2576,195 @@ fn a_still_photographs_itself_into_the_screencast_exactly_once() {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-        assert_eq!(
-            stamps.len(),
-            motion::SHUTTER_FRAMES as usize,
-            "a still provoked {} screencast frames, not {}",
-            stamps.len(),
-            motion::SHUTTER_FRAMES,
-        );
-        // And it is stamped inside the still's own window, which is what makes
-        // crediting the still with its reply enough to keep it off the screen.
+        rounds.push((requested, replied, stamps));
+    }
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    rounds
+}
+
+/// A still photographs itself into the screencast, exactly once, at a
+/// device scale of 1.
+///
+/// The number of frames a still provokes is the number the whole rest policy
+/// is built on, and it is a property of the engine rather than of this crate:
+/// a `Page.captureScreenshot` forces a capture of the page's surface, and the
+/// screencast is watching that same surface. Taking it for granted is what
+/// made the first version of the policy loop — the frame the still provoked
+/// was read as the page moving, which cleared the rest, which asked for
+/// another still. So it is asserted here, on a page nothing at all is
+/// happening to, along with where in the still's window the frame lands.
+#[test]
+fn a_still_photographs_itself_into_the_screencast_exactly_once() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    // How many frames a still provokes is the engine's behaviour; where
+    // they are stamped is a measurement of time, which the shared macOS VM
+    // cannot be trusted with (#46). There the count is still asserted.
+    let timed = !skip_timing_on_shared_runner("the shutter frame's stamp");
+    for (requested, replied, stamps) in shutter_rounds(&mut client, 1.0) {
+        assert_eq!(stamps.len(), 1, "a still provoked {} frames", stamps.len());
+        // And it is stamped inside the still's own window, which is what
+        // makes crediting the still with its reply enough to keep it off the
+        // screen.
         assert!(
-            stamps[0] >= requested && stamps[0] <= replied,
+            !timed || (stamps[0] >= requested && stamps[0] <= replied),
             "the shutter frame is stamped outside the still it belongs to"
         );
     }
+    client.close();
+    engine.kill();
+}
 
-    let _ = client.call("Page.stopScreencast", Json::empty());
+/// At a device scale of 2 a still provokes up to two frames, and they can be
+/// stamped after its reply — the loop found on a Retina Mac. What the policy
+/// forgives is asserted here: no more than `motion::SHUTTER_FRAMES`, and none
+/// later than the still's window after its reply.
+#[test]
+fn at_scale_two_a_still_photographs_itself_at_most_twice_and_within_its_window() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    // The count is the engine's; the window is time, skipped on the shared
+    // macOS VM (#46), where a frame was once stamped 184 ms late.
+    let timed = !skip_timing_on_shared_runner("the shutter frames' window");
+    for (requested, replied, stamps) in shutter_rounds(&mut client, 2.0) {
+        assert!(
+            stamps.len() <= motion::SHUTTER_FRAMES as usize,
+            "a still provoked {} frames",
+            stamps.len()
+        );
+        let took = (replied - requested).max(motion::SHUTTER_GRACE.as_secs_f64());
+        for stamp in stamps {
+            assert!(
+                !timed || (stamp >= requested && stamp <= replied + took),
+                "a shutter frame at {:+.0} ms, past the window",
+                (stamp - requested) * 1000.0
+            );
+        }
+    }
+    client.close();
+    engine.kill();
+}
+
+/// What makes [`ARTICLE`] change once, late: a timer's black box at (200,
+/// 100) to (280, 150) CSS, over the text.
+const LATE_BOX: &str = "setTimeout(function(){var d=document.createElement('div');\
+d.style.cssText='position:absolute;z-index:9;left:200px;top:100px;width:80px;height:50px;background:#000';\
+document.body.appendChild(d)},700)";
+
+/// The program's loop, cut down to what paints: frames told to the policy
+/// and painted when it says so, stills asked for when it says so and
+/// painted when it says so. What it returns is what the pane ends on — the
+/// last still, if the last thing painted was a still — and how many stills
+/// were asked for in the last `tail` of the run.
+fn run_the_rest_policy(
+    client: &mut Client,
+    run: Duration,
+    tail: Duration,
+) -> (Option<Vec<u8>>, usize) {
+    let started = Instant::now();
+    let mut rest = Motion::new(started);
+    let mut in_flight: Option<Pending> = None;
+    let mut on_screen: Option<Vec<u8>> = None;
+    let mut asked = Vec::new();
+    while started.elapsed() < run {
+        let now = Instant::now();
+        for (_, stamp) in take_frames(client) {
+            if rest.motion_frame(stamp, Instant::now()) {
+                on_screen = None;
+            }
+        }
+        if let Some(pending) = &in_flight {
+            if let Some(reply) = client.take_reply(pending) {
+                in_flight = None;
+                if rest.still_arrived(motion::now_seconds()) {
+                    match still_picture(reply) {
+                        Some(png) => on_screen = Some(png),
+                        None => rest.still_failed(),
+                    }
+                }
+            }
+        }
+        if in_flight.is_none() && rest.wants_still(now) {
+            in_flight = Some(ask_for_a_still(client));
+            rest.still_requested(motion::now_seconds());
+            asked.push(started.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let late = asked.iter().filter(|at| **at + tail >= run).count();
+    eprintln!("stills asked for at {asked:?}");
+    (on_screen, late)
+}
+
+/// After a load that paints late, at scale 1 and at 2, under forced
+/// transparency: the pane ends on a still, the still shows the late change,
+/// its forced-transparent parts are clear, and once the page is quiet no
+/// more stills are asked for.
+#[test]
+fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    // The second at a Retina pane's size, 3200x1760, where the second
+    // shutter was found: it comes more often the more a still costs.
+    for (scale, pane) in [(1.0, (WIDE, TALL)), (2.0, (3200, 1760))] {
+        let css = (
+            (f64::from(pane.0) / scale) as u32,
+            (f64::from(pane.1) / scale) as u32,
+        );
+        client
+            .call(
+                "Emulation.setDeviceMetricsOverride",
+                Json::object(vec![
+                    ("width", Json::number(css.0)),
+                    ("height", Json::number(css.1)),
+                    ("deviceScaleFactor", Json::number(scale)),
+                    ("mobile", Json::Bool(false)),
+                ]),
+            )
+            .expect("the scale");
+        transparent(&mut client, false);
+        cast(&mut client, "jpeg", Some(motion::QUALITY), css.0, css.1);
+        client
+            .call(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(ARTICLE))]),
+            )
+            .expect("the article loads");
+        assert_eq!(
+            wait_for_title(&mut client, "article", Duration::from_secs(15)),
+            "article"
+        );
+        evaluate(&mut client, LATE_BOX);
+        let (still, late) =
+            run_the_rest_policy(&mut client, Duration::from_secs(5), Duration::from_secs(2));
+        let _ = client.call("Page.stopScreencast", Json::empty());
+        let png = still.expect("the pane ends on a still, not a moving frame");
+        let image = blinkterm::png::decode(&png, 64 << 20).expect("a still decodes");
+        let pixel = |x: f64, y: f64| {
+            let at = (((y * scale) as u32 * image.width + (x * scale) as u32) * 4) as usize;
+            [
+                image.rgba[at],
+                image.rgba[at + 1],
+                image.rgba[at + 2],
+                image.rgba[at + 3],
+            ]
+        };
+        let (box_, bare) = (pixel(240.0, 125.0), pixel(5.0, 165.0));
+        eprintln!("scale {scale}: the late box {box_:?}, the bare page {bare:?}, {late} still(s) at the end");
+        assert_eq!(
+            box_,
+            [0, 0, 0, 255],
+            "scale {scale}: the still shows the change"
+        );
+        assert_eq!(bare[3], 0, "scale {scale}: and the forced-transparent page");
+        assert_eq!(late, 0, "scale {scale}: a quiet page asks for nothing");
+    }
     client.close();
     engine.kill();
 }
@@ -6445,7 +6623,11 @@ fn the_zoom_survives_a_navigation_and_a_new_tab_starts_at_its_hosts_level() {
         .expect("Page.enable");
     blinkterm::app::prepare_session(
         &mut second,
-        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false),
+        &blinkterm::appearance::Appearance::new(
+            blinkterm::appearance::Choice::Auto,
+            false,
+            blinkterm::appearance::Alpha::Off,
+        ),
         &Identity::new(None, None, "C"),
     );
     let (width, _, ratio) = page_metrics(&mut second);
@@ -6477,8 +6659,11 @@ fn a_dark_terminal_gets_dark_pages_and_so_does_a_tab_opened_later() {
     assert!(!prefers_dark(&mut page), "the engine's own answer is light");
     assert!(corner_luminance(&mut page) > 0.9);
 
-    let mut appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
+    let mut appearance = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::Off,
+    );
     assert!(appearance.learned((0x1c, 0x1c, 0x1c)));
     blinkterm::app::prepare_session(&mut page, &appearance, &Identity::new(None, None, "C"));
     assert!(
@@ -6549,8 +6734,11 @@ fn forced_dark_paints_a_white_page_dark() {
     go_to(&mut client, WHITE);
     assert!(corner_luminance(&mut client) > 0.9, "white to begin with");
 
-    let forced =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, true, false);
+    let forced = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        true,
+        blinkterm::appearance::Alpha::Off,
+    );
     blinkterm::app::prepare_session(&mut client, &forced, &Identity::new(None, None, "C"));
     let dark = |client: &mut Client| corner_luminance(client) < 0.1;
     assert!(wait_until(&mut client, true, dark), "painted dark");
@@ -6582,13 +6770,35 @@ fn far_corner(client: &mut Client) -> [u8; 4] {
     [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]]
 }
 
+/// [`WHITE`] with the background painted by the page itself, on `body`, as
+/// most real pages paint theirs: what the override alone leaves opaque.
+const PAINTED: &str = "data:text/html,<body style='margin:0;background:%23fff'>\
+<p>Some text on a white page.</p><script>document.title='ready'</script></body>";
+
+/// A page whose background is a container of its own covering the page,
+/// which is not `html` or `body` and so stays under `--alpha`.
+const CONTAINER: &str = "data:text/html,<body style='margin:0'>\
+<div style='position:fixed;left:0;top:0;right:0;bottom:0;background:%23fff'></div>\
+<script>document.title='ready'</script></body>";
+
+/// The brightest of a still's text pixels — its first line, wherever
+/// something at least half opaque was painted — and how many there were.
+fn text_pixels(client: &mut Client) -> (f64, usize) {
+    let (rgba, width, _) = still(client);
+    rgba[..(38 * width * 4) as usize]
+        .chunks_exact(4)
+        .filter(|p| p[3] >= 128)
+        .map(|p| blinkterm::appearance::luminance((p[0], p[1], p[2])))
+        .fold((0.0, 0), |(most, count), l| (f64::max(most, l), count + 1))
+}
+
 /// The appearance `--alpha` gives a session, told the way the program tells
 /// one.
 fn transparent(client: &mut Client, force_dark: bool) {
     let alpha = blinkterm::appearance::Appearance::new(
         blinkterm::appearance::Choice::Auto,
         force_dark,
-        true,
+        blinkterm::appearance::Alpha::On(100),
     );
     blinkterm::app::prepare_session(client, &alpha, &Identity::new(None, None, "C"));
 }
@@ -6620,11 +6830,11 @@ fn a_page_with_no_background_is_transparent_under_the_override_and_stays_so_acro
         started.elapsed()
     );
 
-    go_to(&mut client, PAGE);
+    go_to(&mut client, CONTAINER);
     assert_eq!(
         wait_until(&mut client, 255, alpha),
         255,
-        "a page with a background of its own keeps it"
+        "a page that paints a container of its own keeps it"
     );
     go_to(&mut client, CLEAR);
     let navigated = far_corner(&mut client);
@@ -6647,9 +6857,11 @@ fn a_page_with_no_background_is_transparent_under_the_override_and_stays_so_acro
     engine.kill();
 }
 
-/// Why a bare page is black while it moves under `--alpha`: the screencast
-/// keeps the transparency in a PNG, and a JPEG — the local route's moving
-/// frame — has nowhere to put it and paints it black.
+/// Why the local route's frames are keyed under `--alpha` rather than asked
+/// for transparent: the screencast keeps real transparency in a PNG, and a
+/// JPEG — the local route's moving frame — has nowhere to put it and paints
+/// it black. Over ssh and in tmux the frames are PNG, and this is what they
+/// carry.
 #[test]
 fn the_screencast_carries_the_alpha_as_png_and_paints_it_black_as_jpeg() {
     let Some((mut engine, mut client)) = connect() else {
@@ -6679,26 +6891,38 @@ fn the_screencast_carries_the_alpha_as_png_and_paints_it_black_as_jpeg() {
         panic!("no frame in five seconds");
     };
 
-    cast(&mut client, "png", None, WIDTH, HEIGHT);
-    let png = first(&mut client, true);
-    let _ = client.call("Page.stopScreencast", Json::empty());
-    let image = blinkterm::png::decode(&png, 64 * 1024 * 1024).expect("a frame decodes");
-    let at = (((image.height - 5) * image.width + image.width - 5) * 4) as usize;
-    let pixel = &image.rgba[at..at + 4];
-    eprintln!("png cast {}x{}: {pixel:?}", image.width, image.height);
-    assert_eq!(pixel[3], 0, "the PNG cast keeps the transparency");
+    // A bare page, and one whose own white `body` is forced away.
+    for (name, page) in [("bare", CLEAR), ("painted", PAINTED)] {
+        go_to(&mut client, page);
+        assert_eq!(wait_until(&mut client, 0, alpha), 0, "{name}: transparent");
 
-    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDTH, HEIGHT);
-    let jpeg = first(&mut client, false);
-    let _ = client.call("Page.stopScreencast", Json::empty());
-    let image = blinkterm::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
-    let at = (((image.height - 5) * image.width + image.width - 5) * 3) as usize;
-    let pixel = &image.rgb[at..at + 3];
-    eprintln!("jpeg cast {}x{}: {pixel:?}", image.width, image.height);
-    assert!(
-        pixel.iter().all(|&c| c < 8),
-        "the JPEG cast paints the transparency black: {pixel:?}"
-    );
+        cast(&mut client, "png", None, WIDTH, HEIGHT);
+        let png = first(&mut client, true);
+        let _ = client.call("Page.stopScreencast", Json::empty());
+        let image = blinkterm::png::decode(&png, 64 * 1024 * 1024).expect("a frame decodes");
+        let at = (((image.height - 5) * image.width + image.width - 5) * 4) as usize;
+        let pixel = &image.rgba[at..at + 4];
+        eprintln!(
+            "{name}: png cast {}x{}: {pixel:?}",
+            image.width, image.height
+        );
+        assert_eq!(pixel[3], 0, "{name}: the PNG cast keeps the transparency");
+
+        cast(&mut client, "jpeg", Some(motion::QUALITY), WIDTH, HEIGHT);
+        let jpeg = first(&mut client, false);
+        let _ = client.call("Page.stopScreencast", Json::empty());
+        let image = blinkterm::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+        let at = (((image.height - 5) * image.width + image.width - 5) * 3) as usize;
+        let pixel = &image.rgb[at..at + 3];
+        eprintln!(
+            "{name}: jpeg cast {}x{}: {pixel:?}",
+            image.width, image.height
+        );
+        assert!(
+            pixel.iter().all(|&c| c < 8),
+            "{name}: the JPEG cast paints the transparency black: {pixel:?}"
+        );
+    }
 
     client.close();
     engine.kill();
@@ -6722,14 +6946,7 @@ fn the_override_beside_forced_dark_and_beside_a_page_that_says_it_is_dark() {
     assert_eq!(wait_until(&mut client, 0, alpha), 0, "transparent");
     // The brightest of the text's pixels: the first line, above the block,
     // wherever something opaque was painted.
-    let text = |client: &mut Client| {
-        let (rgba, width, _) = still(client);
-        rgba[..(38 * width * 4) as usize]
-            .chunks_exact(4)
-            .filter(|p| p[3] >= 128)
-            .map(|p| blinkterm::appearance::luminance((p[0], p[1], p[2])))
-            .fold(0.0, f64::max)
-    };
+    let text = |client: &mut Client| text_pixels(client).0;
     let black_text = text(&mut client);
     eprintln!("the override alone: text at most {black_text:.3}");
     assert!(black_text < 0.1, "black text on nothing");
@@ -6753,6 +6970,436 @@ fn the_override_beside_forced_dark_and_beside_a_page_that_says_it_is_dark() {
         text(&mut client)
     );
     assert_eq!(forced[3], 0, "auto dark leaves the canvas transparent");
+
+    // A page that paints its own white, under both: the background forced
+    // away, and auto dark still making its black text light.
+    go_to(&mut client, PAINTED);
+    let painted = far_corner(&mut client);
+    let (painted_text, count) = text_pixels(&mut client);
+    eprintln!(
+        "a painted white page, --force-dark and --alpha: {painted:?}, \
+         text at most {painted_text:.3} over {count} pixels"
+    );
+    assert_eq!(painted[3], 0, "the page's own white forced transparent");
+    assert!(painted_text > 0.5, "and its text light");
+
+    client.close();
+    engine.kill();
+}
+
+/// `--alpha` on a page that paints its own background, as most do: the
+/// override alone leaves it white, and the adopted stylesheet makes it see
+/// through — on the page already loaded, and on every one after it.
+#[test]
+fn a_page_that_paints_its_own_background_is_see_through_under_forced_transparency_and_stays_so() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    go_to(&mut client, PAINTED);
+    assert_eq!(far_corner(&mut client), [255, 255, 255, 255], "white");
+    let sheets = evaluate(&mut client, "document.styleSheets.length").as_f64();
+
+    evaluate(&mut client, "window.kept = 1");
+    let started = Instant::now();
+    transparent(&mut client, false);
+    let alpha = |client: &mut Client| far_corner(client)[3];
+    assert_eq!(wait_until(&mut client, 0, alpha), 0, "transparent in place");
+    let flipped = started.elapsed();
+    assert_eq!(
+        evaluate(&mut client, "window.kept").as_f64(),
+        Some(1.0),
+        "the same document, not a reload: runImmediately"
+    );
+    eprintln!(
+        "forced transparent on the loaded page: {:?} after {flipped:?}",
+        far_corner(&mut client)
+    );
+
+    let (text, count) = text_pixels(&mut client);
+    eprintln!("the text: at most {text:.3} over {count} opaque pixels");
+    assert!(count > 0, "the text is still there, opaque");
+    assert!(text < 0.1, "and black");
+
+    go_to(&mut client, PAINTED);
+    assert_eq!(far_corner(&mut client)[3], 0, "after a navigation");
+    evaluate(&mut client, "document.title='leaving'");
+    client
+        .call("Page.reload", Json::empty())
+        .expect("the page reloads");
+    assert_eq!(
+        wait_for_title(&mut client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+    assert_eq!(far_corner(&mut client)[3], 0, "after a reload");
+
+    // Registered again, as a colour re-send does: still one sheet.
+    transparent(&mut client, false);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // What the page can see of it: one adopted sheet, its own sheets as they
+    // were, and nothing on its window.
+    let flag = evaluate(&mut client, "typeof __blinktermAlpha");
+    let own = evaluate(&mut client, "document.styleSheets.length").as_f64();
+    let adopted = evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64();
+    eprintln!("the page sees: flag {flag}, styleSheets {own:?}, adoptedStyleSheets {adopted:?}");
+    assert_eq!(flag.as_str(), Some("undefined"), "the flag is the world's");
+    assert_eq!(own, sheets, "styleSheets unchanged");
+    assert_eq!(adopted, Some(1.0), "one adopted sheet, however often told");
+
+    client.close();
+    engine.kill();
+}
+
+/// A page whose iframe, in the same process, paints its own white `body`
+/// at (100, 100) to (300, 200) — with a script of its own when `script`.
+fn framed(script: bool) -> String {
+    let script = if script { "<script>1</script>" } else { "" };
+    format!(
+        "data:text/html,<body style='margin:0'>\
+<iframe srcdoc='<body style=margin:0;background:%23fff>{script}</body>' \
+style='position:absolute;left:100px;top:100px;width:200px;height:100px;border:0'></iframe>\
+<script>document.title='ready'</script></body>"
+    )
+}
+
+/// The alpha of the still's pixel in the middle of [`framed`]'s iframe.
+fn inside_the_frame(client: &mut Client) -> u8 {
+    let (rgba, width, _) = still(client);
+    rgba[((150 * width + 200) * 4 + 3) as usize]
+}
+
+/// A same-process iframe is a frame of the same target, so the script
+/// reaches it and its own white `body` goes too: the frame already loaded
+/// when the script is registered, and one loaded after it.
+///
+/// With one exception, measured here and documented rather than defended:
+/// the engine makes a frame's JavaScript context only when something needs
+/// it, and a script registered for new documents runs when it is made — so
+/// an iframe with no script of its own, that nothing on the page reaches
+/// into, is never told, and keeps its white. Touching its document from the
+/// page makes the context, and the script runs then.
+#[test]
+fn forced_transparency_reaches_a_same_process_iframe() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+
+    go_to(&mut client, &framed(true));
+    assert_eq!(
+        wait_until(&mut client, 255, inside_the_frame),
+        255,
+        "the iframe's white"
+    );
+    transparent(&mut client, false);
+    let in_place = wait_until(&mut client, 0, inside_the_frame);
+    eprintln!("the iframe's pixel, in place: alpha {in_place}");
+    assert_eq!(in_place, 0, "the frame already loaded");
+    go_to(&mut client, &framed(true));
+    let navigated = wait_until(&mut client, 0, inside_the_frame);
+    eprintln!("the iframe's pixel, after a navigation: alpha {navigated}");
+    assert_eq!(navigated, 0, "and a frame loaded after it");
+
+    go_to(&mut client, &framed(false));
+    std::thread::sleep(Duration::from_millis(500));
+    let untouched = inside_the_frame(&mut client);
+    evaluate(
+        &mut client,
+        "document.querySelector('iframe').contentDocument.nodeType",
+    );
+    let touched = wait_until(&mut client, 0, inside_the_frame);
+    eprintln!(
+        "an iframe with no script of its own: alpha {untouched} untouched, \
+         {touched} once the page reaches into it"
+    );
+    assert_eq!(touched, 0, "told once its context is made");
+
+    client.close();
+    engine.kill();
+}
+
+/// alt+shift+s under `--alpha`: the PNG saved is the engine's, so the forced
+/// transparency is in the file.
+#[test]
+fn a_saved_picture_under_forced_transparency_keeps_it() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    go_to(&mut client, PAINTED);
+    transparent(&mut client, false);
+    let alpha = |client: &mut Client| far_corner(client)[3];
+    assert_eq!(wait_until(&mut client, 0, alpha), 0, "transparent");
+
+    let answer = client
+        .call(
+            "Page.captureScreenshot",
+            save::capture_params(WIDTH, HEIGHT),
+        )
+        .expect("a capture");
+    let data = answer.get("data").and_then(Json::as_str).expect("data");
+    let png = blinkterm::base64::decode(data.as_bytes()).expect("base64");
+    let image = blinkterm::png::decode(&png, 64 * 1024 * 1024).expect("a PNG");
+    let at = (((image.height - 5) * image.width + image.width - 5) * 4) as usize;
+    let corner = &image.rgba[at..at + 4];
+    eprintln!("the saved picture's corner: {corner:?}");
+    assert_eq!(corner[3], 0, "the file keeps the transparency");
+
+    client.close();
+    engine.kill();
+}
+
+/// The appearance `--alpha` gives a session on the local route, where the
+/// frames are keyed: the backgrounds painted [`blinkterm::chroma::KEY`].
+fn keyed(client: &mut Client) {
+    let mut alpha = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::On(100),
+    );
+    alpha.keyed = true;
+    blinkterm::app::prepare_session(client, &alpha, &Identity::new(None, None, "C"));
+}
+
+/// Black text, a photograph, a green button, a box of vivid purple and a
+/// half-black overlay, on a white page: what a key costs, in one place.
+const MIXED: &str = "data:text/html,<body style='margin:0;background:%23fff;font:16px sans-serif'>\
+<h1 style='margin:8px'>Black text, a heading</h1>\
+<p style='margin:8px'>Body text in black on a white page, and \
+<a href='%23' style='color:%231a0dab'>a blue link</a>.</p>\
+<button style='position:absolute;left:8px;top:120px;width:120px;height:32px;background:%2334a853;color:%23fff;border:0'>Green</button>\
+<div style='position:absolute;left:160px;top:120px;width:120px;height:32px;background:%23d500f9'></div>\
+<canvas id=c width=320 height=200 style='position:absolute;left:20px;top:220px'></canvas>\
+<div style='position:absolute;left:420px;top:240px;width:240px;height:120px;background:rgba(0,0,0,0.5)'></div>\
+<script>var c=document.getElementById('c').getContext('2d');\
+var g=c.createLinearGradient(0,0,320,200);g.addColorStop(0,'%2387ceeb');\
+g.addColorStop(0.5,'%23228b22');g.addColorStop(1,'%23ffd700');c.fillStyle=g;c.fillRect(0,0,320,200);\
+for(var i=0;i<400;i++){c.fillStyle='hsla('+(i*37%25360)+',70%25,'+(30+i%2540)+'%25,0.5)';\
+c.beginPath();c.arc((i*53)%25320,(i*29)%25200,4+i%256,0,7);c.fill()}\
+document.title='ready'</script></body>";
+
+/// RGBA, its width and its height.
+type Picture = (Vec<u8>, u32, u32);
+
+/// A keyed JPEG frame of `page` at 1280x768 and the keyed still of the same
+/// moment, as the program makes them, and how long the frame took to decode
+/// plain and keyed.
+fn keyed_frame_and_still(
+    client: &mut Client,
+    page: &str,
+) -> (Picture, Picture, (Duration, Duration)) {
+    go_to(client, page);
+    let is_key = |client: &mut Client| {
+        let (rgba, width, height) = still(client);
+        let at = (((height - 5) * width + width - 5) * 4) as usize;
+        rgba[at..at + 3] == [255, 0, 255]
+    };
+    assert!(wait_until(client, true, is_key), "painted on the key");
+    cast(client, "jpeg", Some(motion::QUALITY), WIDE, TALL);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let jpeg = loop {
+        if let Some((frame, _)) = take_frames(client).pop() {
+            break frame;
+        }
+        assert!(Instant::now() < deadline, "no frame");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = client.call("Page.stopScreencast", Json::empty());
+
+    let runs = 30;
+    let started = Instant::now();
+    for _ in 0..runs {
+        let _ = blinkterm::jpeg::decode(&jpeg, 64 << 20).expect("decodes");
+    }
+    let plain = started.elapsed() / runs;
+    let started = Instant::now();
+    let mut frame = None;
+    for _ in 0..runs {
+        let mut image =
+            blinkterm::jpeg::decode_rgba_with(&jpeg, 64 << 20, blinkterm::chroma::key_pixel)
+                .expect("decodes");
+        blinkterm::chroma::despill(&mut image.rgba, image.width, image.height);
+        frame = Some(image);
+    }
+    let keyed = started.elapsed() / runs;
+    let frame = frame.expect("a frame");
+
+    let (mut rgba, width, height) = still(client);
+    blinkterm::chroma::key(&mut rgba, width, height);
+    (
+        (frame.rgba, frame.width, frame.height),
+        (rgba, width, height),
+        (plain, keyed),
+    )
+}
+
+/// The share of the pixels of `rgba` inside `rect` (CSS pixels at scale 1)
+/// that `keep` says yes to.
+fn share(rgba: &[u8], width: u32, rect: (u32, u32, u32, u32), keep: impl Fn(&[u8]) -> bool) -> f64 {
+    let (x0, y0, w, h) = rect;
+    let mut yes = 0;
+    for y in y0..y0 + h {
+        for x in x0..x0 + w {
+            let at = ((y * width + x) * 4) as usize;
+            if keep(&rgba[at..at + 4]) {
+                yes += 1;
+            }
+        }
+    }
+    f64::from(yes) / f64::from(w * h)
+}
+
+/// `--alpha` on the local route: the page painted on the key, a JPEG frame
+/// keyed as it is decoded, and the still keyed the same way — so the page is
+/// see-through while it moves as well as at rest, and looks the same in
+/// both. What is measured: the bare page cleared, the text left opaque and
+/// without a magenta fringe, and what the key costs in content and time.
+#[test]
+fn under_a_key_a_moving_frame_is_as_see_through_as_the_still() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(WIDE)),
+                ("height", Json::number(TALL)),
+                ("deviceScaleFactor", Json::number(1)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("the size");
+    go_to(&mut client, PAINTED);
+    keyed(&mut client);
+
+    let ((frame, width, _), (still, still_width, _), (plain, keyed)) =
+        keyed_frame_and_still(&mut client, PAINTED);
+    assert_eq!(width, WIDE);
+    assert_eq!(still_width, WIDE);
+    let clear = |p: &[u8]| p[3] == 0;
+    // Everything below the line of text is the bare page.
+    let bare = (0, 60, WIDE, TALL - 60);
+    let (frame_bare, still_bare) = (
+        share(&frame, width, bare, clear),
+        share(&still, width, bare, clear),
+    );
+    // The text: opaque, dark, and no key left in it.
+    let text = (0, 0, 400, 40);
+    let opaque = |p: &[u8]| p[3] >= 128;
+    let fringe = frame
+        .chunks_exact(4)
+        .take((40 * width) as usize)
+        .filter(|p| p[3] == 255)
+        .map(|p| i32::from(p[0].min(p[2])) - i32::from(p[1]))
+        .max()
+        .unwrap_or(0);
+    eprintln!(
+        "keyed, white page: bare page clear {:.4} moving, {:.4} at rest; text opaque {:.4}; \
+         the most key left in an opaque pixel {fringe}; decode {plain:?}, decode and key {keyed:?}",
+        frame_bare,
+        still_bare,
+        share(&frame, width, text, opaque),
+    );
+    assert!(frame_bare > 0.99, "the moving frame is see-through");
+    assert_eq!(still_bare, 1.0, "and the still");
+    assert!(share(&frame, width, text, opaque) > 0.02, "the text stays");
+    assert!(fringe < 32, "no magenta fringe: {fringe}");
+
+    let ((frame, width, _), (still, _, _), _) = keyed_frame_and_still(&mut client, MIXED);
+    let green = (8, 120, 120, 32);
+    let purple = (160, 120, 120, 32);
+    let photo = (20, 220, 320, 200);
+    let overlay = (420, 240, 240, 120);
+    let alpha_mean = |rgba: &[u8], rect: (u32, u32, u32, u32)| {
+        let (x0, y0, w, h) = rect;
+        let mut sum = 0u64;
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                sum += u64::from(rgba[((y * width + x) * 4 + 3) as usize]);
+            }
+        }
+        sum as f64 / f64::from(w * h) / 255.0
+    };
+    eprintln!(
+        "keyed, mixed page, moving / at rest: green button opaque {:.3} / {:.3}, \
+         vivid purple box opaque {:.3} / {:.3}, photo opaque {:.3} / {:.3}, \
+         50% overlay alpha {:.2} / {:.2}, bare page clear {:.4} / {:.4}",
+        share(&frame, width, green, |p| p[3] == 255),
+        share(&still, width, green, |p| p[3] == 255),
+        share(&frame, width, purple, |p| p[3] == 255),
+        share(&still, width, purple, |p| p[3] == 255),
+        share(&frame, width, photo, |p| p[3] == 255),
+        share(&still, width, photo, |p| p[3] == 255),
+        alpha_mean(&frame, overlay),
+        alpha_mean(&still, overlay),
+        share(&frame, width, (700, 400, 500, 300), clear),
+        share(&still, width, (700, 400, 500, 300), clear),
+    );
+    assert!(
+        share(&frame, width, green, |p| p[3] == 255) > 0.95,
+        "green stays"
+    );
+    assert!(
+        share(&still, width, photo, |p| p[3] == 255) > 0.95,
+        "a photo stays"
+    );
+    assert!(
+        share(&still, width, purple, |p| p[3] == 255) < 0.1,
+        "the key's own hue goes: the cost of the colour"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// alt+shift+s under a key: the engine's PNG is of the page on magenta, and
+/// the file written is keyed, transparent where the page is.
+#[test]
+fn a_saved_picture_under_a_key_is_keyed_before_it_is_written() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    go_to(&mut client, PAINTED);
+    keyed(&mut client);
+    let magenta = |client: &mut Client| far_corner(client) == [255, 0, 255, 255];
+    assert!(wait_until(&mut client, true, magenta), "on the key");
+
+    let answer = client
+        .call(
+            "Page.captureScreenshot",
+            save::capture_params(WIDTH, HEIGHT),
+        )
+        .expect("a capture");
+    let data = answer.get("data").and_then(Json::as_str).expect("data");
+    let png = blinkterm::base64::decode(data.as_bytes()).expect("base64");
+    let file = save::key_png(&png).expect("keyed");
+    let image = blinkterm::png::decode(&file, 64 * 1024 * 1024).expect("a PNG");
+    let at = (((image.height - 5) * image.width + image.width - 5) * 4) as usize;
+    let corner = &image.rgba[at..at + 4];
+    eprintln!(
+        "the saved picture's corner: {corner:?}; {} bytes from the engine, {} written",
+        png.len(),
+        file.len()
+    );
+    assert_eq!(corner[3], 0, "the file is clear where the page is");
 
     client.close();
     engine.kill();
@@ -7906,7 +8553,11 @@ fn a_crashed_page_keeps_its_tab_and_a_reload_brings_it_back_casting() {
     eprintln!("frames in a second after the reload, the cast untouched: {unstarted}");
     blinkterm::app::revive(
         &mut tab.connection,
-        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false),
+        &blinkterm::appearance::Appearance::new(
+            blinkterm::appearance::Choice::Auto,
+            false,
+            blinkterm::appearance::Alpha::Off,
+        ),
         blinkterm::zoom::Viewport::fit((WIDTH, HEIGHT), 1.0),
         Metrics {
             cols: WIDTH / CELL.0,
@@ -8280,8 +8931,11 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
     let dir = root.join("profile");
     let downloads = root.join("downloads");
     std::fs::create_dir_all(&downloads).expect("a download directory");
-    let appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
+    let appearance = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::Off,
+    );
     let launch = engine::Launch::default();
     let profile = Profile::take(Choice::At(dir.clone())).expect("a kept profile");
     let Booted {
@@ -8652,8 +9306,11 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
     let root = temp_dir("permissions");
     let downloads = root.join("downloads");
     std::fs::create_dir_all(&downloads).expect("a download directory");
-    let appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
+    let appearance = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::Off,
+    );
     let mut allowed = Allowed::in_memory();
     allowed
         .set(&origin, &[Permission::Camera])
@@ -9294,7 +9951,11 @@ fn a_page_is_told_chromium_and_this_program_and_nothing_headless() {
     };
     blinkterm::app::prepare_session(
         &mut client,
-        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false),
+        &blinkterm::appearance::Appearance::new(
+            blinkterm::appearance::Choice::Auto,
+            false,
+            blinkterm::appearance::Alpha::Off,
+        ),
         &Identity::new(engine.agent(), None, "ja_JP.UTF-8"),
     );
     // On a page served over http from 127.0.0.1, which is a secure context:
@@ -9374,7 +10035,11 @@ fn an_accept_lang_of_the_persons_own_survives_the_override() {
         .with_accept_language(blinkterm::identity::accept_lang_arg(&launch.args));
     blinkterm::app::prepare_session(
         &mut page,
-        &blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false),
+        &blinkterm::appearance::Appearance::new(
+            blinkterm::appearance::Choice::Auto,
+            false,
+            blinkterm::appearance::Alpha::Off,
+        ),
         &identity,
     );
     let languages = evaluate(&mut page, "navigator.languages.join(',')");
@@ -9398,8 +10063,11 @@ fn a_url_handed_over_the_socket_becomes_the_tab_in_front() {
     let dir = root.join("profile");
     let downloads = root.join("downloads");
     std::fs::create_dir_all(&downloads).expect("a download directory");
-    let appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
+    let appearance = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::Off,
+    );
     let profile = Profile::take(Choice::At(dir.clone())).expect("a kept profile");
     // Bound where the program binds it: under the lock, before the engine.
     let mut listener = Listener::bind(&dir).expect("listening");
@@ -9514,8 +10182,11 @@ const HEAVY: usize = 300;
 /// sending `*.test` to this machine and the blocker given or not.
 fn booted_blocking(blocker: Option<&Arc<Blocker>>) -> Booted {
     let downloads = temp_dir("block-downloads");
-    let appearance =
-        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false, false);
+    let appearance = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::Off,
+    );
     let launch = engine::Launch {
         args: vec!["--host-resolver-rules=MAP *.test 127.0.0.1".to_string()],
         ..engine::Launch::default()

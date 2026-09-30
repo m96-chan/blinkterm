@@ -46,7 +46,8 @@
 //! ([`transparent_params`]), so the pixels come back transparent and the
 //! terminal's own background — its colour, its opacity, its blur — shows
 //! through. A page that paints a background keeps it; only the canvas under
-//! it changes.
+//! it changes — which is why the override does not come alone (see the next
+//! section).
 //!
 //! It is sent from [`Appearance::commands`], after the scheme and the
 //! forcing, and for the same reason they are there: it is per session, and
@@ -57,7 +58,8 @@
 //! `--force-dark` is; there is no key that turns it off.
 //!
 //! Measured against `chrome-headless-shell` 153 with a page that paints
-//! nothing, the pixel read from a PNG `Page.captureScreenshot`:
+//! nothing, the pixel read from a PNG `Page.captureScreenshot`, with the
+//! override alone:
 //!
 //! | step | the canvas's pixel, RGBA |
 //! | --- | --- |
@@ -78,10 +80,89 @@
 //! keeps the transparency, and a light terminal needs nothing.
 //!
 //! The screencast honours it too, but only in PNG: a JPEG frame of the same
-//! page is 0, 0, 0 where the PNG is transparent. The moving frames stay JPEG
-//! on the local route all the same, so there a page with no background is
-//! black while it moves and transparent once it rests and the lossless still
-//! arrives; see [`crate::motion`] for why that is the choice.
+//! page is 0, 0, 0 where the PNG is transparent. So on the local route, where
+//! the moving frames are JPEG, the page is not painted on nothing but on a
+//! key colour, which the decoder takes back out; see "Keyed, where the frames
+//! are JPEG" below and [`crate::chroma`].
+//!
+//! # Forced transparent, and an amount
+//!
+//! The override alone shows nothing on most real pages, because most real
+//! pages paint their own background — `body { background: #fff }`, or the
+//! same on `html` — and a background the page paints is not the canvas's
+//! default. So `--alpha` also makes the page's own `html` and `body`
+//! backgrounds transparent, with [`TRANSPARENT_CSS`]: the `background`
+//! shorthand, so a background image goes as well, and `!important`, which
+//! in an adopted sheet beats the page's own `!important` at the same
+//! specificity. Text, pictures and anything painted on another element stay:
+//! a site whose white is a wrapper `div` keeps it.
+//!
+//! It is put there by [`TRANSPARENT_SCRIPT`], registered with
+//! `Page.addScriptToEvaluateOnNewDocument` right after the override
+//! ([`transparent_style_params`]), per session like the rest. The script
+//! adopts a constructed stylesheet rather than adding a `<style>`: a
+//! constructed sheet is not subject to a page's CSP `style-src`, and the DOM
+//! is not changed, for the reasons [`crate::find`] gives for highlighting
+//! without touching it. It runs in an isolated world, [`ALPHA_WORLD`], so the
+//! flag that keeps it to once a document is not on the page's `window`, and
+//! with `runImmediately`, so a page already loaded — the one on screen when
+//! the colours are sent again — flips where it stands. What a page can see of
+//! it is `document.adoptedStyleSheets` one longer; `document.styleSheets` is
+//! as it was, and `__blinktermAlpha` is `undefined` to it.
+//!
+//! What it does not reach, documented rather than defended: a page that
+//! assigns `adoptedStyleSheets` wholesale, dropping the sheet; a page's own
+//! `!important` in an inline `style` attribute, which beats any sheet; an
+//! iframe from another site, which runs in a process of its own that is
+//! not attached, so its background stays; and a same-process iframe with no
+//! script of its own that nothing reaches into — the engine makes a frame's
+//! context only when something needs it, the script runs when it is made,
+//! and such a frame keeps its white until the page touches its document.
+//!
+//! # Keyed, where the frames are JPEG
+//!
+//! On the local route the moving frames are JPEG, which has no alpha, so
+//! transparency asked of the engine comes out black while a page moves — and
+//! a page moves whenever anything on it does: a text box's caret blinking is
+//! a frame every half second, and a page with one flickered black and clear
+//! for as long as it was open. There ([`Appearance::keyed`], set from the
+//! route) the override and the forced background are the key colour instead
+//! of nothing ([`keyed_params`], [`KEYED_CSS`]), and every frame and every
+//! still is keyed back to transparency as it is decoded ([`crate::chroma`],
+//! which has the colour, the measurements and the costs). Over ssh and in
+//! tmux the engine's PNG goes to the terminal as it came, so there the pages
+//! are asked for real transparency, as above.
+//!
+//! # The number
+//!
+//! The number, `--alpha 70`, is the opacity the picture is sent at, text
+//! included; it changes nothing the engine is told. It is applied after the
+//! key, in place ([`crate::graphics::scale_alpha`]), to the still and to the
+//! moving frame alike; at 100 nothing is scaled. Over ssh and in tmux, where
+//! the frames are the engine's PNG sent as they came
+//! ([`crate::route::Payload::Png`]), the number is not applied: the pages
+//! are see-through there, and what is left is opaque.
+//!
+//! Measured against `chrome-headless-shell` 153, a page whose `body` paints
+//! `#fff` with a line of black text, read from a PNG `Page.captureScreenshot`
+//! with the backgrounds made transparent rather than keyed:
+//!
+//! | step | the canvas's pixel, RGBA |
+//! | --- | --- |
+//! | the engine's default, or the override alone | 255, 255, 255, 255 |
+//! | the script, on the loaded page | 0, 0, 0, 0 — within 50 ms, the same document |
+//! | `Page.navigate`, `Page.reload` | 0, 0, 0, 0 |
+//! | its text | black and opaque, as it was |
+//! | `--force-dark` as well | 0, 0, 0, 0, the text made light |
+//! | a same-process iframe's white `body`, with a script | 0, in place and after a navigation |
+//! | the same with no script, untouched | 255, and 0 once the page reads its document |
+//! | a screencast frame, PNG / JPEG | 0, 0, 0, 0 / 0, 0, 0 |
+//! | the saved PNG (`alt+shift+s`) | 0, 0, 0, 0 |
+//! | registered twice, as a colour re-send does | one adopted sheet |
+//!
+//! And what the amount costs, on an Apple M-series at 1280x770: 0.2 ms to
+//! scale a picture's alpha, on top of a frame that is RGBA already because it
+//! was keyed.
 
 use crate::json::Json;
 
@@ -125,6 +206,51 @@ impl Choice {
     }
 }
 
+/// `--alpha`: off, or on with the opacity, from 1 to 100, the picture is sent
+/// at. Any `On` has the engine paint no default background and makes the
+/// page's own `html` and `body` backgrounds transparent; the number is only
+/// how much of what is left shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Alpha {
+    #[default]
+    Off,
+    On(u8),
+}
+
+impl Alpha {
+    /// `--alpha`'s amount or `alpha =`'s value, `name` saying which: `true`
+    /// is 100, `false` is off, and a number is from 1 to 100 — 0 is refused,
+    /// as `--fps 0` is, because a picture sent at nothing is not one.
+    pub fn parse(name: &str, text: &str) -> Result<Alpha, String> {
+        match text {
+            "true" => return Ok(Alpha::On(100)),
+            "false" => return Ok(Alpha::Off),
+            _ => {}
+        }
+        let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+        match text.parse::<u8>() {
+            Ok(n @ 1..=100) if digits => Ok(Alpha::On(n)),
+            _ => Err(format!(
+                "{name} is true, false or a number from 1 to 100, not {text:?}"
+            )),
+        }
+    }
+
+    /// Whether the backgrounds are made transparent at all.
+    pub fn on(self) -> bool {
+        matches!(self, Alpha::On(_))
+    }
+
+    /// What every pixel's alpha is scaled by, out of 255: `None` when nothing
+    /// is to be scaled, which is off and 100 alike.
+    pub fn scaling(self) -> Option<u8> {
+        match self {
+            Alpha::On(n) if n < 100 => Some(((u32::from(n) * 255 + 50) / 100) as u8),
+            _ => None,
+        }
+    }
+}
+
 /// Everything a session is told about its appearance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Appearance {
@@ -133,18 +259,31 @@ pub struct Appearance {
     terminal: Option<Scheme>,
     /// `--force-dark`.
     pub force_dark: bool,
-    /// `--alpha`: no default background, so the terminal's shows through.
-    pub alpha: bool,
+    /// `--alpha`: no default background and none on `html` or `body`, so the
+    /// terminal's shows through, and the amount the picture is sent at.
+    pub alpha: Alpha,
+    /// Whether this program decodes the frames itself — the route's payload
+    /// is raw pixels — so that `--alpha` can paint a key colour and take it
+    /// back out ([`crate::chroma`]) rather than ask for real transparency,
+    /// which a JPEG frame cannot carry.
+    pub keyed: bool,
 }
 
 impl Appearance {
-    pub fn new(choice: Choice, force_dark: bool, alpha: bool) -> Appearance {
+    pub fn new(choice: Choice, force_dark: bool, alpha: Alpha) -> Appearance {
         Appearance {
             choice,
             terminal: None,
             force_dark,
             alpha,
+            keyed: false,
         }
+    }
+
+    /// Whether the pages are painted on the key rather than on nothing:
+    /// `--alpha`, on a route whose frames this program decodes.
+    pub fn keys(&self) -> bool {
+        self.alpha.on() && self.keyed
     }
 
     /// The scheme to tell a page: the flag's, else the terminal's, else none
@@ -171,9 +310,12 @@ impl Appearance {
 
     /// The commands for one session, in order: `setEmulatedMedia` when there
     /// is a scheme to say, `setAutoDarkModeOverride` when forcing,
-    /// `setDefaultBackgroundColorOverride` to transparent under `--alpha`.
-    /// Nothing at all for a session that has nothing to be told, which is a
-    /// session the engine's defaults already describe.
+    /// `setDefaultBackgroundColorOverride` under `--alpha`, and after it the
+    /// script that does the same to the page's own backgrounds — to nothing
+    /// ([`transparent_style_params`]), or to the key where the frames are
+    /// keyed ([`keyed_params`], [`keyed_style_params`]). Nothing at all for a
+    /// session that has nothing to be told, which is a session the engine's
+    /// defaults already describe.
     pub fn commands(&self) -> Vec<(&'static str, Json)> {
         let mut out = Vec::new();
         if let Some(scheme) = self.scheme() {
@@ -182,10 +324,23 @@ impl Appearance {
         if self.force_dark {
             out.push(("Emulation.setAutoDarkModeOverride", auto_dark_params(true)));
         }
-        if self.alpha {
+        if self.keys() {
+            out.push((
+                "Emulation.setDefaultBackgroundColorOverride",
+                keyed_params(),
+            ));
+            out.push((
+                "Page.addScriptToEvaluateOnNewDocument",
+                keyed_style_params(),
+            ));
+        } else if self.alpha.on() {
             out.push((
                 "Emulation.setDefaultBackgroundColorOverride",
                 transparent_params(),
+            ));
+            out.push((
+                "Page.addScriptToEvaluateOnNewDocument",
+                transparent_style_params(),
             ));
         }
         out
@@ -246,6 +401,101 @@ pub fn transparent_params() -> Json {
     )])
 }
 
+/// `Emulation.setDefaultBackgroundColorOverride`'s parameters for the key:
+/// [`crate::chroma::KEY`], opaque.
+pub fn keyed_params() -> Json {
+    let (r, g, b) = crate::chroma::KEY;
+    Json::object(vec![(
+        "color",
+        Json::object(vec![
+            ("r", Json::number(r)),
+            ("g", Json::number(g)),
+            ("b", Json::number(b)),
+            ("a", Json::number(1)),
+        ]),
+    )])
+}
+
+/// The isolated world [`TRANSPARENT_SCRIPT`] runs in, so the flag it leaves
+/// on its global is not on the page's `window`.
+pub const ALPHA_WORLD: &str = "blinkterm-alpha";
+
+/// [`TRANSPARENT_CSS`], as a literal [`TRANSPARENT_SCRIPT`] can be built from.
+macro_rules! transparent_css {
+    () => {
+        "html, body { background: transparent !important; }"
+    };
+}
+
+/// [`KEYED_CSS`], likewise. The colour is [`crate::chroma::KEY_CSS`].
+macro_rules! keyed_css {
+    () => {
+        "html, body { background: #ff00ff !important; }"
+    };
+}
+
+/// The script that adopts `css` as a constructed stylesheet, once a
+/// document; see [`TRANSPARENT_SCRIPT`].
+macro_rules! style_script {
+    ($css:expr) => {
+        concat!(
+            "(() => {",
+            " if (globalThis.__blinktermAlpha === document) return;",
+            " globalThis.__blinktermAlpha = document;",
+            " try {",
+            " const s = new CSSStyleSheet();",
+            " s.replaceSync(\"",
+            $css,
+            "\");",
+            " document.adoptedStyleSheets = [...document.adoptedStyleSheets, s];",
+            " } catch (e) {}",
+            " })()"
+        )
+    };
+}
+
+/// What `--alpha` makes of a page's own backgrounds: the shorthand, so a
+/// background image goes too, and `!important`, so it beats the page's.
+pub const TRANSPARENT_CSS: &str = transparent_css!();
+
+/// The same, where the frames are keyed: the background is the key, which
+/// the decoder takes back out.
+pub const KEYED_CSS: &str = keyed_css!();
+
+/// Adopts [`TRANSPARENT_CSS`] as a constructed stylesheet, once a document.
+///
+/// The flag on the world's global is the document it was adopted into, so a
+/// second run on that document — the script registered again when the
+/// colours are re-sent — does nothing. It is the document and not `true`
+/// because a window can outlive its first document: a frame's initial
+/// `about:blank` hands its window to the same-origin document that replaces
+/// it, and a `true` left on the first must not have the second skipped. A
+/// document that refuses the sheet is left as it was.
+pub const TRANSPARENT_SCRIPT: &str = style_script!(transparent_css!());
+
+/// [`TRANSPARENT_SCRIPT`] with [`KEYED_CSS`].
+pub const KEYED_SCRIPT: &str = style_script!(keyed_css!());
+
+/// `Page.addScriptToEvaluateOnNewDocument`'s parameters for
+/// [`TRANSPARENT_SCRIPT`]: in [`ALPHA_WORLD`], and run on the document already
+/// there as well as on every one after it.
+pub fn transparent_style_params() -> Json {
+    style_params(TRANSPARENT_SCRIPT)
+}
+
+/// The same for [`KEYED_SCRIPT`].
+pub fn keyed_style_params() -> Json {
+    style_params(KEYED_SCRIPT)
+}
+
+fn style_params(source: &str) -> Json {
+    Json::object(vec![
+        ("source", Json::string(source)),
+        ("worldName", Json::string(ALPHA_WORLD)),
+        ("runImmediately", Json::Bool(true)),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,36 +523,35 @@ mod tests {
 
     #[test]
     fn the_flag_beats_the_terminal_and_auto_without_an_answer_says_nothing() {
-        let mut auto = Appearance::new(Choice::Auto, false, false);
+        let mut auto = Appearance::new(Choice::Auto, false, Alpha::Off);
         assert_eq!(auto.scheme(), None);
         assert!(auto.commands().is_empty(), "the engine's default, unsaid");
+        let alpha = Appearance::new(Choice::Auto, false, Alpha::On(70)).commands();
         assert_eq!(
-            Appearance::new(Choice::Auto, false, true)
-                .commands()
-                .into_iter()
-                .map(|(method, params)| format!("{method} {params}"))
-                .collect::<Vec<_>>(),
+            alpha.iter().map(|(method, _)| *method).collect::<Vec<_>>(),
             [
-                "Emulation.setDefaultBackgroundColorOverride {\"color\":{\"r\":0,\"g\":0,\"b\":0,\"a\":0}}"
+                "Emulation.setDefaultBackgroundColorOverride",
+                "Page.addScriptToEvaluateOnNewDocument"
             ],
-            "the override alone, with no answer yet"
+            "the override and the script alone, with no answer yet"
         );
+        assert_is_the_script(&alpha[1].1);
         assert!(auto.learned((0, 0, 0)));
         assert_eq!(auto.scheme(), Some(Scheme::Dark));
 
-        let mut light = Appearance::new(Choice::Light, false, false);
+        let mut light = Appearance::new(Choice::Light, false, Alpha::Off);
         assert_eq!(light.scheme(), Some(Scheme::Light));
         assert!(!light.learned((0, 0, 0)), "the flag was not asking");
         assert_eq!(light.scheme(), Some(Scheme::Light));
 
-        let mut dark = Appearance::new(Choice::Dark, false, false);
+        let mut dark = Appearance::new(Choice::Dark, false, Alpha::Off);
         assert!(!dark.learned((255, 255, 255)));
         assert_eq!(dark.scheme(), Some(Scheme::Dark));
     }
 
     #[test]
     fn learning_the_same_answer_twice_changes_nothing() {
-        let mut appearance = Appearance::new(Choice::Auto, false, false);
+        let mut appearance = Appearance::new(Choice::Auto, false, Alpha::Off);
         assert!(appearance.learned((0x1c, 0x1c, 0x1c)));
         assert!(!appearance.learned((0x28, 0x28, 0x28)), "still dark");
         assert!(appearance.learned((0xfd, 0xf6, 0xe3)), "now light");
@@ -311,7 +560,7 @@ mod tests {
 
     #[test]
     fn the_commands_name_the_scheme_and_the_forcing() {
-        let mut appearance = Appearance::new(Choice::Auto, true, false);
+        let mut appearance = Appearance::new(Choice::Auto, true, Alpha::Off);
         let text = |appearance: &Appearance| {
             appearance
                 .commands()
@@ -337,20 +586,94 @@ mod tests {
         );
         assert_eq!(auto_dark_params(false).to_string(), r#"{"enabled":false}"#);
 
-        appearance.alpha = true;
+        appearance.alpha = Alpha::On(100);
+        let all = text(&appearance);
         assert_eq!(
-            text(&appearance),
+            all[..3],
             [
                 "Emulation.setEmulatedMedia {\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":\"dark\"}]}",
                 "Emulation.setAutoDarkModeOverride {\"enabled\":true}",
                 "Emulation.setDefaultBackgroundColorOverride {\"color\":{\"r\":0,\"g\":0,\"b\":0,\"a\":0}}",
             ],
-            "the override comes last"
+            "the override comes after the scheme and the forcing"
         );
+        assert_eq!(all.len(), 4, "and the script after it: {all:?}");
+        let (method, params) = appearance.commands().pop().expect("the script");
+        assert_eq!(method, "Page.addScriptToEvaluateOnNewDocument");
+        assert_is_the_script(&params);
         assert_eq!(
             transparent_params().to_string(),
             r#"{"color":{"r":0,"g":0,"b":0,"a":0}}"#
         );
+    }
+
+    /// `Page.addScriptToEvaluateOnNewDocument`'s parameters are the alpha
+    /// script's: its world, run on the document already there, and the CSS.
+    fn assert_is_the_script(params: &Json) {
+        assert_eq!(
+            params.get("worldName").and_then(Json::as_str),
+            Some(ALPHA_WORLD)
+        );
+        assert_eq!(
+            params.get("runImmediately").and_then(Json::as_bool),
+            Some(true)
+        );
+        let source = params.get("source").and_then(Json::as_str).expect("source");
+        assert!(source.contains(TRANSPARENT_CSS), "{source}");
+        assert!(source.contains("adoptedStyleSheets"), "{source}");
+        assert!(source.contains("__blinktermAlpha"), "{source}");
+    }
+
+    #[test]
+    fn where_the_frames_are_keyed_the_backgrounds_are_the_key_and_not_nothing() {
+        let mut keyed = Appearance::new(Choice::Auto, false, Alpha::On(70));
+        keyed.keyed = true;
+        assert!(keyed.keys());
+        let commands = keyed.commands();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            format!("{} {}", commands[0].0, commands[0].1),
+            "Emulation.setDefaultBackgroundColorOverride \
+             {\"color\":{\"r\":255,\"g\":0,\"b\":255,\"a\":1}}"
+        );
+        let source = commands[1].1.get("source").and_then(Json::as_str);
+        assert_eq!(source, Some(KEYED_SCRIPT));
+        assert!(KEYED_SCRIPT.contains(KEYED_CSS));
+        assert!(KEYED_CSS.contains(crate::chroma::KEY_CSS));
+        assert_eq!(
+            commands[1].1.get("worldName").and_then(Json::as_str),
+            Some(ALPHA_WORLD)
+        );
+
+        let mut off = Appearance::new(Choice::Auto, false, Alpha::Off);
+        off.keyed = true;
+        assert!(!off.keys(), "a route that decodes is no reason to key");
+        assert!(off.commands().is_empty());
+    }
+
+    #[test]
+    fn an_alpha_is_true_false_or_one_to_a_hundred() {
+        assert_eq!(Alpha::parse("--alpha", "true"), Ok(Alpha::On(100)));
+        assert_eq!(Alpha::parse("--alpha", "false"), Ok(Alpha::Off));
+        assert_eq!(Alpha::parse("--alpha", "70"), Ok(Alpha::On(70)));
+        assert_eq!(Alpha::parse("--alpha", "100"), Ok(Alpha::On(100)));
+        assert_eq!(Alpha::parse("--alpha", "1"), Ok(Alpha::On(1)));
+        assert_eq!(Alpha::default(), Alpha::Off);
+        for text in ["0", "101", "yes", "70%", "", "+70", "256"] {
+            let why = Alpha::parse("alpha", text).expect_err(text);
+            assert_eq!(
+                why,
+                format!("alpha is true, false or a number from 1 to 100, not {text:?}")
+            );
+        }
+        assert!(!Alpha::Off.on());
+        assert!(Alpha::On(1).on());
+        assert_eq!(Alpha::Off.scaling(), None);
+        assert_eq!(Alpha::On(100).scaling(), None, "at 100 nothing is touched");
+        assert_eq!(Alpha::On(70).scaling(), Some(179));
+        assert_eq!(Alpha::On(50).scaling(), Some(128));
+        assert_eq!(Alpha::On(1).scaling(), Some(3));
+        assert_eq!(Alpha::On(99).scaling(), Some(252));
     }
 
     #[test]

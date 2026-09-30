@@ -140,20 +140,32 @@ unless you ask.
 
 ### Transparent pages
 
-`--alpha` (`alpha = true` in the file) has the engine paint nothing behind a
-page: where the page has no background of its own, the terminal's shows
-through — its colour, and its opacity or blur if it has them. A page that
-paints a background is unchanged.
+`--alpha` (`alpha = true` in the file) lets the terminal's background show
+through a page — its colour, and its opacity or blur if it has them. The
+engine paints nothing behind the page, and the page's own `html` and `body`
+backgrounds are made transparent, image and all, so a light page is its
+text and pictures over your terminal. What the page paints on anything else
+stays: a site whose white is a container of its own — a wrapper `div`, a
+card — keeps that part opaque, and so do an iframe from another site and a
+page's own `!important` inline style on `body`.
 
-It is transparent at rest. While a page is moving — scrolling, animating —
-its frames are JPEG, which has no transparency, so what would show through
-is black until the page stops and the lossless still arrives, a moment
-later. That is on purpose: while you are scrolling you are driving the page,
-not looking through it, and keeping the moving frames JPEG keeps them as
-fast as without the option. Over ssh and inside tmux the moving frames are
-already PNG and stay transparent.
+A number is how opaque the whole picture is: `--alpha 70` (or
+`--alpha=70`, `alpha = 70`) sends everything, text included, at 70%, and
+`--alpha` alone is 100. `--alpha=false` turns off an `alpha = …` in the
+file. Over ssh and inside tmux the number is not applied: the pages are
+still see-through, and what is left is sent opaque.
 
-A page that says nothing about its colours is black text on your
+It is see-through while the page moves as well as at rest. The moving
+frames are JPEG, which has no transparency, so locally the page is painted
+on magenta (`#ff00ff`) and the magenta is taken back out of every frame and
+every still as they are decoded — a chroma key, about a millisecond a
+frame. What that costs you is what the page itself shows in magenta or a
+vivid purple, which goes transparent too; a half-transparent overlay over
+the bare page comes out a little more opaque than it is; and pink or purple
+text right against the see-through background loses its pink at the edges
+(a visited link's purple goes navy there). Over ssh and inside tmux the
+frames are the engine's PNG and carry real transparency, and there is no
+key. A page that says nothing about its colours is black text on your
 background, which on a dark terminal is unreadable: use `--force-dark` with
 it, which makes the text light and keeps the transparency, or a light
 terminal. There is no key to turn it off while running.

@@ -44,12 +44,16 @@ options:
                    auto (the default) asks the terminal its background
   --force-dark     paint every page dark, even one with no dark style
                    (Chromium's auto dark mode)
-  --alpha          paint nothing behind a page: where the page paints no
-                   background the terminal's own shows through (a page with
-                   a background is unchanged). Only at rest: while the page
-                   moves that is black, and turns clear when it stops. Black
+  --alpha [<1-100>]
+                   let the terminal show through the page: the engine paints
+                   nothing behind it and the page's own html/body background
+                   is made transparent (text and pictures stay). With a
+                   number the whole picture is sent at that opacity, text
+                   included; --alpha alone is 100. Locally the page is
+                   painted on magenta and the magenta taken back out, so
+                   what the page itself shows in magenta goes too. Black
                    text over a dark terminal is yours to read: --force-dark
-                   helps
+                   helps. Over ssh and in tmux the number is not applied
   --engine <path>  the Chromium to run (default: $BLINKTERM_ENGINE, else
                    the first of chrome-headless-shell, chromium,
                    chromium-browser, google-chrome, chromium-shell on PATH)

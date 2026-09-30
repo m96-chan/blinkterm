@@ -42,15 +42,25 @@
 //!
 //! A page taller than that is cut, not sliced: the picture is its top
 //! [`PIXELS`] worth, and the row says so — `saved …png, the top 12500 of
-//! 40000 px`. Slicing would mean joining PNGs, which is an encoder this
-//! program does not have, or several files, which is not a picture of the
-//! page. The budget is in device pixels, because what comes back is the CSS
+//! 40000 px`. Slicing would mean joining PNGs — decoding every slice and
+//! encoding the whole again, with the plain encoder below that exists for the
+//! key — or several files, which is not a picture of the page. The budget is in device pixels, because what comes back is the CSS
 //! clip times the device's pixel ratio: at 200% a page 640 wide is cut at
 //! 6250 CSS rows. The picture is taken at the tab's own level, so there is
 //! nothing to undo afterwards.
 //!
 //! The width is the content's, which is the viewport less a scrollbar where
 //! there is one: 1265 for a 1280 pane with the engine's scrollbars.
+//!
+//! # Under a chroma key
+//!
+//! Where `--alpha` has the page painted on magenta for the frames' sake
+//! ([`crate::chroma`]), the engine's picture is of the page on magenta, so it
+//! is decoded, keyed as the screen is, and written back out with
+//! [`crate::png::encode_rgba`] ([`key_png`]) — transparent where the page is.
+//! That encoder is the least compression worth having, so a page of text is a
+//! few times the engine's own PNG; measured, a 640x360 page of a line of text
+//! was 4.2 kB from the engine and 8.3 kB keyed.
 //!
 //! # A PDF comes as a stream
 //!
@@ -315,6 +325,10 @@ pub struct Job {
     /// The file while it is being written, which goes if the job does
     /// before it is whole — a failure, a tab closed, an engine that died.
     partial: Option<PathBuf>,
+    /// The page is painted on a chroma key ([`crate::chroma`]), so the
+    /// picture is keyed before it is written: the file transparent where the
+    /// page is, not magenta.
+    keyed: bool,
 }
 
 /// What a [`Job`] is waiting on.
@@ -386,7 +400,14 @@ impl Job {
             phase,
             sent: now,
             partial: None,
+            keyed: false,
         })
+    }
+
+    /// Key the picture before it is written, for a page painted on the key.
+    pub fn keyed(mut self, keyed: bool) -> Job {
+        self.keyed = keyed;
+        self
     }
 
     /// A PDF or a picture.
@@ -467,7 +488,10 @@ impl Job {
                     return Ok(None);
                 };
                 let (height, rows) = (*height, *rows);
-                let bytes = decoded(&reply?)?;
+                let mut bytes = decoded(&reply?)?;
+                if self.keyed {
+                    bytes = key_png(&bytes)?;
+                }
                 let path = self.write_whole(dir, &bytes)?;
                 Ok(Some(Saved {
                     path,
@@ -578,6 +602,20 @@ impl Drop for Job {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// The engine's PNG of a page painted on the key, keyed and written back
+/// out: transparent where the page is, as it looks on the screen, but at
+/// full opacity whatever `--alpha`'s number is.
+pub fn key_png(png: &[u8]) -> Result<Vec<u8>, String> {
+    let mut image = crate::png::decode(png, PIXELS as usize * 4)
+        .map_err(|e| format!("cannot key the picture: {e}"))?;
+    crate::chroma::key(&mut image.rgba, image.width, image.height);
+    Ok(crate::png::encode_rgba(
+        image.width,
+        image.height,
+        &image.rgba,
+    ))
 }
 
 /// The bytes of a reply's base64 `data`.

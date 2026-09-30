@@ -43,13 +43,14 @@ use crate::bindings::{Action, Bindings, Lookup};
 use crate::block::{self, Blocker, Unblocked};
 use crate::bookmarks::{Bookmarks, Toggled};
 use crate::cdp::{Client, Event, Notifier, Pending};
+use crate::chroma;
 use crate::clipboard;
 use crate::dialog::{Answer, Dialog, Kind};
 use crate::download::{self, Downloads};
 use crate::engine::Engine;
 use crate::find;
 use crate::fullscreen::{self, Heard, Layout};
-use crate::graphics::{Painter, Raw};
+use crate::graphics::{self, Painter, Raw};
 use crate::hints;
 use crate::history::{self, History};
 use crate::historylist::{self, HistoryList};
@@ -1201,7 +1202,11 @@ pub fn run(options: Options) -> Result<(), String> {
     };
     // What pages are told about light and dark, before there is a page to
     // tell: the flags now, the terminal's answer when it comes.
-    let appearance = Appearance::new(options.scheme, options.force_dark, options.alpha);
+    let mut appearance = Appearance::new(options.scheme, options.force_dark, options.alpha);
+    // Under `--alpha`, a page painted on the key where this program decodes
+    // the frames and so can take it back out; on nothing where the engine's
+    // PNG goes to the terminal as it came. See [`crate::chroma`].
+    appearance.keyed = route.payload == Payload::Raw;
     // Once for the run, and before the pane is taken, so that a directory
     // which is a file is a sentence in the shell. Every engine is told it.
     let downloads_dir = download::prepare(options.download.clone())?;
@@ -2814,6 +2819,10 @@ fn connect_tab(
 /// session that missed this would be the one page in the browser that was
 /// light in a dark terminal.
 ///
+/// Under `--alpha` the script that makes a page's own backgrounds transparent
+/// is registered here too, every time; it is idempotent per document, so a
+/// second registration on a colour re-send adds nothing to the page.
+///
 /// Told rather than asked: a page that has just been made may already be
 /// stopped behind a dialog, and a scheme that did not take is a page that is
 /// light, which is no reason not to open it.
@@ -3833,7 +3842,21 @@ fn handle_page_events(
         // that looks frozen, which is what the engine test comparing the two
         // formats through both decoders exists to catch before a person meets
         // it.
-        if let Ok(image) = crate::jpeg::decode(&jpeg, FRAME_BUDGET) {
+        //
+        // Under `--alpha` the page was painted on the key, and the frame is
+        // keyed as it is decoded — RGBA, the alpha written with the colour —
+        // then despilled and taken to the amount. See [`crate::chroma`].
+        if chrome.appearance.keys() {
+            let keyed = crate::jpeg::decode_rgba_with(&jpeg, FRAME_BUDGET, chroma::key_pixel);
+            if let Ok(mut image) = keyed {
+                chroma::despill(&mut image.rgba, image.width, image.height);
+                if let Some(alpha) = chrome.appearance.alpha.scaling() {
+                    graphics::scale_alpha(&mut image.rgba, alpha);
+                }
+                let raw = Raw::rgba(&image.rgba, image.width, image.height);
+                paint(pane, tabs, chrome, raw)?;
+            }
+        } else if let Ok(image) = crate::jpeg::decode(&jpeg, FRAME_BUDGET) {
             let raw = Raw::rgb(&image.rgb, image.width, image.height);
             paint(pane, tabs, chrome, raw)?;
         }
@@ -3896,7 +3919,7 @@ fn put_frame(
     if !placeholders.is_empty() {
         pane.write(&placeholders).map_err(|e| e.to_string())?;
     }
-    let named = chrome.painter.transport() == crate::graphics::Transport::SharedMemory;
+    let named = chrome.painter.transport() == graphics::Transport::SharedMemory;
     let bytes = make(&mut chrome.painter, cells, row);
     if named {
         pane.write(&bytes).map_err(|e| e.to_string())?;
@@ -4065,16 +4088,40 @@ fn collect_still(
         chrome.motion.still_failed();
         return Ok(());
     };
-    // At a fractional level the engine's rounding leaves the still a pixel or
-    // two off the pane, and a picture that is not the pane's size is one the
-    // terminal resamples until the text goes soft. See [`zoom::fit`].
     let pane_pixels = chrome.layout.pixels(chrome.metrics);
-    let fitted = zoom::fit(&image.rgba, image.width, image.height, 4, pane_pixels);
-    let raw = match &fitted {
-        Some(pixels) => Raw::rgba(pixels, pane_pixels.0, pane_pixels.1),
-        None => Raw::rgba(&image.rgba, image.width, image.height),
+    let scaling = chrome.appearance.alpha.scaling();
+    let keyed = chrome.appearance.keys();
+    let (pixels, (width, height)) = fitted_still(image, pane_pixels, keyed, scaling);
+    paint(pane, tabs, chrome, Raw::rgba(&pixels, width, height))
+}
+
+/// A decoded still made ready to send: fitted to the pane, keyed if the page
+/// was painted on the key, and its alpha scaled under `--alpha` with an
+/// amount.
+///
+/// At a fractional level the engine's rounding leaves the still a pixel or
+/// two off the pane, and a picture that is not the pane's size is one the
+/// terminal resamples until the text goes soft. See [`zoom::fit`]. The key
+/// and the scaling are done on whichever buffer comes out of that, in place,
+/// with no allocation; the key the same way as a moving frame's, so a page
+/// looks the same stopped as moving ([`crate::chroma`]).
+fn fitted_still(
+    image: crate::png::PngImage,
+    pane: (u32, u32),
+    keyed: bool,
+    scaling: Option<u8>,
+) -> (Vec<u8>, (u32, u32)) {
+    let (mut pixels, size) = match zoom::fit(&image.rgba, image.width, image.height, 4, pane) {
+        Some(fitted) => (fitted, pane),
+        None => (image.rgba, (image.width, image.height)),
     };
-    paint(pane, tabs, chrome, raw)
+    if keyed {
+        chroma::key(&mut pixels, size.0, size.1);
+    }
+    if let Some(alpha) = scaling {
+        graphics::scale_alpha(&mut pixels, alpha);
+    }
+    (pixels, size)
 }
 
 /// Ask for a still, if the page has earned one.
@@ -4118,7 +4165,7 @@ fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     );
     match sent {
         Ok(pending) => {
-            chrome.motion.still_requested();
+            chrome.motion.still_requested(motion::now_seconds());
             chrome.still = Some(Still {
                 target,
                 pending,
@@ -6471,7 +6518,7 @@ fn start_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome, kind: save::Kind) {
                 screen::clip_to(job.name(), download::NAME_CELLS)
             );
             chrome.downloads.announce(words, now);
-            chrome.save = Some(job);
+            chrome.save = Some(job.keyed(chrome.appearance.keys()));
         }
         Err(why) => {
             let name = save::file_name(&title, &url, kind);
@@ -8822,7 +8869,11 @@ mod tests {
             &options,
             &profile,
             downloads.clone(),
-            Appearance::new(crate::appearance::Choice::default(), false, true),
+            Appearance::new(
+                crate::appearance::Choice::default(),
+                false,
+                crate::appearance::Alpha::On(100),
+            ),
             Identity::new(None, None, "C"),
             Allowed::in_memory(),
             None,
@@ -8837,6 +8888,67 @@ mod tests {
         });
         assert!(chrome.cast.png, "the PNG route's frames, as without it");
         std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_still_under_an_amount_is_scaled_in_place_and_at_a_hundred_untouched() {
+        // 4x4, every pixel a colour of its own; the first clear, the second
+        // half-covered, the rest opaque.
+        let mut rgba: Vec<u8> = (0..16u8)
+            .flat_map(|i| [i * 10, i * 5, 255 - i * 10, 255])
+            .collect();
+        rgba[3] = 0;
+        rgba[7] = 128;
+        let still = || crate::png::PngImage {
+            width: 4,
+            height: 4,
+            rgba: rgba.clone(),
+        };
+        let alphas = |pixels: &[u8]| pixels.chunks(4).map(|p| p[3]).collect::<Vec<_>>();
+
+        let (pixels, size) = fitted_still(still(), (4, 4), false, None);
+        assert_eq!(size, (4, 4));
+        assert_eq!(pixels, rgba, "at 100 nothing is touched");
+
+        let (pixels, size) = fitted_still(still(), (4, 4), false, Some(179));
+        assert_eq!(size, (4, 4));
+        let mut expected = vec![179; 16];
+        expected[0] = 0;
+        expected[1] = 90;
+        assert_eq!(alphas(&pixels), expected);
+        for (after, before) in pixels.chunks(4).zip(rgba.chunks(4)) {
+            assert_eq!(after[..3], before[..3], "the colour as it was");
+        }
+
+        // A pane one pixel wider: zoom::fit's own buffer, scaled the same.
+        let (pixels, size) = fitted_still(still(), (5, 4), false, Some(179));
+        assert_eq!(size, (5, 4));
+        assert_eq!(pixels.len(), 5 * 4 * 4);
+        let alphas = alphas(&pixels);
+        assert_eq!(alphas[..2], [0, 90], "the first row's own pixels");
+        assert_eq!(alphas[4], 179, "the repeated edge, scaled once");
+        assert!(
+            alphas[5..].iter().all(|&a| a == 179),
+            "every other pixel opaque, at the amount: {alphas:?}"
+        );
+    }
+
+    #[test]
+    fn a_keyed_still_clears_the_key_and_then_takes_the_amount() {
+        // A row of four: the key, black, white, the key.
+        let still = crate::png::PngImage {
+            width: 4,
+            height: 1,
+            rgba: vec![
+                255, 0, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255, 255, 0, 255, 255,
+            ],
+        };
+        let (pixels, _) = fitted_still(still, (4, 1), true, Some(179));
+        assert_eq!(
+            pixels,
+            [0, 0, 0, 0, 0, 0, 0, 179, 255, 255, 255, 179, 0, 0, 0, 0],
+            "the key clear, the page at the amount"
+        );
     }
 
     #[test]
@@ -8861,7 +8973,11 @@ mod tests {
             &options,
             &profile,
             downloads.clone(),
-            Appearance::new(crate::appearance::Choice::default(), false, false),
+            Appearance::new(
+                crate::appearance::Choice::default(),
+                false,
+                crate::appearance::Alpha::Off,
+            ),
             Identity::new(None, None, "C"),
             Allowed::in_memory(),
             None,

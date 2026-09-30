@@ -17,11 +17,17 @@
 //! in the pane — and hands over pixels, which is the protocol's own raw
 //! format and needs no compositor change at all.
 //!
-//! Under `--alpha` the still is what carries the transparency: RGBA, sent as
-//! `f=32` with the alpha the page left, straight, as the protocol takes it —
-//! the terminal blends it over its own background, and nothing here converts
-//! it. A JPEG frame has no alpha, so a bare page is black while it moves
-//! (see [`crate::motion`]).
+//! Under `--alpha` every picture is RGBA, sent as `f=32` with straight alpha,
+//! as the protocol takes it — the terminal blends it over its own
+//! background. The page is painted on a key colour, and the JPEG frame is
+//! keyed back to transparency as it is decoded, in the one allocation the
+//! decode makes anyway ([`crate::chroma`], [`crate::jpeg::decode_rgba_with`]);
+//! the still is keyed the same way once it is fitted. That is a third more
+//! bytes than `f=24`: 3.9 MB a 1280x770 frame where RGB is 2.9 MB.
+//!
+//! With an amount — `--alpha 70` — the whole picture is sent at that opacity:
+//! its alpha scaled in place by [`scale_alpha`], after the key and with no
+//! copy. At 100 nothing is scaled.
 //!
 //! It costs bytes: 2.9 MB of RGB where the JPEG was 185 kB. Through `t=s`
 //! that is a `write` into tmpfs and a `read` out of it, which is a memcpy at
@@ -249,7 +255,8 @@ const IN_FLIGHT: usize = 16;
 /// `crate::jpeg` produces RGB and a JPEG has no alpha to lose,
 /// `crate::png` produces RGBA and a still is one frame in a hundred and
 /// fifty milliseconds, so neither conversion would buy anything. Under
-/// `--alpha` the still's alpha is the point.
+/// `--alpha` the alpha is the point, and the JPEG frame is decoded to RGBA
+/// in the first place to be keyed, so it is four there too.
 #[derive(Debug, Clone, Copy)]
 pub struct Raw<'a> {
     pub pixels: &'a [u8],
@@ -287,6 +294,16 @@ impl<'a> Raw<'a> {
         } else {
             32
         }
+    }
+}
+
+/// `--alpha` with an amount: every pixel's alpha times `alpha` out of 255,
+/// rounded, in place. Straight alpha, as the protocol takes it, so the colour
+/// is left as it is — what was clear stays clear, what was opaque becomes
+/// `alpha`, and what the page left half-covered is scaled in proportion.
+pub fn scale_alpha(rgba: &mut [u8], alpha: u8) {
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = ((u32::from(px[3]) * u32::from(alpha) + 127) / 255) as u8;
     }
 }
 
@@ -1124,6 +1141,34 @@ pub(crate) mod tests {
             assert_eq!(cmd.format, format);
             assert_eq!((cmd.width, cmd.height), (2, 2));
         }
+    }
+
+    #[test]
+    fn scaling_alpha_touches_the_fourth_byte_only() {
+        let mut pixels = rgba();
+        pixels[7] = 0;
+        pixels[11] = 128;
+        let before = pixels.clone();
+        scale_alpha(&mut pixels, 179);
+        assert_eq!(
+            pixels.chunks(4).map(|p| p[3]).collect::<Vec<_>>(),
+            [179, 0, 90, 179],
+            "255 is the amount, nothing stays nothing, and the rest in proportion"
+        );
+        for (after, before) in pixels.chunks(4).zip(before.chunks(4)) {
+            assert_eq!(
+                after[..3],
+                before[..3],
+                "straight alpha: the colour as it was"
+            );
+        }
+        let bodies = apc_bodies(&inline_command(&Raw::rgba(&pixels, 2, 2), cells(2, 1)));
+        let cmd = GraphicsCommand::parse(&bodies[0]).expect("parses");
+        assert_eq!(cmd.format, Format::Rgba);
+
+        let mut whole = rgba();
+        scale_alpha(&mut whole, 255);
+        assert_eq!(whole, rgba(), "255 is a scaling that changes nothing");
     }
 
     #[test]

@@ -10,6 +10,9 @@ named as the option is without its `--`:
     # what a page is told about you
     color-scheme = dark
     scale = 2
+    # the terminal through the page, at 70%
+    alpha = 70
+    force-dark = true
     user-agent = Mozilla/5.0 (X11; Linux x86_64) blinkterm
     # the engine
     engine = /opt/chrome-headless-shell-linux64/chrome-headless-shell
@@ -21,7 +24,9 @@ The command line wins over the file, and `$BLINKTERM_ENGINE` sits between
 the two for `engine`. `--config <path>` reads another file, `--no-config`
 none. A line the program does not understand stops it with the file and
 line number; a missing file is nothing. A flag is `true` or `false`
-(`force-dark = true`, `alpha = true`), and a path may start with `~/`.
+(`force-dark = true`), and a path may start with `~/`. `alpha` is
+`true`, `false` or an opacity from 1 to 100 (`alpha = 70`; see
+[Transparent pages](usage.md#transparent-pages)).
 There is no `url` setting: the page to open is what the command line is
 for, and `home = <url>` is the page opened when none is given.
 `normal-mode = true` starts in normal mode (`ctrl+.`), `restore = true`

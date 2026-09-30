@@ -12,14 +12,22 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
-- `--alpha` (`alpha = true` in the config file) has the engine paint nothing
-  behind a page, so where a page has no background of its own the terminal's
-  shows through; a page with a background is unchanged. It is transparent
-  at rest: while a page moves its JPEG frames show that part black, until
-  the still arrives (over ssh and in tmux, where the frames are PNG, it
-  stays transparent). A page's default black text sits on the terminal's
-  colour, so `--force-dark` goes with it on a dark terminal
-  ([#79](https://github.com/m96-chan/blinkterm/issues/79)).
+- `--alpha [<1-100>]` (`alpha = true|false|<1-100>` in the config file) lets
+  the terminal's background show through a page: the engine paints nothing
+  behind it, and the page's own `html` and `body` backgrounds are forced
+  transparent, so a light page is its text and pictures over the terminal. A
+  page that paints a container of its own keeps that. With a number the whole
+  picture, text included, is sent at that opacity; `--alpha` alone is 100,
+  and `alpha = false` or `--alpha=false` turns a file's setting off. It is
+  see-through while the page moves as well as at rest: locally, where the
+  moving frames are JPEG, the page is painted on magenta and the magenta
+  keyed back out of every frame and still, so what a page shows in magenta
+  or vivid purple goes too. Over ssh and in tmux the frames are PNG with
+  real transparency, and the number is not applied there. A page's default
+  black text sits on the terminal's colour, so `--force-dark` goes with it
+  on a dark terminal
+  ([#79](https://github.com/m96-chan/blinkterm/issues/79),
+  [#84](https://github.com/m96-chan/blinkterm/issues/84)).
 
 ### Changed
 

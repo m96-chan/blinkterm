@@ -36,33 +36,34 @@
 //! same reason. A page that never moves costs one still and then nothing at
 //! all — no screencast frames, no polling, no repainting.
 //!
-//! # Still JPEG while it moves, in alpha mode
+//! # Still JPEG while it moves, in alpha mode — keyed
 //!
-//! Under `--alpha` the engine paints no default background
-//! ([`crate::appearance`]), and what the page leaves bare is transparent — in
-//! a PNG. A JPEG has nowhere to keep that. Chromium encodes the screencast
-//! from a premultiplied bitmap and drops the alpha, so a transparent pixel
-//! comes out 0, 0, 0: measured, the same pixel that is 0, 0, 0, 0 in a PNG
-//! frame of the same page. **So on the local route a page with no background
-//! is black while it moves, and turns transparent when it rests**, with the
-//! lossless still.
+//! Under `--alpha` what the page leaves bare is to be transparent, and a JPEG
+//! has nowhere to keep that. Chromium encodes the screencast from a
+//! premultiplied bitmap and drops the alpha, so a transparent pixel comes out
+//! 0, 0, 0: measured, the same pixel that is 0, 0, 0, 0 in a PNG frame of the
+//! same page. With the page's own `html` and `body` backgrounds forced
+//! transparent that is most of a real page, and asking for real transparency
+//! made a light page moving its dark text on black.
 //!
-//! That is chosen, not overlooked. A page that is moving is a page somebody
-//! is driving — a hand on the wheel or a key held — and the frames that pass
-//! while they do are the lossy ones nobody reads, the same argument as the
-//! JPEG itself above; many programs drop their transparency while they are
-//! being operated for the same reason. The cast stays what the route makes it
-//! ([`Cast::for_route`]), so the option costs a moving page nothing. The
-//! alternative was measured and set aside: a PNG cast keeps the alpha, and on
-//! an Apple M3 at 1280x768, the scrolling article of the engine tests, it was
-//! 55.2 fps at 292 kB a frame against JPEG's 59.7 at 234 kB, with 8.3 ms to
-//! decode a frame here against 6.1 — but 33.8 against 57.8 on two cores, per
-//! the table above, and 3.9 MB of RGBA a frame through `/dev/shm` rather than
-//! 2.9 of RGB.
+//! That was first taken to be a fair trade — the frames that pass while a
+//! page moves are the ones somebody is driving past — and it was not,
+//! because a page moves without anybody driving it: a text box's caret
+//! blinking is a frame every half second, and Google's front page, with its
+//! caret in the search box, flickered black and clear for as long as it was
+//! open. The PNG cast keeps the alpha and was measured and set aside for what
+//! it costs: on an Apple M3 at 1280x768, the scrolling article of the engine
+//! tests, 55.2 fps at 292 kB a frame against JPEG's 59.7 at 234 kB, with
+//! 8.3 ms to decode a frame here against 6.1 — and 33.8 against 57.8 on two
+//! cores, per the table above.
 //!
-//! On a route whose frames are already the engine's PNG — over ssh, inside
-//! tmux ([`crate::route::Payload::Png`]) — the moving frames carry the alpha
-//! anyway, and nothing turns black.
+//! **So the cast stays JPEG, and the page is painted on a key colour that the
+//! decoder takes back out** ([`crate::chroma`]): see-through while it moves as
+//! well as at rest, at 0.9 ms a 1280x768 frame, and the still keyed the same
+//! way so that the two look alike. The cast stays what the route makes it
+//! ([`Cast::for_route`]). On a route whose frames are already the engine's
+//! PNG — over ssh, inside tmux ([`crate::route::Payload::Png`]) — the frames
+//! carry real transparency, and there is no key.
 //!
 //! # When a still is worth asking for
 //!
@@ -104,8 +105,9 @@
 //! it** — with one frame forgiven, because the still photographs itself. See
 //! [`SHUTTER_FRAMES`]: `Page.captureScreenshot` forces a surface capture and
 //! the screencast is watching that same surface, so every screenshot is
-//! followed by exactly one screencast frame of the picture it just took. Two
-//! or more frames in the window are the page moving; one is the shutter.
+//! followed by exactly one screencast frame of the picture it just took — at
+//! a device scale of 1; see "A second shutter, after the reply" for 2. More
+//! frames in the window than the still's own are the page moving.
 //!
 //! That replaces an earlier rule, and the earlier one is worth recording
 //! because of what it did with that shutter frame. It credited the still with
@@ -124,6 +126,34 @@
 //! dropped *and is not motion*, because it shows a moment that has already
 //! been drawn. The shutter frame, stamped 35 to 48 ms before the reply, is
 //! exactly such a frame. The loop has nothing to stand on.
+//!
+//! # A second shutter, after the reply
+//!
+//! All of that was measured at a device scale of 1, and at 2 — a HiDPI
+//! terminal, `--scale 2`, every Retina Mac — the engine does something else.
+//! Probed against `chrome-headless-shell` 153 on a page nothing was happening
+//! to, a still at scale 2 provokes one frame or two, and they are stamped
+//! *after* the reply as often as before it: at +24 and +107 ms from the
+//! request with the reply at +84, at +65 and +84 with the reply at +63. A
+//! frame stamped after the reply is newer than the still by the rule above,
+//! so it went up over it, cleared the rest, and 250 ms later asked for
+//! another still, which did the same: **the loop was back**, at about two
+//! stills a second, on a page that was not moving. Without `--alpha` that is
+//! the text going soft and sharp twice a second; under it, a page whose bare
+//! parts are black in a JPEG, and a pane that ends on whichever of the two
+//! came last — which is how it was found, on Wikipedia in Kitty on a Mac.
+//!
+//! So a still now owns a short window after its reply as well as the one
+//! before it: frames stamped up to its own round trip after the reply
+//! ([`Motion::still_arrived`], at least [`SHUTTER_GRACE`]), up to
+//! [`SHUTTER_FRAMES`] of them counting the ones in flight, are not painted.
+//! What a frame in that window cannot say is whether it is the engine's
+//! second shutter or the page changing just then, so it is not simply
+//! dropped either: the first still to see one is followed, once the page is
+//! quiet again, by one **confirming** still, and only that one's window is
+//! taken on trust. A page at rest at scale 2 costs two stills rather than
+//! one; a page that changed in the first still's window ends on a still that
+//! shows the change; and nothing loops.
 //!
 //! The clock all of that is measured on is the wall clock:
 //! `Page.screencastFrame` carries `metadata.timestamp`, which CDP defines as
@@ -183,11 +213,20 @@ pub const INPUT_QUIET: Duration = Duration::from_millis(400);
 /// back — and not one frame in the three seconds either side of them.
 /// `fromSurface=false` makes no difference.
 ///
-/// So one frame inside a still's window is the still photographing itself, and
-/// anything more is the page moving. `tests/engine.rs` asserts
-/// the one, because it is the number this rule is built on and an engine that
-/// changed it would otherwise change the policy quietly.
-pub const SHUTTER_FRAMES: u32 = 1;
+/// That was at a device scale of 1. At 2 it is one or two, in flight or just
+/// after the reply (see "A second shutter, after the reply" above), so two is
+/// the most a still's window forgives: up to two frames there are the still
+/// photographing itself, anything more is the page moving, and the second of
+/// two is also why a confirming still is taken. `tests/engine.rs` asserts
+/// both scales, because this is the number the rule is built on and an
+/// engine that changed it would otherwise change the policy quietly.
+pub const SHUTTER_FRAMES: u32 = 2;
+
+/// The least a still's window runs on after its reply: a frame stamped up to
+/// this long after it — or up to the still's own round trip, if that was
+/// longer — may be the engine's second shutter rather than the page. The
+/// probe at scale 2 put that frame 20 to 45 ms after the reply.
+pub const SHUTTER_GRACE: Duration = Duration::from_millis(60);
 
 /// Wall-clock seconds, on the clock CDP's `TimeSinceEpoch` uses.
 pub fn now_seconds() -> f64 {
@@ -218,6 +257,19 @@ pub struct Motion {
     /// [`SHUTTER_FRAMES`]: this is the whole of the test that decides whether
     /// the still may be painted.
     frames_in_flight: u32,
+    /// When the still in flight was asked for, in wall-clock seconds.
+    requested_at: f64,
+    /// The end of the painted still's window after its reply, in wall-clock
+    /// seconds, and how many more frames in it are the still's own. See
+    /// "A second shutter, after the reply" above.
+    shutter_until: f64,
+    shutter_left: u32,
+    /// The still in flight, or on screen, is a confirming one: frames in its
+    /// window are taken to be its shutter, and ask for nothing more.
+    confirming: bool,
+    /// A frame in a still's window was held back, so a confirming still is
+    /// owed once the page is quiet.
+    confirm: bool,
 }
 
 impl Motion {
@@ -232,6 +284,11 @@ impl Motion {
             at_rest: false,
             in_flight: false,
             frames_in_flight: 0,
+            requested_at: 0.0,
+            shutter_until: 0.0,
+            shutter_left: 0,
+            confirming: false,
+            confirm: false,
         }
     }
 
@@ -256,6 +313,12 @@ impl Motion {
     /// Anything else is the page moving, so the rest timer restarts — and it
     /// is counted against a still that is in flight, because [`SHUTTER_FRAMES`]
     /// of them are the still itself and the rest are the page.
+    ///
+    /// Between the two, a frame stamped inside a painted still's window after
+    /// its reply is the engine's second shutter or the page changing in that
+    /// moment, and nothing about it says which: it is not painted, and unless
+    /// the still on screen is itself a confirming one, the tab leaves rest so
+    /// that one confirming still follows once the page is quiet.
     pub fn motion_frame(&mut self, timestamp: Option<f64>, now: Instant) -> bool {
         if self.in_flight {
             self.frames_in_flight += 1;
@@ -264,7 +327,24 @@ impl Motion {
             if when < self.painted_at {
                 return false;
             }
+            if self.at_rest && self.shutter_left > 0 && when <= self.shutter_until {
+                self.shutter_left -= 1;
+                if !self.confirming {
+                    self.confirm = true;
+                    self.at_rest = false;
+                    self.last_frame = now;
+                }
+                return false;
+            }
             self.painted_at = when;
+        }
+        // Painted. Outside a still's flight that is the page moving, and
+        // whatever was owed a confirmation will get an ordinary still of its
+        // own; inside one it is counted above, and the still decides.
+        self.shutter_left = 0;
+        if !self.in_flight {
+            self.confirming = false;
+            self.confirm = false;
         }
         // A frame with no timestamp is a frame the engine described oddly, and
         // a frame in hand beats no frame.
@@ -323,10 +403,14 @@ impl Motion {
     ///
     /// Nothing about the screen changes here. What starts is the window the
     /// rule is about: the frames that arrive between now and the reply are
-    /// counted, and [`SHUTTER_FRAMES`] of them are free.
-    pub fn still_requested(&mut self) {
+    /// counted, and [`SHUTTER_FRAMES`] of them are free. `at` is the wall
+    /// clock now, which the window after the reply is measured by; a still
+    /// asked for while a confirmation is owed is the confirming one.
+    pub fn still_requested(&mut self, at: f64) {
         self.in_flight = true;
         self.frames_in_flight = 0;
+        self.requested_at = at;
+        self.confirming = std::mem::take(&mut self.confirm);
     }
 
     /// The still came back, at wall-clock `replied_at`. Returns whether it
@@ -342,6 +426,12 @@ impl Motion {
     /// the latest rather than the earliest is what makes the shutter frame,
     /// which is stamped tens of milliseconds before this, fall on the stale
     /// side and stay off the screen.
+    ///
+    /// The still's window then runs on past the reply for as long as the
+    /// still took, and at least [`SHUTTER_GRACE`], with what is left of
+    /// [`SHUTTER_FRAMES`] to forgive there. Two frames already in flight are
+    /// as ambiguous as one after the reply, and owe a confirming still in the
+    /// same way — unless this is the confirming one.
     pub fn still_arrived(&mut self, replied_at: f64) -> bool {
         if !self.in_flight {
             return false;
@@ -349,20 +439,35 @@ impl Motion {
         self.in_flight = false;
         let frames = std::mem::take(&mut self.frames_in_flight);
         if frames > SHUTTER_FRAMES {
+            self.confirming = false;
             return false;
         }
+        let took = (replied_at - self.requested_at).max(SHUTTER_GRACE.as_secs_f64());
         self.painted_at = replied_at;
+        self.shutter_until = replied_at + took;
+        self.shutter_left = SHUTTER_FRAMES - frames;
         self.at_rest = true;
+        if frames > 1 && !self.confirming {
+            self.confirm = true;
+            self.at_rest = false;
+        }
         true
     }
 
-    /// The still could not be taken, or would not decode. The tab is marked at
-    /// rest anyway, so that a page whose screenshots fail is asked once rather
-    /// than fifty times a second until it moves again.
+    /// The still could not be taken, or would not decode.
+    ///
+    /// If nothing was painted while it was out, the tab is marked at rest
+    /// anyway, so that a page whose screenshots fail is asked once rather
+    /// than fifty times a second until it moves again. If a frame was — the
+    /// page moved while the engine failed to photograph it, a timeout during
+    /// a load — the screen is that frame, so the tab stays in motion and the
+    /// next quiet asks again; otherwise the pane would stay on a moving frame
+    /// for as long as the page stayed still.
     pub fn still_failed(&mut self) {
         self.in_flight = false;
-        self.frames_in_flight = 0;
-        self.at_rest = true;
+        self.confirming = false;
+        let moved = std::mem::take(&mut self.frames_in_flight) > 0;
+        self.at_rest = !moved;
     }
 
     /// Whether a still has been asked for and not yet answered.
@@ -553,12 +658,12 @@ mod tests {
         let resting = at + REST_AFTER;
         assert!(motion.wants_still(resting));
 
-        motion.still_requested();
+        let requested_at = 1000.2;
+        motion.still_requested(requested_at);
         assert!(motion.still_in_flight());
         assert!(!motion.wants_still(resting), "one at a time");
         // Ninety milliseconds of engine, and the shutter frame turns up in
         // them.
-        let requested_at = 1000.2;
         assert!(shutter(&mut motion, requested_at, resting));
         assert!(motion.still_arrived(requested_at + 0.09));
         assert!(motion.at_rest());
@@ -576,7 +681,7 @@ mod tests {
         let resting = start + REST_AFTER;
         assert!(motion.wants_still(resting));
         let requested_at = 1000.0;
-        motion.still_requested();
+        motion.still_requested(requested_at);
         assert!(motion.still_arrived(requested_at + 0.09));
         assert!(motion.at_rest());
 
@@ -593,7 +698,7 @@ mod tests {
         assert!(!motion.wants_still(late + Duration::from_secs(3600)));
     }
 
-    /// Two frames in the window are the page moving, and the still goes.
+    /// Three frames in the window are the page moving, and the still goes.
     #[test]
     fn frames_beyond_the_shutter_throw_the_still_away() {
         let start = Instant::now();
@@ -601,10 +706,11 @@ mod tests {
         let resting = start + REST_AFTER;
         assert!(motion.wants_still(resting));
         let requested_at = 1000.0;
-        motion.still_requested();
+        motion.still_requested(requested_at);
 
         // The shutter, and then the page itself, at the VM's 25 ms gap.
         assert!(shutter(&mut motion, requested_at, resting));
+        assert!(motion.motion_frame(Some(requested_at + 0.015), resting));
         let moved = resting + Duration::from_millis(40);
         assert!(motion.motion_frame(Some(requested_at + 0.04), moved));
         assert!(
@@ -628,7 +734,7 @@ mod tests {
         motion.motion_frame(Some(1000.0), start);
         let resting = start + REST_AFTER;
         assert!(motion.wants_still(resting));
-        motion.still_requested();
+        motion.still_requested(1000.3);
         assert!(motion.still_arrived(1000.4));
         assert!(motion.at_rest());
     }
@@ -687,7 +793,7 @@ mod tests {
         let start = Instant::now();
         let mut motion = Motion::new(start);
         motion.motion_frame(Some(1000.0), start);
-        motion.still_requested();
+        motion.still_requested(1000.4);
         assert!(motion.still_arrived(1000.5));
 
         let late = start + Duration::from_millis(10);
@@ -702,19 +808,119 @@ mod tests {
         assert!(!motion.wants_still(late + QUIET));
     }
 
-    /// Motion wins a tie: a frame captured at the instant the still's reply
-    /// came back is painted over it, because another is coming behind it.
+    /// The loop found on Wikipedia at scale 2: a still, then a frame stamped
+    /// just after its reply. That frame is held rather than painted, one
+    /// confirming still follows, and the same thing after that one asks for
+    /// nothing more — two stills, and the pane ends on the second.
     #[test]
-    fn a_frame_from_the_same_instant_as_the_still_wins() {
+    fn a_frame_just_after_a_stills_reply_is_held_and_one_confirming_still_follows() {
         let start = Instant::now();
         let mut motion = Motion::new(start);
-        motion.still_requested();
-        assert!(motion.still_arrived(1000.0));
+        let resting = start + REST_AFTER;
+        assert!(motion.wants_still(resting));
+        motion.still_requested(1000.0);
+        assert!(motion.still_arrived(1000.08));
+        assert!(motion.at_rest());
+
+        // The engine's second shutter, 20 ms after the reply: inside the
+        // window, which is the still's own 80 ms round trip.
+        let second = resting + Duration::from_millis(100);
         assert!(
-            motion.motion_frame(Some(1000.0), start),
-            "not older than the still, so it goes up"
+            !motion.motion_frame(Some(1000.1), second),
+            "held: the still stays on the screen"
+        );
+        assert!(!motion.at_rest(), "but a confirmation is owed");
+        assert!(!motion.wants_still(second + Duration::from_millis(249)));
+        let quiet = second + REST_AFTER;
+        assert!(motion.wants_still(quiet));
+
+        motion.still_requested(1000.5);
+        assert!(motion.still_arrived(1000.58));
+        assert!(motion.at_rest());
+        // Its own shutter after the reply, twice over, is taken on trust.
+        let late = quiet + Duration::from_millis(100);
+        assert!(!motion.motion_frame(Some(1000.6), late));
+        assert!(!motion.motion_frame(Some(1000.61), late));
+        assert!(motion.at_rest(), "the confirming still is the last word");
+        assert!(!motion.wants_still(late + Duration::from_secs(3600)));
+    }
+
+    /// Two frames in flight are painted as they come, and the still that
+    /// follows them is painted too — but they could have been the page, so
+    /// it owes a confirmation.
+    #[test]
+    fn two_frames_in_flight_paint_the_still_and_owe_a_confirmation() {
+        let start = Instant::now();
+        let mut motion = Motion::new(start);
+        let resting = start + REST_AFTER;
+        motion.still_requested(1000.0);
+        assert!(motion.motion_frame(Some(1000.02), resting));
+        assert!(motion.motion_frame(Some(1000.06), resting));
+        assert!(motion.still_arrived(1000.08), "the still goes up over them");
+        assert!(!motion.at_rest(), "and one more is owed");
+        assert!(motion.wants_still(resting + REST_AFTER));
+        motion.still_requested(1000.5);
+        assert!(motion.motion_frame(Some(1000.52), resting + REST_AFTER));
+        assert!(motion.motion_frame(Some(1000.55), resting + REST_AFTER));
+        assert!(motion.still_arrived(1000.58));
+        assert!(motion.at_rest(), "not by the confirming one");
+    }
+
+    /// A frame past a still's window is the page moving, as it always was:
+    /// painted, and the rest is over.
+    #[test]
+    fn a_frame_after_a_stills_window_is_painted() {
+        let start = Instant::now();
+        let mut motion = Motion::new(start);
+        motion.still_requested(1000.0);
+        assert!(motion.still_arrived(1000.03));
+        // The window is at least SHUTTER_GRACE: 60 ms past the reply.
+        let inside = 1000.03 + SHUTTER_GRACE.as_secs_f64() - 0.005;
+        let past = 1000.03 + SHUTTER_GRACE.as_secs_f64() + 0.005;
+        assert!(!motion.motion_frame(Some(inside), start));
+        motion.still_requested(1000.4);
+        assert!(motion.still_arrived(1000.43));
+        assert!(
+            motion.motion_frame(Some(past + 0.4), start),
+            "past the window, so it goes up"
         );
         assert!(!motion.at_rest());
+    }
+
+    /// A page that changes once, late — a script's timer — in the moment
+    /// after a still: whether that frame is taken for the shutter or not, the
+    /// pane ends on a still taken after it.
+    #[test]
+    fn a_late_change_in_a_stills_window_still_ends_in_a_still_that_shows_it() {
+        let start = Instant::now();
+        let mut motion = Motion::new(start);
+        let resting = start + REST_AFTER;
+        motion.still_requested(1000.0);
+        assert!(shutter(&mut motion, 1000.0, resting));
+        assert!(motion.still_arrived(1000.09));
+        let changed = resting + Duration::from_millis(120);
+        assert!(!motion.motion_frame(Some(1000.12), changed), "held");
+        let quiet = changed + REST_AFTER;
+        assert!(motion.wants_still(quiet), "and photographed again");
+        motion.still_requested(1000.4);
+        assert!(motion.still_arrived(1000.49));
+        assert!(motion.at_rest());
+    }
+
+    /// A still that fails after frames went up while it was out: the screen
+    /// is one of those frames, so the tab is not at rest and asks again —
+    /// the first load, when a screenshot can time out while the page paints.
+    #[test]
+    fn a_still_that_fails_after_frames_were_painted_is_asked_for_again() {
+        let start = Instant::now();
+        let mut motion = Motion::new(start);
+        let resting = start + REST_AFTER;
+        motion.still_requested(1000.0);
+        let painted = resting + Duration::from_millis(500);
+        assert!(motion.motion_frame(Some(1000.5), painted));
+        motion.still_failed();
+        assert!(!motion.at_rest());
+        assert!(motion.wants_still(painted + QUIET));
     }
 
     /// A tab switch forgets everything, including a still that was in flight:
@@ -724,7 +930,7 @@ mod tests {
         let start = Instant::now();
         let mut motion = Motion::new(start);
         motion.motion_frame(Some(2000.0), start);
-        motion.still_requested();
+        motion.still_requested(2000.1);
         assert!(motion.still_in_flight());
 
         let switched = start + Duration::from_secs(5);
@@ -746,7 +952,7 @@ mod tests {
         let mut motion = Motion::new(start);
         let resting = start + REST_AFTER;
         assert!(motion.wants_still(resting));
-        motion.still_requested();
+        motion.still_requested(1000.0);
         motion.still_failed();
         assert!(!motion.still_in_flight());
         assert!(!motion.wants_still(resting + Duration::from_secs(10)));
