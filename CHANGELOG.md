@@ -55,6 +55,11 @@ flag, a different default, a raised Rust floor all do.
   asked directly whether it has finished. A page counts once per document,
   so answering a dialog on a loaded page no longer counts it twice
   ([#70](https://github.com/m96-chan/blinkterm/issues/70)).
+- A death `blinkterm` cannot catch — `SIGSEGV`, `SIGBUS`, `SIGILL`,
+  `SIGFPE`, `SIGABRT` — now puts the terminal back and stops the engine on
+  the way down, instead of leaving a shell with mouse reporting on and the
+  keyboard flags pushed, typing every mouse report and every key back as
+  text ([#78](https://github.com/m96-chan/blinkterm/issues/78)).
 
 ## [0.2.0] - 2026-09-30
 

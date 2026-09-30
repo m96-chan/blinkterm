@@ -227,6 +227,40 @@ extern "C" fn on_quit(_signal: libc::c_int) {
     QUIT.store(true, Ordering::SeqCst);
 }
 
+/// A death this program cannot do anything about, on the way down: the
+/// terminal put back, and the engine stopped.
+///
+/// `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE` and `SIGABRT` are the ways out the
+/// panic hook never sees. A release build aborts on panic, so the hook covers
+/// every panic, but nothing in Rust covers a fault in the engine's client
+/// library, in a `mmap`ped frame store, or a `CHECK` that came from outside —
+/// and what the person is left with then is what issue #78 reported: a shell
+/// with mouse reporting still on and the keyboard flags still pushed, typing
+/// every report and every key back as text, and a Chromium still running.
+///
+/// What a handler may do bounds this exactly. [`screen::emergency_from_signal`]
+/// is one `write(2)` of bytes that were already there and one `tcsetattr(3)`;
+/// [`crate::engine::kill_engine`] is one atomic swap and one `kill(2)`. The
+/// temporary profile is *not* removed here — that is `opendir` and `unlink`
+/// over a tree, none of which a handler may do — so a crash leaves one
+/// behind, in `$TMPDIR`, where the next clean run's own removal does not
+/// reach it. A directory left in `/tmp` is the lesser of the two.
+///
+/// The handler was installed with `SA_RESETHAND`, so the signal's disposition
+/// is already the default by the time this runs: `raise` is the program dying
+/// of exactly what it was going to die of, with the status the shell expects
+/// (128 + n) and whatever crash report the system was going to write.
+extern "C" fn on_fatal(signal: libc::c_int) {
+    screen::emergency_from_signal();
+    crate::engine::kill_engine();
+    // SAFETY: `raise(3)` takes an integer and reads no memory, and is
+    // async-signal-safe. The disposition is the default already
+    // (`SA_RESETHAND`), so this does not come back here.
+    unsafe {
+        libc::raise(signal);
+    }
+}
+
 extern "C" fn on_winch(_signal: libc::c_int) {
     RESIZED.store(true, Ordering::SeqCst);
 }
@@ -348,6 +382,10 @@ impl Shrunk {
 /// Ask to be told about the three signals that matter, without `SA_RESTART`:
 /// a `poll` that is interrupted is a `poll` that comes back and looks at the
 /// flags, which is the whole point of setting them.
+///
+/// And about the five that mean the program is over whatever it does next,
+/// so that it can still put the terminal back on the way down: see
+/// [`on_fatal`].
 fn install_signals() {
     // SAFETY: every pointer handed over below points at a live local that
     // outlives its call -- `sigaction(2)` and `sigemptyset(3)` copy what they
@@ -371,6 +409,34 @@ fn install_signals() {
         // program before it has put the terminal back: with this, a write to
         // it is `EPIPE`, which `cdp` turns into a sentence.
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        // And the ways out that are not this program's decision.
+        //
+        // `SA_RESETHAND` so that the handler runs once and the signal's own
+        // default is back before it does: a fault inside the handler is then
+        // the program dying rather than the handler again, and the `raise` at
+        // the end is the death it was already having. `SA_NODEFER` beside it
+        // so that `raise` is delivered there and then rather than held until
+        // the handler returns. `SA_ONSTACK` because the Rust runtime has
+        // given each thread an alternate stack for exactly this, and a stack
+        // overflow is a `SIGSEGV` with no stack left to run a handler on.
+        //
+        // This does replace the runtime's own `SIGSEGV` handler, and with it
+        // the "has overflowed its stack" line it prints. That is the trade:
+        // a sentence nobody sees, against a terminal the person has to close
+        // the window to get back.
+        for signal in [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGFPE,
+            libc::SIGABRT,
+        ] {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_fatal as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER | libc::SA_ONSTACK;
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
     }
 }
 
