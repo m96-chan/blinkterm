@@ -95,11 +95,29 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The largest message that will be assembled.
 ///
-/// A screencast frame at a pane's size is tens of kilobytes; a megabyte is a
-/// very large page screenshot. Sixteen is room for anything CDP sends and a
-/// ceiling on what a confused peer can make this program allocate — which on
-/// a pipe with no length prefix means sixteen megabytes with no NUL in them.
-pub const MAX_MESSAGE: usize = 16 << 20;
+/// A screencast frame at a pane's size is tens of kilobytes and a still of
+/// the pane a megabyte. What sets the number is the picture of a whole page
+/// ([`crate::save`]), which is base64 of a PNG and so four thirds of it,
+/// measured against `chrome-headless-shell` 153 at 1280 wide:
+///
+/// | page | PNG | message |
+/// | --- | --- | --- |
+/// | text, 4000 px tall | 1.53 MB | 2.04 MB |
+/// | text, 40000 px tall | 15.5 MB | 20.6 MB |
+/// | noise, 4000 px tall (3.01 bytes a pixel) | 15.4 MB | 20.5 MB |
+///
+/// Sixteen, which this was, is exceeded by the second row, and a message too
+/// big for the ceiling is not a failed screenshot: it ends the pipe, and with
+/// it every tab. So the ceiling is sixty-four, and [`crate::save::PIXELS`]
+/// bounds a capture so that the worst case measured, noise at 3.01 bytes a
+/// pixel, is 61.2 MiB on the pipe and under it. It is still a ceiling on what
+/// a confused peer can make this program allocate — sixty-four megabytes with
+/// no NUL in them — and a message that size costs, transiently, about twice
+/// over: the read buffer, then the text cut off it and the value parsed from
+/// that. Measured, a 63.6 MB message takes a process from 3.6 MB to a peak of
+/// 129 MB resident, arrives 1.0 s after it was asked for, and is parsed in
+/// 22 ms; the buffer is given back as soon as the message is cut from it.
+pub const MAX_MESSAGE: usize = 64 << 20;
 
 /// How long a write may wait for the engine to make room in the pipe.
 ///
@@ -554,7 +572,17 @@ fn read_loop(read: RawFd, routes: &Mutex<Routes>, stop: &AtomicBool) {
             Err(err) => break format!("cannot wait on the engine's pipe: {err}"),
         }
         match tty::read_available(read, &mut chunk) {
-            Ok(ReadOutcome::Data(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(ReadOutcome::Data(n)) => {
+                buf.extend_from_slice(&chunk[..n]);
+                // No NUL in what just came is no message ended, and looking
+                // for one from the front again would be looking through the
+                // whole of a large message once a read: 5.7 seconds for a
+                // 63.6 MB picture in 64 KiB reads, measured, against 20 ms to
+                // parse it. The ceiling is still checked, by the split.
+                if !chunk[..n].contains(&0) && buf.len() <= MAX_MESSAGE {
+                    continue;
+                }
+            }
             Ok(ReadOutcome::WouldBlock) => continue,
             Ok(ReadOutcome::Eof) => break "the engine closed its end of the pipe".to_string(),
             Err(err) => break format!("cannot read the engine's pipe: {err}"),
@@ -563,12 +591,17 @@ fn read_loop(read: RawFd, routes: &Mutex<Routes>, stop: &AtomicBool) {
             Ok(messages) => messages,
             Err(why) => break why,
         };
+        // A picture of a whole page leaves a buffer of a hundred megabytes
+        // behind it, which the next frame has no use for.
+        if buf.capacity() > MAX_MESSAGE / 4 {
+            buf.shrink_to(CHUNK);
+        }
         if messages.is_empty() {
             continue;
         }
         if let Ok(routes) = routes.lock() {
-            for message in &messages {
-                route(&routes.mailboxes, message);
+            for message in messages {
+                route(&routes.mailboxes, &message);
             }
         }
     };
@@ -661,7 +694,7 @@ fn route(mailboxes: &HashMap<Option<String>, Slot>, text: &str) {
     };
     let (lock, signal) = &**slot;
     if let Ok(mut mailbox) = lock.lock() {
-        sort(&mut mailbox, &value);
+        sort(&mut mailbox, value);
         // Under the mailbox's lock, like everything else that touches the
         // wake pipe, so a knock and a close of the pipe cannot cross.
         mailbox.knock();
@@ -1071,19 +1104,31 @@ fn outcome(method: &str, reply: &Json) -> Result<Json, String> {
 /// dropped. There is nothing useful to do with it and a pipe is not worth
 /// ending over one. (Text that is not JSON never gets this far: [`route`]
 /// parses once, for the session and for this.)
-fn sort(mailbox: &mut Mailbox, value: &Json) {
+///
+/// It takes the message rather than borrowing it, so that a reply is filed
+/// as it was parsed rather than copied: a picture of a whole page is a reply
+/// of up to sixty megabytes.
+fn sort(mailbox: &mut Mailbox, value: Json) {
     if let Some(id) = value.get("id").and_then(Json::as_i64) {
         // The one lookup that stands between an hour of browsing and a map of
         // hundreds of thousands of answers to questions nobody asked.
         if mailbox.wanted.contains(&id) {
-            mailbox.replies.insert(id, value.clone());
+            mailbox.replies.insert(id, value);
         }
         return;
     }
     if let Some(method) = value.get("method").and_then(Json::as_str) {
+        let method = method.to_string();
+        let params = match value {
+            Json::Object(fields) => fields
+                .into_iter()
+                .find(|(key, _)| key == "params")
+                .map(|(_, params)| params),
+            _ => None,
+        };
         let event = Event {
-            method: method.to_string(),
-            params: value.get("params").cloned().unwrap_or(Json::Null),
+            method,
+            params: params.unwrap_or(Json::Null),
         };
         // A page that is repainting can produce events faster than a pane can
         // draw them. The queue is bounded so that a slow frame cannot become
@@ -1106,7 +1151,7 @@ mod tests {
     /// had parsed it.
     fn sort_text(mailbox: &mut Mailbox, text: &str) {
         if let Ok(value) = Json::parse(text) {
-            sort(mailbox, &value);
+            sort(mailbox, value);
         }
     }
 
@@ -1349,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn sixteen_megabytes_with_no_end_is_an_error_and_not_an_allocation() {
+    fn sixty_four_megabytes_with_no_end_is_an_error_and_not_an_allocation() {
         let mut buf = vec![b'x'; MAX_MESSAGE + 1];
         assert!(split_messages(&mut buf).is_err());
         let mut buf = vec![b'x'; MAX_MESSAGE];

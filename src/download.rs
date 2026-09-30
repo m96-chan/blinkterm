@@ -131,6 +131,15 @@
 //! partials of the guids this run saw begin and not save are removed —
 //! those and nothing else. The directory is the person's, and
 //! `*.crdownload` in it may be any Chromium's, including one still running.
+//!
+//! # A file this program writes itself
+//!
+//! A page saved as a PDF or a picture ([`crate::save`]) goes to the same
+//! directory, and is named, reserved and said on the row the same way: made
+//! 0700 if it is missing ([`Downloads::ensure`]), `(1)` when the name is
+//! taken ([`reserve`]), `saved ~/Downloads/…` or `couldn't save …` for eight
+//! seconds ([`Downloads::saved`], [`Downloads::could_not_save`]). It is not a
+//! [`Download`]: the engine never announces it and it has no guid.
 
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, OpenOptions};
@@ -169,7 +178,7 @@ pub const NAME_CELLS: usize = 40;
 /// wrong half.
 const EXTENSION_BYTES: usize = 16;
 
-/// How many `(n)` suffixes are tried before the guid is kept as the name.
+/// How many `(n)` suffixes are tried before [`reserve`] gives up.
 const COLLISIONS: u32 = 1000;
 
 /// How long [`Downloads::cancel_all`] spends on the way out, in total. A
@@ -662,6 +671,44 @@ impl Downloads {
         }
     }
 
+    /// Make the directory if it is not there, once a run, as the first
+    /// download does; the reason if it cannot be.
+    ///
+    /// For a file this program writes itself, which has no
+    /// `Browser.downloadWillBegin` to do it. The answer is kept either way, so
+    /// a download that begins afterwards is told the same.
+    pub fn ensure(&mut self) -> Result<(), String> {
+        self.dir_ready
+            .get_or_insert_with(|| ensure_dir(&self.dir, self.home.as_deref()))
+            .clone()
+    }
+
+    /// Put `words` on the row for [`NOTICE_FOR`], as the end of a download
+    /// does. `true` when the row's words changed. A download in flight still
+    /// wins over them; see [`Downloads::line`].
+    pub fn announce(&mut self, words: String, now: Instant) -> bool {
+        let before = self.line(now);
+        self.notice = Some((words, now + NOTICE_FOR));
+        self.line(now) != before
+    }
+
+    /// `saved ~/Downloads/<name>` for a file this program wrote at `path`,
+    /// with `, <more>` after it when there is more to say.
+    pub fn saved(&mut self, path: &Path, more: Option<String>, now: Instant) -> bool {
+        let saved = saved_as(path, &self.dir, self.home.as_deref());
+        let words = match more {
+            Some(more) => format!("saved {saved}, {more}"),
+            None => format!("saved {saved}"),
+        };
+        self.announce(words, now)
+    }
+
+    /// `couldn't save <name>: <why>`, the name clipped as a download's is.
+    pub fn could_not_save(&mut self, name: &str, why: &str, now: Instant) -> bool {
+        let words = format!("couldn't save {}: {why}", screen::clip_to(name, NAME_CELLS));
+        self.announce(words, now)
+    }
+
     /// The downloads still coming, oldest first.
     pub fn in_flight(&self) -> impl DoubleEndedIterator<Item = &Download> {
         self.list
@@ -835,9 +882,9 @@ pub fn ensure_dir(dir: &Path, home: Option<&Path>) -> Result<(), String> {
 /// `OpenOptions::create_new`, which is `O_EXCL` — the one atomic way to ask
 /// "is this name mine" — so that two downloads ending in one pass, or another
 /// program writing the same directory, cannot both get it. The reserved file
-/// is empty and is what [`keep`] renames over. After a thousand tries the
-/// guid itself is the name, which is the finished file's own and so always
-/// the engine's to have.
+/// is empty, and is what [`keep`] renames over or what a saved page is
+/// written into. After a thousand tries it is `AlreadyExists`, and what then
+/// is the caller's: [`keep`] keeps the guid as the name.
 ///
 /// Why not `renameat2(RENAME_NOREPLACE)` or `link(2)` and `unlink`: both are
 /// atomic too, but `RENAME_NOREPLACE` is Linux-only and refused by some
@@ -845,7 +892,7 @@ pub fn ensure_dir(dir: &Path, home: Option<&Path>) -> Result<(), String> {
 /// without hard links, which is exactly what a USB stick's exFAT
 /// `~/Downloads` is. `O_EXCL` and then `rename` over one's own placeholder
 /// works everywhere `open(2)` does.
-pub fn reserve(dir: &Path, name: &str, guid: &str) -> io::Result<PathBuf> {
+pub fn reserve(dir: &Path, name: &str) -> io::Result<PathBuf> {
     for n in 0..COLLISIONS {
         let candidate = if n == 0 {
             name.to_string()
@@ -859,7 +906,10 @@ pub fn reserve(dir: &Path, name: &str, guid: &str) -> io::Result<PathBuf> {
             Err(e) => return Err(e),
         }
     }
-    Ok(dir.join(guid))
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "a thousand files by that name",
+    ))
 }
 
 /// Move the finished `<dir>/<guid>` to its name: [`reserve`], then
@@ -878,7 +928,13 @@ pub fn keep(dir: &Path, guid: &str, name: &str) -> Result<PathBuf, String> {
         return Err(format!("the engine's file is not there: {e}"));
     }
     let name = safe_name(name);
-    let path = reserve(dir, &name, guid).map_err(|e| format!("cannot name it: {e}"))?;
+    let path = match reserve(dir, &name) {
+        Ok(path) => path,
+        // After a thousand, the guid is the name: the file is already there
+        // under it, so it is always the engine's to have.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => finished.clone(),
+        Err(e) => return Err(format!("cannot name it: {e}")),
+    };
     if path == finished {
         return Ok(path);
     }
@@ -1362,5 +1418,59 @@ mod tests {
         assert!(!downloads.take(&other, now));
         assert!(downloads.all().is_empty());
         let _ = std::fs::remove_dir_all(downloads.dir());
+    }
+
+    #[test]
+    fn a_file_this_program_wrote_is_said_on_the_row_like_a_download() {
+        let base = scratch("own");
+        let dir = base.join("Downloads");
+        let mut downloads = Downloads::new(dir.clone());
+        let now = Instant::now();
+        assert_eq!(downloads.ensure(), Ok(()));
+        assert!(dir.is_dir(), "made, as the first download would make it");
+        assert!(downloads.announce("saving article.pdf".to_string(), now));
+        assert_eq!(downloads.line(now).as_deref(), Some("saving article.pdf"));
+        let path = reserve(&dir, "article.pdf").expect("a name");
+        let dir_said = tilde(&dir, home().as_deref());
+        assert!(downloads.saved(&path, None, now));
+        assert_eq!(
+            downloads.line(now),
+            Some(format!("saved {dir_said}/article.pdf"))
+        );
+        let path = reserve(&dir, "article.png").expect("a name");
+        downloads.saved(&path, Some("the top 12500 of 40000 px".to_string()), now);
+        assert_eq!(
+            downloads.line(now),
+            Some(format!(
+                "saved {dir_said}/article.png, the top 12500 of 40000 px"
+            ))
+        );
+        assert!(downloads.could_not_save("article.png", "no answer in 30 seconds", now));
+        assert_eq!(
+            downloads.line(now).as_deref(),
+            Some("couldn't save article.png: no answer in 30 seconds")
+        );
+        assert!(downloads.expire(now + NOTICE_FOR));
+        assert_eq!(downloads.line(now + NOTICE_FOR), None);
+
+        let file = base.join("a-file");
+        std::fs::write(&file, b"").expect("a file");
+        let mut downloads = Downloads::new(file.join("below"));
+        let why = downloads.ensure().expect_err("not a directory to make");
+        assert!(why.starts_with("cannot make "), "{why}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_name_that_is_taken_is_reserved_with_the_next_number() {
+        let dir = scratch("reserve");
+        for _ in 0..3 {
+            reserve(&dir, "page.png").expect("a name");
+        }
+        assert_eq!(
+            reserve(&dir, "page.png").expect("a name"),
+            dir.join("page (3).png")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

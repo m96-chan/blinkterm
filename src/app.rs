@@ -67,6 +67,7 @@ use crate::picker::{self, Pickers};
 use crate::profile::Profile;
 use crate::remote::{self, Delivered, Listener};
 use crate::route::{self, Payload, Route, Wrap};
+use crate::save;
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::session::{self, Offer, Reply, Session, Snapshot};
@@ -398,6 +399,12 @@ struct Chrome {
     /// the tab it started in, and its events come on the browser's
     /// connection. See [`crate::download`].
     downloads: Downloads,
+    /// The page being saved as a PDF or a picture, if one is: one at a
+    /// time, for whichever tab it was asked of, and said on the row as a
+    /// download is. See [`crate::save`] and [`pump_save`].
+    save: Option<save::Job>,
+    /// What `alt+s` prints on: `--pdf-paper`, else the locale's.
+    paper: save::Paper,
     /// The directory the last file was uploaded from, this run: where the
     /// next file input's prompt starts. See [`upload::start_dir`].
     upload_dir: Option<PathBuf>,
@@ -559,6 +566,10 @@ impl Chrome {
             search_url: options.search_url.clone(),
             navigation: None,
             downloads: Downloads::new(downloads_dir),
+            save: None,
+            paper: options
+                .pdf_paper
+                .unwrap_or_else(|| save::Paper::from_locale(&save::Paper::locale())),
             upload_dir: None,
             pickers: options.pickers.clone(),
             display: picker::has_display(|name| std::env::var(name).ok()),
@@ -624,7 +635,8 @@ impl Chrome {
     /// (its needle kept for the next `ctrl+f`), the labels, the focus
     /// question, the tab list (its indexes are about to mean other tabs), the
     /// strip's window, the loading hint, the motion clock, the wheel's hold
-    /// on the dead connection, every download still coming, the fullscreen
+    /// on the dead connection, every download still coming and the page being
+    /// saved (said on the row as a failure, like a download), the fullscreen
     /// watch and the world asked for it (and the tab that would not be
     /// watched), the layout — every relaunched tab lands afresh, not
     /// fullscreen — and the frame owed an acknowledgement, whose number was
@@ -661,6 +673,10 @@ impl Chrome {
         self.motion.reset(now);
         self.wheel.forget();
         self.downloads.engine_died(now);
+        if let Some(job) = self.save.take() {
+            self.downloads
+                .could_not_save(job.name(), "the engine died", now);
+        }
         self.watch = None;
         self.world_ask = None;
         self.unwatched = None;
@@ -1774,6 +1790,10 @@ fn drive(
         // next one armed. What it heard is laid out at the top of the next
         // pass.
         pump_fullscreen(tabs, chrome);
+        // The page being saved: the next step of it, or its file.
+        if pump_save(tabs, chrome) {
+            redraw_row(pane, tabs, chrome)?;
+        }
         // And last, because it is the thing to do when nothing else happened:
         // a page that has stopped moving gets its lossless picture.
         rest_shot(pane, tabs, chrome)?;
@@ -3407,6 +3427,23 @@ fn handle_page_events(
         for Event { method, params } in events {
             match method.as_str() {
                 "Page.screencastFrame" => {
+                    // While the whole page is being photographed the engine
+                    // lays it out at its whole height, and a screencast that
+                    // is running sends a frame of that — 1280x8000 for a page
+                    // 8000 tall, measured — which painted would be the page
+                    // squashed into the pane. It is acknowledged and dropped,
+                    // and not told to the motion clock: it is not the page
+                    // moving. See [`crate::save`].
+                    if chrome
+                        .save
+                        .as_ref()
+                        .is_some_and(|job| job.capturing() && job.target() == tab.target)
+                    {
+                        if let Some(session) = params.get("sessionId").and_then(Json::as_i64) {
+                            acknowledge(&mut tab.connection, session);
+                        }
+                        continue;
+                    }
                     if let Some(session) = params.get("sessionId").and_then(Json::as_i64) {
                         // On a route whose link is slower than the engine the
                         // frame in front is acknowledged when it has gone to
@@ -4512,11 +4549,14 @@ fn handle_input(
                     chrome.mode.toggle();
                     redraw_row(pane, tabs, chrome)?;
                 }
-                Some(Command::CopySelection | Command::Find)
-                    if tabs.active().is_some_and(Tab::is_crashed) =>
-                {
-                    // Both ask the page, and a dead renderer would hold the
-                    // question until the deadline.
+                Some(
+                    Command::CopySelection
+                    | Command::Find
+                    | Command::SavePdf
+                    | Command::SaveScreenshot,
+                ) if tabs.active().is_some_and(Tab::is_crashed) => {
+                    // They all ask the page, and a dead renderer would hold
+                    // the question until the deadline.
                     note(tabs, load::sentence(&Problem::Crashed));
                     redraw_row(pane, tabs, chrome)?;
                 }
@@ -4532,6 +4572,15 @@ fn handle_input(
                 }
                 Some(Command::Permissions) => {
                     open_allow(tabs, chrome);
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(what @ (Command::SavePdf | Command::SaveScreenshot)) => {
+                    let kind = if what == Command::SavePdf {
+                        save::Kind::Pdf
+                    } else {
+                        save::Kind::Screenshot
+                    };
+                    start_save(tabs, chrome, kind);
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(Command::ListTabs) => {
@@ -4939,6 +4988,11 @@ enum Command {
     /// `ctrl+shift+h` or `alt+h`: the history list. See
     /// [`crate::historylist`].
     History,
+    /// `alt+s`: the page in front as a PDF, in the downloads directory. See
+    /// [`crate::save`].
+    SavePdf,
+    /// `alt+shift+s`: the whole of it as a PNG there.
+    SaveScreenshot,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -4966,6 +5020,10 @@ enum Command {
 /// the person is meant to be reading, which is the url bar's reason. Nor does
 /// the history list, although the tab list does: what it picks is a page to
 /// load, and here that would be a navigation queued behind the question.
+///
+/// Saving the page does not survive either: a page stopped behind a dialog
+/// answers neither `Page.printToPDF` nor `Page.getLayoutMetrics` until it
+/// is answered, and a PDF of a page with a question over it is not the page.
 ///
 /// Normal mode's toggle survives: it touches no page, and a person can leave
 /// the mode while a question waits.
@@ -5008,7 +5066,9 @@ fn survives_dialog(command: Command) -> bool {
         | Command::ZoomIn
         | Command::ZoomOut
         | Command::ZoomReset
-        | Command::History => false,
+        | Command::History
+        | Command::SavePdf
+        | Command::SaveScreenshot => false,
     }
 }
 
@@ -5625,6 +5685,11 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// What it shadows on a page is an `accesskey` on `c` or `u`, on the same
 /// terms `alt+1`..`alt+9` already shadow the digits.
 ///
+/// Saving is `alt+s`, and the whole page as a picture `alt+shift+s`, not
+/// `ctrl+s`: in a terminal that does not speak the Kitty protocol `ctrl+s`
+/// is XOFF, and the terminal stops. `alt+s` shadows an `accesskey` on `s`,
+/// on the terms `alt+c` does.
+///
 /// Find is `ctrl+f` because that is the reflex, and the compositor binds
 /// nothing on it. What it shadows is a page's own `ctrl+f` handler, which in
 /// a headless engine opened nothing anyway. Inside a line being typed it is
@@ -5726,6 +5791,11 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Char('c') => Some(Command::CopySelection),
             Key::Char('u') => Some(Command::CopyUrl),
+            // `ESC S` is how a terminal without the Kitty protocol says
+            // alt+shift+s: the capital, with no shift bit.
+            Key::Char('S') => Some(Command::SaveScreenshot),
+            Key::Char('s') if key.mods.shift() => Some(Command::SaveScreenshot),
+            Key::Char('s') => Some(Command::SavePdf),
             Key::Char('p') => Some(Command::Permissions),
             Key::Char('t') => Some(Command::ReopenTab),
             Key::Char('=' | '+') => Some(Command::ZoomIn),
@@ -5782,6 +5852,8 @@ fn command_of(action: Action) -> Command {
         Action::Permissions => Command::Permissions,
         Action::Copy => Command::CopySelection,
         Action::CopyUrl => Command::CopyUrl,
+        Action::SavePdf => Command::SavePdf,
+        Action::SaveScreenshot => Command::SaveScreenshot,
         Action::ToggleNormal => Command::ToggleNormal,
     }
 }
@@ -5987,6 +6059,112 @@ fn open_allow(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     match Allow::open(&url, &chrome.allowed) {
         Ok(allow) => chrome.allow = Some(allow),
         Err(sentence) => note(tabs, sentence),
+    }
+}
+
+/// Start saving the page in front as `kind`, or say why not.
+///
+/// One at a time: a second key while one is out says `still saving` and
+/// starts nothing. A page with nothing of its own to save — no url,
+/// `about:blank`, the engine's error page standing in for one that did not
+/// come — is a note instead, as the allow line's refusal is; the engine
+/// would print either as an empty page. The directory is made here, as a
+/// download's first event makes it, so that the reason it cannot be is
+/// said before anything is asked of the engine.
+fn start_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome, kind: save::Kind) {
+    let now = Instant::now();
+    if let Some(job) = &chrome.save {
+        let words = format!(
+            "still saving {}",
+            screen::clip_to(job.name(), download::NAME_CELLS)
+        );
+        chrome.downloads.announce(words, now);
+        return;
+    }
+    let nothing = tabs.active().map(|tab| {
+        tab.url.is_empty()
+            || tab.url == "about:blank"
+            || matches!(tab.problem, Some(Problem::Unreachable { .. }))
+    });
+    match nothing {
+        None => return,
+        Some(true) => {
+            note(tabs, "nothing to save here");
+            return;
+        }
+        Some(false) => {}
+    }
+    let (paper, scale) = (chrome.paper, chrome.scale);
+    let Some(tab) = tabs.active_mut() else {
+        return;
+    };
+    if let Err(why) = chrome.downloads.ensure() {
+        let name = save::file_name(&tab.title, &tab.url, kind);
+        chrome.downloads.could_not_save(&name, &why, now);
+        return;
+    }
+    let (target, title, url) = (tab.target.clone(), tab.title.clone(), tab.url.clone());
+    let factor = scale * tab.zoom.factor();
+    let begun = save::Job::begin(
+        &mut tab.connection,
+        kind,
+        &target,
+        &title,
+        &url,
+        paper,
+        factor,
+        now,
+    );
+    match begun {
+        Ok(job) => {
+            let words = format!(
+                "saving {}",
+                screen::clip_to(job.name(), download::NAME_CELLS)
+            );
+            chrome.downloads.announce(words, now);
+            chrome.save = Some(job);
+        }
+        Err(why) => {
+            let name = save::file_name(&title, &url, kind);
+            chrome.downloads.could_not_save(&name, &why, now);
+        }
+    }
+}
+
+/// Once a pass: the page being saved, a step further. `true` when the row's
+/// words changed.
+///
+/// The job is asked of its own tab's connection, found by target, which is
+/// not always the tab in front: a person may switch away while a long page
+/// is photographed, and the file is theirs all the same. A tab that has
+/// closed ends it. A picture taken of the tab in front leaves its motion
+/// clock where the capture found it, so it is started again with no still
+/// out, and the page gets a fresh lossless still a rest interval later.
+fn pump_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
+    let Some(mut job) = chrome.save.take() else {
+        return false;
+    };
+    let now = Instant::now();
+    let in_front = tabs.active_target() == Some(job.target());
+    let Some(tab) = tabs.index_of(job.target()).and_then(|i| tabs.get_mut(i)) else {
+        return chrome
+            .downloads
+            .could_not_save(job.name(), "the tab closed", now);
+    };
+    match job.poll(&mut tab.connection, chrome.downloads.dir(), now) {
+        save::Progress::Waiting => {
+            chrome.save = Some(job);
+            false
+        }
+        save::Progress::Done(Ok(save::Saved { path, cut })) => {
+            if job.kind() == save::Kind::Screenshot && in_front {
+                chrome.motion.reset(now);
+                chrome.still = None;
+            }
+            let more = cut.map(|(rows, height)| format!("the top {rows} of {height} px"));
+            chrome.downloads.saved(&path, more, now)
+        }
+        save::Progress::Done(Err(why)) => chrome.downloads.could_not_save(job.name(), &why, now),
     }
 }
 
@@ -8458,6 +8636,32 @@ mod tests {
         // selection has to be asked of a page that may be stopped.
         assert!(survives_dialog(Command::CopyUrl));
         assert!(!survives_dialog(Command::CopySelection));
+    }
+
+    #[test]
+    fn alt_s_saves_a_pdf_and_alt_shift_s_the_picture_and_neither_survives_a_dialog() {
+        assert_eq!(
+            command(&key(Key::Char('s'), Mods::ALT)),
+            Some(Command::SavePdf)
+        );
+        assert_eq!(
+            command(&key(Key::Char('s'), Mods::ALT | Mods::SHIFT)),
+            Some(Command::SaveScreenshot)
+        );
+        // `ESC S`, a terminal without the Kitty protocol's alt+shift+s.
+        assert_eq!(
+            command(&key(Key::Char('S'), Mods::ALT)),
+            Some(Command::SaveScreenshot)
+        );
+        // ctrl+s is XOFF where the Kitty protocol is not spoken, and `s` is
+        // typing.
+        assert_eq!(command(&key(Key::Char('s'), Mods::CTRL)), None);
+        assert_eq!(command(&key(Key::Char('s'), 0)), None);
+        assert_eq!(command(&key(Key::Char('S'), Mods::SHIFT)), None);
+        assert_eq!(command_of(Action::SavePdf), Command::SavePdf);
+        assert_eq!(command_of(Action::SaveScreenshot), Command::SaveScreenshot);
+        assert!(!survives_dialog(Command::SavePdf));
+        assert!(!survives_dialog(Command::SaveScreenshot));
     }
 
     #[test]

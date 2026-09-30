@@ -5154,6 +5154,308 @@ fn quitting_with_a_download_coming_leaves_no_partial_file() {
 }
 
 // ---------------------------------------------------------------------------
+// Saving a page
+// ---------------------------------------------------------------------------
+
+use blinkterm::save::{self, Job, Progress, Saved};
+
+/// Save what `client` shows into `dir` the way the loop does: begun, then
+/// polled every 20 ms, as passes come, until it is over. The frames and
+/// events that come meanwhile are drained, as the loop drains them, and
+/// every screencast frame is handed to `frame` with whether the job said it
+/// was capturing when it came.
+fn save_page(
+    client: &mut Client,
+    kind: save::Kind,
+    dir: &std::path::Path,
+    title: &str,
+    url: &str,
+    mut frame: impl FnMut(&Json, bool),
+) -> Result<Saved, String> {
+    let mut job = Job::begin(
+        client,
+        kind,
+        "the-target",
+        title,
+        url,
+        save::Paper::A4,
+        1.0,
+        Instant::now(),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        for event in client.events() {
+            if event.method != "Page.screencastFrame" {
+                continue;
+            }
+            if let Some(session) = event.params.get("sessionId").and_then(Json::as_i64) {
+                let _ = client.notify(
+                    "Page.screencastFrameAck",
+                    Json::object(vec![("sessionId", Json::number(session as f64))]),
+                );
+            }
+            frame(&event.params, job.capturing());
+        }
+        match job.poll(client, dir, Instant::now()) {
+            Progress::Waiting => {}
+            Progress::Done(done) => return done,
+        }
+        assert!(Instant::now() < deadline, "the save never ended");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The size a PNG says it is, from its `IHDR`.
+fn png_size(png: &[u8]) -> (u32, u32) {
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "not a PNG");
+    let word = |at: usize| u32::from_be_bytes([png[at], png[at + 1], png[at + 2], png[at + 3]]);
+    (word(16), word(20))
+}
+
+/// `Page.getLayoutMetrics`'s `cssContentSize`, as [`save::content_size`]
+/// reads it.
+fn content_size(client: &mut Client) -> (u32, u32) {
+    let metrics = client
+        .call("Page.getLayoutMetrics", Json::empty())
+        .expect("the metrics");
+    save::content_size(&metrics).expect("a content size")
+}
+
+/// What the page says its viewport is: `innerWidth x innerHeight x
+/// devicePixelRatio`.
+fn inner_size(client: &mut Client) -> String {
+    match evaluate(
+        client,
+        "innerWidth + 'x' + innerHeight + 'x' + devicePixelRatio",
+    ) {
+        Json::String(size) => size,
+        other => panic!("no size: {other:?}"),
+    }
+}
+
+/// A page of nothing, `height` CSS pixels tall, titled `tall`.
+fn tall_page(client: &mut Client, height: u32) {
+    let url = format!(
+        "data:text/html,<title>tall</title><body style='margin:0'>\
+         <div style='height:{height}px;background:linear-gradient(%23c33,%2333c)'></div>"
+    );
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(url))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(client, "tall", Duration::from_secs(15)),
+        "tall"
+    );
+}
+
+/// The acceptance test for #63: a long article saved as a PDF, and the same
+/// page as a picture of all of it, each under the page's title, the second
+/// picture numbered; the page's viewport as it was afterwards, because the
+/// engine puts it back itself and nothing here does.
+#[test]
+fn a_page_is_saved_as_a_pdf_and_as_a_picture_of_its_whole_height() {
+    let Some((mut engine, mut client, _target)) = connect_with_target() else {
+        return;
+    };
+    let (base, dir) = download_dir("save");
+    std::fs::create_dir_all(&dir).expect("the directory");
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    article(&mut client, WIDTH, HEIGHT);
+
+    let saved = save_page(
+        &mut client,
+        save::Kind::Pdf,
+        &dir,
+        "article",
+        ARTICLE,
+        |_, _| {},
+    )
+    .expect("a PDF");
+    assert_eq!(saved.path, dir.join("article.pdf"));
+    assert_eq!(saved.cut, None);
+    let pdf = std::fs::read(&saved.path).expect("the PDF");
+    assert!(pdf.starts_with(b"%PDF-"), "{:?}", &pdf[..pdf.len().min(16)]);
+    assert!(pdf.len() > 20_000, "a long article is {} bytes", pdf.len());
+    eprintln!("article.pdf: {} bytes", pdf.len());
+
+    let (width, height) = content_size(&mut client);
+    let (rows, cut) = save::rows_within(width, height, 1.0);
+    let saved = save_page(
+        &mut client,
+        save::Kind::Screenshot,
+        &dir,
+        "article",
+        ARTICLE,
+        |_, _| {},
+    )
+    .expect("a picture");
+    assert_eq!(saved.path, dir.join("article.png"));
+    assert_eq!(saved.cut, cut.then_some((rows, height)));
+    let png = std::fs::read(&saved.path).expect("the picture");
+    assert_eq!(
+        png_size(&png),
+        (width, rows),
+        "the page is {width}x{height}"
+    );
+    eprintln!(
+        "article.png: {width}x{rows} of {height}, {} bytes",
+        png.len()
+    );
+    assert_eq!(
+        inner_size(&mut client),
+        format!("{WIDTH}x{HEIGHT}x1"),
+        "the viewport as it was"
+    );
+
+    let again = save_page(
+        &mut client,
+        save::Kind::Screenshot,
+        &dir,
+        "article",
+        ARTICLE,
+        |_, _| {},
+    )
+    .expect("a second picture");
+    assert_eq!(again.path, dir.join("article (1).png"));
+    assert_eq!(
+        names_in(&dir),
+        ["article (1).png", "article.pdf", "article.png"]
+    );
+
+    // A page shorter than the budget is all there, not cut.
+    tall_page(&mut client, 3000);
+    let (width, height) = content_size(&mut client);
+    assert_eq!(height, 3000);
+    let saved = save_page(
+        &mut client,
+        save::Kind::Screenshot,
+        &dir,
+        "",
+        "data:,",
+        |_, _| {},
+    )
+    .expect("a picture");
+    assert_eq!(saved.path, dir.join("page.png"));
+    assert_eq!(saved.cut, None);
+    let png = std::fs::read(&saved.path).expect("the picture");
+    assert_eq!(png_size(&png), (width, 3000));
+
+    client.close();
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A page taller than [`save::PIXELS`] allows at its width is saved to that
+/// depth and not further, and the job says where it stopped: the budget is
+/// what keeps the reply under the pipe's ceiling.
+#[test]
+fn a_page_taller_than_the_budget_is_saved_to_its_top_and_said_so() {
+    let Some((mut engine, mut client, _target)) = connect_with_target() else {
+        return;
+    };
+    let (base, dir) = download_dir("save-tall");
+    std::fs::create_dir_all(&dir).expect("the directory");
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    let tall = (save::PIXELS / u64::from(WIDTH)) as u32 + 3000;
+    tall_page(&mut client, tall);
+    let (width, height) = content_size(&mut client);
+    assert_eq!(height, tall);
+    let (rows, cut) = save::rows_within(width, height, 1.0);
+    assert!(cut && rows < tall, "{rows} of {tall}");
+
+    let started = Instant::now();
+    let saved = save_page(
+        &mut client,
+        save::Kind::Screenshot,
+        &dir,
+        "tall",
+        "data:,",
+        |_, _| {},
+    )
+    .expect("a picture");
+    eprintln!("{width}x{rows} of {height} in {:?}", started.elapsed());
+    assert_eq!(saved.path, dir.join("tall.png"));
+    assert_eq!(saved.cut, Some((rows, tall)));
+    let png = std::fs::read(&saved.path).expect("the picture");
+    assert_eq!(png_size(&png), (width, rows));
+    assert!(u64::from(width) * u64::from(rows) <= save::PIXELS);
+    assert_eq!(
+        inner_size(&mut client),
+        format!("{WIDTH}x{HEIGHT}x1"),
+        "the viewport as it was"
+    );
+
+    client.close();
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// What the loop's guard is for: a screencast that is running while the
+/// whole page is photographed sends a frame of the page laid out at its
+/// whole height, which painted into the pane would be the page squashed.
+/// It comes while the job says it is capturing, and the frames after it are
+/// the viewport again.
+#[test]
+fn a_frame_of_the_whole_page_comes_while_it_is_captured() {
+    let Some((mut engine, mut client, _target)) = connect_with_target() else {
+        return;
+    };
+    let (base, dir) = download_dir("save-frame");
+    std::fs::create_dir_all(&dir).expect("the directory");
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    tall_page(&mut client, 8000);
+    cast(&mut client, "jpeg", Some(85), WIDTH, HEIGHT);
+    // The frames of the page as it is, before anything is asked.
+    std::thread::sleep(Duration::from_millis(300));
+    take_frames(&mut client);
+
+    let mut seen: Vec<(f64, bool)> = Vec::new();
+    save_page(
+        &mut client,
+        save::Kind::Screenshot,
+        &dir,
+        "tall",
+        "data:,",
+        |params, capturing| {
+            let height = params
+                .path(&["metadata", "deviceHeight"])
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0);
+            seen.push((height, capturing));
+        },
+    )
+    .expect("a picture");
+    eprintln!("frames (deviceHeight, capturing): {seen:?}");
+    let whole: Vec<&(f64, bool)> = seen
+        .iter()
+        .filter(|(height, _)| *height > f64::from(HEIGHT))
+        .collect();
+    assert!(
+        !whole.is_empty(),
+        "no frame of the whole page, so the guard guards nothing: {seen:?}"
+    );
+    assert!(
+        whole.iter().all(|(_, capturing)| *capturing),
+        "a frame of the whole page came when the guard was down: {seen:?}"
+    );
+
+    client.close();
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
 // Enter
 // ---------------------------------------------------------------------------
 
