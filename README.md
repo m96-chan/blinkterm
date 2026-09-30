@@ -89,7 +89,14 @@ ssh), and `--frames raw|png` overrides the choice.
 Rust 1.87 or newer; see [Checks](#checks):
 
 ```sh
-cargo install --git https://github.com/m96-chan/blinkterm
+cargo install --locked blinkterm
+```
+
+`--locked` builds with the lock file the release was tested with. For what is
+on `main` rather than the last release:
+
+```sh
+cargo install --locked --git https://github.com/m96-chan/blinkterm
 ```
 
 Or, on Linux, with [Homebrew](https://brew.sh):
@@ -490,8 +497,8 @@ With nothing set, on `chrome-headless-shell` 153 in a `ja_JP.UTF-8` locale:
 
 ```
 navigator.webdriver   false
-navigator.userAgent   Mozilla/5.0 (…) Chrome/153.0.0.0 Safari/537.36 blinkterm/0.1.0
-userAgentData.brands  Chromium 153, blinkterm 0.1.0, and a GREASE brand
+navigator.userAgent   Mozilla/5.0 (…) Chrome/153.0.0.0 Safari/537.36 blinkterm/0.2.0
+userAgentData.brands  Chromium 153, blinkterm 0.2.0, and a GREASE brand
 navigator.languages   ja-JP, ja, en
 ```
 

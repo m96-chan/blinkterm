@@ -1,0 +1,63 @@
+# Publishing to crates.io, from a tag and from nothing else.
+#
+# A version on crates.io cannot be replaced, only yanked, so the upload is the
+# last step of a job whose other steps are reasons not to: the tag has to name
+# the version `Cargo.toml` says, the tagged commit has to be on `main` (which
+# CI has already run in full, the engine job included), and the package has
+# to build as crates.io will build it. Any of those failing stops the job with
+# nothing sent.
+#
+# The token is the `CRATESIO_KEY` repository secret, handed to cargo in the
+# one step that needs it and nowhere else. RELEASING.md has the rest of a
+# release around this.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+# Two tags pushed at once publish one after the other, never side by side.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The whole history, so that whether the tag is on main can be asked.
+          fetch-depth: 0
+      - name: Install the stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: The tag names the version in Cargo.toml
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "blinkterm"))')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag is $GITHUB_REF_NAME but Cargo.toml says $version"
+            exit 1
+          fi
+      - name: The tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not on main; tag the commit main ended up on"
+            exit 1
+          fi
+      - name: The package builds as crates.io will build it
+        run: cargo publish --dry-run --locked
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATESIO_KEY }}
+        run: cargo publish --locked

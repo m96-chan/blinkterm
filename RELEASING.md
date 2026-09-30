@@ -120,20 +120,25 @@ terminal is a path dev-dependency that `cargo publish` leaves out, so the crate
 publishes. `include` in `Cargo.toml` keeps the package to the program: the
 tests are not in it, because they need that terminal.
 
-After step 3 above, from the tagged commit:
+Publishing is the tag's: pushing `vX.Y.Z` (step 3 above) runs
+`.github/workflows/release.yml`, which checks that the tag names the version
+in `Cargo.toml` and sits on `main`, builds the package as crates.io will
+(`cargo publish --dry-run`), and then uploads it with the `CRATESIO_KEY`
+repository secret. A version on crates.io cannot be replaced, only yanked,
+which is why the checks come first and why the tag is the only way in.
+
+To look before tagging:
 
 ```sh
-# 6. what would be uploaded, built from the package rather than the tree
 cargo publish --dry-run --locked
 cargo package --list                  # src/, Cargo.*, README, LICENSE, CHANGELOG
-
-# 7. upload it; a version on crates.io cannot be replaced, only yanked
-cargo publish --locked
 ```
 
-`cargo install` uses the published lock file only when `--locked` is passed.
-Once the first version is up, the README's install line becomes
-`cargo install --locked blinkterm`, with `--git` kept for `main`.
+If the workflow cannot be used, `cargo login` and `cargo publish --locked`
+from the tagged commit do the same by hand.
+
+`cargo install` uses the published lock file only when `--locked` is passed,
+which is why the README says `cargo install --locked blinkterm`.
 
 ## If this gets tedious
 
