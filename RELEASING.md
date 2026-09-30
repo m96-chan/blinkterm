@@ -23,8 +23,9 @@ below.
 
 ## Before a release
 
-- CI green on `main`, all four jobs in `CI`. The `engine` job is the one that
-  matters most and the one that cannot run on a laptop without a Chromium.
+- CI green on `main`, all five jobs in `CI`. The `engine` and `mac` jobs run
+  the real-engine suite on Linux and macOS; they are the ones that cannot run
+  on a laptop without a Chromium.
 - The `Homebrew` workflow is green too: it builds `packaging/homebrew/blinkterm.rb`
   the way `brew install` would, and runs on pull requests that touch it, the
   lock file, or the workflow.
@@ -105,10 +106,11 @@ copies the formula, and pushes. Until then it is two commands.
 The changelog section, and one thing that is not in the repository's diff but
 is part of what the release *is*:
 
-- **the Chromium the engine tests passed against**. The `engine` job pins a
-  `chrome-headless-shell` by version and checksum and prints its `--version`;
-  take it from that run's log. The program does not
-  ship an engine, so "it works" is always "it worked against this one".
+- **the Chromium the engine tests passed against**. The `engine` and `mac`
+  jobs pin Linux and macOS `chrome-headless-shell` builds by version and
+  checksum and print their `--version`; take them from those runs' logs. The
+  program does not ship an engine, so "it works" is always "it worked against
+  this one".
 
 ## crates.io
 

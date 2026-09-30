@@ -68,10 +68,10 @@ flag, a different default, a raised Rust floor all do.
   tOS as git revisions are copied into `src/`, and the tests' copy of tOS's
   terminal is in `vendor/`, unpublished
   ([#33](https://github.com/m96-chan/blinkterm/issues/33)).
-- The groundwork for macOS: frames through `shm_open` shared memory,
-  Chrome and Chromium found in `/Applications`, `--use-mock-keychain` for
-  the engine. It builds for macOS but has not run on a Mac, so macOS is not
-  supported yet ([#46](https://github.com/m96-chan/blinkterm/issues/46)).
+- macOS support: frames through `shm_open` shared memory, Chrome and Chromium
+  found in `/Applications`, `--use-mock-keychain` for the engine, and the unit
+  and real-engine suites run on Apple silicon in CI
+  ([#46](https://github.com/m96-chan/blinkterm/issues/46)).
 - The terminal is asked before the engine starts, and one that does not
   answer the graphics query gets a sentence instead of a blank pane
   (`--no-probe` skips it). Inside tmux (`set -g allow-passthrough on`) the
@@ -138,6 +138,15 @@ flag, a different default, a raised Rust floor all do.
   ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
 
 ### Fixed
+
+- Scrolling on macOS now keeps its 16 ms schedule instead of inheriting the
+  operating system's roughly 8 ms timed-wait coalescing, which made a steady
+  wheel visibly lurch. Going to the end of a page no longer leaves elastic
+  overscroll that swallows the next notch in the opposite direction
+  ([#46](https://github.com/m96-chan/blinkterm/issues/46)).
+- A terminal's `ctrl`+click opens a background tab on macOS too; it is sent as
+  the `cmd`+click Chromium expects there
+  ([#46](https://github.com/m96-chan/blinkterm/issues/46)).
 
 - A middle click or `ctrl`+click on a link used to open a page the
   program never attached to — a renderer running for nobody until the
