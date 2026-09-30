@@ -35,7 +35,7 @@ use crate::text;
 pub const NOTHING: &str = "nothing logged";
 
 /// What `ctrl+shift+j` says with `console = false` or `--no-console`.
-pub const OFF: &str = "the console is off (console = false)";
+pub const OFF: &str = "the console is off (--no-console or console = false)";
 
 /// One entry, as the panel copied it.
 #[derive(Debug, Clone, PartialEq, Eq)]
