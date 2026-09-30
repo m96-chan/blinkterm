@@ -177,6 +177,28 @@ unsafe extern "C" {
     fn mach_absolute_time() -> u64;
     fn mach_timebase_info(info: *mut MachTimebase) -> libc::c_int;
     fn mach_wait_until(deadline: u64) -> libc::c_int;
+    fn pthread_set_qos_class_self_np(
+        qos_class: libc::c_uint,
+        relative_priority: libc::c_int,
+    ) -> libc::c_int;
+}
+
+/// Apple's user-interactive QoS class: work that directly drives an animation.
+#[cfg(target_os = "macos")]
+const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
+
+/// Tell macOS that this thread supplies frames for an interaction in progress.
+///
+/// The animation thread is asleep whenever there is no wheel motion, so this
+/// does not turn idle work into high-priority work. It does stop a loaded host
+/// from scheduling active ticks tens of milliseconds late, which an accurate
+/// absolute deadline alone cannot prevent.
+#[cfg(target_os = "macos")]
+fn prioritize_animation_thread() {
+    // SAFETY: this changes only the calling pthread's QoS. User-interactive is
+    // the documented class for animation and zero is the required relative
+    // priority. Failure leaves the thread at its inherited QoS.
+    let _ = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
 }
 
 /// Wait for one active animation tick without macOS's timer-coalescing jitter.
@@ -598,6 +620,8 @@ impl Drop for Wheel {
 /// The step is worked out under the lock and sent outside it, so that a notch
 /// arriving from the loop waits for arithmetic rather than for a socket.
 fn animate(shared: &Shared) {
+    #[cfg(target_os = "macos")]
+    prioritize_animation_thread();
     loop {
         let sending = {
             let Ok(mut state) = shared.state.lock() else {
