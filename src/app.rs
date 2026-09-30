@@ -4152,7 +4152,7 @@ fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     );
     match sent {
         Ok(pending) => {
-            chrome.motion.still_requested();
+            chrome.motion.still_requested(motion::now_seconds());
             chrome.still = Some(Still {
                 target,
                 pending,

@@ -2442,7 +2442,7 @@ fn roll(client: &mut Client, notches: u32, apart: Duration) -> Roll {
             // Nothing is ever sent for it; what is recorded is that the policy
             // would have, which is what `app::rest_shot` asks every pass.
             roll.wanted.push(Instant::now());
-            rest.still_requested();
+            rest.still_requested(motion::now_seconds());
             rest.still_failed();
         }
         if sent == notches && wheel.owed() == (0.0, 0.0) && !roll.wanted.is_empty() {
@@ -2501,43 +2501,49 @@ const EVERY: Duration = Duration::from_millis(50);
 const STEADY: u32 = 6;
 const STEADILY: Duration = Duration::from_millis(100);
 
-/// A still photographs itself into the screencast, exactly once.
-///
-/// `motion::SHUTTER_FRAMES` is the number the whole rest policy is built on,
-/// and it is a property of the engine rather than of this crate: a
-/// `Page.captureScreenshot` forces a capture of the page's surface, and the
-/// screencast is watching that same surface. Taking it for granted is what
-/// made the first version of the policy loop — the frame the still provoked
-/// was read as the page moving, which cleared the rest, which asked for
-/// another still. So it is asserted here, on a page nothing at all is
-/// happening to, along with where in the still's window the frame lands.
-#[test]
-fn a_still_photographs_itself_into_the_screencast_exactly_once() {
-    let Some((mut engine, mut client)) = connect() else {
-        return;
-    };
-    prepare(&mut client);
-    article(&mut client, WIDE, TALL);
-    let _ = screenshot(&mut client, "png", None);
-    cast(&mut client, "jpeg", Some(motion::QUALITY), WIDE, TALL);
+/// Stills of a page nobody is touching, at a device scale of `scale`: for
+/// each, when it was asked for, when its reply was taken, and the stamps of
+/// every screencast frame it provoked, in wall-clock seconds.
+fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<(f64, f64, Vec<f64>)> {
+    prepare(client);
+    article(client, WIDE, TALL);
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(WIDE as f64 / scale)),
+                ("height", Json::number(TALL as f64 / scale)),
+                ("deviceScaleFactor", Json::number(scale)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("the scale");
+    let _ = screenshot(client, "png", None);
+    // The cast at the page's CSS size, as the program asks for it.
+    let css = (
+        (f64::from(WIDE) / scale) as u32,
+        (f64::from(TALL) / scale) as u32,
+    );
+    cast(client, "jpeg", Some(motion::QUALITY), css.0, css.1);
     // Let the load's own frames go by, and check that a page nobody is
     // touching then produces none of its own.
     let settle = Instant::now() + Duration::from_secs(2);
     while Instant::now() < settle {
-        take_frames(&mut client);
+        take_frames(client);
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut idle = 0usize;
     let quiet = Instant::now() + Duration::from_secs(2);
     while Instant::now() < quiet {
-        idle += take_frames(&mut client).len();
+        idle += take_frames(client).len();
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(idle, 0, "the page moved on its own, so this proves nothing");
 
+    let mut rounds = Vec::new();
     for round in 0..5 {
         let requested = motion::now_seconds();
-        let pending = ask_for_a_still(&mut client);
+        let pending = ask_for_a_still(client);
         let mut answer = None;
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -2557,15 +2563,11 @@ fn a_still_photographs_itself_into_the_screencast_exactly_once() {
         let mut stamps = Vec::new();
         let until = Instant::now() + Duration::from_millis(600);
         while Instant::now() < until {
-            stamps.extend(
-                take_frames(&mut client)
-                    .into_iter()
-                    .filter_map(|(_, at)| at),
-            );
+            stamps.extend(take_frames(client).into_iter().filter_map(|(_, at)| at));
             std::thread::sleep(Duration::from_millis(5));
         }
         eprintln!(
-            "still {round}: {:.0} ms to the reply, {} frame(s) at [{}] ms from the request",
+            "scale {scale}, still {round}: {:.0} ms to the reply, {} frame(s) at [{}] ms from the request",
             (replied - requested) * 1000.0,
             stamps.len(),
             stamps
@@ -2574,22 +2576,188 @@ fn a_still_photographs_itself_into_the_screencast_exactly_once() {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-        assert_eq!(
-            stamps.len(),
-            motion::SHUTTER_FRAMES as usize,
-            "a still provoked {} screencast frames, not {}",
-            stamps.len(),
-            motion::SHUTTER_FRAMES,
-        );
-        // And it is stamped inside the still's own window, which is what makes
-        // crediting the still with its reply enough to keep it off the screen.
+        rounds.push((requested, replied, stamps));
+    }
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    rounds
+}
+
+/// A still photographs itself into the screencast, exactly once, at a
+/// device scale of 1.
+///
+/// The number of frames a still provokes is the number the whole rest policy
+/// is built on, and it is a property of the engine rather than of this crate:
+/// a `Page.captureScreenshot` forces a capture of the page's surface, and the
+/// screencast is watching that same surface. Taking it for granted is what
+/// made the first version of the policy loop — the frame the still provoked
+/// was read as the page moving, which cleared the rest, which asked for
+/// another still. So it is asserted here, on a page nothing at all is
+/// happening to, along with where in the still's window the frame lands.
+#[test]
+fn a_still_photographs_itself_into_the_screencast_exactly_once() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    for (requested, replied, stamps) in shutter_rounds(&mut client, 1.0) {
+        assert_eq!(stamps.len(), 1, "a still provoked {} frames", stamps.len());
+        // And it is stamped inside the still's own window, which is what
+        // makes crediting the still with its reply enough to keep it off the
+        // screen.
         assert!(
             stamps[0] >= requested && stamps[0] <= replied,
             "the shutter frame is stamped outside the still it belongs to"
         );
     }
+    client.close();
+    engine.kill();
+}
 
-    let _ = client.call("Page.stopScreencast", Json::empty());
+/// At a device scale of 2 a still provokes up to two frames, and they can be
+/// stamped after its reply — the loop found on a Retina Mac. What the policy
+/// forgives is asserted here: no more than `motion::SHUTTER_FRAMES`, and none
+/// later than the still's window after its reply.
+#[test]
+fn at_scale_two_a_still_photographs_itself_at_most_twice_and_within_its_window() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    for (requested, replied, stamps) in shutter_rounds(&mut client, 2.0) {
+        assert!(
+            stamps.len() <= motion::SHUTTER_FRAMES as usize,
+            "a still provoked {} frames",
+            stamps.len()
+        );
+        let took = (replied - requested).max(motion::SHUTTER_GRACE.as_secs_f64());
+        for stamp in stamps {
+            assert!(
+                stamp >= requested && stamp <= replied + took,
+                "a shutter frame at {:+.0} ms, past the window",
+                (stamp - requested) * 1000.0
+            );
+        }
+    }
+    client.close();
+    engine.kill();
+}
+
+/// What makes [`ARTICLE`] change once, late: a timer's black box at (200,
+/// 100) to (280, 150) CSS, over the text.
+const LATE_BOX: &str = "setTimeout(function(){var d=document.createElement('div');\
+d.style.cssText='position:absolute;z-index:9;left:200px;top:100px;width:80px;height:50px;background:#000';\
+document.body.appendChild(d)},700)";
+
+/// The program's loop, cut down to what paints: frames told to the policy
+/// and painted when it says so, stills asked for when it says so and
+/// painted when it says so. What it returns is what the pane ends on — the
+/// last still, if the last thing painted was a still — and how many stills
+/// were asked for in the last `tail` of the run.
+fn run_the_rest_policy(
+    client: &mut Client,
+    run: Duration,
+    tail: Duration,
+) -> (Option<Vec<u8>>, usize) {
+    let started = Instant::now();
+    let mut rest = Motion::new(started);
+    let mut in_flight: Option<Pending> = None;
+    let mut on_screen: Option<Vec<u8>> = None;
+    let mut asked = Vec::new();
+    while started.elapsed() < run {
+        let now = Instant::now();
+        for (_, stamp) in take_frames(client) {
+            if rest.motion_frame(stamp, Instant::now()) {
+                on_screen = None;
+            }
+        }
+        if let Some(pending) = &in_flight {
+            if let Some(reply) = client.take_reply(pending) {
+                in_flight = None;
+                if rest.still_arrived(motion::now_seconds()) {
+                    match still_picture(reply) {
+                        Some(png) => on_screen = Some(png),
+                        None => rest.still_failed(),
+                    }
+                }
+            }
+        }
+        if in_flight.is_none() && rest.wants_still(now) {
+            in_flight = Some(ask_for_a_still(client));
+            rest.still_requested(motion::now_seconds());
+            asked.push(started.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let late = asked.iter().filter(|at| **at + tail >= run).count();
+    eprintln!("stills asked for at {asked:?}");
+    (on_screen, late)
+}
+
+/// After a load that paints late, at scale 1 and at 2, under forced
+/// transparency: the pane ends on a still, the still shows the late change,
+/// its forced-transparent parts are clear, and once the page is quiet no
+/// more stills are asked for.
+#[test]
+fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    // The second at a Retina pane's size, 3200x1760, where the second
+    // shutter was found: it comes more often the more a still costs.
+    for (scale, pane) in [(1.0, (WIDE, TALL)), (2.0, (3200, 1760))] {
+        let css = (
+            (f64::from(pane.0) / scale) as u32,
+            (f64::from(pane.1) / scale) as u32,
+        );
+        client
+            .call(
+                "Emulation.setDeviceMetricsOverride",
+                Json::object(vec![
+                    ("width", Json::number(css.0)),
+                    ("height", Json::number(css.1)),
+                    ("deviceScaleFactor", Json::number(scale)),
+                    ("mobile", Json::Bool(false)),
+                ]),
+            )
+            .expect("the scale");
+        transparent(&mut client, false);
+        cast(&mut client, "jpeg", Some(motion::QUALITY), css.0, css.1);
+        client
+            .call(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(ARTICLE))]),
+            )
+            .expect("the article loads");
+        assert_eq!(
+            wait_for_title(&mut client, "article", Duration::from_secs(15)),
+            "article"
+        );
+        evaluate(&mut client, LATE_BOX);
+        let (still, late) =
+            run_the_rest_policy(&mut client, Duration::from_secs(5), Duration::from_secs(2));
+        let _ = client.call("Page.stopScreencast", Json::empty());
+        let png = still.expect("the pane ends on a still, not a moving frame");
+        let image = blinkterm::png::decode(&png, 64 << 20).expect("a still decodes");
+        let pixel = |x: f64, y: f64| {
+            let at = (((y * scale) as u32 * image.width + (x * scale) as u32) * 4) as usize;
+            [
+                image.rgba[at],
+                image.rgba[at + 1],
+                image.rgba[at + 2],
+                image.rgba[at + 3],
+            ]
+        };
+        let (box_, bare) = (pixel(240.0, 125.0), pixel(5.0, 165.0));
+        eprintln!("scale {scale}: the late box {box_:?}, the bare page {bare:?}, {late} still(s) at the end");
+        assert_eq!(
+            box_,
+            [0, 0, 0, 255],
+            "scale {scale}: the still shows the change"
+        );
+        assert_eq!(bare[3], 0, "scale {scale}: and the forced-transparent page");
+        assert_eq!(late, 0, "scale {scale}: a quiet page asks for nothing");
+    }
     client.close();
     engine.kill();
 }
