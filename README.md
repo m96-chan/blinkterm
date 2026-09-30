@@ -35,7 +35,17 @@ blinkterm localhost:3000       # this machine gets http://, everything else http
 
 ## Installing
 
-Rust 1.87 or newer:
+A prebuilt binary, with
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) or from an
+archive on the [releases page](https://github.com/m96-chan/blinkterm/releases)
+(Linux x86-64 and arm64, glibc or static musl; Apple silicon and Intel Macs);
+[docs/install.md](docs/install.md#prebuilt-binaries) says how to check one:
+
+```sh
+cargo binstall blinkterm
+```
+
+Or from source, with Rust 1.87 or newer:
 
 ```sh
 cargo install --locked blinkterm

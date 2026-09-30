@@ -2,6 +2,63 @@
 
 ## Installing
 
+### Prebuilt binaries
+
+Every release after v0.3.0 has an archive per target on its
+[GitHub Release](https://github.com/m96-chan/blinkterm/releases), built by
+GitHub's runners from the tagged commit:
+
+| archive target | for |
+|---|---|
+| `x86_64-unknown-linux-gnu` | x86-64 Linux with glibc 2.35 or newer (Debian 12, Ubuntu 22.04, Fedora 36 on) |
+| `aarch64-unknown-linux-gnu` | the same on arm64 |
+| `x86_64-unknown-linux-musl` | x86-64 Linux with any libc or none: Alpine, a bare container, a tOS rootfs |
+| `aarch64-unknown-linux-musl` | the same on arm64 |
+| `aarch64-apple-darwin` | a Mac with Apple silicon |
+| `x86_64-apple-darwin` | an Intel Mac |
+
+The gnu build is the one for an ordinary Linux; the musl build is static,
+links nothing at run time, and is the one for anywhere a glibc is too old or
+missing. Each archive is `blinkterm-<version>-<target>.tar.gz` and unpacks to
+a directory of the same name holding `blinkterm`, the README, the licence and
+the changelog. For arm64 Linux:
+
+```sh
+v=X.Y.Z t=aarch64-unknown-linux-gnu      # the release's version, as on its page
+curl -fsSLO https://github.com/m96-chan/blinkterm/releases/download/v$v/blinkterm-$v-$t.tar.gz
+tar xzf blinkterm-$v-$t.tar.gz
+install -m 0755 blinkterm-$v-$t/blinkterm ~/.local/bin/
+```
+
+With [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall), which
+picks the archive for your machine (gnu before musl on Linux) and falls back
+to building when there is none:
+
+```sh
+cargo binstall blinkterm
+```
+
+To check an archive before running it: each release has a `SHA256SUMS`, and
+every archive carries a build provenance attestation, a statement signed
+through [Sigstore](https://www.sigstore.dev) that GitHub's runner built this
+file from this repository at the tagged commit, in the release workflow.
+
+```sh
+curl -fsSLO https://github.com/m96-chan/blinkterm/releases/download/v$v/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS      # shasum -a 256 -c --ignore-missing on a Mac
+gh attestation verify blinkterm-$v-$t.tar.gz --repo m96-chan/blinkterm
+```
+
+The Mac binaries are not signed or notarised. Fetched with `curl` as above,
+the binary runs; one saved by Safari or Finder is quarantined, and macOS
+refuses to start it until `xattr -d com.apple.quarantine blinkterm` has
+removed the attribute — the same as the engine below.
+
+Then the engine: `blinkterm --install-engine` fetches the tested one
+([below](#the-engine)).
+
+### From source
+
 Rust 1.87 or newer; see [Checks](development.md#checks):
 
 ```sh
@@ -23,9 +80,10 @@ brew install m96-chan/tap/blinkterm
 
 That builds from source too — the tap's formula asks Homebrew for a Rust and
 runs the same `cargo install --locked` — so it is the same binary by a shorter
-command, not a prebuilt one; prebuilt binaries are
-[#22](https://github.com/m96-chan/blinkterm/issues/22). The engine below is
-still yours to install, and `brew` says so when it is done. It installs on
+command, not a prebuilt one; the prebuilt ones are
+[above](#prebuilt-binaries). The engine below is
+still yours to install — `blinkterm --install-engine` does it — and `brew`
+says so when it is done. It installs on
 macOS too, from v0.2.0 on.
 The formula lives
 in this repository, at `packaging/homebrew/blinkterm.rb`, and

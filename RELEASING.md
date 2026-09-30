@@ -52,6 +52,15 @@ git tag -a vX.Y.Z -m "blinkterm X.Y.Z"
 git push origin vX.Y.Z
 ```
 
+The tag runs `.github/workflows/release.yml`, and that is the release: it
+checks the tag against `Cargo.toml` and `main`, builds the six archives on
+runners of their own architecture and runs each one, writes `SHA256SUMS`
+and a build provenance attestation, creates the GitHub Release with the
+changelog section as its notes and the archives attached, and publishes to
+crates.io. `cargo binstall blinkterm` works as soon as both are up: the
+template in `Cargo.toml`'s `[package.metadata.binstall]` names the archives
+on the release, and `tests/release.rs` keeps the two agreeing.
+
 ## Homebrew
 
 The formula is `packaging/homebrew/blinkterm.rb` here, and
@@ -93,22 +102,32 @@ from crates.io as it goes; Homebrew allows a build network access by default,
 on Linux (Landlock) as on macOS, and the formula does not opt out.
 Once the stable block is in, the README's `brew install` line drops `--HEAD`.
 
-Step 5 is what the release workflow will do once there is one (#22): a job
-after the tag that checks out the tap with a `HOMEBREW_TAP_TOKEN` secret,
-copies the formula, and pushes. Until then it is two commands.
+Step 5 stays by hand. The release workflow could do it, but only with a
+token that can push to the tap, and there is none in this repository's
+secrets; a formula copy a few times a year is not worth a second long-lived
+credential. The formula builds from source, so it does not use the release's
+archives either.
 
 ## What goes in the release notes
 
-The changelog section, and one thing that is not in the repository's diff but
-is part of what the release *is*:
+The workflow writes them: the version's changelog section, without its
+heading, and one thing that is not in the repository's diff but is part of
+what the release *is*:
 
 - **the Chromium the engine tests passed against**. The `engine` and `mac`
   jobs pin Linux and macOS `chrome-headless-shell` builds by version and
-  checksum and print their `--version`; take them from those runs' logs.
-  It is also `install::SHELL_VERSION`, which is what `--install-engine`
-  fetches. The
-  program does not ship an engine, so "it works" is always "it worked against
-  this one".
+  checksum, and `install::SHELL_VERSION` in `src/install.rs` is the same
+  version: it is what `--install-engine` fetches, and a unit test holds the
+  two workflow pins, the README, `docs/install.md` and `--help` to it. The
+  notes step reads it from `src/install.rs`, and `tests/release.rs` checks
+  that the line it reads is there. The program does not ship an engine, so
+  "it works" is always "it worked against this one".
+
+`tests/release.rs` checks, on every push, that the changelog has a section
+for the version `Cargo.toml` says, so a bump without step 2 is a red build
+before it is an empty release. If the workflow cannot write the notes, edit
+the release by hand with the same two things; the engine jobs' logs print
+the engine's `--version`.
 
 ## crates.io
 
@@ -119,11 +138,13 @@ publishes. `include` in `Cargo.toml` keeps the package to the program: the
 tests are not in it, because they need that terminal.
 
 Publishing is the tag's: pushing `vX.Y.Z` (step 3 above) runs
-`.github/workflows/release.yml`, which checks that the tag names the version
-in `Cargo.toml` and sits on `main`, builds the package as crates.io will
-(`cargo publish --dry-run`), and then uploads it with the `CRATESIO_KEY`
-repository secret. A version on crates.io cannot be replaced, only yanked,
-which is why the checks come first and why the tag is the only way in.
+`.github/workflows/release.yml`, whose `verify` job checks that the tag names
+the version in `Cargo.toml` and sits on `main` and builds the package as
+crates.io will (`cargo publish --dry-run`). The `publish` job then waits for
+all six archives to build, and only then uploads the package with the
+`CRATESIO_KEY` repository secret. A version on crates.io cannot be replaced,
+only yanked, which is why the checks come first, why a version never reaches
+crates.io without its archives, and why the tag is the only way in.
 
 To look before tagging:
 
@@ -137,6 +158,30 @@ from the tagged commit do the same by hand.
 
 `cargo install` uses the published lock file only when `--locked` is passed,
 which is why the README says `cargo install --locked blinkterm`.
+
+## Trying the release workflow
+
+A manual run is a dry run: it builds, runs and packs all six archives and
+publishes nothing, whatever branch it is on.
+
+```sh
+gh workflow run release.yml --ref <branch>
+gh run watch                              # or the Actions tab
+gh run download <run-id> -n dist-X.Y.Z    # the archives, SHA256SUMS, notes.md
+```
+
+Each target's archive is also its own artifact, `blinkterm-X.Y.Z-<target>`.
+The tag checks, the attestation, the release and crates.io are skipped.
+
+## If a job fails after the tag
+
+Re-run the failed jobs from the run's page (`gh run rerun <run-id> --failed`).
+Nothing is published until every build has passed. The `release` job is safe
+to run again: it edits a release that exists and replaces its assets. A
+`publish` that already went through fails harmlessly on a second attempt,
+with crates.io saying the version is already uploaded. If `gh release create`
+refuses the tag right after it was pushed, that is GitHub not having caught
+up; re-run the job.
 
 ## If this gets tedious
 

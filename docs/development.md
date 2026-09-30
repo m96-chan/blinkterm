@@ -65,7 +65,8 @@ cargo would resolve today, and a stale lock file is a red build.
 
 The engine is pinned in one place, `install::SHELL_VERSION` and the three
 checksums beside it in `src/install.rs`, and a unit test holds CI's two
-`env:` blocks, `README.md`, `docs/install.md` and `--help` to it. Moving to a
+`env:` blocks, `README.md`, `docs/install.md` and `--help` to it; the release
+workflow's notes read it from there too. Moving to a
 new engine is editing the constant, the three checksums (`mac-x64` by hand:
 `curl -fsSL <url> | shasum -a 256`, since no job runs an Intel Mac) and
 `ci.yml`, together.
