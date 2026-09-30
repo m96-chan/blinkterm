@@ -87,9 +87,13 @@ machine. It prints a warning when it does. Do not browse as root.
   hand your clipboard back ([#9](https://github.com/m96-chan/blinkterm/issues/9)).
 
   The hover url is the page's string and goes through the same sanitizer as
-  the title (#28). The tab list (`ctrl+shift+a`) is the one other text this
-  program writes, on the rows under the status row while it is open: its rows
-  are titles and urls and go through the same sanitizer as the row. The pointer shape sent to the terminal is one of a fixed
+  the title (#28). The tab list (`ctrl+shift+a`), the history list
+  (`ctrl+shift+h`) and the console (`ctrl+shift+j`) are the other text this
+  program writes, on the rows under the status row while one is open: titles,
+  urls, and the console's lines, which are the most page-controlled text of
+  all — a `console.log` is anything a script likes. Every one goes through
+  `text::sanitize` twice: as it is kept, and again as the row is drawn. The
+  console is kept in memory only, per tab, and never written to disk. The pointer shape sent to the terminal is one of a fixed
   table of names this program owns — the page's `cursor` value chooses among
   them and is never itself written
   ([#15](https://github.com/m96-chan/blinkterm/issues/15)).

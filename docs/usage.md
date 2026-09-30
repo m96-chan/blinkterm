@@ -16,6 +16,7 @@
 | `alt+1` … `alt+8`, `alt+9` | the nth tab, the last tab |
 | `ctrl+shift+a` (or `alt+a`) | the tab list: type to filter by title or url, `↑`/`↓` to pick, `enter` to switch, `esc` to close |
 | `ctrl+shift+h` (or `alt+h`) | the history list: every page visited, newest first, `title — url` and when; type words in any order to filter by title or url, `↑`/`↓` to pick, `enter` opens it here, `alt+enter`/`ctrl+enter` (or a middle click) in a new tab, `shift+delete` forgets it, `esc` closes. See [History](configuration.md#history) |
+| `ctrl+shift+j` (or `alt+j`) | the page's console: `console.*` calls, uncaught exceptions and requests that failed (status 400 and up, or a network error), newest last, each row `level  text — url:line`; type words in any order to filter, `↑`/`↓` scroll, `esc` or `enter` closes. Kept per tab, the last 1000, across navigations with a `-- navigated to …` row between. `ctrl+shift+j` is Kitty's and Ghostty's own by default; `alt+j` reaches every terminal. See [The console](features.md#the-console) |
 | `ctrl+shift+pageup` / `pagedown` (or `alt+shift+pageup` / `pagedown`) | move this tab left or right |
 | middle click or `ctrl`+click on a link | open it in a tab behind this one |
 | `alt+=` / `alt+-` | zoom in and out (`ctrl+=` / `ctrl+-` where your terminal lets them through) |
@@ -190,9 +191,11 @@ link and an I-beam over a text field; the rest ignore it. A zoom that is not
 100% is a word at the right too, `150%`, after the loading hint, and after
 it how many requests a [block list](features.md#blocking-ads-and-trackers) stopped on
 this page, `12 blocked` — counted from the page's last landing, per tab —
-or `unblocked` on a site you turned blocking off for.
+or `unblocked` on a site you turned blocking off for. After that, `2 errors`:
+the errors the page logged, threw or failed to fetch since you last opened
+its [console](features.md#the-console) (`ctrl+shift+j`) on this tab.
 
-The url bar, the find prompt, the tab list or the history list, the allow
+The url bar, the find prompt, the tab list, the history list or the console, the allow
 line (`alt+p`), a page's dialog and a file input's path take the whole row while they are
 open, and `esc` goes to whichever of them has it before it leaves
 fullscreen or stops a load; no link is shown while one of them is there.

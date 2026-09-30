@@ -108,6 +108,65 @@ its forced-transparent backgrounds included — keyed, locally, the way the
 screen is, so the file is not magenta; a number after `--alpha` is not
 applied to it, so the file is the page at full opacity.
 
+## The console
+
+`ctrl+shift+j` (or `alt+j`, which every terminal lets through; Kitty keeps
+`ctrl+shift+j` for scrolling and Ghostty for writing the screen to a file)
+shows the console of the page in front over the screen, the way the history
+list is shown: one row each, newest last, the pick on the newest.
+
+    log    hello 1 {a: 2}  —  https://example.com/app.js:12
+    error  Uncaught TypeError: x is undefined  —  https://example.com/app.js:40
+    error  Failed to load resource: the server responded with a status of 404 (Not Found)  —  https://example.com/logo.png
+    --     navigated to https://example.com/next
+
+Three things go in it. What the page's scripts say with `console.log`,
+`console.error` and the rest, their arguments on one line — a string as
+itself, an object as a short preview, `{a: 1, b: "x", …}`, an array as
+`[1, 2, …]`. Exceptions nobody caught, as `Uncaught Error: …` with where
+they were thrown. And requests that failed: a status of 400 and up, a
+refused connection, a request the [blocker](#blocking-ads-and-trackers)
+stopped (`net::ERR_BLOCKED_BY_CLIENT`), in the engine's own words with the
+url beside them. The level leads each row — `error`, `warn`, `info`, `log`,
+`debug` — as a word rather than a colour, so that typing `error` narrows the
+list to the errors; words typed in any order filter it by level, text and
+place. `↑`/`↓` and the page keys move the pick, and `esc` or `enter` closes
+it: there is nothing on a row to open. What it shows is what the page had
+said when it was opened; open it again for what came since.
+
+Each tab keeps its last 1000, in memory only, across navigations with a
+`-- navigated to …` row between pages, and a tab's console goes when the
+tab does. The row says `2 errors` at the right — errors since you last
+opened the console on this tab — so a page that failed quietly says so.
+`console = false` (or `--no-console`) turns all of it off, and then no page
+is asked for its console at all.
+
+How: every page's session is given `Runtime.enable`, which reports the
+console calls and the exceptions, and `Log.enable`, which reports the failed
+requests. What they send is recorded on the thread that reads the engine's
+pipe and never reaches the tab's mailbox, which holds 512 events and drops
+the oldest: a page that logs two thousand lines as it loads would otherwise
+push its own landing and load out of it. The `Network` domain, which would
+say more about a failed request, is not enabled, for the numbers in
+`src/load.rs`: 341 events and 212 kB for one page of 51 requests. Measured
+against chrome-headless-shell 153, with the page loaded from its landing to
+its load event and the console off and on: a page of links 109 ms either
+way, a page that logs 500 lines with an object each 51 ms and 59 ms. The
+objects a page logs are let go of on every landing and every thousand
+calls, since the engine otherwise keeps them for as long as the console is
+heard (10 000 logged objects: 3.0 MB of the page's heap kept, against
+0.4 MB unheard).
+
+What is not shown: `%c` styles and `%s` substitution (the format string is
+shown as written, followed by its arguments); an object past its preview;
+anything a worker logs, or an iframe the engine runs in a process of its
+own; a failed request's status except in the text the engine writes; and
+whatever a page logged before its tab was attached, other than what the
+engine replays. A single line of more than 64 MB — a page that logs a
+string that long on purpose — ends the engine's pipe, which the program
+survives by starting the engine again, as it does for a page title that
+long; `console = false` is the answer to a page that does it.
+
 ## Uploading a file
 
 A click on a page's file input — an "attach", a "choose file" — takes the
