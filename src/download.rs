@@ -975,6 +975,7 @@ mod tests {
             params: json(&format!(
                 r#"{{"frameId":"F00D","guid":"{guid}","url":"http://127.0.0.1/{name}","suggestedFilename":"{name}"}}"#
             )),
+            session: None,
         }
     }
 
@@ -984,6 +985,7 @@ mod tests {
             params: json(&format!(
                 r#"{{"guid":"{guid}","totalBytes":{total},"receivedBytes":{received},"state":"{state}"}}"#
             )),
+            session: None,
         }
     }
 
@@ -1414,6 +1416,7 @@ mod tests {
         let other = Event {
             method: "Target.targetInfoChanged".to_string(),
             params: json(&format!(r#"{{"guid":"{GUID}"}}"#)),
+            session: None,
         };
         assert!(!downloads.take(&other, now));
         assert!(downloads.all().is_empty());

@@ -50,6 +50,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use crate::cdp::Event;
 use crate::input::{Key, KeyAction, KeyInput};
 use crate::json::Json;
 use crate::line::{Edit, Line};
@@ -68,6 +69,13 @@ pub struct Chooser {
     /// The frame the input is in. Kept for the day the row says so, and not
     /// drawn today — the same reasoning as [`crate::dialog::Dialog::url`].
     pub frame_id: String,
+    /// The CDP session the question came in on, which is where the answer
+    /// has to go: the tab's own for an input in the page, and an
+    /// out-of-process iframe's for one inside a cross-site frame. The
+    /// `backendNodeId` belongs to that frame's renderer and means nothing to
+    /// any other, so an answer sent to the page would be an answer sent
+    /// nowhere. See [`crate::cdp::Client::adopt`] and issue #57.
+    pub session: Option<String>,
 }
 
 impl Chooser {
@@ -77,7 +85,8 @@ impl Chooser {
     /// fires one of those, and the page's promise is rejected with an
     /// `AbortError` before anything could be sent, whatever anyone does —
     /// there is no input to give files to, so there is no question to ask.
-    pub fn opening(params: &Json) -> Option<Chooser> {
+    pub fn opening(event: &Event) -> Option<Chooser> {
+        let params = &event.params;
         let backend_node_id = params.get("backendNodeId").and_then(Json::as_i64)?;
         let multiple = params.get("mode").and_then(Json::as_str) == Some("selectMultiple");
         let frame_id = params
@@ -88,6 +97,7 @@ impl Chooser {
             backend_node_id,
             multiple,
             frame_id: text::sanitize(frame_id).into_owned(),
+            session: event.session.clone(),
         })
     }
 }
@@ -701,6 +711,7 @@ mod tests {
             backend_node_id: 3,
             multiple,
             frame_id: "F".to_string(),
+            session: None,
         }
     }
 
@@ -739,7 +750,13 @@ mod tests {
 
     #[test]
     fn the_opening_event_says_which_node_and_whether_several() {
-        let read = |params: &str| Chooser::opening(&Json::parse(params).expect("JSON"));
+        let read = |params: &str| {
+            Chooser::opening(&Event {
+                method: "Page.fileChooserOpened".to_string(),
+                params: Json::parse(params).expect("JSON"),
+                session: Some("S1".to_string()),
+            })
+        };
         // As `chrome-headless-shell` 153 sends it, and nothing else.
         assert_eq!(
             read(r#"{"frameId":"F1","mode":"selectSingle","backendNodeId":3}"#),
@@ -747,13 +764,15 @@ mod tests {
                 backend_node_id: 3,
                 multiple: false,
                 frame_id: "F1".to_string(),
-            })
+                session: Some("S1".to_string()),
+            }),
+            "the session the question came in on is the session the answer goes to"
         );
         let several = read(r#"{"frameId":"F1","mode":"selectMultiple","backendNodeId":9}"#);
         assert!(several.expect("a chooser").multiple);
         // `showOpenFilePicker()` has no input to give files to.
         assert_eq!(read(r#"{"frameId":"F1","mode":"selectSingle"}"#), None);
-        assert_eq!(Chooser::opening(&Json::empty()), None);
+        assert_eq!(read("{}"), None);
     }
 
     #[test]

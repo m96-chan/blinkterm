@@ -263,6 +263,20 @@ fn take_frames(client: &mut Client) -> Vec<(Vec<u8>, Option<f64>)> {
     frames
 }
 
+/// Acknowledge a screencast frame, which is what keeps the next one coming.
+/// Anything else is nothing.
+fn acknowledge_frame(client: &mut Client, event: &blinkterm::cdp::Event) {
+    if event.method != "Page.screencastFrame" {
+        return;
+    }
+    if let Some(session) = event.params.get("sessionId").and_then(Json::as_i64) {
+        let _ = client.notify(
+            "Page.screencastFrameAck",
+            Json::object(vec![("sessionId", Json::number(session as f64))]),
+        );
+    }
+}
+
 /// Start a screencast in one format at one size.
 fn cast(client: &mut Client, format: &str, quality: Option<u32>, width: u32, height: u32) {
     let mut fields = vec![
@@ -4733,7 +4747,7 @@ fn wait_for_chooser(client: &Client, timeout: Duration) -> Chooser {
     while Instant::now() < deadline {
         for event in client.events() {
             if event.method == "Page.fileChooserOpened" {
-                return Chooser::opening(&event.params)
+                return Chooser::opening(&event)
                     .unwrap_or_else(|| panic!("a chooser with no input: {}", event.params));
             }
         }
@@ -4796,7 +4810,7 @@ fn a_file_typed_on_the_row_reaches_the_pages_file_input() {
     let mut upload = Upload::new(chooser, dir.clone(), None);
     let keys = [letter('n'), press(Key::Escape)];
     assert_eq!(type_path(&mut upload, &keys), Typed::Cancel);
-    blinkterm::app::cancel_chooser(&mut client, upload.chooser.backend_node_id);
+    blinkterm::app::cancel_chooser(&mut client, None, upload.chooser.backend_node_id);
     assert_eq!(
         wait_for_title(&mut client, "cancelled", Duration::from_secs(5)),
         "cancelled"
@@ -4809,6 +4823,255 @@ fn a_file_typed_on_the_row_reaches_the_pages_file_input() {
 
     std::fs::remove_dir_all(&dir).ok();
     client.close();
+    engine.kill();
+}
+
+/// The child of the page below: an input filling the whole frame, on a site
+/// of its own.
+const FRAME_PAGE: &str = "<!doctype html><title>frame</title><body style='margin:0'>\
+<input id=f type=file style='position:absolute;left:0;top:0;width:400px;height:300px'>\
+<script>f.addEventListener('change',function(){var a=[];\
+for(var x of f.files)a.push(x.name+' '+x.size);document.title='files '+a.join(', ')});\
+f.addEventListener('cancel',function(){document.title='cancelled'});</script></body>";
+
+/// Serve [`FRAME_PAGE`] to anything under `/frame` and a page holding it in
+/// an iframe to anything else, and say which port.
+///
+/// Its own server rather than [`serve`] because this one is answered on two
+/// host names, which is what makes the frame cross-site, and because it
+/// answers each connection on a thread of its own: Chromium opens a socket
+/// for a navigation and another it may send nothing on, and a server that
+/// reads them one after another can be left waiting on the quiet one.
+fn serve_two_sites() -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
+    let port = listener.local_addr().expect("an address").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut head = [0u8; 2048];
+                let read = stream.read(&mut head).unwrap_or(0);
+                let request = String::from_utf8_lossy(&head[..read]).to_string();
+                let body = if request.starts_with("GET /frame") {
+                    FRAME_PAGE.to_string()
+                } else {
+                    format!(
+                        "<!doctype html><title>holder</title><body style='margin:0'>\
+<iframe src='http://frame.test:{port}/frame' width=400 height=300 \
+style='border:0;position:absolute;left:0;top:0'></iframe></body>"
+                    )
+                };
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+/// Issue #57: the input is inside a **cross-site iframe**, which is a target
+/// of its own in a renderer of its own. Its `Page.fileChooserOpened` does not
+/// come through the page's session — measured, it never arrived at all — so
+/// the click opened the engine's own picker, which headless does not have and
+/// cancels at once: the person saw nothing happen and the page heard
+/// `cancel`.
+///
+/// What this asserts is the whole road back: the engine attaches to the frame
+/// because `connect_tab` asked it to, the tab adopts that session, the
+/// chooser arrives on it, and the file typed on the row reaches the input in
+/// the frame — read out of the frame's own document, on the frame's own
+/// session.
+#[test]
+fn a_file_typed_on_the_row_reaches_an_input_in_a_cross_site_iframe() {
+    if std::env::var_os(engine::ENGINE_ENV).is_none() {
+        eprintln!(
+            "skipped: {} is not set; name a Chromium to run this against",
+            engine::ENGINE_ENV
+        );
+        return;
+    }
+    let port = serve_two_sites();
+    // Two names for the one loopback server: `holder.test` and `frame.test`
+    // are different sites, which is what makes the frame out-of-process.
+    // `--site-per-process` so that it is one wherever the engine would
+    // otherwise decide it was not worth a process.
+    let launch = engine::Launch {
+        args: vec![
+            "--site-per-process".to_string(),
+            "--host-resolver-rules=MAP *.test 127.0.0.1".to_string(),
+        ],
+        ..engine::Launch::default()
+    };
+    let mut engine = match Engine::launch_with(
+        Profile::temporary().expect("a temporary profile"),
+        Duration::from_secs(30),
+        &launch,
+    ) {
+        Ok(engine) => engine,
+        Err(why) => {
+            eprintln!("skipped: {why}");
+            return;
+        }
+    };
+    let mut browser = engine.browser().expect("the browser's client");
+    browser
+        .call(
+            "Target.setDiscoverTargets",
+            Json::object(vec![("discover", Json::Bool(true))]),
+        )
+        .expect("discovery");
+    let first = engine::first_page_target(&mut browser, Duration::from_secs(20)).expect("a page");
+    let page = browser
+        .attach(&first, Duration::from_secs(10))
+        .expect("a session on the page");
+    let mut tabs = Tabs::new(Tab::new(first, page, "about:blank"));
+    let appearance = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::Off,
+    );
+    // Through the program's own way of opening a url in front, which is
+    // where the engine is asked to attach to the page's frames, and in front
+    // because a page the engine has never raised is a hidden page and a
+    // click on one lands nowhere.
+    let opened = blinkterm::app::open_delivered(
+        &mut tabs,
+        &mut browser,
+        &appearance,
+        &Identity::new(None, None, "C"),
+        &[Ok(format!("http://holder.test:{port}/holder"))],
+    );
+    assert!(opened.iter().all(Result::is_ok), "{opened:?}");
+    let index = tabs.active_index();
+    let raised = tabs.get_mut(index).expect("the tab").target.clone();
+    browser
+        .call(
+            "Target.activateTarget",
+            Json::object(vec![("targetId", Json::string(&raised))]),
+        )
+        .expect("the tab comes to the front");
+    let tab = tabs.get_mut(index).expect("the tab");
+    viewport(&mut tab.connection);
+    // And painting, as `activate` leaves it. This is not decoration: a click
+    // that has to be routed into another process is hit-tested from what the
+    // compositor drew, and a page nobody is drawing is a page a click lands
+    // nowhere on — measured, the input in the frame did not even see the
+    // `click` until the screencast was running.
+    cast(&mut tab.connection, "jpeg", Some(60), WIDTH, HEIGHT);
+
+    // What `handle_page_events` does with this tab's queue: the frames
+    // acknowledged, and a `Target.attachedToTarget` given to the code that
+    // adopts the frame's session and turns interception on in it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut frames = 0;
+    while frames == 0 && Instant::now() < deadline {
+        for event in tab.connection.events() {
+            acknowledge_frame(&mut tab.connection, &event);
+            if event.method == "Target.attachedToTarget"
+                && blinkterm::app::frame_attached(tab, &event)
+            {
+                frames += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        frames, 1,
+        "the engine never attached to the cross-site frame"
+    );
+
+    // The click, in the top left of the page, which is the frame. Repeated
+    // until it is answered: the browser routes a click into another process
+    // from what the compositor drew, so a page that has not been painted yet
+    // is a page the click lands nowhere on.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut clicked: Option<Instant> = None;
+    let chooser = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the click never reached the input in the frame"
+        );
+        if clicked.is_none_or(|at| at.elapsed() >= Duration::from_millis(500)) {
+            click_at(&mut tab.connection, 8, 8);
+            clicked = Some(Instant::now());
+        }
+        let mut opened = None;
+        for event in tab.connection.events() {
+            acknowledge_frame(&mut tab.connection, &event);
+            if event.method == "Page.fileChooserOpened" {
+                opened = Chooser::opening(&event);
+            }
+        }
+        if let Some(chooser) = opened {
+            break chooser;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let frame_session = chooser
+        .session
+        .clone()
+        .expect("the chooser names the session it came in on");
+    assert_ne!(
+        Some(frame_session.as_str()),
+        tab.connection.session(),
+        "the question came in on the frame's session, not the page's"
+    );
+
+    let dir = temp_dir("upload-frame");
+    std::fs::write(dir.join("report.pdf"), UPLOADED).expect("a file");
+    let mut upload = Upload::new(chooser, dir.clone(), None);
+    let mut keys = letters("rep");
+    keys.extend([press(Key::Tab), press(Key::Enter)]);
+    assert_eq!(type_path(&mut upload, &keys), Typed::Send);
+    tab.connection
+        .notify_on(
+            Some(&frame_session),
+            "DOM.setFileInputFiles",
+            upload.reply(),
+        )
+        .expect("the answer goes out on the frame's session");
+
+    // Read out of the frame's own document, on the frame's own session:
+    // proof that the file reached the input the person clicked.
+    let wanted = format!("files report.pdf {}", UPLOADED.len());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut title = String::new();
+    while title != wanted && Instant::now() < deadline {
+        let answer = tab
+            .connection
+            .call_on(
+                Some(&frame_session),
+                "Runtime.evaluate",
+                Json::object(vec![
+                    ("expression", Json::string("document.title")),
+                    ("returnByValue", Json::Bool(true)),
+                ]),
+                Duration::from_secs(5),
+            )
+            .expect("the frame answers");
+        title = answer
+            .path(&["result", "value"])
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if title != wanted {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    assert_eq!(
+        title, wanted,
+        "the file never reached the input in the frame"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    browser.close();
+    drop(tabs);
     engine.kill();
 }
 
@@ -4914,7 +5177,7 @@ fn a_gui_picker_hands_the_page_the_file_it_printed() {
         run_picker("sh -c 'echo notes.txt; exit 1'", &dir, &chooser),
         Picked::Cancel
     );
-    blinkterm::app::cancel_chooser(&mut client, chooser.backend_node_id);
+    blinkterm::app::cancel_chooser(&mut client, None, chooser.backend_node_id);
     assert_eq!(
         wait_for_title(&mut client, "cancelled", Duration::from_secs(5)),
         "cancelled"

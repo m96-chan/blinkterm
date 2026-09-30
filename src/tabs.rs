@@ -517,7 +517,7 @@ impl<C> Tab<C> {
         if event.method != "Page.fileChooserOpened" {
             return false;
         }
-        let Some(chooser) = Chooser::opening(&event.params) else {
+        let Some(chooser) = Chooser::opening(event) else {
             self.note = Some("this page's file picker isn't supported".to_string());
             return true;
         };
@@ -1018,6 +1018,7 @@ mod tests {
         Event {
             method: method.to_string(),
             params: Json::parse(params).expect("the test's own JSON"),
+            session: None,
         }
     }
 
