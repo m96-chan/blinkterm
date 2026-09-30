@@ -31,8 +31,12 @@ class Blinkterm < Formula
 
   def caveats
     <<~EOS
-      blinkterm does not ship a browser engine. It looks at $BLINKTERM_ENGINE
-      first, then on PATH for chrome-headless-shell, chromium, chromium-browser,
+      blinkterm does not ship a browser engine, but
+
+        blinkterm --install-engine
+
+      fetches the one it is tested against. It looks at $BLINKTERM_ENGINE
+      first, then for that one, then on PATH for chrome-headless-shell, chromium, chromium-browser,
       google-chrome and chromium-shell, in that order. The one it is tested
       against is chrome-headless-shell from Chrome for Testing:
 

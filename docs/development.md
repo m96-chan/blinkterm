@@ -20,6 +20,16 @@ BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
 `xdg-open` would, against a socket the test listens on; it needs no engine
 and runs with the rest of `cargo test`.
 
+`tests/install.rs` runs `blinkterm --install-engine` for real: it downloads
+the pinned `chrome-headless-shell` (about 100 MB) into a scratch
+`$XDG_DATA_HOME`, and with `$BLINKTERM_ENGINE` removed and `PATH` empty checks
+that the search finds it. It runs only when `BLINKTERM_NETWORK` is set, which
+CI's two engine jobs do:
+
+```sh
+BLINKTERM_NETWORK=1 cargo test --release --test install
+```
+
 `--release` because several of them assert on timings, and one at a time
 because each starts a Chromium of its own: two engines painting at once on a
 small machine make the scroll tests measure the machine. `tools/Dockerfile`
@@ -52,6 +62,13 @@ code for `aarch64-apple-darwin` on the floor toolchain.
 
 `--locked` throughout, so that CI tests what is committed rather than what
 cargo would resolve today, and a stale lock file is a red build.
+
+The engine is pinned in one place, `install::SHELL_VERSION` and the three
+checksums beside it in `src/install.rs`, and a unit test holds CI's two
+`env:` blocks, `README.md`, `docs/install.md` and `--help` to it. Moving to a
+new engine is editing the constant, the three checksums (`mac-x64` by hand:
+`curl -fsSL <url> | shasum -a 256`, since no job runs an Intel Mac) and
+`ci.yml`, together.
 
 The floor is Rust **1.87**: `src/` calls `is_multiple_of`. CI builds against
 exactly the `rust-version` in `Cargo.toml`, so the number stays true.

@@ -104,7 +104,9 @@ is part of what the release *is*:
 
 - **the Chromium the engine tests passed against**. The `engine` and `mac`
   jobs pin Linux and macOS `chrome-headless-shell` builds by version and
-  checksum and print their `--version`; take them from those runs' logs. The
+  checksum and print their `--version`; take them from those runs' logs.
+  It is also `install::SHELL_VERSION`, which is what `--install-engine`
+  fetches. The
   program does not ship an engine, so "it works" is always "it worked against
   this one".
 
