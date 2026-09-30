@@ -1312,6 +1312,64 @@ fn a_tab_opened_behind_by_this_program_loads_without_being_looked_at() {
     engine.kill();
 }
 
+/// Issue #70: a page opened straight into a new tab may never tell this
+/// program it has loaded. `Target.createTarget` with a url starts the
+/// navigation before the attach that follows it has enabled `Page`, and a
+/// page quick enough is finished before anything is listening — measured
+/// against `chrome-headless-shell` 153 with a `data:` url, where the whole
+/// load but `Page.frameStoppedLoading` was gone. What is left after that, and
+/// after the bin [`activate`] makes of the queue when the tab comes to the
+/// front, is the page itself: it still says it has finished
+/// (`document.readyState`), which is what [`blinkterm::app::page_loaded`] now
+/// carries back so the visit can be recorded.
+#[test]
+fn a_tab_whose_queued_events_went_in_the_bin_still_says_its_page_finished() {
+    let Some((mut engine, page, target)) = connect_with_target() else {
+        return;
+    };
+    let (mut browser, mut tabs) = tabbed(&engine, page, target);
+    let appearance = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::Off,
+    );
+    // A `data:` url rather than [`serve`]: what is tested is a target made
+    // with a url it loads on its own, and one that needs no socket cannot be
+    // a test of the socket. It is also the quickest page there is, which is
+    // what loses the load event.
+    let index = blinkterm::app::open_behind(
+        &mut tabs,
+        &mut browser,
+        &appearance,
+        &Identity::new(None, None, "C"),
+        "data:text/html,<title>plain</title><body>plain",
+    )
+    .expect("the engine opens a page");
+
+    let tab = tabs.get_mut(index).expect("the tab");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut finished = None;
+    while Instant::now() < deadline && finished.is_none() {
+        // The bin, which is what `activate` does to a tab coming to the
+        // front: every event read and dropped, the load event among them if
+        // it ever came at all.
+        let _ = tab.connection.events();
+        let loaded = blinkterm::app::page_loaded(&mut tab.connection).expect("the page answers");
+        if loaded.complete {
+            finished = Some(loaded);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let finished = finished.expect("the page never said it had finished");
+    assert_eq!(finished.title, "plain");
+    assert_eq!(finished.status, None);
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
 /// `ctrl+t`: a target this program asked for, attached to by the id the
 /// engine gave back, and not announced twice as a tab.
 #[test]
@@ -3687,7 +3745,8 @@ fn the_status_of_the_document_comes_with_its_title() {
         blinkterm::app::page_loaded(&mut tab.connection),
         Some(Loaded {
             title: "nope".to_string(),
-            status: Some(404)
+            status: Some(404),
+            complete: true
         })
     );
     assert_eq!(tab.problem, Some(Problem::Status(404)));
@@ -3707,7 +3766,8 @@ fn the_status_of_the_document_comes_with_its_title() {
         blinkterm::app::page_loaded(&mut tab.connection),
         Some(Loaded {
             title: "fine".to_string(),
-            status: None
+            status: None,
+            complete: true
         })
     );
     assert_eq!(tab.problem, None);
@@ -3718,7 +3778,8 @@ fn the_status_of_the_document_comes_with_its_title() {
         blinkterm::app::page_loaded(&mut tab.connection),
         Some(Loaded {
             title: String::new(),
-            status: None
+            status: None,
+            complete: true
         }),
         "an error page has no title and no status"
     );

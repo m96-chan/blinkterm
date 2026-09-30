@@ -75,7 +75,7 @@ use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::session::{self, Offer, Reply, Session, Snapshot};
 use crate::tablist::{self, TabList};
-use crate::tabs::{Outcome, Tab, Tabs};
+use crate::tabs::{Counted, Outcome, Tab, Tabs};
 use crate::upload::{self, Upload};
 use crate::zoom::{self, Scale, Viewport, Zoom, Zooms};
 
@@ -2119,6 +2119,28 @@ pub fn page_title(client: &mut Client) -> Option<String> {
     page_loaded(client).map(|loaded| loaded.title)
 }
 
+/// Write the page now in `tab` into the history, once.
+///
+/// Called wherever this program learns that a page has finished loading, and
+/// the tab's [`Counted`] flag is what makes calling it twice for one document
+/// the same as calling it once: the news arrives by two roads — the engine's
+/// `Page.loadEventFired`, and the page asked directly in [`activate`] when
+/// the queue holding that event went in the bin — and before #70 the second
+/// road recorded nothing at all, so a page opened straight into a new tab
+/// that loaded before the switch was never a visit.
+///
+/// A page that did not come has a problem and is not a visit; `about:` and
+/// `data:` are refused by the history itself. What it costs is one line
+/// appended to a file, and a history that cannot be written is not a reason
+/// to stop.
+fn record_visit<C>(tab: &mut Tab<C>, history: &mut History) {
+    if tab.counted == Counted::Yes || tab.problem.is_some() || !History::records(&tab.url) {
+        return;
+    }
+    tab.counted = Counted::Yes;
+    let _ = history.visited(&tab.url, &tab.title, unix_now());
+}
+
 /// Send the active tab somewhere. The sentence, if it would not go.
 ///
 /// A navigation fails in one of two ways, and only one of them comes back as
@@ -2325,7 +2347,33 @@ fn activate(
     bin_events(tab, &base, chrome);
     if tab.dialog.is_none() && !tab.dormant {
         if let Some(loaded) = page_loaded(&mut tab.connection) {
+            let complete = loaded.complete;
             tab.loaded(loaded);
+            // The page says it has finished, which is the load event this
+            // tab's queue was holding when the bin took it — and the only
+            // word there will ever be for a tab created with a url that
+            // loaded before this program had attached and was switched to in
+            // the same pass (issue #70). Only of the document the last
+            // navigation asked for: while one is pending the page answering
+            // is still the last one, finished long ago, and counting it
+            // would be a second visit to the page being left.
+            if complete && tab.committed {
+                // The load is over, and nothing else is coming to say so:
+                // `Page.frameStoppedLoading` was in the bin too, and a tab
+                // left saying "loading" says it until its next navigation.
+                if tab.loading {
+                    tab.stopped_loading();
+                }
+                // The visit itself is owed rather than written: this runs
+                // from `handle_input`, and the tab's url is the one that was
+                // asked for until `handle_target_events` reads the engine's
+                // rename of the target later in this same pass, which after
+                // a redirect is the only word on where the page ended up.
+                // See [`Counted::Due`].
+                if tab.counted == Counted::No {
+                    tab.counted = Counted::Due;
+                }
+            }
         }
     }
     start_screencast(&mut tab.connection, pixels, stopped, cast)?;
@@ -3519,6 +3567,27 @@ fn handle_page_events(
         let Some(tab) = tabs.get_mut(index) else {
             continue;
         };
+        // A visit [`activate`] owed the history, written now: the engine's
+        // rename of the target has been read this pass (`handle_target_events`
+        // runs before this), so the url on the tab is the one the redirects
+        // ended at. Above the drain, because the tab that owes it is the one
+        // whose events went in the bin and it may have nothing queued at all.
+        if tab.counted == Counted::Due && !tab.dormant {
+            // That rename clears the title, on the sound reasoning that a tab
+            // which has gone somewhere has not got there yet and its own
+            // `Page` events will say what it is called — but those are the
+            // events that went in the bin, so nothing would. The page is
+            // asked once more, here rather than in [`activate`], because here
+            // is after the rename and the history wants the landed page's
+            // name beside its url.
+            if tab.title.is_empty() && tab.dialog.is_none() && !tab.is_crashed() {
+                if let Some(loaded) = page_loaded(&mut tab.connection) {
+                    tab.loaded(loaded);
+                    redraw |= index == active;
+                }
+            }
+            record_visit(tab, &mut chrome.history);
+        }
         let events = tab.connection.events();
         if events.is_empty() {
             continue;
@@ -3803,15 +3872,10 @@ fn handle_page_events(
             if let Some(loaded) = page_loaded(&mut tab.connection) {
                 tab.loaded(loaded);
                 // The one moment the page's final url, after its redirects,
-                // and its title are both known: this is a visit. A page that
-                // did not come has a problem and is not one; `about:` and
-                // `data:` are refused by the history itself. A tab behind is
-                // in this loop too, so a page opened in a new window counts.
-                // What it costs is one line appended to a file, and a history
-                // that cannot be written is not a reason to stop.
-                if tab.problem.is_none() && History::records(&tab.url) {
-                    let _ = chrome.history.visited(&tab.url, &tab.title, unix_now());
-                }
+                // and its title are both known: this is a visit. A tab behind
+                // is in this loop too, so a page opened in a new window
+                // counts.
+                record_visit(tab, &mut chrome.history);
             }
         }
     }
@@ -9084,6 +9148,41 @@ mod tests {
         assert_eq!(bar.line.text(), "https://example.com/kept");
         bar_step(&mut bar, &history, &marks, &key(Key::Up, 0));
         assert_eq!(bar.line.text(), "https://example.com/visited");
+    }
+
+    /// Issue #70: the news that a page has finished reaches this module by
+    /// two roads, and the tab's [`Counted`] flag is what makes one document
+    /// one visit however many of them say so — and a new document a visit
+    /// again.
+    #[test]
+    fn one_document_is_one_visit_however_often_it_is_said_to_have_loaded() {
+        let mut history = History::in_memory();
+        let mut tab: Tab<u32> = Tab::new("a", 0, "https://example.com/");
+        tab.title = "Example".to_string();
+
+        record_visit(&mut tab, &mut history);
+        assert_eq!(tab.counted, Counted::Yes);
+        // The load event, and then a dialog answered on the same page, which
+        // asks the title again: the second is not a second visit.
+        record_visit(&mut tab, &mut history);
+        assert_eq!(history.entries()[0].visits, 1, "counted twice");
+
+        // A reload lands the same url again, and that is a visit of its own.
+        tab.landed(load::Landing::Document("https://example.com/".to_string()));
+        assert_eq!(tab.counted, Counted::No, "a landing is a document again");
+        tab.title = "Example".to_string();
+        record_visit(&mut tab, &mut history);
+        assert_eq!(history.entries()[0].visits, 2);
+
+        // A page that did not come is not a visit, and neither is a blank
+        // tab; the tab is still left saying nothing is owed.
+        let mut failed: Tab<u32> = Tab::new("b", 0, "https://example.cmo/");
+        failed.counted = Counted::Due;
+        failed.failed_to_reach("https://example.cmo/", "net::ERR_NAME_NOT_RESOLVED");
+        record_visit(&mut failed, &mut history);
+        let mut blank: Tab<u32> = Tab::new("c", 0, "about:blank");
+        record_visit(&mut blank, &mut history);
+        assert_eq!(history.entries().len(), 1, "{:?}", history.entries());
     }
 
     #[test]

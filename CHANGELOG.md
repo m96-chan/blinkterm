@@ -35,6 +35,17 @@ flag, a different default, a raised Rust floor all do.
   how to build. The full manual moved to `docs/`: installing, keys and use,
   settings and profiles, features, how it works, and development.
 
+### Fixed
+
+- A page opened straight into a new tab — `alt+enter` in the history list,
+  a url from `blinkterm --remote`, a pick opened in a new tab — is recorded
+  in the history again. A page quick enough finished loading before the
+  program was listening, or while the queue the switch puts in the bin was
+  holding the news, and neither road counted the visit; the page is now
+  asked directly whether it has finished. A page counts once per document,
+  so answering a dialog on a loaded page no longer counts it twice
+  ([#70](https://github.com/m96-chan/blinkterm/issues/70)).
+
 ## [0.2.0] - 2026-09-30
 
 ### Added

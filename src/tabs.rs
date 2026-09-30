@@ -194,6 +194,37 @@ pub struct Tab<C> {
     /// them. Only ever `true` on the tab in front: a tab that is left is
     /// told to leave fullscreen and set `false` as it goes.
     pub fullscreen: bool,
+    /// Where the document now in this tab stands with the history; see
+    /// [`Counted`]. [`Counted::No`] at every landing and at creation,
+    /// because each new document is a visit of its own.
+    pub counted: Counted,
+}
+
+/// Whether the document a tab is showing has been written into the history
+/// ([`crate::history`]), and if not, whether it is owed one.
+///
+/// A flag on the tab and not a comparison of urls, because the same page can
+/// be visited twice in a row — a reload, a link back to where the tab already
+/// was — and both are visits. What it stops is one document being counted
+/// twice, which matters because the news that a page has finished reaches
+/// [`crate::app`] by two roads: the engine's `Page.loadEventFired`, and the
+/// page asked directly when a tab comes to the front and its queued events go
+/// in the bin. Before this, a page opened straight into a new tab and
+/// switched to in the same pass was counted by neither (issue #70), and a
+/// dialog answered on a loaded page was counted again by the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Counted {
+    /// Nothing has said this document finished loading.
+    No,
+    /// The page said so when it was asked directly, its own events having
+    /// gone in the bin. The visit is not written there and then: the tab's
+    /// url is still the one that was asked for until the browser
+    /// connection's rename of the target is read, which happens later in the
+    /// same pass, and after a redirect that rename is the only word on where
+    /// the page actually ended up.
+    Due,
+    /// Written.
+    Yes,
 }
 
 impl<C> Tab<C> {
@@ -217,6 +248,7 @@ impl<C> Tab<C> {
             dormant: false,
             reviving: false,
             fullscreen: false,
+            counted: Counted::No,
         }
     }
 
@@ -348,6 +380,8 @@ impl<C> Tab<C> {
         // Whatever was fullscreen was in the document that has just gone
         // (measured: a navigation leaves fullscreen).
         self.fullscreen = false;
+        // A new document is a visit of its own, whatever the last one was.
+        self.counted = Counted::No;
         // Read before it is set below: it says whether a reason from
         // `failed_to_reach` belongs to this landing.
         let ours = self.loading;
@@ -1550,6 +1584,7 @@ mod tests {
         tab.loaded(Loaded {
             title: title.to_string(),
             status,
+            complete: true,
         });
     }
 
