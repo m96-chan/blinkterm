@@ -215,6 +215,8 @@ pub enum Action {
     Copy,
     CopyUrl,
     ToggleNormal,
+    /// `ctrl+shift+h`: the history list. See [`crate::historylist`].
+    History,
 }
 
 /// One row of [`ACTIONS`]: the name a `key.` line gives, the action, the
@@ -236,9 +238,9 @@ const TAB_NAMES: &str = "tab-1 .. tab-8";
 /// [`Action::every`] and [`defaults`] expand it.
 ///
 /// The keys are the documented spellings, not every press the built-in table
-/// answers: it reads shift only for `tab`, `t`, `a` and the page keys, so
+/// answers: it reads shift only for `tab`, `t`, `a`, `h` and the page keys, so
 /// `ctrl+shift+=` zooms in too, and a chord is exact.
-pub const ACTIONS: [Row; 24] = [
+pub const ACTIONS: [Row; 25] = [
     Row {
         name: "quit",
         action: Action::Quit,
@@ -322,6 +324,12 @@ pub const ACTIONS: [Row; 24] = [
         action: Action::ListTabs,
         keys: "ctrl+shift+a, alt+a",
         what: "the tab list",
+    },
+    Row {
+        name: "history",
+        action: Action::History,
+        keys: "ctrl+shift+h, alt+h",
+        what: "the history list",
     },
     Row {
         name: "move-tab-left",

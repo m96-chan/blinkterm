@@ -1103,20 +1103,23 @@ fn number_width(n: usize) -> usize {
     }
 }
 
-/// One tab as the tab list shows it.
+/// One row of a list over the screen: a tab as the tab list shows it, or a
+/// page visited as the history list does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListItem<'a> {
-    /// The tab's number in the strip, from one.
-    pub number: usize,
+    /// What comes before the title: the tab's number and the `!` of one
+    /// waiting on a dialog or a path, as the strip marks it (`9!`), or when a
+    /// page was visited (`3 hours ago`). Text rather than a number because
+    /// it is the one part the two lists do not share. The history list pads
+    /// it so that the titles under each other start in one column.
+    pub lead: &'a str,
     pub title: &'a str,
     pub url: &'a str,
-    /// The one Enter would switch to: drawn in reverse video.
+    /// The one Enter would pick: drawn in reverse video.
     pub picked: bool,
-    /// Waiting on a dialog or a path: marked `!` as the strip marks it.
-    pub asks: bool,
 }
 
-/// The rows under the status row while the tab list is open: from `row`
+/// The rows under the status row while a list is open: from `row`
 /// (one-based) for `rows` rows, one item each, `  3  title  —  url` clipped
 /// to the pane, the picked one in reverse video, every row cleared to the
 /// edge, and the rows left over cleared.
@@ -1135,8 +1138,7 @@ pub fn list_rows(cols: u32, row: u32, rows: u32, items: &[ListItem]) -> Vec<u8> 
         let Some(item) = items.get(at as usize) else {
             continue;
         };
-        let mark = if item.asks { "!" } else { "" };
-        let mut text = format!("  {}{mark}  {}", item.number, item.title);
+        let mut text = format!("  {}  {}", item.lead, item.title);
         if !item.url.is_empty() {
             text.push_str("  —  ");
             text.push_str(item.url);
@@ -1967,25 +1969,22 @@ mod tests {
     fn the_list_rows_fill_the_width_mark_the_pick_and_clear_what_is_left() {
         let items = [
             ListItem {
-                number: 3,
+                lead: "3",
                 title: "Build log",
                 url: "https://ci.example/build/4471",
                 picked: true,
-                asks: false,
             },
             ListItem {
-                number: 9,
+                lead: "9!",
                 title: "Changelog",
                 url: "https://docs.example/changelog/a/very/long/path",
                 picked: false,
-                asks: true,
             },
             ListItem {
-                number: 12,
+                lead: "12",
                 title: "Mail",
                 url: "",
                 picked: false,
-                asks: false,
             },
         ];
         let rows = text(&list_rows(40, 2, 4, &items));
@@ -2012,6 +2011,21 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows.ends_with("\x1b[5;1H\x1b[K"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_lead_of_words_goes_before_the_title_as_a_number_does() {
+        let items = [ListItem {
+            lead: "3 hours ago *",
+            title: "Build log",
+            url: "https://ci.example/",
+            picked: false,
+        }];
+        let rows = text(&list_rows(80, 2, 1, &items));
+        assert_eq!(
+            rows,
+            "\x1b[2;1H\x1b[K  3 hours ago *  Build log  —  https://ci.example/"
+        );
     }
 
     /// Whether the list's rows are text between their own escapes.
@@ -2272,18 +2286,16 @@ mod tests {
                 }
                 let items = [
                     ListItem {
-                        number: 1,
+                        lead: "1!",
                         title: hostile,
                         url: hostile,
                         picked: true,
-                        asks: true,
                     },
                     ListItem {
-                        number: 2,
+                        lead: "2",
                         title: hostile,
                         url: hostile,
                         picked: false,
-                        asks: false,
                     },
                 ];
                 let list = list_rows(cols, 2, 3, &items);

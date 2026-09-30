@@ -12,24 +12,27 @@
 //! In strip order rather than most recent first, because nothing records when
 //! a tab was last in front, and an order the list invented would be one that
 //! `ctrl+tab` does not walk.
+//!
+//! The pick, the page keys and the window are [`crate::list`]'s, which the
+//! history list shares; what is the tab list's own is what a match is and
+//! that a pick names a tab by its place in the strip.
 
 use std::borrow::Cow;
 
-use crate::input::{Key, KeyAction, KeyInput};
-use crate::line::{Edit, Line};
+pub use crate::list::{Step, Window};
+
+use crate::input::KeyInput;
+use crate::line::Line;
+use crate::list::List;
 use crate::tabs::Tabs;
 use crate::text;
 
 /// The list while it is open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabList {
-    /// The filter being typed. Starts empty: there is no last filter to
-    /// offer, since what the person wants each time is a different tab.
-    pub line: Line,
-    /// Which of the matches is picked, from zero. Clamped into the matches
-    /// whenever it is read, so that a filter which shrinks the list never
-    /// leaves the pick past its end.
-    picked: usize,
+    /// The filter and the pick. A [`Step::Pick`] out of it is a position
+    /// among the matches; out of [`TabList::step`] it is a strip index.
+    list: List,
 }
 
 /// One tab as the list shows it: what [`TabList::matches`] hands back per
@@ -47,36 +50,23 @@ pub struct Entry<'a> {
     pub asks: bool,
 }
 
-/// What a key did to the list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Step {
-    /// Still open; the row and the rows are out of date.
-    Typing,
-    /// Escape: closed, nothing picked.
-    Close,
-    /// Enter, or a click on a row: switch to this tab (its strip index).
-    /// `None` when the filter matched nothing — Enter on an empty list
-    /// closes it, as Escape does, since there is nothing else it can mean.
-    Pick(Option<usize>),
-    /// `ctrl+q`.
-    Quit,
-}
-
-/// The matches on the screen: `first..first + shown`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Window {
-    pub first: usize,
-    pub shown: usize,
-}
-
 impl TabList {
     /// Open with the tab in front picked, so that Enter with nothing typed
     /// goes nowhere.
     pub fn open(active: usize) -> TabList {
         TabList {
-            line: Line::empty(),
-            picked: active,
+            list: List::open(active),
         }
+    }
+
+    /// The filter being typed.
+    pub fn line(&self) -> &Line {
+        &self.list.line
+    }
+
+    /// The filter being typed, to paste into.
+    pub fn line_mut(&mut self) -> &mut Line {
+        &mut self.list.line
     }
 
     /// The tabs that match the filter, in strip order.
@@ -87,7 +77,7 @@ impl TabList {
     /// a tab whose number starts with them, so `1` `2` reaches the twelfth
     /// tab that `alt+` cannot. An empty filter matches every tab.
     pub fn matches<'a, C>(&self, tabs: &'a Tabs<C>) -> Vec<Entry<'a>> {
-        let filter = self.line.text().to_lowercase();
+        let filter = self.list.line.text().to_lowercase();
         let digits = !filter.is_empty() && filter.bytes().all(|b| b.is_ascii_digit());
         tabs.iter()
             .enumerate()
@@ -111,111 +101,48 @@ impl TabList {
     /// Which match is picked, clamped to the `matches` there are; `None`
     /// for none.
     pub fn picked(&self, matches: usize) -> Option<usize> {
-        matches.checked_sub(1).map(|last| self.picked.min(last))
+        self.list.picked(matches)
     }
 
     /// One key. `matched` is the strip index of every tab that matches now,
     /// in order — which the caller knows and the list does not — and `page`
-    /// how many rows the list has on the screen.
-    ///
-    /// [`Line`] is asked first, so the url bar's editing keys are the
-    /// filter's; what it reports as `Previous`/`Next` (Up, Down, `ctrl+p`,
-    /// `ctrl+n`) moves the pick instead of walking a history the list does
-    /// not have. PageUp and PageDown move it by `page` rows. A change to the
-    /// text puts the pick back on the first match, because the matches are a
-    /// new list and the first of them is the best answer to what was just
-    /// typed; a move of the cursor leaves it alone.
+    /// how many rows the list has on the screen. See [`List::step`] for the
+    /// keys; a [`Step::Pick`] here carries the strip index.
     pub fn step(&mut self, key: &KeyInput, matched: &[usize], page: usize) -> Step {
-        if key.action == KeyAction::Release {
-            return Step::Typing;
-        }
-        let count = matched.len();
-        // Where the pick is now, which is where a move starts from.
-        let at = self.picked(count).unwrap_or(0);
-        let last = count.saturating_sub(1);
-        let plain = !key.mods.ctrl() && !key.mods.alt();
-        match key.key {
-            Key::PageUp if plain => {
-                self.picked = at.saturating_sub(page.max(1));
-                return Step::Typing;
-            }
-            Key::PageDown if plain => {
-                self.picked = (at + page.max(1)).min(last);
-                return Step::Typing;
-            }
-            _ => {}
-        }
-        let before = self.line.text().to_string();
-        match self.line.step(key) {
-            Edit::Go => Step::Pick(self.picked(count).map(|at| matched[at])),
-            Edit::Cancel => Step::Close,
-            Edit::Quit => Step::Quit,
-            Edit::Previous => {
-                self.picked = at.saturating_sub(1);
-                Step::Typing
-            }
-            Edit::Next => {
-                self.picked = (at + 1).min(last);
-                Step::Typing
-            }
-            Edit::Typing | Edit::Inserted => {
-                if self.line.text() != before {
-                    self.picked = 0;
-                }
-                Step::Typing
-            }
-        }
+        strip_index(self.list.step(key, matched.len(), page), matched)
     }
 
     /// A click on the `row`th visible row (from zero), with `shown` the
     /// window that was drawn and `matched` the strip index of every match:
     /// pick the tab on it, or nothing for a row past the end.
     pub fn click(&mut self, row: usize, shown: &Window, matched: &[usize]) -> Step {
-        if row >= shown.shown {
-            return Step::Typing;
-        }
-        let at = shown.first + row;
-        match matched.get(at) {
-            Some(&index) => {
-                self.picked = at;
-                Step::Pick(Some(index))
-            }
-            None => Step::Typing,
-        }
+        strip_index(self.list.click(row, shown, matched.len()), matched)
     }
 
-    /// Which matches fit in `rows`, keeping the pick in view.
-    ///
-    /// The strip's rule: a window that moves only when the pick leaves it,
-    /// kept in `first` between draws by the caller, and never past the end,
-    /// so that a list that shrank under a filter is not a screen of blank
-    /// rows with the matches scrolled off the top.
+    /// Which matches fit in `rows`, keeping the pick in view. See
+    /// [`List::window`].
     pub fn window(&self, count: usize, rows: usize, first: usize) -> Window {
-        let rows = rows.max(1);
-        let mut first = first.min(count.saturating_sub(rows));
-        if let Some(at) = self.picked(count) {
-            if at < first {
-                first = at;
-            } else if at >= first + rows {
-                first = at + 1 - rows;
-            }
-        }
-        Window {
-            first,
-            shown: count.saturating_sub(first).min(rows),
-        }
+        self.list.window(count, rows, first)
     }
 
     /// `2/11`, for the right-hand end of the row.
     pub fn count_text(matched: usize, total: usize) -> String {
-        format!("{matched}/{total}")
+        List::count_text(matched, total)
+    }
+}
+
+/// A pick among the matches, as the strip index of the tab it is.
+fn strip_index(step: Step, matched: &[usize]) -> Step {
+    match step {
+        Step::Pick(Some(at)) => Step::Pick(matched.get(at).copied()),
+        other => other,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::Mods;
+    use crate::input::{Key, KeyAction, Mods};
     use crate::tabs::Tab;
 
     fn tab(title: &str, url: &str) -> Tab<u32> {
@@ -289,7 +216,7 @@ mod tests {
     fn the_list_opens_on_the_tab_in_front_and_shows_every_tab_untyped() {
         let tabs = three();
         let list = TabList::open(1);
-        assert_eq!(list.line.text(), "");
+        assert_eq!(list.line().text(), "");
         assert_eq!(indices(&list, &tabs), [0, 1, 2]);
         assert_eq!(list.picked(3), Some(1), "the tab in front is picked");
         let entries = list.matches(&tabs);

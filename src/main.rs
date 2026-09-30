@@ -140,6 +140,9 @@ keys:
   alt+1 .. alt+8 the nth tab; alt+9 the last tab
   ctrl+shift+a   the tab list (alt+a too): type to filter, up/down to pick,
                  enter to switch, esc to close
+  ctrl+shift+h   the history list (alt+h too): type words to filter, enter
+                 opens here, alt+enter or ctrl+enter in a new tab,
+                 shift+delete forgets the page
   ctrl+shift+pageup/pagedown
                  move this tab left, right (alt+shift+pageup/pagedown too)
   middle click or ctrl+click on a link
