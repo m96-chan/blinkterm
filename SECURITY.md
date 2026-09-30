@@ -40,7 +40,7 @@ machine. It prints a warning when it does. Do not browse as root.
   real headless shell — `chrome-headless-shell`, or Chromium itself. It does
   not hold for Debian's `chromium-shell`, which is Chromium's `content_shell`
   and opens its DevTools port whatever it is told; with that engine any local
-  process running as you can still attach, and the README says so.
+  process running as you can still attach, and docs/install.md says so.
 
 - **The `--remote` socket.** A running `blinkterm` listens on
   `<profile>/blinkterm.sock` (0600, inside the 0700 profile; on a Mac with a

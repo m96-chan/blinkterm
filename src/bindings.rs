@@ -13,7 +13,7 @@
 //!
 //! [`ACTIONS`] is the other half: every command with a name, the chords the
 //! built-in table answers it on, and a half-line of what it does. `--help`'s
-//! list of actions is made from it ([`help`]), and tests hold the README's
+//! list of actions is made from it ([`help`]), and tests hold `docs/configuration.md`'s
 //! rebinding table and `command` itself to it, so that a command added
 //! without a name, or a default key changed in one place only, fails `cargo
 //! test` rather than a person reading the help.
@@ -488,8 +488,8 @@ impl Action {
 /// them: its row's `keys` parsed, and `alt+n` for `tab-n`.
 ///
 /// Nothing in the program asks this — the built-in table is `app::command`,
-/// which is a `match` — but the tests on both sides do, the README's table
-/// here and `command` itself in `app.rs`, and it is one function for both.
+/// which is a `match` — but the tests on both sides do, `docs/configuration.md`'s
+/// table here and `command` itself in `app.rs`, and it is one function for both.
 pub fn defaults(action: Action) -> Vec<Chord> {
     if let Action::Tab(n) = action {
         return Chord::parse(&format!("alt+{n}")).into_iter().collect();
@@ -676,10 +676,10 @@ mod tests {
         );
     }
 
-    /// The rows of the README's `### Rebinding keys` table, each cell with
+    /// The rows of `docs/configuration.md`'s `### Rebinding keys` table, each cell with
     /// its backticks gone and `…` written `..`, as [`ACTIONS`] writes a range.
     fn readme_rows() -> Vec<Vec<String>> {
-        include_str!("../README.md")
+        include_str!("../docs/configuration.md")
             .lines()
             .skip_while(|line| *line != "### Rebinding keys")
             .skip(1)
