@@ -29,7 +29,9 @@ line number; a missing file is nothing. A flag is `true` or `false`
 [Transparent pages](usage.md#transparent-pages)).
 There is no `url` setting: the page to open is what the command line is
 for, and `home = <url>` is the page opened when none is given.
-`normal-mode = true` starts in normal mode (`ctrl+.`), `restore = true`
+`normal-mode = true` starts in normal mode (`ctrl+.`), `keymap = mac|linux`
+(or `--keymap`) picks the built-in keys (see [Rebinding keys](#rebinding-keys)),
+`restore = true`
 reopens the last session's tabs (see [The session](#the-session)), and
 `mute = true` (or `--mute`) starts the engine silent (see
 [Sound](features.md#sound-permissions-and-fullscreen)). `tmux = on|off|auto`,
@@ -76,44 +78,57 @@ nothing else, for scripts.
 
 ### Rebinding keys
 
+There are two sets of built-in keys, the keymaps. `keymap = linux` is the
+one the program was built with: `ctrl` for what a browser has taught
+everybody, `alt` for the rest. `keymap = mac` is the one for a Mac, where
+Kitty keeps most `cmd` chords for itself and Option makes characters rather
+than being `alt`: `cmd` where Kitty leaves it free and Chrome or Safari use
+it, `ctrl` elsewhere. Each is the default on its platform — `mac` on macOS,
+`linux` everywhere else — so a Mac in a stock Kitty gets keys that arrive
+with no change to `kitty.conf`. Either can be set, in the file or with
+`--keymap mac|linux`: over ssh from a Mac's Kitty to a Linux machine,
+`keymap = mac` on the far side gives the keys the Mac's Kitty lets through.
+[On a Mac](usage.md#on-a-mac) says what Kitty keeps and why.
+
 `key.<chord> = <action>` in the settings file puts an action on a key, and
-`key.<chord> = none` takes a key back for the page:
+`key.<chord> = none` takes a key back for the page, on top of either
+keymap:
 
     key.f5 = reload
     key.ctrl+b = back
     key.ctrl+w = none
 
-| action | default | does |
-| --- | --- | --- |
-| `quit` | `ctrl+q` | quit |
-| `url` | `ctrl+l` | type a url |
-| `reload` | `ctrl+r` | reload |
-| `back` | `alt+left` | back |
-| `forward` | `alt+right` | forward |
-| `new-tab` | `ctrl+t` | a new tab |
-| `close-tab` | `ctrl+w` | close this tab |
-| `reopen-tab` | `ctrl+shift+t`, `alt+t` | reopen the tab closed last |
-| `bookmark` | `ctrl+d` | bookmark this page, or remove the bookmark |
-| `next-tab` | `ctrl+tab` | the next tab |
-| `previous-tab` | `ctrl+shift+tab` | the tab before |
-| `tab-1` … `tab-8` | `alt+1` … `alt+8` | the nth tab |
-| `last-tab` | `alt+9` | the last tab |
-| `list-tabs` | `ctrl+shift+a`, `alt+a` | the tab list |
-| `history` | `ctrl+shift+h`, `alt+h` | the history list |
-| `move-tab-left` | `ctrl+shift+pageup`, `alt+shift+pageup` | move this tab left |
-| `move-tab-right` | `ctrl+shift+pagedown`, `alt+shift+pagedown` | move this tab right |
-| `zoom-in` | `alt+=`, `ctrl+=` | zoom in |
-| `zoom-out` | `alt+-`, `ctrl+-` | zoom out |
-| `zoom-reset` | `alt+0`, `ctrl+0` | back to 100% |
-| `find` | `ctrl+f` | find in the page |
-| `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
-| `block` | `alt+b` | stop blocking ads and trackers on this site, or start again |
-| `fill-login` | `alt+l` | fill the login form from your password manager |
-| `copy` | `alt+c` | copy the selection, or the line being typed |
-| `copy-url` | `alt+u` | copy the url |
-| `save-pdf` | `alt+s` | save this page as a PDF |
-| `save-screenshot` | `alt+shift+s` | save the whole page as a picture |
-| `normal-mode` | `ctrl+.` | normal mode on or off |
+| action | linux | mac | does |
+| --- | --- | --- | --- |
+| `quit` | `ctrl+q` | `ctrl+q` | quit |
+| `url` | `ctrl+l` | `ctrl+l` | type a url |
+| `reload` | `ctrl+r` | `ctrl+r` | reload |
+| `back` | `alt+left` | `cmd+[` | back |
+| `forward` | `alt+right` | `cmd+]` | forward |
+| `new-tab` | `ctrl+t` | `ctrl+t` | a new tab |
+| `close-tab` | `ctrl+w` | `ctrl+w` | close this tab |
+| `reopen-tab` | `ctrl+shift+t`, `alt+t` | `cmd+shift+t` | reopen the tab closed last |
+| `bookmark` | `ctrl+d` | `cmd+d` | bookmark this page, or remove the bookmark |
+| `next-tab` | `ctrl+tab` | `cmd+alt+right`, `ctrl+pagedown` | the next tab |
+| `previous-tab` | `ctrl+shift+tab` | `cmd+alt+left`, `ctrl+pageup` | the tab before |
+| `tab-1` … `tab-8` | `alt+1` … `alt+8` | `ctrl+1` … `ctrl+8` | the nth tab |
+| `last-tab` | `alt+9` | `ctrl+9` | the last tab |
+| `list-tabs` | `ctrl+shift+a`, `alt+a` | `cmd+shift+a` | the tab list |
+| `history` | `ctrl+shift+h`, `alt+h` | `cmd+y` | the history list |
+| `move-tab-left` | `ctrl+shift+pageup`, `alt+shift+pageup` | `cmd+shift+pageup` | move this tab left |
+| `move-tab-right` | `ctrl+shift+pagedown`, `alt+shift+pagedown` | `cmd+shift+pagedown` | move this tab right |
+| `zoom-in` | `alt+=`, `ctrl+=` | `ctrl+=` | zoom in |
+| `zoom-out` | `alt+-`, `ctrl+-` | `ctrl+-` | zoom out |
+| `zoom-reset` | `alt+0`, `ctrl+0` | `ctrl+0` | back to 100% |
+| `find` | `ctrl+f` | `ctrl+f` | find in the page |
+| `permissions` | `alt+p` | `cmd+p` | allow this site the camera, microphone, location, notifications or clipboard |
+| `block` | `alt+b` | `cmd+b` | stop blocking ads and trackers on this site, or start again |
+| `fill-login` | `alt+l` | `cmd+shift+l` | fill the login form from your password manager |
+| `copy` | `alt+c` | `cmd+c`, `cmd+shift+c` | copy the selection, or the line being typed |
+| `copy-url` | `alt+u` | `cmd+u` | copy the url |
+| `save-pdf` | `alt+s` | `cmd+s` | save this page as a PDF |
+| `save-screenshot` | `alt+shift+s` | `cmd+shift+s` | save the whole page as a picture |
+| `normal-mode` | `ctrl+.` | `ctrl+.` | normal mode on or off |
 
 A chord is `ctrl`, `alt`, `shift` or `super` joined with `+` to a key — a
 character, or `plus`, `space`, `tab`, `enter`, `esc`, `backspace`,
@@ -129,7 +144,14 @@ later line for the same chord replaces an earlier one; binding a chord the
 program already used moves nothing else, so `key.ctrl+t = quit` leaves
 `new-tab` on no key. Normal mode's letters are not affected by `key.` lines:
 `key.ctrl+r = none` leaves `r` as reload. `blinkterm --help` lists the
-actions too.
+actions too, with the keymap of the platform it runs on, and
+`blinkterm --doctor` says which keymap is in effect and names each `key.`
+line on a chord Kitty or macOS keeps. In Kitty, such a line is also named
+on the status row at start, with the `kitty.conf` line that frees it.
+
+Under `keymap = mac` the `linux` column still answers underneath, so the
+`alt` chords work on a Mac whose Kitty has `macos_option_as_alt left` (or
+`right`, or `yes`), and the `ctrl` ones wherever Kitty lets them through.
 
 ## Profiles
 

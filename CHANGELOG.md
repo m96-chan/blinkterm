@@ -12,6 +12,25 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- Keys that work on a Mac. `keymap = mac|linux` (or `--keymap`) picks the
+  built-in keys, and on macOS the default is now `mac`: a table that arrives
+  in a stock Kitty, with no change to `kitty.conf`, because Kitty on macOS
+  keeps most `cmd` chords and Option makes characters rather than `alt`.
+  `cmd+[`/`cmd+]` back and forward, `cmd+d` bookmark, `cmd+shift+t` reopen,
+  `cmd+alt+left`/`right` or `ctrl+pageup`/`pagedown` the tabs, `ctrl+1` …
+  `ctrl+9` a tab by number, `cmd+shift+a` the tab list, `cmd+y` history,
+  `cmd+c` copy, `cmd+s` save a PDF, and `ctrl` where Kitty lets the Linux
+  chord through (`ctrl+l`, `ctrl+t`, `ctrl+w`, `ctrl+r`, `ctrl+f`, `ctrl+=`,
+  `ctrl+q`). The Linux keys still answer underneath, so `alt` chords work on a
+  Mac with `macos_option_as_alt left`. `key.<chord>` lines apply on top of
+  either keymap. `--doctor` prints a `keys:` line saying which keymap is in
+  effect, and names every `key.` line on a chord Kitty or macOS keeps by
+  default; in Kitty such a line is also named on the status row at start,
+  with the `map <chord> no_op` line for `kitty.conf` that frees it. The Linux
+  keys are unchanged
+  ([#80](https://github.com/m96-chan/blinkterm/issues/80),
+  [#78](https://github.com/m96-chan/blinkterm/issues/78)).
+
 - `--alpha [<1-100>]` (`alpha = true|false|<1-100>` in the config file) lets
   the terminal's background show through a page: the engine paints nothing
   behind it, and the page's own `html` and `body` backgrounds are forced

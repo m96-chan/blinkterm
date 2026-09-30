@@ -168,6 +168,7 @@ pub mod scroll;
 pub mod session;
 pub mod tablist;
 pub mod tabs;
+pub mod taken;
 pub mod text;
 pub mod tty;
 pub mod upload;
