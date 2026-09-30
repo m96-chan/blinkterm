@@ -2011,8 +2011,8 @@ fn raw_pixels_cost_the_terminal_a_fraction_of_what_a_png_frame_did() {
     let (mut before_terminal, mut png_decoding) = (Duration::ZERO, Duration::ZERO);
     while started.elapsed() < run_for {
         for (png, _) in take_frames(&mut client) {
-            // What `--alpha` costs this process a moving frame, printed and
-            // not asserted: the PNG decoded here, as the program does then.
+            // What a PNG moving frame would cost this process to decode,
+            // printed and not asserted: the number `--alpha` was weighed on.
             let at = Instant::now();
             let _ = blinkterm::png::decode(&png, 64 * 1024 * 1024).expect("a frame decodes");
             png_decoding += at.elapsed();
@@ -2105,7 +2105,7 @@ fn raw_pixels_cost_the_terminal_a_fraction_of_what_a_png_frame_did() {
         "{WIDE}x{TALL} end to end:\n  \
          before  png  decoded by the terminal: {before_fps:.1} fps, \
          {} kB a frame, {before_each:?} in the terminal, \
-         {:?} decoding here (--alpha)\n  \
+         {:?} if decoded here\n  \
          after   jpeg q{} decoded here:        {after_fps:.1} fps, \
          {} kB a frame, {:?} decoding, {after_each:?} in the terminal\n  \
          the terminal's share is {:.1}x smaller",
@@ -6647,9 +6647,9 @@ fn a_page_with_no_background_is_transparent_under_the_override_and_stays_so_acro
     engine.kill();
 }
 
-/// Why a moving frame is PNG under `--alpha`: the screencast keeps the
-/// transparency in a PNG, and a JPEG, which has nowhere to put it, paints it
-/// black.
+/// Why a bare page is black while it moves under `--alpha`: the screencast
+/// keeps the transparency in a PNG, and a JPEG — the local route's moving
+/// frame — has nowhere to put it and paints it black.
 #[test]
 fn the_screencast_carries_the_alpha_as_png_and_paints_it_black_as_jpeg() {
     let Some((mut engine, mut client)) = connect() else {

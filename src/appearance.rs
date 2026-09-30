@@ -78,8 +78,10 @@
 //! keeps the transparency, and a light terminal needs nothing.
 //!
 //! The screencast honours it too, but only in PNG: a JPEG frame of the same
-//! page is 0, 0, 0 where the PNG is transparent, which is why the moving
-//! frames are PNG under `--alpha` ([`crate::motion`]).
+//! page is 0, 0, 0 where the PNG is transparent. The moving frames stay JPEG
+//! on the local route all the same, so there a page with no background is
+//! black while it moves and transparent once it rests and the lossless still
+//! arrives; see [`crate::motion`] for why that is the choice.
 
 use crate::json::Json;
 

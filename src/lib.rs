@@ -76,8 +76,9 @@
 //! moves costs one still and then nothing. [`motion`] has the table, the
 //! reason quality 85 rather than 70 or 95, and the rule that decides which of
 //! two frames arriving out of order is the one to keep. `--alpha`, which lets
-//! the terminal's background show through a page, makes the moving frames PNG
-//! as well, because a JPEG paints the transparency black.
+//! the terminal's background show through a page, leaves that as it is: the
+//! still is transparent, and a JPEG frame, which cannot be, shows a bare page
+//! black while it moves.
 //!
 //! The frames are decoded here rather than by the terminal, which is the
 //! other half of the change and the reason the compositor needed none: the

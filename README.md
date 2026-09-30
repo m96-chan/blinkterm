@@ -84,8 +84,10 @@ three-eighths, of the pane until the link catches up, and the still of a
 page at rest is always full size. `--fps <n>` caps it (15 by default over
 ssh), and `--frames raw|png` overrides the choice.
 
-`--alpha` (see [Transparent pages](#transparent-pages)) makes the frames PNG
-on every route, locally too, since a JPEG cannot carry the transparency.
+Under `--alpha` (see [Transparent pages](#transparent-pages)) the frames stay
+as they are: locally the JPEG frames of a moving page cannot carry the
+transparency and show it black, while the PNG frames over ssh and in tmux do
+carry it.
 
 ## Installing
 
@@ -878,14 +880,20 @@ unless you ask.
 `--alpha` (`alpha = true` in the file) has the engine paint nothing behind a
 page: where the page has no background of its own, the terminal's shows
 through — its colour, and its opacity or blur if it has them. A page that
-paints a background is unchanged. Two costs. The frames while a page moves
-are PNG rather than JPEG, because a JPEG would paint the transparent parts
-black, and the engine encodes PNG more slowly (on a slow machine, around 34
-frames a second where JPEG is near 60). And a page that says nothing about
-its colours is black text on your background, which on a dark terminal is
-unreadable: use `--force-dark` with it, which makes the text light and keeps
-the transparency, or a light terminal. There is no key to turn it off while
-running.
+paints a background is unchanged.
+
+It is transparent at rest. While a page is moving — scrolling, animating —
+its frames are JPEG, which has no transparency, so what would show through
+is black until the page stops and the lossless still arrives, a moment
+later. That is on purpose: while you are scrolling you are driving the page,
+not looking through it, and keeping the moving frames JPEG keeps them as
+fast as without the option. Over ssh and inside tmux the moving frames are
+already PNG and stay transparent.
+
+A page that says nothing about its colours is black text on your
+background, which on a dark terminal is unreadable: use `--force-dark` with
+it, which makes the text light and keeps the transparency, or a light
+terminal. There is no key to turn it off while running.
 
 ## The status row
 

@@ -654,11 +654,10 @@ impl Chrome {
     }
 
     /// The route [`run`] chose for this run's frames: the painter that sends
-    /// them and the cast that asks for them — PNG on every route under
-    /// `--alpha`. Once, before the first frame.
+    /// them and the cast that asks for them. Once, before the first frame.
     fn take_route(&mut self, route: Route) {
         self.painter = Painter::with_route(route);
-        self.cast = motion::Cast::for_route(&route, self.appearance.alpha);
+        self.cast = motion::Cast::for_route(&route);
         self.throttle = motion::Throttle::default();
     }
 
@@ -3825,26 +3824,16 @@ fn handle_page_events(
         if chrome.painter.route().payload == Payload::Png {
             return paint_png(pane, tabs, chrome, &frame);
         }
+        let jpeg = frame;
         // Ordered above, decoded here: a frame that lost to the still on
         // screen is eight milliseconds of work not done.
-        //
-        // A raw route's frame is JPEG, decoded to RGB — or, under `--alpha`,
-        // PNG decoded to RGBA, so the transparency the page left reaches the
-        // terminal while it moves as well as at rest. Either way it goes at
-        // the size it came, with no `zoom::fit`: a moving frame is the
-        // terminal's to scale.
         //
         // A frame that will not decode is dropped on the same rule as one that
         // would not base64: one of them is nothing. A run of them is a page
         // that looks frozen, which is what the engine test comparing the two
         // formats through both decoders exists to catch before a person meets
         // it.
-        if chrome.cast.png {
-            if let Ok(image) = crate::png::decode(&frame, FRAME_BUDGET) {
-                let raw = Raw::rgba(&image.rgba, image.width, image.height);
-                paint(pane, tabs, chrome, raw)?;
-            }
-        } else if let Ok(image) = crate::jpeg::decode(&frame, FRAME_BUDGET) {
+        if let Ok(image) = crate::jpeg::decode(&jpeg, FRAME_BUDGET) {
             let raw = Raw::rgb(&image.rgb, image.width, image.height);
             paint(pane, tabs, chrome, raw)?;
         }
@@ -8811,6 +8800,43 @@ mod tests {
             relaunched_words(3, 2),
             format!("{started}; 2 of 3 tabs restored")
         );
+    }
+
+    #[test]
+    fn alpha_leaves_the_cast_as_the_route_has_it_and_only_the_still_is_transparent() {
+        let options = crate::options::resolve(
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+        )
+        .expect("the defaults");
+        let profile = Profile::temporary().expect("a temporary profile");
+        let downloads =
+            std::env::temp_dir().join(format!("blinkterm-app-alpha-{}", std::process::id()));
+        let mut chrome = Chrome::new(
+            Metrics {
+                cols: 80,
+                rows: 24,
+                cell: (8, 16),
+            },
+            &options,
+            &profile,
+            downloads.clone(),
+            Appearance::new(crate::appearance::Choice::default(), false, true),
+            Identity::new(None, None, "C"),
+            Allowed::in_memory(),
+            None,
+            Unblocked::in_memory(),
+        );
+        let local = Route::local(true);
+        chrome.take_route(local);
+        assert!(!chrome.cast.png, "JPEG while the page moves, alpha or not");
+        chrome.take_route(Route {
+            payload: Payload::Png,
+            ..local
+        });
+        assert!(chrome.cast.png, "the PNG route's frames, as without it");
+        std::fs::remove_dir_all(&downloads).ok();
     }
 
     #[test]

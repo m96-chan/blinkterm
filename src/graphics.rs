@@ -17,10 +17,11 @@
 //! in the pane — and hands over pixels, which is the protocol's own raw
 //! format and needs no compositor change at all.
 //!
-//! Under `--alpha` the moving frames are PNG too, decoded here to RGBA and
-//! sent as `f=32` with the alpha the page left, straight, as the protocol
-//! takes it — the terminal blends it over its own background, and nothing
-//! here converts it.
+//! Under `--alpha` the still is what carries the transparency: RGBA, sent as
+//! `f=32` with the alpha the page left, straight, as the protocol takes it —
+//! the terminal blends it over its own background, and nothing here converts
+//! it. A JPEG frame has no alpha, so a bare page is black while it moves
+//! (see [`crate::motion`]).
 //!
 //! It costs bytes: 2.9 MB of RGB where the JPEG was 185 kB. Through `t=s`
 //! that is a `write` into tmpfs and a `read` out of it, which is a memcpy at
@@ -248,7 +249,7 @@ const IN_FLIGHT: usize = 16;
 /// `crate::jpeg` produces RGB and a JPEG has no alpha to lose,
 /// `crate::png` produces RGBA and a still is one frame in a hundred and
 /// fifty milliseconds, so neither conversion would buy anything. Under
-/// `--alpha` every frame is RGBA, and the alpha is the point.
+/// `--alpha` the still's alpha is the point.
 #[derive(Debug, Clone, Copy)]
 pub struct Raw<'a> {
     pub pixels: &'a [u8],
@@ -1256,9 +1257,9 @@ pub(crate) mod tests {
 
     #[test]
     fn an_rgba_frame_keeps_its_alpha_through_the_store() {
-        // `--alpha`: a moving frame is RGBA, and what the page left
-        // transparent has to reach the terminal's store as it was — straight
-        // alpha, not flattened, not made opaque.
+        // `--alpha`: the still is RGBA, and what the page left transparent
+        // has to reach the terminal's store as it was — straight alpha, not
+        // flattened, not made opaque.
         let see_through = vec![
             10, 20, 30, 0, 40, 50, 60, 128, //
             70, 80, 90, 255, 100, 110, 120, 0,
