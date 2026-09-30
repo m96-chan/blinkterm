@@ -378,12 +378,12 @@ pub fn refusal(verdict: Verdict, env: &crate::route::Env) -> Option<String> {
 const LABEL: usize = 15;
 
 /// One fact, its name in the margin.
-fn say(name: &str, fact: &str) {
+pub(crate) fn say(name: &str, fact: &str) {
     println!("{:<LABEL$}{fact}", format!("{name}:"));
 }
 
 /// A line under the last fact, in the same column.
-fn more(fact: &str) {
+pub(crate) fn more(fact: &str) {
     println!("{:<LABEL$}{fact}", "");
 }
 
@@ -493,23 +493,36 @@ fn engine_lines(options: &Options, provenance: &Provenance) -> bool {
     say("engine", &path.display().to_string());
     more(&match provenance.engine_from {
         Some(source) => format!("from {source}"),
+        None if crate::install::installed_engine().as_deref() == Some(path.as_path()) => {
+            "installed by --install-engine".to_string()
+        }
         None => "on PATH".to_string(),
     });
-    let profile = match Profile::temporary() {
-        Ok(profile) => profile,
-        Err(why) => {
-            more(&format!("not started: {why}"));
-            return false;
+    match start_once(&options.engine) {
+        Ok((took, product)) => {
+            more(&format!(
+                "answered on its pipe in {:.2} s: {product}",
+                took.as_secs_f64()
+            ));
+            true
         }
-    };
+        Err(why) => {
+            more(&why);
+            false
+        }
+    }
+}
+
+/// Start the engine `launch` names on a temporary profile, ask it which
+/// product it is, and stop it: how long it took to answer and what it said,
+/// or a sentence that begins with what went wrong (`not started: …`, `did
+/// not answer: …`). Both are plain text already, for a terminal. Shared by
+/// `--doctor` and `--install-engine`, which checks what it unpacked with it.
+pub(crate) fn start_once(launch: &engine::Launch) -> Result<(Duration, String), String> {
+    let profile = Profile::temporary().map_err(|why| format!("not started: {why}"))?;
     let started = Instant::now();
-    let engine = match Engine::launch_with(profile, crate::app::ENGINE_TIMEOUT, &options.engine) {
-        Ok(engine) => engine,
-        Err(why) => {
-            more(&format!("did not answer: {}", crate::text::sanitize(&why)));
-            return false;
-        }
-    };
+    let engine = Engine::launch_with(profile, crate::app::ENGINE_TIMEOUT, launch)
+        .map_err(|why| format!("did not answer: {}", crate::text::sanitize(&why)))?;
     let took = started.elapsed();
     let product = engine
         .browser()
@@ -524,15 +537,10 @@ fn engine_lines(options: &Options, provenance: &Provenance) -> bool {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "no product named".to_string());
-    more(&format!(
-        "answered on its pipe in {:.2} s: {}",
-        took.as_secs_f64(),
-        crate::text::sanitize(&product)
-    ));
     // Dropped here, which stops it and removes its temporary profile, before
     // the terminal is put in raw mode.
     drop(engine);
-    true
+    Ok((took, crate::text::sanitize(&product).into_owned()))
 }
 
 fn profile_line(choice: &profile::Choice) {

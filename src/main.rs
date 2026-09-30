@@ -9,6 +9,7 @@ use blinkterm::app;
 use blinkterm::bindings::{self, Keymap};
 use blinkterm::doctor;
 use blinkterm::engine;
+use blinkterm::install;
 use blinkterm::options::{self, Invocation};
 
 /// `--help` up to its keys: the same whatever the keymap.
@@ -58,8 +59,9 @@ options:
                    text over a dark terminal is yours to read: --force-dark
                    helps. Over ssh and in tmux the number is not applied
   --engine <path>  the Chromium to run (default: $BLINKTERM_ENGINE, else
-                   the first of chrome-headless-shell, chromium,
-                   chromium-browser, google-chrome, chromium-shell on PATH)
+                   the one --install-engine put in place, else the first of
+                   chrome-headless-shell, chromium, chromium-browser,
+                   google-chrome, chromium-shell on PATH)
   --engine-arg <--flag>
                    one more argument for the engine; repeatable
                    (--accept-lang=ja, --disable-features=...). Four are
@@ -124,6 +126,12 @@ options:
                    Kitty graphics and keyboard protocols and which route
                    frames will take, print what was found, and exit; 1 if
                    something is missing
+  --install-engine fetch chrome-headless-shell 153.0.8010.52, the build the
+                   tests pass against, from Chrome for Testing for this
+                   machine (linux64, mac-arm64, mac-x64), check it against
+                   the SHA-256 compiled into this program, unpack it under
+                   $XDG_DATA_HOME/blinkterm/engine/ (~/.local/share/...),
+                   start it once, and exit. Nothing is downloaded otherwise
   --tmux <auto|on|off>
                    wrap pictures for tmux's passthrough and draw them as
                    unicode placeholders (at most 297 columns of picture).
@@ -149,9 +157,10 @@ actions are listed after the keys.
 
 The page is rendered by a headless Chromium, which this program starts and
 stops. It is looked for in --engine, then $BLINKTERM_ENGINE, then the
-settings file, then on PATH as chrome-headless-shell, chromium,
-chromium-browser, google-chrome or chromium-shell. blinkterm does not ship
-one; install the one you want.
+settings file, then where --install-engine put one, then on PATH as
+chrome-headless-shell, chromium, chromium-browser, google-chrome or
+chromium-shell. blinkterm does not ship one; blinkterm --install-engine
+fetches the tested one, or install the one you want.
 
 A profile is made readable by you alone (0700), and one blinkterm uses it at a
 time: a second one started on the same profile is refused, and told which pid
@@ -334,6 +343,7 @@ fn main() -> ExitCode {
         Invocation::Doctor(options, provenance) => {
             return exit(doctor::report(&options, &provenance));
         }
+        Invocation::InstallEngine(options) => return exit(install::run(&options)),
         Invocation::Run(options) => options,
     };
 
@@ -348,7 +358,8 @@ fn main() -> ExitCode {
             eprintln!("blinkterm: {message}");
             if message.contains(engine::ENGINE_ENV) || message.contains("PATH") {
                 eprintln!(
-                    "blinkterm: install a chromium, or set {}",
+                    "blinkterm: run blinkterm --install-engine to fetch the tested engine, \
+                     install a chromium, or set {}",
                     engine::ENGINE_ENV
                 );
             }
@@ -410,5 +421,11 @@ mod tests {
     fn the_options_list_names_keymap() {
         assert!(USAGE_HEAD.contains("  --keymap <mac|linux>\n"));
         assert!(USAGE_TAIL.starts_with("Everything else goes to the page."));
+    }
+
+    #[test]
+    fn the_options_list_names_install_engine() {
+        assert!(USAGE_HEAD.contains("  --install-engine "));
+        assert!(USAGE_HEAD.contains("blinkterm --install-engine\nfetches the tested one"));
     }
 }
