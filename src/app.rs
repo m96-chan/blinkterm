@@ -5290,7 +5290,7 @@ enum Command {
     /// `alt+l`: the login form filled from the password command. See
     /// [`crate::login`].
     FillLogin,
-    /// `alt+r`: the site styles and scripts read again and told to every
+    /// `alt+shift+r`: the site styles and scripts read again and told to every
     /// tab. See [`crate::sites`].
     ReloadSites,
     /// `alt+r`: the article without the page around it. See
@@ -6397,8 +6397,11 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('s') => Some(Command::SavePdf),
             Key::Char('p') => Some(Command::Permissions),
             Key::Char('b') => Some(Command::Block),
-            Key::Char('r') => Some(Command::ReloadSites),
             Key::Char('l') => Some(Command::FillLogin),
+            // `ESC R`, as with `ESC S`: alt+shift+r from a terminal without
+            // the Kitty protocol.
+            Key::Char('R') => Some(Command::ReloadSites),
+            Key::Char('r') if key.mods.shift() => Some(Command::ReloadSites),
             Key::Char('r') => Some(Command::Reader),
             Key::Char('t') => Some(Command::ReopenTab),
             Key::Char('=' | '+') => Some(Command::ZoomIn),
@@ -6802,7 +6805,7 @@ fn toggle_block(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     note(tabs, sentence);
 }
 
-/// `alt+r`: the site files read again, from the directory the run started
+/// `alt+shift+r`: the site files read again, from the directory the run started
 /// with, and every tab that can answer told — its old registrations taken
 /// back by identifier and the new ones made. The styles change where each
 /// page stands; the scripts run from each page's next load, because a
@@ -9599,10 +9602,20 @@ mod tests {
     }
 
     #[test]
-    fn alt_r_reads_the_site_files_again_and_survives_a_dialog() {
+    fn alt_shift_r_reads_the_site_files_again_and_survives_a_dialog() {
+        assert_eq!(
+            command(&key(Key::Char('r'), Mods::ALT | Mods::SHIFT)),
+            Some(Command::ReloadSites)
+        );
+        // `ESC R`: the capital with no shift bit.
+        assert_eq!(
+            command(&key(Key::Char('R'), Mods::ALT)),
+            Some(Command::ReloadSites)
+        );
+        // Plain `alt+r` is the reader's.
         assert_eq!(
             command(&key(Key::Char('r'), Mods::ALT)),
-            Some(Command::ReloadSites)
+            Some(Command::Reader)
         );
         assert_eq!(command_of(Action::ReloadSites), Command::ReloadSites);
         // It sends nothing to a page that has a dialog up.
@@ -9728,6 +9741,7 @@ mod tests {
             if command(&press) == Some(Command::Reader) {
                 assert_eq!(press.key, Key::Char('r'), "{press:?}");
                 assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
+                assert!(!press.mods.shift(), "alt+shift+r is reload-sites: {press:?}");
             }
         }
     }

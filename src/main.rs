@@ -204,7 +204,7 @@ keys:
                  stay here
   alt+r          reader mode: the article alone, without the page around it;
                  again to put the page back
-  alt+r          read the site styles and scripts again
+  alt+shift+r    read the site styles and scripts again
   esc            leave a page's fullscreen; stop a page that is loading
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no

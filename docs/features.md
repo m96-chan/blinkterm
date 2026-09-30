@@ -432,7 +432,7 @@ named after the host, in a directory beside the settings file.
 Names are matched without regard to case. A name that is not a host —
 anything but letters, digits, `.` and `-` after an optional `*.` — is
 refused, and said: in the shell as blinkterm starts, and on the row after
-`alt+r`. Other files (`notes.txt`, an editor's `x.css.swp`), dotfiles and
+`alt+shift+r`. Other files (`notes.txt`, an editor's `x.css.swp`), dotfiles and
 subdirectories are passed over. Hosts only: a path, a port or an IPv6
 address is not a pattern.
 
@@ -478,12 +478,12 @@ Each script is registered on its own, so a file with a syntax error stops
 only itself; its top-level declarations are its own, as in a userscript
 manager.
 
-**`alt+r`** (`reload-sites`) reads the directory again and tells every tab.
+**`alt+shift+r`** (`reload-sites`) reads the directory again and tells every tab.
 The row says what was read, `site files: 2 styles, 1 script`. Styles change
 on the page where it stands. Scripts apply from each page's next load — a
 script run again on a live page would do its work twice. A tab stopped
 behind a dialog, or crashed, keeps the files it had, and the row says how
-many did. If `alt+r` is taken by your terminal, bind another key:
+many did. If `alt+shift+r` is taken by your terminal, bind another key:
 `key.f9 = reload-sites` (see [Rebinding keys](configuration.md#rebinding-keys)).
 
 **The directory** is read once as blinkterm starts. `--sites-dir <dir>` (or
@@ -509,7 +509,7 @@ Measured against `chrome-headless-shell` 153:
 | a host's style, on load, after a navigation, after a reload | applied |
 | a script, before the page's first inline script | ran first |
 | a `// @world main` script under `script-src 'none'` | ran |
-| a style after `alt+r` | in place, on the same document |
-| the old script after `alt+r` | never ran again |
+| a style after `alt+shift+r` | in place, on the same document |
+| the old script after `alt+shift+r` | never ran again |
 | five script files, registered on a new tab | 0.5 to 10 ms |
 | 210 KB of CSS, to `domInteractive` | +7 ms on a page it fits, +1 ms on one it does not |

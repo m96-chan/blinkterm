@@ -184,7 +184,7 @@ machine. It prints a warning when it does. Do not browse as root.
   not stop it (measured with `script-src 'none'`). So a file another local
   user could change is a way into every page you open, and a file, or the
   directory itself, that group or others can write (`mode & 0o022`) is
-  refused by name, in the shell at start and on the row after `alt+r`.
+  refused by name, in the shell at start and on the row after `alt+shift+r`.
   Nothing in the files leaves the machine unless a script you wrote sends it
   ([#66](https://github.com/m96-chan/blinkterm/issues/66)).
 

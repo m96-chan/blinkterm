@@ -51,11 +51,11 @@ flag, a different default, a raised Rust floor all do.
   file has the last word. A style is adopted at document start, and is
   nothing the page can see in its own sheets; a script runs at document
   start in an isolated world that shares only the DOM, or in the page's own
-  when its first line is `// @world main`. `alt+r` (`reload-sites`) reads the
-  directory again: styles change where the page stands, scripts from the
-  next load. `--sites-dir <dir>` (`sites-dir =`) reads another directory,
-  and `--no-sites` (`sites = false`) none. A file or directory that another
-  user could write is refused by name
+  when its first line is `// @world main`. `alt+shift+r` (`reload-sites`)
+  reads the directory again: styles change where the page stands, scripts
+  from the next load. `--sites-dir <dir>` (`sites-dir =`) reads another
+  directory, and `--no-sites` (`sites = false`) none. A file or directory
+  that another user could write is refused by name
   ([#66](https://github.com/m96-chan/blinkterm/issues/66)).
 
 ### Changed

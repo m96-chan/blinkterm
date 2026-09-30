@@ -234,7 +234,7 @@ pub enum Action {
     /// `alt+b`: blocking off for the site in front, or on again. See
     /// [`crate::block`].
     Block,
-    /// `alt+r`: read the site styles and scripts again. See
+    /// `alt+shift+r`: read the site styles and scripts again. See
     /// [`crate::sites`].
     ReloadSites,
 }
@@ -258,7 +258,7 @@ const TAB_NAMES: &str = "tab-1 .. tab-8";
 /// [`Action::every`] and [`defaults`] expand it.
 ///
 /// The keys are the documented spellings, not every press the built-in table
-/// answers: it reads shift only for `tab`, `t`, `a`, `h`, `s` and the page keys, so
+/// answers: it reads shift only for `tab`, `t`, `a`, `h`, `r`, `s` and the page keys, so
 /// `ctrl+shift+=` zooms in too, and a chord is exact.
 pub const ACTIONS: [Row; 32] = [
     Row {
@@ -408,7 +408,7 @@ pub const ACTIONS: [Row; 32] = [
     Row {
         name: "reload-sites",
         action: Action::ReloadSites,
-        keys: "alt+r",
+        keys: "alt+shift+r",
         what: "read the site styles and scripts again",
     },
     Row {

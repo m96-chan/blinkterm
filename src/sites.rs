@@ -96,7 +96,7 @@
 //!
 //! # Reload
 //!
-//! `alt+r` (`reload-sites`) reads the directory again, and every tab that
+//! `alt+shift+r` (`reload-sites`) reads the directory again, and every tab that
 //! can answer is told: `Page.removeScriptToEvaluateOnNewDocument` for every
 //! identifier the tab was given ([`remove`]), then the new set ([`install`]).
 //! By identifier, because that is the only handle the engine gives on a
@@ -125,7 +125,7 @@
 //! another user can change is a way into every page. A file larger than
 //! [`MAX_FILE_BYTES`] or not UTF-8 is refused too. Each refusal is one
 //! sentence ([`Sites::skipped`]), said in the shell at start and on the row
-//! after `alt+r`.
+//! after `alt+shift+r`.
 //!
 //! # Measured
 //!

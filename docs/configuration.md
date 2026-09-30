@@ -114,7 +114,7 @@ nothing else, for scripts.
 | `reader` | `alt+r` | the article without the page around it |
 | `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
 | `block` | `alt+b` | stop blocking ads and trackers on this site, or start again |
-| `reload-sites` | `alt+r` | read the site styles and scripts again |
+| `reload-sites` | `alt+shift+r` | read the site styles and scripts again |
 | `fill-login` | `alt+l` | fill the login form from your password manager |
 | `copy` | `alt+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | copy the url |
