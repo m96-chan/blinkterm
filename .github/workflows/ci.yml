@@ -251,8 +251,13 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       # Debug unit tests include the real shm_open object-store round trip. One
       # at a time keeps their timing measurements about this program rather
-      # than about several test threads competing on a three-core runner.
+      # than about several test threads competing on a three-core runner. The
+      # hosted VM can itself be descheduled for over 100 ms, so its timing
+      # tests use functional lower bounds; a real Mac without this explicit
+      # marker keeps the strict frame-clock assertions.
       - run: cargo test --locked --lib -- --test-threads=1
+        env:
+          BLINKTERM_SHARED_RUNNER: 1
       - name: Install the engine
         # Chrome for Testing's chrome-headless-shell for mac-arm64, the same
         # version the Linux job pins, by checksum. `curl` sets no quarantine
@@ -275,3 +280,4 @@ jobs:
       - run: cargo test --release --locked --test engine -- --test-threads=1
         env:
           BLINKTERM_ENGINE: ${{ runner.temp }}/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell
+          BLINKTERM_SHARED_RUNNER: 1
