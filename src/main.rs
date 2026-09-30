@@ -69,6 +69,13 @@ options:
                    there is no display
   --file-picker-multiple, --file-picker-terminal-multiple <command>
                    used instead for an input that takes several files
+  --password-command <command>
+                   a program that prints the login for a site: the password
+                   on the first line, `login: <user>` on another (pass show
+                   web/{domain}; rbw get --full {host}). {host}, {domain},
+                   {url}. Run by alt+l, never by itself
+  --password-command-terminal <command>
+                   the same, for one that needs this terminal
   --proxy <host:port|scheme://host:port|direct://>
                    send requests through a proxy (loopback never is)
   --mute           start the engine silent (--mute-audio); pages play and

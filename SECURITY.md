@@ -129,6 +129,37 @@ machine. It prints a warning when it does. Do not browse as root.
   checks before anything is sent
   ([#58](https://github.com/m96-chan/blinkterm/issues/58)).
 
+- **Logins from a password manager.** Nothing here stores a password:
+  `password-command` names a program of yours (`pass`, `rbw`, `op` …), run
+  without a shell with `{host}`, `{domain}` or `{url}` of the page in front
+  in its arguments — the host name and the path, never the query string,
+  since a process's arguments are readable by every local process — and
+  only when you press `alt+l`; no page event, load or dialog can start it.
+  It runs only when the page in front is `https`, or `http` on
+  `localhost`/`127.*`/`[::1]`, decided from the url this program has before
+  anything is started. What it prints is read from a pipe nobody else
+  holds, kept in one buffer that is overwritten with zeros when it is
+  dropped, handed to the page as an argument of one
+  `Runtime.callFunctionOn` — never spliced into script source — and
+  forgotten; the buffers the output passed through are overwritten the same
+  way. It never reaches the status row (which says `filled login for
+  example.com`, not what with), the tab list, the history, the session, the
+  zoom or permissions files, or this program's stderr. In the page, the
+  script runs in an isolated world and fills only a document whose
+  `location` passes the same scheme rule and whose host name is the one the
+  secret was fetched for: the top document and its same-origin frames; a
+  cross-origin frame is unreachable from that world by the engine's own
+  rule, and a `srcdoc`/`about:blank` frame has no host name and is skipped.
+  It sets the fields and fires `input`/`change`, and never submits. What is
+  *not* done: the copies this program cannot scrub are the DevTools message
+  on the private pipe and the JSON it is serialized from, both built and
+  freed inside one call; the engine's stderr does not carry DevTools
+  traffic unless you hand it `--engine-arg=--enable-logging` with a verbose
+  level — do not, on a profile you fill logins into; and a page that has
+  already been compromised can read its own form, as in any browser. The
+  user name printed by the command is treated exactly as the password
+  ([#65](https://github.com/m96-chan/blinkterm/issues/65)).
+
 - **Shared memory.** Frames go through POSIX shared memory objects named
   `blinkterm-<pid>-...` and unlinked by the terminal as it reads them — a
   frame is a picture of whatever you are looking at. On Linux they are files
@@ -181,6 +212,8 @@ machine. It prints a warning when it does. Do not browse as root.
   Chromium with site isolation, which lives in a target this program does not
   attach to and gets no prompt — the headless shell keeps such a frame
   in-process, measured, and there the prompt works.
+- A password manager command of your own that logs or echoes what it
+  printed.
 - The proof-of-concept scripts in `tools/`. `tools/Dockerfile` binds the
   debugging port to `0.0.0.0` and says so in a comment: it is a development
   image and an open CDP port is remote code execution by design. Do not run it

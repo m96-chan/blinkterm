@@ -60,6 +60,7 @@ use crate::json::Json;
 use crate::keys;
 use crate::line::{Edit, Line};
 use crate::load::{self, Loaded, Problem};
+use crate::login;
 use crate::motion::{self, Motion};
 use crate::normal;
 use crate::options::Options;
@@ -198,6 +199,12 @@ const WORLD_TIMEOUT: Duration = Duration::from_secs(2);
 /// for its computed cursor, so a page of forty thousand is about half a
 /// second. Five, like [`FIND_TIMEOUT`]. See [`crate::hints`].
 const HINT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the fill of a login form may be out with the page: one
+/// `Runtime.callFunctionOn` over a page's inputs, which is milliseconds, and
+/// the page's own `input` listeners, which are the page's. Five, like the
+/// hints'.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the question after a click in normal mode — did focus land in
 /// something editable? — may be out. The hover ask's, which it is the same
@@ -427,6 +434,12 @@ struct Chrome {
     /// and is refused by the lock, which says what to do. See
     /// [`pump_remote`].
     remote: Option<Listener>,
+    /// The password commands the settings name; none, and `fill-login`
+    /// says so. See [`crate::login`].
+    logins: login::Programs,
+    /// The login being fetched or filled for one tab: one at a time. See
+    /// [`start_login`].
+    login: Option<LoginState>,
     /// Where the pointer is and what is under it, for the tab in front only.
     /// See [`crate::hover`].
     hover: hover::Tracker,
@@ -591,6 +604,8 @@ impl Chrome {
             display: picker::has_display(|name| std::env::var(name).ok()),
             picker: None,
             remote: None,
+            logins: options.logins.clone(),
+            login: None,
             hover: hover::Tracker::default(),
             asking: None,
             shape: Shape::Default,
@@ -673,11 +688,14 @@ impl Chrome {
     /// terminal and not about the engine.
     /// What was on the tabs — a dialog, a file input's half-typed path — goes
     /// with them, and so does a file picker's window that is open for one of
-    /// them, ended as it is dropped: the input it would answer is gone.
+    /// them, ended as it is dropped: the input it would answer is gone. A
+    /// password command running for one of them is ended the same way, and
+    /// a fill waiting for its answer is forgotten.
     /// Nothing is sent: this is this program's memory only, and the pointer's
     /// shape is the caller's to give back to the terminal.
     fn engine_gone(&mut self, now: Instant) {
         self.picker = None;
+        self.login = None;
         self.still = None;
         self.navigation = None;
         self.asking = None;
@@ -1731,6 +1749,10 @@ fn drive(
         watching.extend(chrome.picker.as_ref().and_then(picker::Gui::fd));
         // A `blinkterm --remote` knocking; see [`pump_remote`].
         watching.extend(chrome.remote.as_ref().map(Listener::fd));
+        // A password command's, likewise; see [`pump_login`].
+        if let Some(LoginState::Fetching(gui)) = &chrome.login {
+            watching.extend(gui.fd());
+        }
         // A frame owed an acknowledgement is acknowledged the pass after the
         // pane has written it ([`tick_frames`]), and nothing wakes this poll
         // when the writer finishes; so while one is owed the passes come
@@ -1779,6 +1801,9 @@ fn drive(
         // announcements of targets are read below, so that the tabs are in
         // the list by then and those announcements are ignored as ours.
         pump_remote(pane, tabs, browser, chrome, &ready)?;
+        // A password command that has answered, or a page that has answered
+        // the fill.
+        pump_login(pane, tabs, chrome, &ready)?;
         // Whatever the pointer did in all the reports just read, told to the
         // page and asked about once: see [`crate::hover`].
         tick_hover(pane, tabs, chrome)?;
@@ -4661,6 +4686,10 @@ fn handle_input(
                     toggle_block(tabs, chrome);
                     redraw_row(pane, tabs, chrome)?;
                 }
+                Some(Command::FillLogin) => {
+                    start_login(pane, tabs, chrome)?;
+                    redraw_row(pane, tabs, chrome)?;
+                }
                 Some(Command::ListTabs) => {
                     chrome.list = Some(Overlay::Tabs(TabList::open(tabs.active_index())));
                     chrome.list_first.set(0);
@@ -5074,6 +5103,9 @@ enum Command {
     /// `alt+b`: blocking off for the site in front, or on again. See
     /// [`crate::block`].
     Block,
+    /// `alt+l`: the login form filled from the password command. See
+    /// [`crate::login`].
+    FillLogin,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -5147,6 +5179,7 @@ fn survives_dialog(command: Command) -> bool {
         | Command::CopySelection
         | Command::Find
         | Command::Permissions
+        | Command::FillLogin
         | Command::ZoomIn
         | Command::ZoomOut
         | Command::ZoomReset
@@ -5556,6 +5589,234 @@ fn finish_picker(
     }
 }
 
+/// A login on its way to a page, one at a time: the password command
+/// running, or the fill sent and its answer awaited. See [`start_login`].
+enum LoginState {
+    /// A password command with a window, running beside the loop. Dropping
+    /// it ends it.
+    Fetching(login::Gui),
+    /// The fill sent to the tab `target`, for `host`, and when. The login
+    /// itself was dropped, and so overwritten, as soon as it was sent.
+    Filling {
+        target: String,
+        host: String,
+        pending: Pending,
+        sent: Instant,
+    },
+}
+
+/// `fill-login`: run the password command for the page in front, and fill
+/// its login form with what it prints ([`crate::login`]).
+///
+/// Only on the key, and only one at a time. Everything that can be decided
+/// before a secret exists is decided here, and each refusal is a sentence
+/// on the row with nothing run: no command set, one already running, a
+/// crashed page, a page that has not come, and — the one that matters — a
+/// page that is not `https` or this machine ([`login::site`]).
+///
+/// A command with a window is started and left to run, as a file picker's
+/// is: [`pump_login`] hears it answer. One that needs the terminal is run
+/// here, to the end ([`run_terminal_login`]). Either is started in `$HOME`,
+/// or failing that where this program was, and never anywhere a page named.
+fn start_login(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+) -> Result<(), String> {
+    if chrome.logins.is_empty() {
+        note(tabs, "no password-command set");
+        return Ok(());
+    }
+    if chrome.login.is_some() {
+        note(tabs, "a password command is already running");
+        return Ok(());
+    }
+    let Some(tab) = tabs.active() else {
+        return Ok(());
+    };
+    if tab.is_crashed() {
+        note(tabs, load::sentence(&Problem::Crashed));
+        return Ok(());
+    }
+    if !accepts_input(tab) || tab.dialog.is_some() || tab.upload.is_some() {
+        return Ok(());
+    }
+    // An error page keeps the url that failed, which may well be https; its
+    // document is the engine's own, and a secret fetched for it would be
+    // fetched for nothing.
+    if !tab.committed || matches!(tab.problem, Some(Problem::Unreachable { .. })) {
+        note(tabs, "the page has not come yet");
+        return Ok(());
+    }
+    let site = match login::site(&tab.url) {
+        Ok(site) => site,
+        Err(refused) => {
+            note(tabs, refused.sentence());
+            return Ok(());
+        }
+    };
+    let (target, url) = (tab.target.clone(), tab.url.clone());
+    let dir = upload::home()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let chosen = chrome
+        .logins
+        .choose(chrome.display)
+        .map(|(kind, command)| (kind, command.clone()));
+    match chosen {
+        Some((picker::Kind::Gui, command)) => {
+            match login::Gui::spawn(&command, &site, &target, &url, &dir) {
+                Ok(gui) => {
+                    note(tabs, login::asking(&site.host));
+                    chrome.login = Some(LoginState::Fetching(gui));
+                }
+                Err(why) => note(tabs, why),
+            }
+        }
+        Some((picker::Kind::Terminal, command)) => {
+            let outcome = run_terminal_login(pane, chrome, &command, &site, &dir)?;
+            if let Some(index) = tabs.index_of(&target) {
+                finish_login(tabs, chrome, index, &site, &url, outcome);
+            }
+        }
+        None => note(tabs, "no password-command set"),
+    }
+    Ok(())
+}
+
+/// A password command's window, or the fill it led to, once a pass.
+///
+/// A command whose tab has closed is ended without a word, by dropping it.
+/// One that has exited is handed to [`finish_login`]. A fill's answer is
+/// said on its tab's row — what was filled, never with what — and one that
+/// does not come in [`LOGIN_TIMEOUT`], or comes as an exception, is "the
+/// page did not take the login".
+fn pump_login(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    ready: &[std::os::fd::RawFd],
+) -> Result<(), String> {
+    match chrome.login.as_mut() {
+        None => Ok(()),
+        Some(LoginState::Fetching(gui)) => {
+            let Some(index) = tabs.index_of(&gui.tab) else {
+                chrome.login = None;
+                return redraw_row(pane, tabs, chrome);
+            };
+            let readable = gui.fd().is_some_and(|fd| ready.contains(&fd));
+            let Some(outcome) = gui.pump(readable) else {
+                return Ok(());
+            };
+            let (site, url) = (gui.site.clone(), gui.url.clone());
+            chrome.login = None;
+            finish_login(tabs, chrome, index, &site, &url, outcome);
+            redraw_row(pane, tabs, chrome)
+        }
+        Some(LoginState::Filling {
+            target,
+            host,
+            pending,
+            sent,
+        }) => {
+            let Some(tab) = tabs.index_of(target).and_then(|index| tabs.get_mut(index)) else {
+                chrome.login = None;
+                return Ok(());
+            };
+            let sentence = match tab.connection.take_reply(pending) {
+                None if sent.elapsed() < LOGIN_TIMEOUT => return Ok(()),
+                Some(Ok(reply)) => match login::filled(&reply) {
+                    Some(filled) => login::sentence(filled, host),
+                    None => login::NOT_TAKEN.to_string(),
+                },
+                None | Some(Err(_)) => login::NOT_TAKEN.to_string(),
+            };
+            tab.note = Some(sentence);
+            chrome.login = None;
+            redraw_row(pane, tabs, chrome)
+        }
+    }
+}
+
+/// Give the terminal to a password command that needs it, run it to the
+/// end, and take the terminal back, exactly as [`run_terminal_picker`] does
+/// for a file picker and for its reasons.
+fn run_terminal_login(
+    pane: &mut Pane,
+    chrome: &mut Chrome,
+    command: &picker::Command,
+    site: &login::Site,
+    dir: &Path,
+) -> Result<login::Outcome, String> {
+    pane.write(&chrome.painter.clear())
+        .map_err(|e| e.to_string())?;
+    pane.release()
+        .map_err(|e| format!("cannot give the terminal to the password command: {e}"))?;
+    let outcome = login::run_terminal(command, site, dir);
+    pane.resume()
+        .map_err(|e| format!("cannot take the terminal back from the password command: {e}"))?;
+    chrome.shape = Shape::Default;
+    RESIZED.store(true, Ordering::SeqCst);
+    Ok(outcome)
+}
+
+/// What a password command's answer does to the tab at `index`, which was
+/// at `url` when it was started for `site`.
+///
+/// No login, or a command that broke, is said on the row. A login is sent
+/// only to the page it was fetched for: the tab still at that url, landed,
+/// and not crashed, asleep or stopped behind a dialog — else "the page
+/// changed" and nothing is sent. Then the fill goes as one
+/// `Runtime.callFunctionOn` in the find prompt's world ([`make_world`]),
+/// with the login as its arguments ([`login::fill_params`]), and the login
+/// is dropped here, overwritten, whatever happened; [`pump_login`] reads
+/// the answer.
+fn finish_login(
+    tabs: &mut Tabs<Client>,
+    chrome: &mut Chrome,
+    index: usize,
+    site: &login::Site,
+    url: &str,
+    outcome: login::Outcome,
+) {
+    let Some(tab) = tabs.get_mut(index) else {
+        return;
+    };
+    let login = match outcome {
+        login::Outcome::Found(login) => login,
+        login::Outcome::None => {
+            tab.note = Some(login::no_login(&site.host));
+            return;
+        }
+        login::Outcome::Failed(why) => {
+            tab.note = Some(why);
+            return;
+        }
+    };
+    if tab.url != url || !tab.committed || tab.is_crashed() || tab.dormant || tab.dialog.is_some() {
+        tab.note = Some(login::CHANGED.to_string());
+        return;
+    }
+    let Some(context) = make_world(&mut tab.connection) else {
+        tab.note = Some(login::NOT_TAKEN.to_string());
+        return;
+    };
+    match tab.connection.send(
+        "Runtime.callFunctionOn",
+        login::fill_params(context, site, &login),
+    ) {
+        Ok(pending) => {
+            chrome.login = Some(LoginState::Filling {
+                target: tab.target.clone(),
+                host: site.host.clone(),
+                pending,
+                sent: Instant::now(),
+            });
+        }
+        Err(_) => tab.note = Some(login::NOT_TAKEN.to_string()),
+    }
+}
+
 /// A page that asked before it was left and was told no.
 ///
 /// It is where it was, and nothing about the tab should say otherwise: not
@@ -5882,6 +6143,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('s') => Some(Command::SavePdf),
             Key::Char('p') => Some(Command::Permissions),
             Key::Char('b') => Some(Command::Block),
+            Key::Char('l') => Some(Command::FillLogin),
             Key::Char('t') => Some(Command::ReopenTab),
             Key::Char('=' | '+') => Some(Command::ZoomIn),
             Key::Char('-' | '_') => Some(Command::ZoomOut),
@@ -5935,6 +6197,7 @@ fn command_of(action: Action) -> Command {
         Action::ZoomReset => Command::ZoomReset,
         Action::Find => Command::Find,
         Action::Permissions => Command::Permissions,
+        Action::FillLogin => Command::FillLogin,
         Action::Copy => Command::CopySelection,
         Action::CopyUrl => Command::CopyUrl,
         Action::SavePdf => Command::SavePdf,
@@ -8002,7 +8265,7 @@ mod tests {
 
         // Everything else belongs to the page.
         assert_eq!(command(&key(Key::Char('q'), 0)), None);
-        assert_eq!(command(&key(Key::Char('l'), Mods::ALT)), None);
+        assert_eq!(command(&key(Key::Char('z'), Mods::ALT)), None);
         assert_eq!(command(&key(Key::Left, Mods::CTRL)), None);
         assert_eq!(command(&key(Key::Char('a'), Mods::CTRL)), None);
         assert_eq!(command(&key(Key::Tab, 0)), None, "tab is the page's");
@@ -8841,6 +9104,29 @@ mod tests {
         for press in every_press() {
             if command(&press) == Some(Command::Permissions) {
                 assert_eq!(press.key, Key::Char('p'), "{press:?}");
+                assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn alt_l_fills_a_login_and_waits_for_a_dialog_like_the_other_page_questions() {
+        assert_eq!(
+            command(&key(Key::Char('l'), Mods::ALT)),
+            Some(Command::FillLogin)
+        );
+        assert_eq!(command_of(Action::FillLogin), Command::FillLogin);
+        // It asks the page, which a dialog has stopped.
+        assert!(!survives_dialog(Command::FillLogin));
+        // `ctrl+l` is still the url bar, and a bare `l` the page's.
+        assert_eq!(
+            command(&key(Key::Char('l'), Mods::CTRL)),
+            Some(Command::EditUrl)
+        );
+        assert_eq!(command(&key(Key::Char('l'), 0)), None);
+        for press in every_press() {
+            if command(&press) == Some(Command::FillLogin) {
+                assert_eq!(press.key, Key::Char('l'), "{press:?}");
                 assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
             }
         }

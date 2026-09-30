@@ -89,6 +89,16 @@
 //! that the picker's terminal mode turns into a signal ends the picker and
 //! not the browser. The picker has both put back to their defaults before
 //! it starts.
+//!
+//! # Not only for files
+//!
+//! Nothing in running one is about files: [`Running`] and
+//! [`run_in_terminal`] start a program the settings name, collect what it
+//! prints, and end it, and say in their sentences what it is (`what`, "the
+//! file picker"). [`Gui`] and [`run_terminal`] put the file picker's
+//! placeholders and answer on top. [`crate::login`] is the second user, for
+//! a password manager's command, which is why what passes through here is
+//! overwritten with zeros once it has been handed on ([`scrub`]).
 
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -145,7 +155,12 @@ impl Command {
     /// Whether the command asks for a file to write its answer to, and so
     /// is not read from its standard output.
     pub fn has_out(&self) -> bool {
-        self.words.iter().any(|word| word.contains("{out}"))
+        self.has("{out}")
+    }
+
+    /// Whether any word holds `placeholder`, braces and all (`"{out}"`).
+    pub fn has(&self, placeholder: &str) -> bool {
+        self.words.iter().any(|word| word.contains(placeholder))
     }
 
     /// The words to run: `{dir}` and `{out}` replaced inside each word, and
@@ -156,14 +171,43 @@ impl Command {
     pub fn expand(&self, dir: &Path, out: Option<&Path>) -> Vec<String> {
         let dir = dir.to_string_lossy();
         let out = out.map(|out| out.to_string_lossy());
+        let mut values = vec![("dir", &*dir)];
+        if let Some(out) = &out {
+            values.push(("out", out));
+        }
+        self.expand_with(&values)
+    }
+
+    /// The words to run, with each `{name}` of `values` — given without its
+    /// braces — replaced inside the words it is in, and nothing split
+    /// again. Any other `{…}` is left as it is written.
+    ///
+    /// In one pass over each word: a value is put in and never read again,
+    /// so a value that itself holds a `{name}` — a directory, or a page's
+    /// path for [`crate::login`] — stays as it is rather than being
+    /// replaced in turn.
+    pub fn expand_with(&self, values: &[(&str, &str)]) -> Vec<String> {
         self.words
             .iter()
             .map(|word| {
-                let word = word.replace("{dir}", &dir);
-                match &out {
-                    Some(out) => word.replace("{out}", out),
-                    None => word,
+                let mut out = String::with_capacity(word.len());
+                let mut rest = word.as_str();
+                'scan: while let Some(open) = rest.find('{') {
+                    out.push_str(&rest[..open]);
+                    let at = &rest[open..];
+                    for (name, value) in values {
+                        let placeholder = format!("{{{name}}}");
+                        if at.starts_with(&placeholder) {
+                            out.push_str(value);
+                            rest = &at[placeholder.len()..];
+                            continue 'scan;
+                        }
+                    }
+                    out.push('{');
+                    rest = &at[1..];
                 }
+                out.push_str(rest);
+                out
             })
             .collect()
     }
@@ -288,14 +332,29 @@ impl Pickers {
     /// when both kinds are set; the one kind there is, when only one is.
     /// `None` only when nothing is set.
     pub fn choose(&self, multiple: bool, display: bool) -> Option<(Kind, &Command)> {
-        let gui = of_kind(&self.gui, &self.gui_multiple, multiple);
-        let terminal = of_kind(&self.terminal, &self.terminal_multiple, multiple);
-        match (gui, terminal) {
-            (Some(gui), Some(_)) if display => Some((Kind::Gui, gui)),
-            (_, Some(terminal)) => Some((Kind::Terminal, terminal)),
-            (Some(gui), None) => Some((Kind::Gui, gui)),
-            (None, None) => None,
-        }
+        choose_kind(
+            of_kind(&self.gui, &self.gui_multiple, multiple),
+            of_kind(&self.terminal, &self.terminal_multiple, multiple),
+            display,
+        )
+    }
+}
+
+/// Of a command with a window and one for the terminal, the one to run: the
+/// window where there is a display and the terminal where there is not, when
+/// both are set; the one there is, when only one is; `None` when neither.
+/// See [`Pickers::choose`], and [`crate::login::Programs::choose`], which
+/// has the same two kinds.
+pub fn choose_kind<'a>(
+    gui: Option<&'a Command>,
+    terminal: Option<&'a Command>,
+    display: bool,
+) -> Option<(Kind, &'a Command)> {
+    match (gui, terminal) {
+        (Some(gui), Some(_)) if display => Some((Kind::Gui, gui)),
+        (_, Some(terminal)) => Some((Kind::Terminal, terminal)),
+        (Some(gui), None) => Some((Kind::Gui, gui)),
+        (None, None) => None,
     }
 }
 
@@ -505,26 +564,91 @@ impl Drop for OutFile {
     }
 }
 
-/// The sentence for a picker that printed more than [`MAX_OUTPUT`].
-const TOO_MUCH: &str = "the file picker printed more than 64 KiB";
+/// What the file picker is called in the sentences of [`Running`] and
+/// [`run_in_terminal`].
+pub const WHAT: &str = "the file picker";
 
-/// Why a picker could not be started, for the row: the program's name, as
-/// plain text since it is the person's own words from a file, and the
-/// system's reason in a few of its own.
-fn cannot_start(program: &str, error: &std::io::Error) -> String {
+/// The sentence for a program that printed more than [`MAX_OUTPUT`]:
+/// `what` is what it is, [`WHAT`] for a picker.
+pub fn too_much(what: &str) -> String {
+    format!("{what} printed more than 64 KiB")
+}
+
+/// Why a program could not be started, for the row: what it is, the
+/// program's name, as plain text since it is the person's own words from a
+/// file, and the system's reason in a few of its own.
+fn cannot_start(what: &str, program: &str, error: &std::io::Error) -> String {
     let why = match error.kind() {
         std::io::ErrorKind::NotFound => "no such program".to_string(),
         kind => kind.to_string(),
     };
-    format!(
-        "can't start the file picker {}: {why}",
-        text::sanitize(program)
-    )
+    format!("can't start {what} {}: {why}", text::sanitize(program))
 }
 
-/// A picker with a window of its own, while it runs. See the module for
-/// why it is left to run and how it is ended.
-pub struct Gui {
+/// Overwrite `bytes` with zeros in a way the optimiser may not drop.
+///
+/// For what a program printed, once it has been handed on: a password
+/// manager's output passes through the same buffers a picker's does
+/// ([`crate::login`]). A plain loop of stores into memory that is about to
+/// be freed is exactly what an optimiser removes; a volatile write is not,
+/// and the fence keeps the writes from being moved past whatever frees the
+/// memory next. Done for every buffer every time, picker or not, since the
+/// cost is nothing beside a process and a pipe.
+pub fn scrub(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        // SAFETY: `write_volatile` writes one `u8` through a pointer made
+        // from a live `&mut u8`, which is aligned and in bounds by
+        // construction.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+/// How a program that has exited ended: whether it said it succeeded, and
+/// the bytes it answered with — its output, or the `{out}` file.
+///
+/// The bytes are overwritten with zeros when it is dropped ([`scrub`]), so
+/// they are only lent out, never moved.
+pub struct Exit {
+    /// Whether it exited with status 0.
+    pub success: bool,
+    /// What it answered with, at most [`MAX_OUTPUT`] bytes.
+    pub answer: Vec<u8>,
+}
+
+impl Drop for Exit {
+    fn drop(&mut self) {
+        scrub(&mut self.answer);
+    }
+}
+
+impl std::fmt::Debug for Exit {
+    /// The length and not the bytes: they may be a password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Exit")
+            .field("success", &self.success)
+            .field("answer", &format_args!("{} bytes", self.answer.len()))
+            .finish()
+    }
+}
+
+/// How much one read of a program's output takes.
+const READ_CHUNK: usize = 8192;
+
+/// The buffer a program's output is collected in: room for all it may
+/// print and one read past it, made at once so that it never grows. A `Vec`
+/// that grows copies itself and frees the old copy as it was, and a freed
+/// copy of a password is one [`scrub`] cannot reach.
+fn output_buffer() -> Vec<u8> {
+    Vec::with_capacity(MAX_OUTPUT + READ_CHUNK)
+}
+
+/// A program with a window of its own, or none, while it runs beside the
+/// loop: started in a process group of its own with nothing on its standard
+/// input and its errors thrown away, read without blocking, and ended when
+/// dropped. See the module for why, and [`Gui`] and [`crate::login::Gui`]
+/// for its two users.
+pub struct Running {
     child: Child,
     /// `kill(2)`'s argument for its group, as [`crate::engine`] keeps one.
     target: i32,
@@ -534,37 +658,22 @@ pub struct Gui {
     /// What it has printed so far.
     read: Vec<u8>,
     out: Option<OutFile>,
-    /// Where it started, which a relative line is under.
-    dir: PathBuf,
-    home: Option<PathBuf>,
     /// Whether it has been waited for, and so has nothing left to kill.
     reaped: bool,
-    /// The tab whose input it is answering, by target id.
-    pub tab: String,
-    /// The input it is answering.
-    pub chooser: Chooser,
+    /// What it is, for the sentences: [`WHAT`], or the password command.
+    what: &'static str,
 }
 
-impl Gui {
-    /// Start `command` in `dir` for `chooser`, on the tab `tab`. The
-    /// sentence for the row when it cannot be.
+impl Running {
+    /// Start `argv`, already expanded, in `dir`; its answer is `out` when
+    /// there is one, else its standard output. The sentence for the row
+    /// when it cannot be started.
     pub fn spawn(
-        command: &Command,
+        argv: &[String],
         dir: &Path,
-        tab: &str,
-        chooser: &Chooser,
-    ) -> Result<Gui, String> {
-        let out = if command.has_out() {
-            Some(OutFile::create().map_err(|e| {
-                format!(
-                    "can't make a file for the file picker to write to: {}",
-                    e.kind()
-                )
-            })?)
-        } else {
-            None
-        };
-        let argv = command.expand(dir, out.as_ref().map(OutFile::path));
+        out: Option<OutFile>,
+        what: &'static str,
+    ) -> Result<Running, String> {
         let mut process = std::process::Command::new(&argv[0]);
         process
             .args(&argv[1..])
@@ -576,23 +685,20 @@ impl Gui {
                 Stdio::piped()
             })
             .stderr(Stdio::null());
-        let (mut child, target) =
-            engine::spawn_in_own_group(&mut process).map_err(|e| cannot_start(&argv[0], &e))?;
+        let (mut child, target) = engine::spawn_in_own_group(&mut process)
+            .map_err(|e| cannot_start(what, &argv[0], &e))?;
         let stdout: Option<OwnedFd> = child.stdout.take().map(OwnedFd::from);
         if let Some(fd) = &stdout {
             tty::set_nonblocking(fd.as_raw_fd()).ok();
         }
-        Ok(Gui {
+        Ok(Running {
             child,
             target,
             stdout,
-            read: Vec::new(),
+            read: output_buffer(),
             out,
-            dir: dir.to_path_buf(),
-            home: upload::home(),
             reaped: false,
-            tab: tab.to_string(),
-            chooser: chooser.clone(),
+            what,
         })
     }
 
@@ -602,29 +708,27 @@ impl Gui {
     }
 
     /// One pass: read what it printed if `readable`, and see whether it has
-    /// exited. `Some` once it is over, and then only once.
+    /// exited. `Some` once it is over, and then only once: its exit and
+    /// answer, or the sentence for why it broke.
     ///
     /// The exit is asked every pass whether the output was readable or not,
-    /// because a picker with `{out}` has no output, and one whose output is
+    /// because a program with `{out}` has no output, and one whose output is
     /// at end of file is no longer polled; a pass is at most the loop's
     /// poll interval, and `try_wait` is one `waitpid`.
-    pub fn pump(&mut self, readable: bool) -> Option<Outcome> {
+    pub fn pump(&mut self, readable: bool) -> Option<Result<Exit, String>> {
         if self.reaped {
             return None;
         }
         if readable && self.drain() {
             self.kill_now();
-            return Some(Outcome::Failed(TOO_MUCH.to_string()));
+            return Some(Err(too_much(self.what)));
         }
         let status = match self.child.try_wait() {
             Ok(None) => return None,
             Ok(Some(status)) => status,
             Err(e) => {
                 self.kill_now();
-                return Some(Outcome::Failed(format!(
-                    "lost the file picker: {}",
-                    e.kind()
-                )));
+                return Some(Err(format!("lost {}: {}", self.what, e.kind())));
             }
         };
         self.reaped = true;
@@ -633,19 +737,17 @@ impl Gui {
         // pipe open and would keep a blocking read here for ever.
         let over = self.drain();
         self.stdout = None;
-        let answer = match &self.out {
-            Some(out) => out.read(),
-            None => std::mem::take(&mut self.read),
+        let exit = Exit {
+            success: status.success(),
+            answer: match &self.out {
+                Some(out) => out.read(),
+                None => std::mem::take(&mut self.read),
+            },
         };
-        if over || answer.len() > MAX_OUTPUT {
-            return Some(Outcome::Failed(TOO_MUCH.to_string()));
+        if over || exit.answer.len() > MAX_OUTPUT {
+            return Some(Err(too_much(self.what)));
         }
-        Some(outcome(
-            status.success(),
-            &answer,
-            &self.dir,
-            self.home.as_deref(),
-        ))
+        Some(Ok(exit))
     }
 
     /// Read whatever is waiting on its output. True when it has now printed
@@ -656,22 +758,24 @@ impl Gui {
         let Some(fd) = self.fd() else {
             return false;
         };
-        let mut buf = [0u8; 8192];
-        loop {
+        let mut buf = [0u8; READ_CHUNK];
+        let over = loop {
             match tty::read_available(fd, &mut buf) {
                 Ok(ReadOutcome::Data(n)) => {
                     self.read.extend_from_slice(&buf[..n]);
                     if self.read.len() > MAX_OUTPUT {
-                        return true;
+                        break true;
                     }
                 }
-                Ok(ReadOutcome::WouldBlock) => return false,
+                Ok(ReadOutcome::WouldBlock) => break false,
                 Ok(ReadOutcome::Eof) | Err(_) => {
                     self.stdout = None;
-                    return false;
+                    break false;
                 }
             }
-        }
+        };
+        scrub(&mut buf);
+        over
     }
 
     /// End it now, with no half second of grace: it is misbehaving.
@@ -683,12 +787,13 @@ impl Gui {
     }
 }
 
-impl Drop for Gui {
+impl Drop for Running {
     /// Asked, then told: `SIGTERM` to the group, half a second for it to go,
     /// then `SIGKILL`, as [`crate::engine::Engine::kill`] does. A dialog
     /// has nothing to save and goes at once; the grace is for a wrapper
-    /// that tidies up.
+    /// that tidies up. And what it printed that nobody took is overwritten.
     fn drop(&mut self) {
+        scrub(&mut self.read);
         if self.reaped {
             return;
         }
@@ -706,6 +811,70 @@ impl Drop for Gui {
         engine::signal_all(self.target, libc::SIGKILL);
         let _ = self.child.wait();
     }
+}
+
+/// A picker with a window of its own, while it runs. See the module for
+/// why it is left to run and how it is ended.
+pub struct Gui {
+    running: Running,
+    /// Where it started, which a relative line is under.
+    dir: PathBuf,
+    home: Option<PathBuf>,
+    /// The tab whose input it is answering, by target id.
+    pub tab: String,
+    /// The input it is answering.
+    pub chooser: Chooser,
+}
+
+impl Gui {
+    /// Start `command` in `dir` for `chooser`, on the tab `tab`. The
+    /// sentence for the row when it cannot be.
+    pub fn spawn(
+        command: &Command,
+        dir: &Path,
+        tab: &str,
+        chooser: &Chooser,
+    ) -> Result<Gui, String> {
+        let out = out_file(command)?;
+        let argv = command.expand(dir, out.as_ref().map(OutFile::path));
+        let running = Running::spawn(&argv, dir, out, WHAT)?;
+        Ok(Gui {
+            running,
+            dir: dir.to_path_buf(),
+            home: upload::home(),
+            tab: tab.to_string(),
+            chooser: chooser.clone(),
+        })
+    }
+
+    /// The descriptor to poll, while there is output still to come.
+    pub fn fd(&self) -> Option<RawFd> {
+        self.running.fd()
+    }
+
+    /// One pass: read what it printed if `readable`, and see whether it has
+    /// exited. `Some` once it is over, and then only once. See
+    /// [`Running::pump`].
+    pub fn pump(&mut self, readable: bool) -> Option<Outcome> {
+        Some(match self.running.pump(readable)? {
+            Ok(exit) => outcome(exit.success, &exit.answer, &self.dir, self.home.as_deref()),
+            Err(why) => Outcome::Failed(why),
+        })
+    }
+}
+
+/// The file a picker with `{out}` writes its answer to; `None` for one
+/// without. The sentence for the row when it cannot be made.
+fn out_file(command: &Command) -> Result<Option<OutFile>, String> {
+    if !command.has_out() {
+        return Ok(None);
+    }
+    OutFile::create().map(Some).map_err(|e| {
+        format!(
+            "can't make a file for the file picker to write to: {}",
+            e.kind()
+        )
+    })
 }
 
 /// `SIGINT` and `SIGQUIT` ignored for as long as it is held, and put back
@@ -756,28 +925,36 @@ impl Drop for QuietSignals {
 
 /// Run a terminal picker to the end, on this terminal, and say how it
 /// ended. The caller has given the terminal back first and takes it again
-/// after; see the module for the process group and the signals.
-///
-/// Its output, when it has no `{out}`, is read on a thread of its own while
-/// this waits, as [`crate::engine`] reads the engine's errors: a picker that
-/// printed more than a pipe holds with nobody reading would never exit.
-/// What is past [`MAX_OUTPUT`] is read and thrown away for the same reason,
-/// and the picker is then taken as broken.
+/// after; see the module for the process group and the signals, and
+/// [`run_in_terminal`] for how its output is read.
 pub fn run_terminal(command: &Command, dir: &Path, home: Option<&Path>) -> Outcome {
-    let out = if command.has_out() {
-        match OutFile::create() {
-            Ok(out) => Some(out),
-            Err(e) => {
-                return Outcome::Failed(format!(
-                    "can't make a file for the file picker to write to: {}",
-                    e.kind()
-                ))
-            }
-        }
-    } else {
-        None
+    let out = match out_file(command) {
+        Ok(out) => out,
+        Err(why) => return Outcome::Failed(why),
     };
     let argv = command.expand(dir, out.as_ref().map(OutFile::path));
+    match run_in_terminal(&argv, dir, out, WHAT) {
+        Ok(exit) => outcome(exit.success, &exit.answer, dir, home),
+        Err(why) => Outcome::Failed(why),
+    }
+}
+
+/// Run `argv`, already expanded, to the end on this terminal, in `dir`, and
+/// say how it ended: its exit and answer — `out` when there is one, else
+/// its standard output — or the sentence for why it broke, which calls it
+/// `what`.
+///
+/// Its output, when it has no `{out}`, is read on a thread of its own while
+/// this waits, as [`crate::engine`] reads the engine's errors: a program
+/// that printed more than a pipe holds with nobody reading would never
+/// exit. What is past [`MAX_OUTPUT`] is read and thrown away for the same
+/// reason, and the program is then taken as broken.
+pub fn run_in_terminal(
+    argv: &[String],
+    dir: &Path,
+    out: Option<OutFile>,
+    what: &'static str,
+) -> Result<Exit, String> {
     let mut process = std::process::Command::new(&argv[0]);
     process
         .args(&argv[1..])
@@ -801,14 +978,13 @@ pub fn run_terminal(command: &Command, dir: &Path, home: Option<&Path>) -> Outco
         });
     }
     let quiet = QuietSignals::new();
-    let mut child = match process.spawn() {
-        Ok(child) => child,
-        Err(e) => return Outcome::Failed(cannot_start(&argv[0], &e)),
-    };
+    let mut child = process
+        .spawn()
+        .map_err(|e| cannot_start(what, &argv[0], &e))?;
     let reader = child.stdout.take().map(|mut stdout| {
         std::thread::spawn(move || {
-            let mut kept = Vec::new();
-            let mut buf = [0u8; 8192];
+            let mut kept = output_buffer();
+            let mut buf = [0u8; READ_CHUNK];
             let mut over = false;
             loop {
                 match stdout.read(&mut buf) {
@@ -820,27 +996,44 @@ pub fn run_terminal(command: &Command, dir: &Path, home: Option<&Path>) -> Outco
                     }
                 }
             }
-            (kept, over)
+            scrub(&mut buf);
+            // Handed back in an `Exit` so that it is scrubbed however it is
+            // dropped; how the program exited is not known here yet.
+            let printed = Exit {
+                success: false,
+                answer: kept,
+            };
+            (printed, over)
         })
     });
     let status = child.wait();
     let printed = reader.and_then(|reader| reader.join().ok());
     drop(quiet);
-    let status = match status {
-        Ok(status) => status,
-        Err(e) => return Outcome::Failed(format!("lost the file picker: {}", e.kind())),
+    let status = status.map_err(|e| format!("lost {what}: {}", e.kind()))?;
+    let mut exit = match (&out, printed) {
+        (Some(out), _) => Exit {
+            success: false,
+            answer: out.read(),
+        },
+        (None, Some((_, true))) => return Err(too_much(what)),
+        (None, Some((printed, false))) => printed,
+        (None, None) => Exit {
+            success: false,
+            answer: Vec::new(),
+        },
     };
-    let answer = match (&out, printed) {
-        (Some(out), _) => out.read(),
-        (None, Some((_, true))) => return Outcome::Failed(TOO_MUCH.to_string()),
-        (None, Some((kept, false))) => kept,
-        (None, None) => Vec::new(),
-    };
-    if answer.len() > MAX_OUTPUT {
-        return Outcome::Failed(TOO_MUCH.to_string());
+    if exit.answer.len() > MAX_OUTPUT {
+        return Err(too_much(what));
     }
-    outcome(status.success(), &answer, dir, home)
+    exit.success = status.success();
+    Ok(exit)
 }
+
+/// The signal dispositions are the process's, and the tests run on threads
+/// of one process: the tests that change them take turns, here and in
+/// [`crate::login`].
+#[cfg(test)]
+pub(crate) static SIGNALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -1141,10 +1334,6 @@ mod tests {
 
     // Running them.
 
-    /// The signal dispositions are the process's, and the tests run on
-    /// threads of one process: the tests that change them take turns.
-    static SIGNALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn chooser(multiple: bool) -> Chooser {
         Chooser {
             backend_node_id: 3,
@@ -1216,7 +1405,13 @@ mod tests {
             false,
         );
         assert_eq!(picker.fd(), None, "its output is not read");
-        let out = picker.out.as_ref().expect("a file").path().to_path_buf();
+        let out = picker
+            .running
+            .out
+            .as_ref()
+            .expect("a file")
+            .path()
+            .to_path_buf();
         assert_eq!(
             finish(&mut picker),
             Outcome::Files(vec![PathBuf::from("/b/x.txt")])
@@ -1245,8 +1440,8 @@ mod tests {
     #[test]
     fn a_window_picker_that_prints_too_much_is_stopped() {
         let mut picker = gui("yes /a/path/that/goes/on", &std::env::temp_dir(), false);
-        assert_eq!(finish(&mut picker), Outcome::Failed(TOO_MUCH.to_string()));
-        assert!(picker.reaped);
+        assert_eq!(finish(&mut picker), Outcome::Failed(too_much(WHAT)));
+        assert!(picker.running.reaped);
     }
 
     /// Whether anything is left running in a process group.
@@ -1290,7 +1485,7 @@ mod tests {
     fn dropping_a_window_picker_ends_it_and_what_it_started() {
         // A wrapper and the program it runs, as `sh -c` around a dialog is.
         let picker = gui("sh -c 'sleep 30; true'", &std::env::temp_dir(), false);
-        let target = picker.target;
+        let target = picker.running.target;
         assert!(target < 0, "a group of its own");
         std::thread::sleep(Duration::from_millis(100));
         assert!(!group_gone(target));
@@ -1359,7 +1554,7 @@ mod tests {
         assert_eq!(run("true {out}"), Outcome::Cancel);
         assert_eq!(
             run("sh -c 'head -c 70000 /dev/zero | tr \"\\0\" a'"),
-            Outcome::Failed(TOO_MUCH.to_string())
+            Outcome::Failed(too_much(WHAT))
         );
         assert_eq!(
             run("blinkterm-no-such-picker"),

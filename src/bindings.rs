@@ -212,6 +212,9 @@ pub enum Action {
     /// `alt+p`: the line that allows this page's origin the camera, the
     /// microphone and the rest. See [`crate::permissions`].
     Permissions,
+    /// `alt+l`: the login form filled from the password command. See
+    /// [`crate::login`].
+    FillLogin,
     Copy,
     CopyUrl,
     /// `alt+s`: the page as a PDF in the downloads directory. See
@@ -248,7 +251,7 @@ const TAB_NAMES: &str = "tab-1 .. tab-8";
 /// The keys are the documented spellings, not every press the built-in table
 /// answers: it reads shift only for `tab`, `t`, `a`, `h`, `s` and the page keys, so
 /// `ctrl+shift+=` zooms in too, and a chord is exact.
-pub const ACTIONS: [Row; 28] = [
+pub const ACTIONS: [Row; 29] = [
     Row {
         name: "quit",
         action: Action::Quit,
@@ -386,6 +389,12 @@ pub const ACTIONS: [Row; 28] = [
         action: Action::Block,
         keys: "alt+b",
         what: "stop blocking ads and trackers on this site, or start again",
+    },
+    Row {
+        name: "fill-login",
+        action: Action::FillLogin,
+        keys: "alt+l",
+        what: "fill the login form from your password manager",
     },
     Row {
         name: "copy",

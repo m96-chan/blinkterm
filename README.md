@@ -377,6 +377,9 @@ page's file input instead of the row (see
 `block-list = <path>`, repeatable, names a list of hosts to block, and
 `block = false` (or `--no-block`) blocks nothing whatever the lists say
 (see [Blocking ads and trackers](#blocking-ads-and-trackers)).
+`password-command` and `password-command-terminal` name a password
+manager's command that `alt+l` fills a login form from (see
+[Filling a login from your password manager](#filling-a-login-from-your-password-manager)).
 
 `--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
 repeatable. Four are refused because they would undo something this
@@ -438,6 +441,7 @@ nothing else, for scripts.
 | `find` | `ctrl+f` | find in the page |
 | `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
 | `block` | `alt+b` | stop blocking ads and trackers on this site, or start again |
+| `fill-login` | `alt+l` | fill the login form from your password manager |
 | `copy` | `alt+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | copy the url |
 | `save-pdf` | `alt+s` | save this page as a PDF |
@@ -638,6 +642,70 @@ or quitting ends the picker, and what it would have chosen goes nowhere.
 While a terminal picker runs, `ctrl+c` is the picker's: `blinkterm`
 ignores it until the picker exits.
 
+## Filling a login from your password manager
+
+`blinkterm` keeps no passwords. If yours are in a password manager with a
+command line, name its command and `alt+l` fills the login form in front
+from it ([#65](https://github.com/m96-chan/blinkterm/issues/65)):
+
+    password-command = pass show web/{domain}
+    password-command = rbw get --full {host}
+    # a terminal one: pick the entry yourself
+    password-command-terminal = sh -c 'gopass show "$(gopass ls --flat | fzf)"'
+    # 1Password, through a wrapper of your own that prints the two lines
+    password-command = ~/bin/op-login {domain}
+
+(one of each, of course). What the command prints is the `pass` convention:
+the password on the first line, exactly as it is, and on a later line
+`login: <user>` (or `username:` or `user:`) for the user name. That is what
+`pass`, `gopass` and `rbw get --full` print already. JSON is not read —
+every manager's is different — so for `op`, `bw` or `keepassxc-cli` a few
+lines of `jq` in a script make the two lines. A command that exits with
+anything but 0, or prints nothing, has no login for the page, and the row
+says `no login for example.com`.
+
+In the command, `{host}` is the page's host name (`accounts.example.com`),
+`{domain}` the host without its subdomains (`example.com`, and
+`example.co.uk` for `www.example.co.uk`) — a guess made without the
+public-suffix list, right for the names people keep entries under; use
+`{host}` when it is wrong for you — and `{url}` the page's url without its
+query string and fragment, since every program on the machine can read
+another's arguments and a query can hold a session token. The command is
+split and run as a file picker's is, with no shell; it starts in your home
+directory.
+
+`password-command` is a program that leaves the terminal alone — one that
+answers straight away, or opens a window of its own — and runs while the
+page keeps drawing; the row says `asking for the login for example.com`.
+`password-command-terminal` is one that needs the terminal: `blinkterm`
+steps aside while it runs, as for a terminal file picker. With both set the
+choice is the file picker's: the window where there is a display, the
+terminal elsewhere (see
+[Choosing it with another program](#choosing-it-with-another-program)).
+Both are options too, `--password-command` and
+`--password-command-terminal`.
+
+The password goes into the password field of the form you are in — or,
+with the focus in no form, the first password field on the page — and the
+user name into the text or email field before it, preferring one whose name
+says user, login, email or account. A login form in a frame of the page's
+own site is reached too; one in a frame of another site is not. Each field
+is set the way typing would leave it, so the page's scripts see it, and
+nothing is submitted: `enter` is yours to press. The row says
+`filled login for example.com`, or `filled password for example.com` when
+there was no user name to fill, or `no password field on this page`.
+
+It runs only when you press `alt+l`: no page, load or dialog can start it,
+and one runs at a time. It runs only for a page on `https`, or on `http` to
+this machine (`localhost`, `127.0.0.1`, `[::1]`); anywhere else the row
+says `fill-login needs https, or localhost` and nothing is run. The page is
+checked again when the answer comes: a tab that went somewhere else in the
+meantime is not filled, and the script in the page fills only documents
+whose host is the one the login was looked up for. The password is never
+on the row, in the history, in the session or in any file, and what held
+it is overwritten once it has been handed over. See
+[SECURITY.md](SECURITY.md) for the details and the limits.
+
 ## Keys
 
 | | |
@@ -665,6 +733,7 @@ ignores it until the picker exits.
 | `alt+shift+s` | save the whole page, top to bottom, as a PNG there. A page past sixteen million pixels is cut to its top, and the row says how much |
 | `alt+p` | allow this site something: the row says `allow https://site: ` and the words it is allowed now, all selected; type any of `camera` `microphone` `location` `notifications` `clipboard`, `enter` sets exactly those (an empty line takes them all back), `esc` leaves it. See [Sound, permissions and fullscreen](#sound-permissions-and-fullscreen) |
 | `alt+b` | stop blocking ads and trackers on this site, or start again: the row says `blocking off for example.com`, and `unblocked` while you are on it. Reload to get what was blocked. In the url bar `alt+b` is still a word back |
+| `alt+l` | fill the login form from your password manager: runs `password-command` for this page's host and puts what it printed into the password field and the user-name field before it, in the page or a same-origin frame; never submits; only on https or localhost. See [Filling a login from your password manager](#filling-a-login-from-your-password-manager) |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |

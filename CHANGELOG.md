@@ -43,6 +43,15 @@ flag, a different default, a raised Rust floor all do.
   the pipe's reader thread through `Fetch`, which cost a 300-image page
   2.12 s against 2.10 s unblocked
   ([#62](https://github.com/m96-chan/blinkterm/issues/62)).
+- `alt+l` (`fill-login`) fills a login form from your password manager:
+  `password-command = <command>` (`pass show web/{domain}`, `rbw get --full
+  {host}`) prints the password on its first line and `login: <user>` on
+  another, and the password field and the user-name field before it are
+  filled and never submitted, in the page or a same-origin frame. Only on
+  the key, only for an https page or one on this machine, and the password
+  is never shown or kept. `password-command-terminal` for one that needs
+  the terminal, with the file picker's display rule; both are options too
+  ([#65](https://github.com/m96-chan/blinkterm/issues/65)).
 - A page's file input can be answered by a program the settings name
   instead of the row: `file-picker = <command>` for one with a window of
   its own (Finder's dialog through `osascript`, `zenity`, `kdialog`),
