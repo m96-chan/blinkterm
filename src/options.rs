@@ -136,6 +136,9 @@ pub struct Options {
     /// `--password-command` and `--password-command-terminal`: what
     /// `fill-login` runs. See [`crate::login`].
     pub logins: login::Programs,
+    /// `--external-browser`: what `open-external` runs; none for the
+    /// platform's own. See [`crate::external`].
+    pub external_browser: Option<picker::Command>,
 }
 
 /// What `main` was asked to do, once the command line has been read.
@@ -223,6 +226,7 @@ pub struct Settings {
     pub block: Option<bool>,
     pub password_command: Option<picker::Command>,
     pub password_command_terminal: Option<picker::Command>,
+    pub external_browser: Option<picker::Command>,
     /// File only: a binding is not a one-run thing.
     pub bindings: Vec<Binding>,
     /// Command line only.
@@ -282,6 +286,7 @@ impl Settings {
             password_command_terminal: self
                 .password_command_terminal
                 .or(under.password_command_terminal),
+            external_browser: self.external_browser.or(under.external_browser),
             bindings,
             config: self.config.or(under.config),
             what: self.what.or(under.what),
@@ -522,6 +527,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             "--file-picker",
             "--password-command-terminal",
             "--password-command",
+            "--external-browser",
         ];
         if let Some((name, text)) = pickers
             .iter()
@@ -533,6 +539,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
                 "--file-picker-multiple" => &mut s.file_picker_multiple,
                 "--password-command-terminal" => &mut s.password_command_terminal,
                 "--password-command" => &mut s.password_command,
+                "--external-browser" => &mut s.external_browser,
                 _ => &mut s.file_picker,
             };
             let text = needed(text, &format!("{name} needs a command: {name} <command>"))?;
@@ -684,7 +691,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 29] = [
+const KEYS: [&str; 30] = [
     "home",
     "profile",
     "temp-profile",
@@ -714,6 +721,7 @@ const KEYS: [&str; 29] = [
     "block",
     "password-command",
     "password-command-terminal",
+    "external-browser",
 ];
 
 /// One file's text. `path` is only for the sentences, every one of which is
@@ -835,6 +843,9 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             }
             "password-command-terminal" => {
                 s.password_command_terminal = Some(picker::Command::parse(key, value).map_err(at)?)
+            }
+            "external-browser" => {
+                s.external_browser = Some(picker::Command::parse(key, value).map_err(at)?)
             }
             _ => unreachable!("every key in KEYS has an arm"),
         }
@@ -958,6 +969,7 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
             gui: s.password_command,
             terminal: s.password_command_terminal,
         },
+        external_browser: s.external_browser,
     })
 }
 
@@ -1023,6 +1035,7 @@ fn home_expanded(mut settings: Settings, home: Option<&Path>) -> Settings {
         &mut settings.file_picker_terminal_multiple,
         &mut settings.password_command,
         &mut settings.password_command_terminal,
+        &mut settings.external_browser,
     ] {
         *command = command.take().map(|command| command.expand_home(home));
     }
@@ -2085,6 +2098,63 @@ mod tests {
         );
         assert_eq!(words(options.logins.terminal).map(|w| w.len()), Some(4));
         assert!(resolved(&[]).expect("resolves").logins.is_empty());
+    }
+
+    #[test]
+    fn the_external_browser_is_read_from_the_line_and_the_file() {
+        let words = |c: Option<picker::Command>| c.map(|c| c.words);
+        let strings = |w: &[&str]| Some(w.iter().map(|w| w.to_string()).collect::<Vec<_>>());
+        let cli = parsed(&["--external-browser", "firefox --new-tab {url}"]).expect("cli");
+        assert_eq!(
+            words(cli.external_browser),
+            strings(&["firefox", "--new-tab", "{url}"])
+        );
+        let cli = parsed(&["--external-browser=open -a 'Google Chrome'"]).expect("cli");
+        assert_eq!(
+            words(cli.external_browser),
+            strings(&["open", "-a", "Google Chrome"])
+        );
+        assert_eq!(
+            parsed(&["--external-browser=a", "--external-browser=b"]),
+            Err("--external-browser once is enough".to_string())
+        );
+        assert_eq!(
+            parsed(&["--external-browser"]),
+            Err("--external-browser needs a command: --external-browser <command>".to_string())
+        );
+        assert_eq!(
+            parsed(&["--external-browser", "x 'y"]),
+            Err("--external-browser has a quote that is never closed".to_string())
+        );
+
+        let from_file = home_expanded(
+            file("external-browser = ~/bin/open-it {url}").expect("a file"),
+            Some(Path::new("/h")),
+        );
+        assert_eq!(
+            words(from_file.external_browser.clone()),
+            strings(&["/h/bin/open-it", "{url}"])
+        );
+        assert_eq!(
+            file("external-browser = a\nexternal-browser = b"),
+            Err("/c:2: external-browser is already set on line 1".to_string())
+        );
+
+        // The line's wins over the file's.
+        let options = resolve(
+            parsed(&["--external-browser=chromium"]).expect("cli"),
+            Settings::default(),
+            from_file.clone(),
+        )
+        .expect("resolves");
+        assert_eq!(words(options.external_browser), strings(&["chromium"]));
+        let options =
+            resolve(parsed(&[]).expect("cli"), Settings::default(), from_file).expect("resolves");
+        assert_eq!(
+            words(options.external_browser),
+            strings(&["/h/bin/open-it", "{url}"])
+        );
+        assert_eq!(resolved(&[]).expect("resolves").external_browser, None);
     }
 
     #[test]

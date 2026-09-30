@@ -28,6 +28,14 @@ flag, a different default, a raised Rust floor all do.
   on a dark terminal
   ([#79](https://github.com/m96-chan/blinkterm/issues/79),
   [#84](https://github.com/m96-chan/blinkterm/issues/84)).
+- `alt+o` (`open-external`) opens the page in front in the desktop browser —
+  `open` on a Mac, `$BROWSER` or `xdg-open` on Linux, or
+  `external-browser = <command>` with `{url}` where the url goes — started
+  detached and left running when `blinkterm` quits. Only `http`, `https` and
+  `file` pages are opened, and over ssh with no display the row says so and
+  points at `alt+u`. Cookies and logins do not travel: the other browser opens
+  the url on its own profile
+  ([#61](https://github.com/m96-chan/blinkterm/issues/61)).
 
 ### Changed
 

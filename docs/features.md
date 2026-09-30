@@ -266,6 +266,58 @@ on the row, in the history, in the session or in any file, and what held
 it is overwritten once it has been handed over. See
 [SECURITY.md](../SECURITY.md) for the details and the limits.
 
+## Opening a page in the desktop browser
+
+Some pages cannot be finished in a terminal: a reCAPTCHA that wants its
+pictures clicked ([#57](https://github.com/m96-chan/blinkterm/issues/57)), a
+file input in a frame of another site, a passkey that wants the machine's
+authenticator, a video behind DRM. `alt+o` (`open-external`) takes the page
+in front to the desktop's own browser, and the row says `sent to the desktop
+browser` ([#61](https://github.com/m96-chan/blinkterm/issues/61)).
+
+With nothing set it runs `open <url>` on a Mac, and on Linux `$BROWSER` when
+it is set (a `%s` in it is where the url goes) or else `xdg-open <url>`. Those
+are only run where there is a desktop to open a window on — `$DISPLAY` or
+`$WAYLAND_DISPLAY` set, or a Mac not reached over ssh, the same rule the file
+picker has. Anywhere else nothing is run and the row says `no desktop here;
+alt+u copies the url`. Over ssh with X forwarding `$DISPLAY` is set, and the
+browser opens on the forwarded display.
+
+A `$BROWSER` that is `blinkterm` itself — `blinkterm --remote`, as
+[Opening a url from another program](usage.md#opening-a-url-from-another-program)
+suggests — is not run, since the page would come straight back as a tab
+here, and it is taken out of the environment of what is run instead, so that
+`xdg-open` on a desktop it does not know cannot fall back to it. On GNOME or
+KDE, `xdg-open` asks the desktop and never reads `$BROWSER` at all.
+
+To name the program yourself:
+
+    external-browser = firefox --new-tab {url}
+    external-browser = open -a Safari {url}
+    external-browser = chromium
+
+`{url}` is where the url goes; a command without it gets the url as its last
+argument. The command is split into words the way the file picker's is and
+run without a shell. A command you named is run wherever you are, display or
+not: you said so. It is an option too, `--external-browser`.
+
+**Nothing of your login goes with it.** Cookies, logins, the tab's history
+and whatever you typed stay here: the other browser is another browser, on
+its own profile, and opens the url afresh — signed in if it already was
+there, and otherwise not. What is handed over is the url, query string
+included, and nothing else.
+
+Only `http`, `https` and `file` pages are opened. A blank tab says `nothing
+to open here`, and `about:`, `chrome:`, `data:`, `javascript:` and `blob:`
+pages say `a <scheme>: page is not opened outside`. The url is the one this
+program has for the tab — the one `alt+u` copies — so the key works on a
+page that has crashed and on one behind a dialog. A `file:` url on a Mac is
+opened by `open` with whatever the desktop opens that file with — Preview for
+a PDF — and `external-browser = open -a Safari {url}` says otherwise.
+
+The program is started on its own, with nothing on its input or output, and
+left alone: quitting `blinkterm` does not close the browser.
+
 ## Sound, permissions and fullscreen
 
 **Sound** comes out of the machine `blinkterm` runs on, through the

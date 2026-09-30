@@ -160,6 +160,20 @@ machine. It prints a warning when it does. Do not browse as root.
   user name printed by the command is treated exactly as the password
   ([#65](https://github.com/m96-chan/blinkterm/issues/65)).
 
+- **The page in the desktop browser.** `alt+o` hands the url of the page in
+  front — query string included — to a program of yours as one argument:
+  `open` on a Mac, `$BROWSER` or `xdg-open` on Linux, or what
+  `external-browser` names. Only on the key, run without a shell, with
+  nothing else from the page: no cookie, no login, nothing the page said.
+  The url is the one this program has for the tab; the page is not asked.
+  A `$BROWSER` whose program is `blinkterm` is not run, and is taken out of
+  the environment of what is run, so the url cannot come back here. Nothing
+  is opened for a page that is not `http`, `https` or `file` (`about:`,
+  `chrome:`, `data:`, `javascript:`, `blob:` …). The program is started in
+  a process group of its own with its standard input, output and error on
+  `/dev/null`, and is never signalled
+  ([#61](https://github.com/m96-chan/blinkterm/issues/61)).
+
 - **Shared memory.** Frames go through POSIX shared memory objects named
   `blinkterm-<pid>-...` and unlinked by the terminal as it reads them — a
   frame is a picture of whatever you are looking at. On Linux they are files

@@ -47,6 +47,8 @@ page's file input instead of the row (see
 `password-command` and `password-command-terminal` name a password
 manager's command that `alt+l` fills a login form from (see
 [Filling a login from your password manager](features.md#filling-a-login-from-your-password-manager)).
+`external-browser` names the program `alt+o` opens the page with (see
+[Opening a page in the desktop browser](features.md#opening-a-page-in-the-desktop-browser)).
 
 `--engine-arg` (and `engine-arg =`) hands Chromium one more argument,
 repeatable. Four are refused because they would undo something this
@@ -111,6 +113,7 @@ nothing else, for scripts.
 | `fill-login` | `alt+l` | fill the login form from your password manager |
 | `copy` | `alt+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | copy the url |
+| `open-external` | `alt+o` | open this page in the desktop browser |
 | `save-pdf` | `alt+s` | save this page as a PDF |
 | `save-screenshot` | `alt+shift+s` | save the whole page as a picture |
 | `normal-mode` | `ctrl+.` | normal mode on or off |
