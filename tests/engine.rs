@@ -11251,3 +11251,468 @@ fn a_large_site_style_is_measured_at_document_start() {
     client.close();
     engine.kill();
 }
+
+// ---------------------------------------------------------------------------
+// Reader mode: the article alone, in a frame of its own in the page.
+// ---------------------------------------------------------------------------
+
+use blinkterm::reader::{self, Answered};
+
+/// A page with an article in the middle of what a page mostly is: a nav of
+/// twelve links, a sidebar of six, a footer of links, and a fixed cookie
+/// box. The article has a title, a byline, eight paragraphs with `quokka`
+/// once, a picture and a relative link; the footer has `quokka` too, which
+/// must not be found once the reader is on.
+fn reader_page() -> String {
+    let nav: String = (0..12)
+        .map(|i| format!("<a href='/n{i}'>Section {i}</a> "))
+        .collect();
+    let side: String = (0..6)
+        .map(|i| format!("<li><a href='/s{i}'>Related story number {i}</a></li>"))
+        .collect();
+    let paragraphs: String = (0..8)
+        .map(|i| {
+            let animal = if i == 3 { "a quokka" } else { "an animal" };
+            format!(
+                "<p>Paragraph {i} of the article, about {animal}, written at length so that \
+                 it reads as prose, with commas, clauses, and a full stop.</p>"
+            )
+        })
+        .collect();
+    format!(
+        "<!doctype html><meta charset=utf-8><title>loading</title>\
+         <body style='margin:8px;font:16px sans-serif;background:#fff'>\
+         <nav id=nav>{nav}</nav>\
+         <aside class=sidebar><ul>{side}</ul></aside>\
+         <article><h1>The article</h1><p class=byline>By Someone</p>\
+         {paragraphs}\
+         <img src=/pic.png alt=pic width=40 height=30>\
+         <a id=more href=/more>more</a></article>\
+         <footer><a href='/about'>About</a> <a href='/terms'>Terms</a> \
+         <p>A footer line that mentions the quokka again, with a link or two.</p></footer>\
+         <div id=cookie style='position:fixed;left:0;bottom:0;width:100%;background:#ccc'>cookies</div>\
+         <div style='height:2000px'></div>\
+         <script>onload=function(){{document.title='ready'}}</script></body>"
+    )
+}
+
+/// A page with nothing to read: a nav and a login form.
+fn nothing_page() -> String {
+    "<!doctype html><meta charset=utf-8><title>loading</title><body>\
+     <nav><a href=/a>Home</a> <a href=/b>About</a></nav>\
+     <form><input name=user><input type=password><button>Sign in</button></form>\
+     <script>onload=function(){document.title='ready'}</script></body>"
+        .to_string()
+}
+
+/// The reader's pages, served, and an engine on one of them with the shared
+/// world made in it, and the port they are served on.
+fn reading(path: &str) -> Option<(Engine, Client, i64, u16)> {
+    let port = serve_pages(|_| {
+        vec![
+            ("/".to_string(), reader_page()),
+            ("/none".to_string(), nothing_page()),
+            ("/more".to_string(), "<title>more</title>".to_string()),
+        ]
+    });
+    let (engine, client, context) = finding(&format!("http://localhost:{port}{path}"), "ready")?;
+    Some((engine, client, context, port))
+}
+
+/// The toggle, as the program sends it, waited for.
+fn toggle(client: &mut Client, context: i64, on: bool, alpha: bool) -> Option<Answered> {
+    let reply = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            reader::call_params(context, on, alpha),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers the reader");
+    reader::answered(&reply)
+}
+
+/// Something about the reader's own document, `d`, asked in the page.
+fn in_reader(client: &mut Client, expression: &str) -> Json {
+    evaluate(
+        client,
+        &format!(
+            "(function(){{var d=document.getElementById('{}').contentDocument;return {expression};}})()",
+            reader::FRAME_ID
+        ),
+    )
+}
+
+/// A list of numbers the page answered.
+fn numbers(json: &Json) -> Vec<f64> {
+    json.as_array()
+        .map(|all| all.iter().filter_map(Json::as_f64).collect())
+        .unwrap_or_default()
+}
+
+/// On: the article is in the frame, cleaned, its urls absolute, and
+/// everything else hidden, the page at the top. On again changes nothing.
+/// Off: the page exactly as it was, at the same place. A wheel over the
+/// frame moves the page, and a reload is the page without it.
+#[test]
+fn reader_mode_keeps_the_article_hides_the_rest_and_comes_off_leaving_the_page_as_it_was() {
+    let Some((mut engine, mut client, context, port)) = reading("/") else {
+        return;
+    };
+    evaluate(&mut client, "scrollTo(0, 300)");
+    assert_eq!(scroll_y(&mut client), 300.0);
+    let sheets = evaluate(&mut client, "document.adoptedStyleSheets.length")
+        .as_f64()
+        .expect("a count");
+
+    let started = Instant::now();
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::On)
+    );
+    eprintln!("reader on: {:?}", started.elapsed());
+    assert_eq!(
+        evaluate(&mut client, "!!document.getElementById('blinkterm-reader')").as_bool(),
+        Some(true)
+    );
+    for hidden in ["nav", "cookie"] {
+        assert_eq!(
+            evaluate(
+                &mut client,
+                &format!("getComputedStyle(document.getElementById('{hidden}')).display")
+            )
+            .as_str(),
+            Some("none"),
+            "{hidden} is hidden"
+        );
+    }
+    assert_eq!(
+        evaluate(&mut client, "typeof __blinktermReader").as_str(),
+        Some("undefined"),
+        "the page does not see the script's state"
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(sheets + 1.0)
+    );
+    assert_eq!(scroll_y(&mut client), 0.0, "the article from its top");
+
+    assert_eq!(
+        in_reader(&mut client, "d.querySelectorAll('p').length").as_f64(),
+        Some(9.0),
+        "eight paragraphs and the line under the title; the byline is not repeated"
+    );
+    assert_eq!(
+        in_reader(&mut client, "d.querySelector('.meta').textContent").as_str(),
+        Some("By Someone")
+    );
+    assert_eq!(
+        in_reader(
+            &mut client,
+            "d.querySelectorAll('nav, footer, aside').length"
+        )
+        .as_f64(),
+        Some(0.0)
+    );
+    assert_eq!(
+        in_reader(
+            &mut client,
+            "d.querySelectorAll('h1').length + ':' + d.querySelector('h1').textContent"
+        )
+        .as_str(),
+        Some("1:The article"),
+        "the title, once"
+    );
+    assert_eq!(
+        in_reader(
+            &mut client,
+            "d.querySelector('a[href]').getAttribute('href')"
+        )
+        .as_str(),
+        Some(format!("http://localhost:{port}/more").as_str()),
+        "a link made absolute"
+    );
+    assert_eq!(
+        in_reader(&mut client, "d.querySelector('img').getAttribute('src')").as_str(),
+        Some(format!("http://localhost:{port}/pic.png").as_str())
+    );
+    assert_eq!(
+        in_reader(&mut client, "d.querySelector('base').target").as_str(),
+        Some("_top")
+    );
+    assert_eq!(
+        in_reader(
+            &mut client,
+            "d.body.querySelectorAll('[style], [class]:not(.meta), [id]').length"
+        )
+        .as_f64(),
+        Some(0.0),
+        "no attribute but the ones that mean something"
+    );
+    let heights = numbers(&evaluate(
+        &mut client,
+        "(function(){var f=document.getElementById('blinkterm-reader');\
+         return [f.getBoundingClientRect().height, f.contentDocument.documentElement.scrollHeight]})()",
+    ));
+    eprintln!(
+        "frame {} tall for a document {} tall",
+        heights[0], heights[1]
+    );
+    assert!(
+        heights[0] >= heights[1] && heights[0] > HEIGHT as f64,
+        "{heights:?}"
+    );
+
+    // What the frame holds growing — an image arriving late — grows the
+    // frame, through the observer on its body.
+    let tall = |client: &mut Client| {
+        evaluate(
+            client,
+            "document.getElementById('blinkterm-reader').getBoundingClientRect().height",
+        )
+        .as_f64()
+        .unwrap_or_default()
+    };
+    let before = tall(&mut client);
+    in_reader(
+        &mut client,
+        "d.querySelector('article').appendChild(d.createElement('div')).style.height='500px'",
+    );
+    assert!(
+        wait_until(&mut client, true, |client| tall(client) > before + 400.0),
+        "the frame follows what it holds: {before} then {}",
+        tall(&mut client)
+    );
+
+    // A wheel over the frame moves the page: the frame's own document does
+    // not scroll, and the page is as tall as the article.
+    client
+        .call(
+            "Input.dispatchMouseEvent",
+            Json::object(vec![
+                ("type", Json::string("mouseWheel")),
+                ("x", Json::number(WIDTH / 2)),
+                ("y", Json::number(HEIGHT / 2)),
+                ("deltaX", Json::number(0)),
+                ("deltaY", Json::number(200)),
+            ]),
+        )
+        .expect("the wheel is dispatched");
+    let moved = wait_until(&mut client, true, |client| scroll_y(client) > 0.0);
+    eprintln!(
+        "a wheel over the frame: the page at {}",
+        scroll_y(&mut client)
+    );
+    assert!(moved, "a wheel over the reader scrolls the page");
+
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::On),
+        "on again is on"
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.querySelectorAll('iframe').length").as_f64(),
+        Some(1.0),
+        "and adds nothing"
+    );
+
+    let started = Instant::now();
+    assert_eq!(
+        toggle(&mut client, context, false, false),
+        Some(Answered::Off)
+    );
+    eprintln!("reader off: {:?}", started.elapsed());
+    assert_eq!(
+        evaluate(&mut client, "!!document.getElementById('blinkterm-reader')").as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(sheets)
+    );
+    assert_eq!(
+        evaluate(
+            &mut client,
+            "getComputedStyle(document.getElementById('nav')).display"
+        )
+        .as_str(),
+        Some("block")
+    );
+    assert_eq!(scroll_y(&mut client), 300.0, "back where the page was");
+    assert_eq!(
+        toggle(&mut client, context, false, false),
+        Some(Answered::Off),
+        "off again is off"
+    );
+
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::On)
+    );
+    evaluate(&mut client, "document.title='leaving'");
+    client
+        .call("Page.reload", Json::empty())
+        .expect("the page reloads");
+    assert_eq!(
+        wait_for_title(&mut client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+    assert_eq!(
+        evaluate(&mut client, "!!document.getElementById('blinkterm-reader')").as_bool(),
+        Some(false),
+        "a reload is the page without the reader"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// A login page: nothing to read, nothing changed, and the row's sentence.
+#[test]
+fn a_page_with_no_article_is_left_alone_and_the_reader_says_so() {
+    let Some((mut engine, mut client, context, _)) = reading("/none") else {
+        return;
+    };
+    let sheets = evaluate(&mut client, "document.adoptedStyleSheets.length");
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::Nothing)
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.querySelectorAll('iframe').length").as_f64(),
+        Some(0.0)
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length"),
+        sheets
+    );
+    assert_eq!(reader::NOTHING, "no article on this page");
+
+    client.close();
+    engine.kill();
+}
+
+/// Find, and the hover, reach into the reader's frame as they reach into
+/// any same-origin frame: the article's `quokka` is found and the hidden
+/// footer's is not, and the link under the pointer is the absolute one.
+#[test]
+fn the_reader_document_is_searched_by_find_and_its_links_are_hovered_and_resolved() {
+    let Some((mut engine, mut client, context, port)) = reading("/") else {
+        return;
+    };
+    assert_eq!(search(&mut client, context, "quokka", 0).count, 2);
+    search(&mut client, context, "", 0);
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::On)
+    );
+    assert_eq!(
+        search(&mut client, context, "quokka", 0).count,
+        1,
+        "the article's, and not the footer's, which is hidden"
+    );
+    search(&mut client, context, "", 0);
+
+    let centre = numbers(&evaluate(
+        &mut client,
+        "(function(){var f=document.getElementById('blinkterm-reader');\
+         var a=f.contentDocument.querySelector('a[href]');a.scrollIntoView({block:'center'});\
+         var o=f.getBoundingClientRect(),r=a.getBoundingClientRect();\
+         return [o.left+r.left+r.width/2, o.top+r.top+r.height/2]})()",
+    ));
+    let (hover, _) = hover_at(&mut client, centre[0] as i32, centre[1] as i32);
+    assert_eq!(hover.href, format!("http://localhost:{port}/more"));
+    assert_eq!(hover.shape, hover::Shape::Pointer, "a hand");
+
+    // Followed, the link loads in the tab, not in the frame; and back is the
+    // page as it loads, without the reader.
+    in_reader(&mut client, "d.querySelector('a[href]').click()");
+    assert_eq!(
+        wait_for_title(&mut client, "more", Duration::from_secs(10)),
+        "more"
+    );
+    let history = client
+        .call("Page.getNavigationHistory", Json::empty())
+        .expect("the history");
+    let current = history
+        .get("currentIndex")
+        .and_then(Json::as_i64)
+        .expect("an index") as usize;
+    let back = history
+        .get("entries")
+        .and_then(Json::as_array)
+        .and_then(|entries| entries.get(current.checked_sub(1)?))
+        .and_then(|entry| entry.get("id"))
+        .and_then(Json::as_i64)
+        .expect("an entry before");
+    client
+        .call(
+            "Page.navigateToHistoryEntry",
+            Json::object(vec![("entryId", Json::number(back as f64))]),
+        )
+        .expect("back");
+    assert_eq!(
+        wait_for_title(&mut client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+    assert_eq!(
+        evaluate(
+            &mut client,
+            "document.querySelectorAll('iframe').length + document.adoptedStyleSheets.length"
+        )
+        .as_f64(),
+        Some(0.0),
+        "the page came back without the reader"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// The reader takes the page's scheme: light by default, dark when the page
+/// is told dark; and under `--alpha` it paints no background in either.
+#[test]
+fn the_reader_is_dark_when_the_page_is_told_dark_and_light_otherwise() {
+    let Some((mut engine, mut client, context, _)) = reading("/") else {
+        return;
+    };
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::On)
+    );
+    let light = corner_luminance(&mut client);
+    eprintln!("the reader, light: {light}");
+    assert!(light > 0.9, "{light}");
+
+    client
+        .call(
+            "Emulation.setEmulatedMedia",
+            blinkterm::appearance::media_params(blinkterm::appearance::Scheme::Dark),
+        )
+        .expect("the scheme is told");
+    assert!(prefers_dark(&mut client));
+    let dark = wait_until(&mut client, true, |client| corner_luminance(client) < 0.184);
+    eprintln!("the reader, dark: {}", corner_luminance(&mut client));
+    assert!(dark, "the reader follows the page's scheme");
+
+    assert_eq!(
+        toggle(&mut client, context, false, false),
+        Some(Answered::Off)
+    );
+    transparent(&mut client, false);
+    assert_eq!(toggle(&mut client, context, true, true), Some(Answered::On));
+    let corner = |client: &mut Client| {
+        let (rgba, width, _) = still(client);
+        rgba[(5 * width as usize + 5) * 4 + 3]
+    };
+    assert_eq!(wait_until(&mut client, 0, corner), 0, "see-through, dark");
+    client
+        .call(
+            "Emulation.setEmulatedMedia",
+            blinkterm::appearance::media_params(blinkterm::appearance::Scheme::Light),
+        )
+        .expect("the scheme is told");
+    assert_eq!(wait_until(&mut client, 0, corner), 0, "and light");
+
+    client.close();
+    engine.kill();
+}

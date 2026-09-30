@@ -161,6 +161,7 @@ pub mod permissions;
 pub mod picker;
 pub mod png;
 pub mod profile;
+pub mod reader;
 pub mod remote;
 pub mod route;
 pub mod save;

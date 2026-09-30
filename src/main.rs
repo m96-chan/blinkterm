@@ -202,6 +202,8 @@ keys:
                  (in the url bar alt+b is still a word back)
   alt+o          open this page in the desktop browser; cookies and logins
                  stay here
+  alt+r          reader mode: the article alone, without the page around it;
+                 again to put the page back
   alt+r          read the site styles and scripts again
   esc            leave a page's fullscreen; stop a page that is loading
   ctrl+q         quit
