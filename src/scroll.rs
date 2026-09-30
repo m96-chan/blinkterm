@@ -1061,6 +1061,14 @@ mod tests {
     /// animation.
     #[test]
     fn the_thread_ticks_on_time_while_the_loop_is_busy() {
+        // A schedule to the millisecond is a test of the machine as much as
+        // of the thread, and GitHub's shared macOS VM is descheduled for over
+        // 100 ms at a time: skipped there rather than loosened (#46). A real
+        // Mac, and Linux, keep it.
+        if cfg!(target_os = "macos") && std::env::var_os("BLINKTERM_SHARED_RUNNER").is_some() {
+            eprintln!("skipped on the shared macOS runner: this asserts on time");
+            return;
+        }
         let recorder = Arc::new(Recorder::default());
         let wheel = Wheel::start();
         let start = Instant::now();
@@ -1078,43 +1086,27 @@ mod tests {
             .iter()
             .map(|(at, _)| at.duration_since(start).as_millis())
             .collect();
-        let shared_runner =
-            cfg!(target_os = "macos") && std::env::var_os("BLINKTERM_SHARED_RUNNER").is_some();
-        if shared_runner {
-            // An animation tied to the seven passes through the loop above can
-            // send at most seven times. A shared runner may deschedule the
-            // whole VM for several ticks, so count independent progress
-            // rather than pretending its wall clock is a frame clock.
-            assert!(
-                sent.len() >= 12,
-                "only {} ticks in 420 ms of {TICK:?}, at {times:?} ms",
-                sent.len()
-            );
-        } else {
-            assert!(
-                sent.len() >= 20,
-                "only {} ticks in 420 ms of {TICK:?}, at {times:?} ms",
-                sent.len()
-            );
-        }
+        assert!(
+            sent.len() >= 20,
+            "only {} ticks in 420 ms of {TICK:?}, at {times:?} ms",
+            sent.len()
+        );
         for (n, (_, step)) in sent.iter().take(20).enumerate() {
             assert!(step.delta.1 > 0.0, "tick {} sent nothing", n + 1);
         }
-        if !shared_runner {
-            let slack = Duration::from_millis(4);
-            for (n, (at, _)) in sent.iter().take(20).enumerate() {
-                let due = start + TICK * (n as u32 + 1);
-                let off = if *at > due {
-                    at.duration_since(due)
-                } else {
-                    due.duration_since(*at)
-                };
-                assert!(
-                    off <= slack,
-                    "tick {} landed {off:?} from its schedule; ticks at {times:?} ms",
-                    n + 1
-                );
-            }
+        let slack = Duration::from_millis(4);
+        for (n, (at, _)) in sent.iter().take(20).enumerate() {
+            let due = start + TICK * (n as u32 + 1);
+            let off = if *at > due {
+                at.duration_since(due)
+            } else {
+                due.duration_since(*at)
+            };
+            assert!(
+                off <= slack,
+                "tick {} landed {off:?} from its schedule; ticks at {times:?} ms",
+                n + 1
+            );
         }
     }
 
