@@ -10,6 +10,16 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Added
+
+- **Clicking the status row.** A click on a tab in the strip switches to
+  it, a middle click closes it (never the last one), a click on `+N` at
+  either end brings the nearest tab past that end into view, and a click on
+  the url — or anywhere on the row with one tab — opens the url bar as
+  `ctrl+l` does; in cells and in Kitty's pixel reports, in tmux too. The
+  release of a press that landed on the row no longer reaches the page
+  ([#90](https://github.com/m96-chan/blinkterm/issues/90)).
+
 ## [0.3.0] - 2026-10-01
 
 ### Added

@@ -1544,6 +1544,154 @@ fn closing_a_tab_leaves_the_one_it_was_opened_from() {
     engine.kill();
 }
 
+/// A press on the strip, as a terminal sends it: read against the spans of
+/// the row this program would draw, which are checked against what the
+/// compositor's own terminal shows in those columns; a left press on a tab
+/// switches to it, a middle press on a tab that is *not* in front closes
+/// that one, and the url opens the bar.
+///
+/// `handle_input` is the loop's and needs a pane on a tty, as every test
+/// here works around; `click_row` and the release rule are held by the unit
+/// tests in `src/app.rs`, and this holds the rest against a real engine.
+#[test]
+fn a_press_on_the_strip_switches_to_that_tab_a_middle_press_closes_it_and_the_url_opens_the_bar() {
+    use blinkterm::input::{page_point, row_cell, Input, MouseInput, Parser};
+    use blinkterm::screen::{self, TabLabel};
+    use blinkterm::strip::{self, Part, Step as Pressed};
+    let Some((mut engine, mut browser, mut tabs)) = two_tabs() else {
+        return;
+    };
+    assert_eq!(
+        tabs.active_index(),
+        1,
+        "the tab the link opened is in front"
+    );
+    // The url the row would end with. The tab's own is filled in by the
+    // loop's navigation events, which these tests do not run; what matters
+    // here is where the row puts it, not which it is.
+    let url = "http://127.0.0.1/second.html";
+
+    // The labels exactly as `redraw_row` makes them.
+    let names: Vec<_> = tabs.iter().map(|tab| tab.label().into_owned()).collect();
+    let labels: Vec<TabLabel> = names
+        .iter()
+        .zip(tabs.iter())
+        .enumerate()
+        .map(|(index, (name, tab))| TabLabel {
+            title: name,
+            active: index == tabs.active_index(),
+            dialog: tab.asks(),
+        })
+        .collect();
+    let drawn = screen::tab_line_from(80, &labels, url, 0);
+    let text = a_terminal_reads_only_text_in(&drawn.bytes);
+    let at = |span: &strip::Span| -> String {
+        text.chars()
+            .skip(span.from)
+            .take(span.to - span.from)
+            .collect()
+    };
+    let span_of = |part: Part| -> strip::Span {
+        *drawn
+            .spans
+            .iter()
+            .find(|span| span.part == part)
+            .unwrap_or_else(|| panic!("no {part:?} in {:?} for {text:?}", drawn.spans))
+    };
+    let (first, second, bar) = (
+        span_of(Part::Tab(0)),
+        span_of(Part::Tab(1)),
+        span_of(Part::Url),
+    );
+    assert!(at(&first).starts_with("1 "), "{text:?} {first:?}");
+    assert!(at(&second).starts_with("2 "), "{text:?} {second:?}");
+    assert!(
+        url.starts_with(&at(&bar)[..at(&bar).len().min(8)]),
+        "{text:?} {bar:?}"
+    );
+
+    let report = |bytes: String| -> MouseInput {
+        match Parser::new().feed(bytes.as_bytes()).as_slice() {
+            [Input::Mouse(report)] => *report,
+            other => panic!("{bytes:?} is not one mouse report: {other:?}"),
+        }
+    };
+    // In cells and in Kitty's pixels, the middle of the first tab's label.
+    let column = (first.from + first.to) / 2;
+    for (bytes, pixels) in [
+        (format!("\x1b[<0;{};1M", column + 1), false),
+        (format!("\x1b[<0;{};9M", column * 8 + 4), true),
+    ] {
+        let press = report(bytes);
+        assert!(page_point(&press, pixels, CELL, 1).1 < 0, "on the row");
+        assert_eq!(row_cell(&press, pixels, CELL), (column, 0));
+        let part = strip::hit(&drawn.spans, column);
+        assert_eq!(part, Some(Part::Tab(0)));
+        assert_eq!(
+            strip::step(part, press.button, tabs.len()),
+            Pressed::Switch(0)
+        );
+    }
+    assert!(tabs.switch_to(0));
+    let front = tabs.active_mut().expect("the first tab");
+    assert_eq!(
+        blinkterm::app::page_title(&mut front.connection).as_deref(),
+        Some("first")
+    );
+
+    // A middle press over the second label, with the first in front: the
+    // tab under the pointer goes, not the one in front.
+    let column = (second.from + second.to) / 2;
+    let press = report(format!("\x1b[<1;{};1M", column + 1));
+    let part = strip::hit(&drawn.spans, row_cell(&press, false, CELL).0);
+    let Pressed::Close(index) = strip::step(part, press.button, tabs.len()) else {
+        panic!("a middle press on {part:?} closed nothing");
+    };
+    assert_eq!(index, 1);
+    // What `close_tab` does: the target in the engine, then the session.
+    let mut tab = tabs.close(index).expect("the tab");
+    browser
+        .call(
+            "Target.closeTarget",
+            Json::object(vec![("targetId", Json::string(&tab.target))]),
+        )
+        .expect("the target closes");
+    tab.connection.close();
+    assert!(
+        pump(
+            &mut browser,
+            &mut tabs,
+            Duration::from_secs(10),
+            |tabs| tabs.len() == 1,
+        ),
+        "the engine's news about the closed target upset the list"
+    );
+    let left = tabs.active_mut().expect("the tab that is left");
+    assert_eq!(
+        blinkterm::app::page_title(&mut left.connection).as_deref(),
+        Some("first"),
+        "the tab in front went instead of the one under the pointer"
+    );
+
+    // The url opens the bar; a gap is nothing; and with one tab left a
+    // middle press closes nothing.
+    let column = (bar.from + bar.to) / 2;
+    let press = report(format!("\x1b[<0;{};1M", column + 1));
+    let part = strip::hit(&drawn.spans, column);
+    assert_eq!(strip::step(part, press.button, 2), Pressed::EditUrl);
+    let gap = first.to;
+    assert_eq!(strip::hit(&drawn.spans, gap), None, "{text:?}");
+    assert_eq!(strip::step(None, Some(0), 2), Pressed::Nothing);
+    assert_eq!(
+        strip::step(Some(Part::Tab(0)), Some(1), tabs.len()),
+        Pressed::Nothing
+    );
+
+    browser.close();
+    drop(tabs);
+    engine.kill();
+}
+
 /// A page that closes itself takes its tab with it, with no key pressed.
 #[test]
 fn a_page_that_calls_window_close_removes_its_own_tab() {

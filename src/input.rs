@@ -1094,6 +1094,28 @@ pub fn page_point(
     }
 }
 
+/// The cell a report is in, zero-based (column, row) from the pane's corner:
+/// in pixels (mode 1016) the pixel divided by the cell, in cells the report
+/// itself less one.
+///
+/// Not [`page_point`], which answers the page's question — a point inside a
+/// cell, and the middle of it when all the report names is the cell. The
+/// status row asks a different one: which of its cells was pressed, since
+/// what it drew there was drawn in cells. See [`crate::strip`]. Both divide
+/// the same pixel by the same cell, so a pixel that `page_point` puts on
+/// the row (`y < 0`) is on row 0 here, and the first pixel of the page is
+/// on row 1.
+pub fn row_cell(report: &MouseInput, pixels: bool, cell: (u32, u32)) -> (usize, usize) {
+    let x = report.x.saturating_sub(1) as usize;
+    let y = report.y.saturating_sub(1) as usize;
+    if pixels {
+        let (cell_w, cell_h) = (cell.0.max(1) as usize, cell.1.max(1) as usize);
+        (x / cell_w, y / cell_h)
+    } else {
+        (x, y)
+    }
+}
+
 /// How many bytes a UTF-8 sequence starting with this one has.
 fn utf8_width(first: u8) -> usize {
     match first {
@@ -1785,6 +1807,37 @@ mod tests {
         };
         assert_eq!(page_point(&inside, true, (8, 16), 1), (100, 44));
         assert!(page_point(&MouseInput { y: 3, ..corner }, true, (8, 16), 1).1 < 0);
+    }
+
+    #[test]
+    fn a_report_on_the_row_names_its_cell_in_pixels_and_in_cells() {
+        let report = MouseInput {
+            kind: MouseKind::Press,
+            button: Some(0),
+            mods: Mods::default(),
+            x: 17,
+            y: 9,
+            wheel: (0, 0),
+        };
+        assert_eq!(row_cell(&report, true, (8, 16)), (2, 0));
+        let in_cells = MouseInput {
+            x: 3,
+            y: 1,
+            ..report
+        };
+        assert_eq!(row_cell(&in_cells, false, (8, 16)), (2, 0));
+
+        // The last pixel row of the status row and the first of the page:
+        // the boundary is where `page_point` puts -1 and 0.
+        let last = MouseInput { y: 16, ..report };
+        assert_eq!(row_cell(&last, true, (8, 16)).1, 0);
+        assert_eq!(page_point(&last, true, (8, 16), 1).1, -1);
+        let first = MouseInput { y: 17, ..report };
+        assert_eq!(row_cell(&first, true, (8, 16)).1, 1);
+        assert_eq!(page_point(&first, true, (8, 16), 1).1, 0);
+
+        // A cell of nothing is not a division by zero.
+        assert_eq!(row_cell(&report, true, (0, 0)), (16, 8));
     }
 
     #[test]
