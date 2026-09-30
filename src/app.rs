@@ -10180,7 +10180,10 @@ mod tests {
             if command(&press) == Some(Command::Reader) {
                 assert_eq!(press.key, Key::Char('r'), "{press:?}");
                 assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
-                assert!(!press.mods.shift(), "alt+shift+r is reload-sites: {press:?}");
+                assert!(
+                    !press.mods.shift(),
+                    "alt+shift+r is reload-sites: {press:?}"
+                );
             }
         }
     }

@@ -122,21 +122,21 @@ keymap:
 | `last-tab` | `alt+9` | `ctrl+9` | the last tab |
 | `list-tabs` | `ctrl+shift+a`, `alt+a` | `cmd+shift+a` | the tab list |
 | `history` | `ctrl+shift+h`, `alt+h` | `cmd+y` | the history list |
-| `console` | `ctrl+shift+j`, `alt+j` | `ctrl+shift+j`, `alt+j` | the page's console: logs, errors and failed requests |
+| `console` | `ctrl+shift+j`, `alt+j` | `cmd+alt+j` | the page's console: logs, errors and failed requests |
 | `move-tab-left` | `ctrl+shift+pageup`, `alt+shift+pageup` | `cmd+shift+pageup` | move this tab left |
 | `move-tab-right` | `ctrl+shift+pagedown`, `alt+shift+pagedown` | `cmd+shift+pagedown` | move this tab right |
 | `zoom-in` | `alt+=`, `ctrl+=` | `ctrl+=` | zoom in |
 | `zoom-out` | `alt+-`, `ctrl+-` | `ctrl+-` | zoom out |
 | `zoom-reset` | `alt+0`, `ctrl+0` | `ctrl+0` | back to 100% |
 | `find` | `ctrl+f` | `ctrl+f` | find in the page |
-| `reader` | `alt+r` | `alt+r` | the article without the page around it |
+| `reader` | `alt+r` | `cmd+shift+r` | the article without the page around it |
 | `permissions` | `alt+p` | `cmd+p` | allow this site the camera, microphone, location, notifications or clipboard |
 | `block` | `alt+b` | `cmd+b` | stop blocking ads and trackers on this site, or start again |
-| `reload-sites` | `alt+shift+r` | `alt+shift+r` | read the site styles and scripts again |
+| `reload-sites` | `alt+shift+r` | `cmd+alt+shift+r` | read the site styles and scripts again |
 | `fill-login` | `alt+l` | `cmd+shift+l` | fill the login form from your password manager |
 | `copy` | `alt+c` | `cmd+c`, `cmd+shift+c` | copy the selection, or the line being typed |
 | `copy-url` | `alt+u` | `cmd+u` | copy the url |
-| `open-external` | `alt+o` | `alt+o` | open this page in the desktop browser |
+| `open-external` | `alt+o` | `cmd+shift+o` | open this page in the desktop browser |
 | `save-pdf` | `alt+s` | `cmd+s` | save this page as a PDF |
 | `save-screenshot` | `alt+shift+s` | `cmd+shift+s` | save the whole page as a picture |
 | `normal-mode` | `ctrl+.` | `ctrl+.` | normal mode on or off |

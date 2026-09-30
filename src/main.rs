@@ -198,7 +198,8 @@ keys (keymap linux; --keymap mac or keymap = mac for the other):
   ctrl+shift+h   the history list (alt+h too): type words to filter, enter
                  opens here, alt+enter or ctrl+enter in a new tab,
                  shift+delete forgets the page
-  ctrl+shift+j   the page's console (alt+j too): what it logged, threw and
+  ctrl+shift+j   the page's console (alt+j too, where the terminal keeps
+                 ctrl+shift+j, as Kitty does): what it logged, threw and
                  failed to fetch, newest last; type words to filter, esc
                  closes; the row counts its errors until you look
   ctrl+shift+pageup/pagedown
@@ -255,6 +256,9 @@ keys (keymap mac; --keymap linux or keymap = linux for the other):
   cmd+y          the history list: type words to filter, enter opens here,
                  alt+enter or ctrl+enter in a new tab, shift+delete forgets
                  the page
+  cmd+alt+j      the page's console: what it logged, threw and failed to
+                 fetch, newest last; type words to filter, esc closes; the
+                 row counts its errors until you look
   cmd+shift+pageup/pagedown
                  move this tab left, right
   middle click or ctrl+click on a link
@@ -273,6 +277,12 @@ keys (keymap mac; --keymap linux or keymap = linux for the other):
   cmd+s          save this page as a PDF in the download directory
   cmd+shift+s    save the whole page as a picture (PNG) there
   cmd+b          stop blocking ads and trackers on this site, or start again
+  cmd+shift+o    open this page in the desktop browser; cookies and logins
+                 stay here
+  cmd+shift+r    reader mode: the article alone, without the page around it;
+                 again to put the page back
+  cmd+alt+shift+r
+                 read the site styles and scripts again
   esc            leave a page's fullscreen; stop a page that is loading
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no

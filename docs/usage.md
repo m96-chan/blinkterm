@@ -49,8 +49,9 @@ new window gets a new tab, and the tab is switched to.
 With more tabs than the row can name, the strip shows a run of them around
 the one in front and `+N` at either end for how many are past it; it scrolls
 when the tab in front reaches an edge. The list (`ctrl+shift+a`) shows all of
-them. Kitty and Ghostty keep `ctrl+shift+a` for themselves and every terminal
-keeps `ctrl+shift+pageup`/`pagedown` — Kitty and tOS for the scrollback,
+them. Kitty and Ghostty keep `ctrl+shift+a` and `ctrl+shift+j` (the
+console) for themselves and every terminal keeps
+`ctrl+shift+pageup`/`pagedown` — Kitty and tOS for the scrollback,
 WezTerm and Ghostty for their own tabs — so each has an `alt` form that
 reaches the program everywhere. Ghostty also keeps `alt+1`..`alt+9` for its
 tabs; its `alt+9` is its last tab, as it is here. Kitty on macOS keeps far
@@ -122,16 +123,20 @@ differ:
 | `last-tab` | `alt+9` | `ctrl+9` |
 | `list-tabs` | `ctrl+shift+a`, `alt+a` | `cmd+shift+a` |
 | `history` | `ctrl+shift+h`, `alt+h` | `cmd+y` |
+| `console` | `ctrl+shift+j`, `alt+j` | `cmd+alt+j` |
 | `move-tab-left` | `ctrl+shift+pageup`, `alt+shift+pageup` | `cmd+shift+pageup` |
 | `move-tab-right` | `ctrl+shift+pagedown`, `alt+shift+pagedown` | `cmd+shift+pagedown` |
 | `zoom-in` | `alt+=`, `ctrl+=` | `ctrl+=` |
 | `zoom-out` | `alt+-`, `ctrl+-` | `ctrl+-` |
 | `zoom-reset` | `alt+0`, `ctrl+0` | `ctrl+0` |
+| `reader` | `alt+r` | `cmd+shift+r` |
 | `permissions` | `alt+p` | `cmd+p` |
 | `block` | `alt+b` | `cmd+b` |
+| `reload-sites` | `alt+shift+r` | `cmd+alt+shift+r` |
 | `fill-login` | `alt+l` | `cmd+shift+l` |
 | `copy` | `alt+c` | `cmd+c`, `cmd+shift+c` |
 | `copy-url` | `alt+u` | `cmd+u` |
+| `open-external` | `alt+o` | `cmd+shift+o` |
 | `save-pdf` | `alt+s` | `cmd+s` |
 | `save-screenshot` | `alt+shift+s` | `cmd+shift+s` |
 
@@ -143,6 +148,9 @@ the Mac ones, so with `macos_option_as_alt left` in `kitty.conf` the `alt`
 chords above work too. `ctrl+1` … `ctrl+9`, `ctrl+=` and the other `ctrl`
 chords need a terminal speaking the Kitty keyboard protocol, which Kitty,
 WezTerm and Ghostty do; without it they arrive as the bare key.
+`cmd+shift+r` is Safari's Reader and `cmd+alt+j` Chrome's console on a Mac;
+`reload-sites` is `cmd+alt+shift+r` because Kitty keeps `cmd+r` and
+`cmd+alt+r`.
 
 A `key.` line on a chord Kitty keeps would do nothing, so in Kitty the
 status row says so at start, with the `kitty.conf` line that frees it, and

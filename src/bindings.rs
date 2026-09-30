@@ -365,7 +365,8 @@ const TAB_NAMES: &str = "tab-1 .. tab-8";
 /// - `cmd` where Kitty on macOS leaves it free and Chrome or Safari use it:
 ///   `cmd+[`/`cmd+]` back and forward, `cmd+d` bookmark, `cmd+shift+t`
 ///   reopen, `cmd+shift+a` Chrome's tab search, `cmd+y` Chrome's history,
-///   `cmd+alt+left`/`right` Chrome's tab switch.
+///   `cmd+alt+left`/`right` Chrome's tab switch, `cmd+shift+r` Safari's
+///   Reader, `cmd+alt+j` Chrome's console.
 /// - `ctrl` where the Linux ctrl chord already reaches a Kitty pane on a
 ///   Mac: `ctrl+l`, `ctrl+r`, `ctrl+t`, `ctrl+w`, `ctrl+f`, `ctrl+q`, `ctrl+=`,
 ///   `ctrl+-`, `ctrl+0`, `ctrl+.`.
@@ -379,7 +380,11 @@ const TAB_NAMES: &str = "tab-1 .. tab-8";
 ///   which needs no Option and works from an external keyboard.
 /// - The rest are `cmd` or `cmd+shift` on the letter the Linux alt chord
 ///   has, where that is free: `cmd+p`, `cmd+b`, `cmd+u`, `cmd+s`,
-///   `cmd+shift+s`, and `cmd+shift+l` because `cmd+l` is Kitty's.
+///   `cmd+shift+s`, `cmd+shift+o`, and `cmd+shift+l` because `cmd+l` is
+///   Kitty's.
+/// - `cmd+alt+shift+r` for reload-sites: `cmd+r` and `cmd+alt+r` are
+///   Kitty's (resizing the window, resetting the terminal), and
+///   `cmd+shift+r` is the reader's.
 pub const ACTIONS: [Row; 33] = [
     Row {
         name: "quit",
@@ -490,7 +495,7 @@ pub const ACTIONS: [Row; 33] = [
         name: "console",
         action: Action::Console,
         keys: "ctrl+shift+j, alt+j",
-        mac: "ctrl+shift+j, alt+j",
+        mac: "cmd+alt+j",
         what: "the page's console: logs, errors and failed requests",
     },
     Row {
@@ -539,7 +544,7 @@ pub const ACTIONS: [Row; 33] = [
         name: "reader",
         action: Action::Reader,
         keys: "alt+r",
-        mac: "alt+r",
+        mac: "cmd+shift+r",
         what: "the article without the page around it",
     },
     Row {
@@ -560,7 +565,7 @@ pub const ACTIONS: [Row; 33] = [
         name: "reload-sites",
         action: Action::ReloadSites,
         keys: "alt+shift+r",
-        mac: "alt+shift+r",
+        mac: "cmd+alt+shift+r",
         what: "read the site styles and scripts again",
     },
     Row {
@@ -588,7 +593,7 @@ pub const ACTIONS: [Row; 33] = [
         name: "open-external",
         action: Action::OpenExternal,
         keys: "alt+o",
-        mac: "alt+o",
+        mac: "cmd+shift+o",
         what: "open this page in the desktop browser",
     },
     Row {
@@ -928,14 +933,49 @@ mod tests {
         }
     }
 
+    /// The Mac chords of the actions added beside the Mac keymap, each
+    /// held by name to what it is and to Kitty's and macOS's tables, so that
+    /// none of them is a chord that never arrives; and the chords they were
+    /// not given, because Kitty keeps them.
     #[test]
-    fn the_linux_chords_kitty_keeps_are_exactly_the_seven_the_docs_give_a_twin_for() {
+    fn the_newer_actions_mac_chords_are_free_in_kitty_and_macos() {
+        for (name, wanted) in [
+            ("open-external", "cmd+shift+o"),
+            ("reload-sites", "cmd+alt+shift+r"),
+            ("reader", "cmd+shift+r"),
+            ("console", "cmd+alt+j"),
+        ] {
+            let row = ACTIONS.iter().find(|row| row.name == name).expect("a row");
+            assert_eq!(row.mac, wanted, "{name}");
+            let chord = Chord::parse(wanted).expect(wanted);
+            assert_eq!(crate::taken::keeper(&chord, true), None, "{name}");
+            assert!(
+                Keymap::Mac
+                    .rows()
+                    .iter()
+                    .any(|binding| binding.chord == chord && binding.action == Some(row.action)),
+                "{name} on {wanted}"
+            );
+        }
+        // Why reload-sites is not `cmd+r` or `cmd+alt+r`.
+        for kept in ["cmd+r", "cmd+alt+r"] {
+            let chord = Chord::parse(kept).expect(kept);
+            assert!(
+                crate::taken::keeper(&chord, true).is_some(),
+                "{kept} is Kitty's"
+            );
+        }
+    }
+
+    #[test]
+    fn the_linux_chords_kitty_keeps_are_exactly_the_eight_the_docs_give_a_twin_for() {
         let wanted = [
             ("reopen-tab", "ctrl+shift+t"),
             ("next-tab", "ctrl+tab"),
             ("previous-tab", "ctrl+shift+tab"),
             ("list-tabs", "ctrl+shift+a"),
             ("history", "ctrl+shift+h"),
+            ("console", "ctrl+shift+j"),
             ("move-tab-left", "ctrl+shift+pageup"),
             ("move-tab-right", "ctrl+shift+pagedown"),
         ];
