@@ -62,16 +62,13 @@ env:
 jobs:
   formula:
     name: brew audit, install, test
-    # The platforms the formula installs on: Linux only while the stable spec
-    # is v0.1.0, which predates macOS support and so still says
-    # `depends_on :linux`. With the first release that carries macOS support,
-    # macos-15 joins this list and that line comes out of the formula
-    # (RELEASING.md, "Homebrew"). fail-fast off, so that then a Linux failure
-    # does not hide whether the macOS build works, or the other way.
+    # The platforms the formula installs on: Linux and, since v0.2.0 (the
+    # first release that runs there), macOS. fail-fast off, so that a Linux
+    # failure does not hide whether the macOS build works, or the other way.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       # The whole history, because Homebrew clones the head from this checkout
