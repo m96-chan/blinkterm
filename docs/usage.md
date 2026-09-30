@@ -23,6 +23,7 @@
 | your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
 | `alt+c` | copy the page's selection to your clipboard; with the url bar, the find prompt, a `prompt()` or a file input's path open, copy that line |
 | `alt+u` | copy the page's url to your clipboard |
+| `alt+o` | open this page in the desktop browser — `open` on a Mac, `xdg-open` or `$BROWSER` on Linux, or `external-browser`; nothing of your login goes with it. Over ssh with no display the row says so; `alt+u` copies the url. See [Opening a page in the desktop browser](features.md#opening-a-page-in-the-desktop-browser) |
 | `alt+s` | save this page as a PDF in the download directory, named after its title; the row says `saved ~/Downloads/<title>.pdf`. See [Saving a page](features.md#saving-a-page) |
 | `alt+shift+s` | save the whole page, top to bottom, as a PNG there. A page past sixteen million pixels is cut to its top, and the row says how much |
 | `alt+p` | allow this site something: the row says `allow https://site: ` and the words it is allowed now, all selected; type any of `camera` `microphone` `location` `notifications` `clipboard`, `enter` sets exactly those (an empty line takes them all back), `esc` leaves it. See [Sound, permissions and fullscreen](features.md#sound-permissions-and-fullscreen) |
@@ -249,6 +250,11 @@ and it must come out as an `http`, `https`, `file` or `about` url. Anything
 else (`javascript:`, `data:`, `chrome://`, `mailto:`) is refused: the sender
 prints one line per refused url on stderr and exits 1, and the urls that were
 fine are opened anyway.
+
+The other direction is `alt+o`, which opens the page in front in the desktop
+browser. A `$BROWSER` that is `blinkterm --remote` is not what `alt+o` runs,
+and is taken out of the environment of what it runs instead (see
+[Opening a page in the desktop browser](features.md#opening-a-page-in-the-desktop-browser)).
 
 How it works: a running `blinkterm` listens on a Unix socket,
 `blinkterm.sock`, next to `blinkterm.lock` in its profile, made 0600 inside the

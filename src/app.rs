@@ -31,6 +31,7 @@
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,6 +49,7 @@ use crate::clipboard;
 use crate::dialog::{Answer, Dialog, Kind};
 use crate::download::{self, Downloads};
 use crate::engine::Engine;
+use crate::external;
 use crate::find;
 use crate::fullscreen::{self, Heard, Layout};
 use crate::graphics::{self, Painter, Raw};
@@ -441,6 +443,13 @@ struct Chrome {
     /// The login being fetched or filled for one tab: one at a time. See
     /// [`start_login`].
     login: Option<LoginState>,
+    /// `external-browser`; none, and the platform's own is run. See
+    /// [`crate::external`].
+    external: Option<picker::Command>,
+    /// The desktop browsers started by `alt+o` and not yet gone, asked once a
+    /// pass whether they have, so that none is left a zombie; never
+    /// signalled — a browser outlives this program on purpose.
+    launched: Vec<Child>,
     /// Where the pointer is and what is under it, for the tab in front only.
     /// See [`crate::hover`].
     hover: hover::Tracker,
@@ -607,6 +616,8 @@ impl Chrome {
             remote: None,
             logins: options.logins.clone(),
             login: None,
+            external: options.external_browser.clone(),
+            launched: Vec::new(),
             hover: hover::Tracker::default(),
             asking: None,
             shape: Shape::Default,
@@ -1809,6 +1820,8 @@ fn drive(
         // A password command that has answered, or a page that has answered
         // the fill.
         pump_login(pane, tabs, chrome, &ready)?;
+        // A desktop browser started by alt+o that has exited, forgotten.
+        external::reap(&mut chrome.launched);
         // Whatever the pointer did in all the reports just read, told to the
         // page and asked about once: see [`crate::hover`].
         tick_hover(pane, tabs, chrome)?;
@@ -4889,6 +4902,10 @@ fn handle_input(
                     copy_out(pane, tabs, &url, Copied::Url)?;
                     redraw_row(pane, tabs, chrome)?;
                 }
+                Some(Command::OpenExternal) => {
+                    open_external(tabs, chrome);
+                    redraw_row(pane, tabs, chrome)?;
+                }
                 Some(what @ (Command::ZoomIn | Command::ZoomOut | Command::ZoomReset)) => {
                     let now = tabs.active().map(|tab| tab.zoom).unwrap_or_default();
                     let wanted = match what {
@@ -5120,6 +5137,9 @@ enum Command {
     CopySelection,
     /// `alt+u`: the current url to the host's clipboard.
     CopyUrl,
+    /// `alt+o`: the page in front's url handed to the desktop browser. See
+    /// [`crate::external`].
+    OpenExternal,
     /// `ctrl+f`: find in the page. See [`crate::find`].
     Find,
     /// `alt+p`: the allow line for the page in front's origin. See
@@ -5193,6 +5213,10 @@ enum Command {
 /// tab's url and title, which this program already has. So does reopening a
 /// closed tab, which opens another tab, as a new tab does.
 ///
+/// Opening the page in the desktop browser survives for the same reason: it
+/// reads the tab's url and touches no page. And a page stuck behind a
+/// question it cannot get past here is the very page one wants elsewhere.
+///
 /// A zoom waits too. The page is stopped, so it would not lay itself out
 /// again or be photographed at the new level until it was answered, and the
 /// level then arrives with whatever else was queued — which is the reload
@@ -5215,6 +5239,7 @@ fn survives_dialog(command: Command) -> bool {
         | Command::ListTabs
         | Command::MoveTab(_)
         | Command::CopyUrl
+        | Command::OpenExternal
         | Command::ToggleNormal
         | Command::Bookmark
         | Command::ReopenTab
@@ -5650,6 +5675,52 @@ enum LoginState {
         pending: Pending,
         sent: Instant,
     },
+}
+
+/// `open-external`: the page in front's url handed to the desktop browser
+/// ([`crate::external`]).
+///
+/// The url is the one this program has for the tab, and nothing is asked of
+/// the page, so it works on a crashed page and behind a dialog. What is
+/// refused is refused on the row with nothing run: a page that is not
+/// `http`, `https` or `file`, and — with no `external-browser` set — a
+/// machine with no desktop to open it on. What is started is left to run and
+/// only ever reaped ([`external::reap`]).
+fn open_external(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(url) = tabs.active().map(|tab| tab.url.clone()) else {
+        return;
+    };
+    if let Err(why) = external::openable(&url) {
+        note(tabs, why);
+        return;
+    }
+    let browser = std::env::var("BROWSER").ok();
+    let plan = external::plan(
+        chrome.external.as_ref(),
+        cfg!(target_os = "macos"),
+        browser.as_deref(),
+        chrome.display,
+    );
+    let command = match plan {
+        external::Plan::Run(command) => command,
+        external::Plan::NoDesktop => {
+            note(tabs, external::NO_DESKTOP);
+            return;
+        }
+    };
+    let argv = external::argv(&command, &url);
+    let mut process = external::process(
+        &argv,
+        external::browser_to_pass(browser.as_deref()).as_deref(),
+        upload::home().as_deref(),
+    );
+    match external::launch(&mut process, &argv[0]) {
+        Ok(child) => {
+            chrome.launched.push(child);
+            note(tabs, external::sent(chrome.external.as_ref()));
+        }
+        Err(why) => note(tabs, why),
+    }
 }
 
 /// `fill-login`: run the password command for the page in front, and fill
@@ -6140,6 +6211,11 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// the precedent the zoom keys set; what that shadows is an `accesskey` on
 /// `t`.
 ///
+/// Opening the page in the desktop browser is `alt+o`, on the modifier the
+/// program already uses; none of tOS, Kitty, WezTerm or Ghostty binds it in
+/// its default table, and what it shadows is an `accesskey` on `o`. Normal
+/// mode's bare `o`, the url bar, is another key and is unaffected.
+///
 /// This is the built-in table, and the one the README documents; the settings
 /// file's `key.` lines are asked before it, by [`keyed`], and every caller
 /// goes through that. What the file may name is [`crate::bindings::ACTIONS`],
@@ -6183,6 +6259,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Char('c') => Some(Command::CopySelection),
             Key::Char('u') => Some(Command::CopyUrl),
+            Key::Char('o') => Some(Command::OpenExternal),
             // `ESC S` is how a terminal without the Kitty protocol says
             // alt+shift+s: the capital, with no shift bit.
             Key::Char('S') => Some(Command::SaveScreenshot),
@@ -6247,6 +6324,7 @@ fn command_of(action: Action) -> Command {
         Action::FillLogin => Command::FillLogin,
         Action::Copy => Command::CopySelection,
         Action::CopyUrl => Command::CopyUrl,
+        Action::OpenExternal => Command::OpenExternal,
         Action::SavePdf => Command::SavePdf,
         Action::SaveScreenshot => Command::SaveScreenshot,
         Action::ToggleNormal => Command::ToggleNormal,
@@ -8309,8 +8387,13 @@ mod tests {
         );
         assert_eq!(command(&key(Key::Left, Mods::ALT)), Some(Command::Back));
         assert_eq!(command(&key(Key::Right, Mods::ALT)), Some(Command::Forward));
+        assert_eq!(
+            command(&key(Key::Char('o'), Mods::ALT)),
+            Some(Command::OpenExternal)
+        );
 
         // Everything else belongs to the page.
+        assert_eq!(command(&key(Key::Char('o'), 0)), None);
         assert_eq!(command(&key(Key::Char('q'), 0)), None);
         assert_eq!(command(&key(Key::Char('z'), Mods::ALT)), None);
         assert_eq!(command(&key(Key::Left, Mods::CTRL)), None);
@@ -9165,6 +9248,7 @@ mod tests {
         // The url is this program's to copy whatever the page is doing; the
         // selection has to be asked of a page that may be stopped.
         assert!(survives_dialog(Command::CopyUrl));
+        assert!(survives_dialog(Command::OpenExternal));
         assert!(!survives_dialog(Command::CopySelection));
     }
 

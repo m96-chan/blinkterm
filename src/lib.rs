@@ -135,6 +135,7 @@ pub mod dialog;
 pub mod doctor;
 pub mod download;
 pub mod engine;
+pub mod external;
 pub mod find;
 pub mod fit;
 pub mod fullscreen;

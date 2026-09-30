@@ -86,6 +86,10 @@ options:
                    {url}. Run by alt+l, never by itself
   --password-command-terminal <command>
                    the same, for one that needs this terminal
+  --external-browser <command>
+                   what alt+o opens this page with, {url} where the url goes
+                   (default: open on a Mac, else $BROWSER unless it is
+                   blinkterm, else xdg-open; nothing without a display)
   --proxy <host:port|scheme://host:port|direct://>
                    send requests through a proxy (loopback never is)
   --mute           start the engine silent (--mute-audio); pages play and
@@ -190,6 +194,8 @@ keys:
   alt+shift+s    save the whole page as a picture (PNG) there
   alt+b          stop blocking ads and trackers on this site, or start again
                  (in the url bar alt+b is still a word back)
+  alt+o          open this page in the desktop browser; cookies and logins
+                 stay here
   esc            leave a page's fullscreen; stop a page that is loading
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no

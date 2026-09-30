@@ -165,7 +165,7 @@ fn refused(scheme: &str) -> String {
 /// that shape too, and are a host and a port. A colon followed by `//` is
 /// always a scheme; one followed by a digit is a port; anything else after
 /// the colon (`javascript:x`, `mailto:a@b`, `about:blank`) is a scheme.
-fn scheme_of(text: &str) -> Option<&str> {
+pub(crate) fn scheme_of(text: &str) -> Option<&str> {
     let (scheme, rest) = text.split_once(':')?;
     let mut chars = scheme.chars();
     let first = chars.next()?;
