@@ -45,6 +45,8 @@ use crate::bookmarks::{Bookmarks, Toggled};
 use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::chroma;
 use crate::clipboard;
+use crate::console::Recorder;
+use crate::consolelist::{self, ConsoleList};
 use crate::dialog::{Answer, Dialog, Kind};
 use crate::download::{self, Downloads};
 use crate::engine::Engine;
@@ -470,11 +472,12 @@ struct Chrome {
     /// The terminal's answer to `CSI 16 t`, for a pane whose kernel window
     /// size has no pixels in it. See [`crate::screen::ASK_CELL_SIZE`].
     cell_hint: Option<(u32, u32)>,
-    /// `Some` while the tab list or the history list is open. The person's,
+    /// `Some` while the tab list, the history list or the console is open. The person's,
     /// like the bar and the find prompt, and exclusive with them by the
     /// keyboard: whichever is open takes every key, so the other cannot be
     /// opened until it closes. See [`crate::tablist`] and
-    /// [`crate::historylist`], and [`Overlay`] for why one field holds both.
+    /// [`crate::historylist`] and [`crate::consolelist`], and [`Overlay`] for
+    /// why one field holds all three.
     list: Option<Overlay>,
     /// The first match on the screen while the list is open, so that the
     /// rows scroll only when the pick leaves them. See [`TabList::window`].
@@ -546,6 +549,14 @@ struct Chrome {
     /// What the row last said about blocking on the page in front, so that
     /// it is drawn again when the count moves and not otherwise.
     blocked_words: Option<String>,
+    /// Every page's console, shared with the pipe's reader thread, which
+    /// records every entry as it is read; `None` with `console = false` or
+    /// `--no-console`, and then no page is asked for its console at all. See
+    /// [`crate::console`].
+    console: Option<Arc<Recorder>>,
+    /// What the row last said about the console's errors on the page in
+    /// front: the twin of `blocked_words`.
+    console_words: Option<String>,
 }
 
 /// A screencast frame this program has not acknowledged yet: which tab's,
@@ -574,6 +585,7 @@ impl Chrome {
         allowed: Allowed,
         blocker: Option<Arc<Blocker>>,
         unblocked: Unblocked,
+        console: Option<Arc<Recorder>>,
     ) -> Chrome {
         Chrome {
             identity,
@@ -651,6 +663,8 @@ impl Chrome {
             blocker,
             unblocked,
             blocked_words: None,
+            console,
+            console_words: None,
         }
     }
 
@@ -755,8 +769,8 @@ impl UrlBar {
     }
 }
 
-/// The list over the screen: the tabs (`ctrl+shift+a`) or the pages visited
-/// (`ctrl+shift+h`).
+/// The list over the screen: the tabs (`ctrl+shift+a`), the pages visited
+/// (`ctrl+shift+h`), or the console of the page in front (`ctrl+shift+j`).
 ///
 /// One field on [`Chrome`] for both rather than one each, because
 /// everything about a list having the screen is the same whichever it is:
@@ -770,6 +784,7 @@ impl UrlBar {
 enum Overlay {
     Tabs(TabList),
     History(HistoryList),
+    Console(ConsoleList),
 }
 
 impl Overlay {
@@ -778,6 +793,7 @@ impl Overlay {
         match self {
             Overlay::Tabs(list) => list.line(),
             Overlay::History(list) => list.line(),
+            Overlay::Console(list) => list.line(),
         }
     }
 
@@ -786,6 +802,7 @@ impl Overlay {
         match self {
             Overlay::Tabs(list) => list.line_mut(),
             Overlay::History(list) => list.line_mut(),
+            Overlay::Console(list) => list.line_mut(),
         }
     }
 }
@@ -1028,14 +1045,26 @@ pub fn boot(
     appearance: &Appearance,
     allowed: &Allowed,
     blocker: Option<&Arc<Blocker>>,
+    console: Option<&Arc<Recorder>>,
 ) -> Result<Booted, String> {
     let engine = Engine::launch_with(profile, ENGINE_TIMEOUT, launch)?;
     // Before anything is attached, because the hook is what gives every
     // page's session `Fetch.enable` as it is attached, the first included;
     // and it forgets the dead engine's pages, whose counts meant nothing now.
+    // The console's recorder wants the same: in place before the first page
+    // says anything, and nothing kept from pages that are gone. The blocker
+    // first, because its pauses hold a page up. See [`crate::cdp::Hooks`].
+    let mut hooks: Vec<Arc<dyn crate::cdp::Intercept>> = Vec::new();
     if let Some(blocker) = blocker {
         blocker.forget_all();
-        engine.intercept(Some(Arc::clone(blocker) as Arc<dyn crate::cdp::Intercept>));
+        hooks.push(Arc::clone(blocker) as Arc<dyn crate::cdp::Intercept>);
+    }
+    if let Some(console) = console {
+        console.forget_all();
+        hooks.push(Arc::clone(console) as Arc<dyn crate::cdp::Intercept>);
+    }
+    if !hooks.is_empty() {
+        engine.intercept(Some(Arc::new(crate::cdp::Hooks(hooks))));
     }
     // Before the first tab is connected, because connecting one is where a
     // session is told who is asking.
@@ -1044,7 +1073,9 @@ pub fn boot(
         launch.user_agent.as_deref(),
         &crate::identity::locale(),
     )
-    .with_accept_language(crate::identity::accept_lang_arg(&launch.args));
+    .with_accept_language(crate::identity::accept_lang_arg(&launch.args))
+    // Only with a recorder to take what `Runtime` and `Log` send.
+    .with_console(console.is_some());
     let mut browser = engine.browser()?;
     browser.call(
         "Target.setDiscoverTargets",
@@ -1078,7 +1109,25 @@ pub fn boot(
     // that the first page is not a tab with less known about it than the
     // rest — its main frame's id above all, which is what its loading is
     // told apart from an iframe's by. See [`connect_tab`].
-    let (client, frame) = connect_tab(&mut browser, &first, appearance, &identity)?;
+    let (mut client, frame) = connect_tab(&mut browser, &first, appearance, &identity)?;
+    // The engine's first page is not the person's, and `Runtime.enable`
+    // replays what a page said before it was asked: on a Mac that page is
+    // the directory listing Cocoa's `NO` opens (see
+    // [`crate::engine::flags`]), whose script throws twenty-one times, and
+    // the row would start at `21 errors`. A second enable is answered by
+    // the renderer after the first one's replay, which the reader has
+    // recorded by then in pipe order; so once it is answered, what the log
+    // holds is that page's, and it goes.
+    if let Some(console) = console {
+        if client
+            .call_within("Runtime.enable", Json::empty(), SWITCH_TIMEOUT)
+            .is_ok()
+        {
+            if let Some(session) = client.session() {
+                console.forget(session);
+            }
+        }
+    }
     let mut first = Tab::new(first, client, "about:blank");
     first.frame = frame;
     Ok(Booted {
@@ -1227,6 +1276,7 @@ pub fn run(options: Options) -> Result<(), String> {
         Unblocked::load(profile.dir())
     };
     let blocker = block::load(&options.block, &unblocked)?;
+    let console = options.console.then(|| Arc::new(Recorder::new()));
     let first = boot(
         profile,
         &options.engine,
@@ -1234,6 +1284,7 @@ pub fn run(options: Options) -> Result<(), String> {
         &appearance,
         &allowed,
         blocker.as_ref(),
+        console.as_ref(),
     )?;
 
     let mut pane = Pane::enter(0, 1, route.wrap == Wrap::None, route.wrap)
@@ -1261,6 +1312,7 @@ pub fn run(options: Options) -> Result<(), String> {
                 allowed,
                 blocker,
                 unblocked,
+                console,
             );
             chrome.cell_hint = heard.cell;
             chrome.take_route(route);
@@ -1566,6 +1618,7 @@ fn relaunch(
         &chrome.appearance,
         &chrome.allowed,
         chrome.blocker.as_ref(),
+        chrome.console.as_ref(),
     ) {
         Ok(booted) => booted,
         Err(failure) => return Err(died(could_not_restart(why, failure), &chrome.session)),
@@ -1693,6 +1746,15 @@ fn drive(
         let blocked = blocked_words(tabs, chrome);
         if blocked != chrome.blocked_words {
             chrome.blocked_words = blocked;
+            redraw_row(pane, tabs, chrome)?;
+        }
+        // The errors the page in front logged since its console was last
+        // opened: counted on the reader thread, which consumes the console's
+        // events and wakes nobody, so read here for the same reason and a
+        // pass late at most, 50 ms.
+        let errors = console_words(tabs, chrome);
+        if errors != chrome.console_words {
+            chrome.console_words = errors;
             redraw_row(pane, tabs, chrome)?;
         }
         // The whole pane for a page that is fullscreen, unless something
@@ -2764,7 +2826,8 @@ fn create_tab(
 /// [`crate::upload`].
 ///
 /// Then [`prepare_session`], which is everything else a session is told once
-/// for its whole life: sent and not waited for, so it costs the new tab
+/// for its whole life — the scheme, the identity, the console's two domains:
+/// sent and not waited for, so it costs the new tab
 /// nothing, and ahead of the frame tree only because it is the one of these
 /// the page will be looked at through.
 ///
@@ -2809,7 +2872,10 @@ fn connect_tab(
 }
 
 /// Tell a new session what every session is told and nothing resets: the
-/// colour scheme a page is to see, and whether it is to be painted dark.
+/// colour scheme a page is to see, whether it is to be painted dark, who is
+/// asking, and that its console is to be reported (`Runtime.enable` and
+/// `Log.enable`, whose events [`crate::console::Recorder`] takes on the
+/// reader thread before any mailbox sees them).
 ///
 /// This is where every per-session `Emulation` command that is not about the
 /// size belongs. The size is not here because it changes with the pane and
@@ -2835,6 +2901,16 @@ pub fn prepare_session(client: &mut Client, appearance: &Appearance, identity: &
     // still calling itself headless. See [`crate::identity`].
     if let Some((method, params)) = identity.command() {
         let _ = client.notify(method, params);
+    }
+    // The console: what the page logs, throws and fails to fetch, recorded on
+    // the reader thread by [`crate::console::Recorder`]. Per session for the
+    // reason the scheme is, and told rather than asked for the same reason;
+    // both are idempotent on a session that already has them. Not with
+    // `console = false`, and never without a recorder in front of the
+    // routing: see [`Identity::console`].
+    if identity.console {
+        let _ = client.notify("Runtime.enable", Json::empty());
+        let _ = client.notify("Log.enable", Json::empty());
     }
 }
 
@@ -3006,6 +3082,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         .then(|| load::loading_hint(active.loading_for(now)));
     let marker = active.zoom.marker();
     let blocked = blocked_words(tabs, chrome);
+    let errors = console_words(tabs, chrome);
     let mode = mode_words(&chrome.mode, chrome.hinting.as_ref());
     let owner = row_owner(
         tabs,
@@ -3031,6 +3108,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
             downloading.or(loading).as_deref(),
             marker.as_deref(),
             blocked.as_deref(),
+            errors.as_deref(),
             mode.as_deref(),
         ]) {
             Some(right) => screen::split_line(cols, &left, &right),
@@ -3060,12 +3138,14 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
                 Some(&news),
                 marker.as_deref(),
                 blocked.as_deref(),
+                errors.as_deref(),
                 mode.as_deref(),
             ]),
             None => words(&[
                 mode.as_deref(),
                 marker.as_deref(),
                 blocked.as_deref(),
+                errors.as_deref(),
                 active.trust.words(),
                 Some(&active.url),
             ]),
@@ -3091,6 +3171,13 @@ fn blocked_words(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<String> {
     chrome.blocker.as_ref()?.words(session)
 }
 
+/// What the row says about the console of the page in front: `1 error`,
+/// `2 errors`, or nothing. See [`Recorder::words`].
+fn console_words(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<String> {
+    let session = tabs.active()?.connection.session();
+    chrome.console.as_ref()?.words(session)
+}
+
 /// The tab list's rows under the status row, for the list as it is now,
 /// keeping the window it chose for the next draw.
 ///
@@ -3101,6 +3188,7 @@ fn list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &Overlay) -> Vec<u8> 
     match list {
         Overlay::Tabs(list) => tab_list_screen(tabs, chrome, list),
         Overlay::History(list) => history_list_screen(chrome, list),
+        Overlay::Console(list) => console_list_screen(chrome, list),
     }
 }
 
@@ -3192,6 +3280,44 @@ fn history_list_screen(chrome: &Chrome, list: &HistoryList) -> Vec<u8> {
     screen::list_rows(chrome.metrics.cols, chrome.layout.page_row(), rows, &items)
 }
 
+/// [`list_screen`] for the console: each row led by its level, `--` for a
+/// landing, padded on the right to the widest among the rows shown so that
+/// the messages start in one column, and the place after the text where the
+/// history list has its url. Nothing here says the level in colour: the
+/// rows are drawn without it on purpose ([`screen::list_rows`]).
+fn console_list_screen(chrome: &Chrome, list: &ConsoleList) -> Vec<u8> {
+    let rows = chrome.metrics.usable_rows();
+    let matches = list.matches();
+    let window = list.window(matches.len(), rows as usize, chrome.list_first.get());
+    chrome.list_first.set(window.first);
+    let picked = list.picked(matches.len());
+    let shown: Vec<&crate::console::Entry> = matches[window.first..window.first + window.shown]
+        .iter()
+        .map(|&index| list.entry(index))
+        .collect();
+    let widest = shown
+        .iter()
+        .map(|entry| entry.lead().chars().count())
+        .max()
+        .unwrap_or(0);
+    let leads: Vec<String> = shown
+        .iter()
+        .map(|entry| format!("{:<widest$}", entry.lead()))
+        .collect();
+    let items: Vec<screen::ListItem> = shown
+        .iter()
+        .zip(&leads)
+        .enumerate()
+        .map(|(at, (entry, lead))| screen::ListItem {
+            lead,
+            title: &entry.text,
+            url: &entry.place,
+            picked: picked == Some(window.first + at),
+        })
+        .collect();
+    screen::list_rows(chrome.metrics.cols, chrome.layout.page_row(), rows, &items)
+}
+
 /// The word for the keyboard's mode: the hints' count while they show,
 /// else the mode's own, else nothing — insert mode says nothing, so a person
 /// who never presses `ctrl+.` sees the row exactly as it was.
@@ -3218,6 +3344,12 @@ fn owned_row<C>(cols: u32, tabs: &Tabs<C>, owner: RowOwner<'_>) -> Vec<u8> {
         RowOwner::List(Overlay::History(list)) => typing_row_beside(
             cols,
             "history: ",
+            list.line(),
+            &list.count_text(list.matches().len()),
+        ),
+        RowOwner::List(Overlay::Console(list)) => typing_row_beside(
+            cols,
+            "console: ",
             list.line(),
             &list.count_text(list.matches().len()),
         ),
@@ -3254,9 +3386,9 @@ enum RowOwner<'a> {
     Bar(&'a UrlBar),
     /// `ctrl+f`'s prompt: the person's, like the bar, and not any page's.
     Find(&'a Find),
-    /// `ctrl+shift+a`'s tab list or `ctrl+shift+h`'s history list: the
-    /// person's, like the two before it, and the one of them that has the
-    /// rows under the row as well.
+    /// `ctrl+shift+a`'s tab list, `ctrl+shift+h`'s history list or
+    /// `ctrl+shift+j`'s console: the person's, like the two before it, and
+    /// the one of them that has the rows under the row as well.
     List(&'a Overlay),
     /// `alt+p`'s allow line: the person's, like the three before it.
     Allow(&'a Allow),
@@ -4757,6 +4889,31 @@ fn handle_input(
                     }
                     redraw_row(pane, tabs, chrome)?;
                 }
+                Some(Command::Console) => {
+                    match chrome.console.clone() {
+                        None => note(tabs, consolelist::OFF),
+                        Some(console) => {
+                            // Opened even on nothing, unlike the history
+                            // list: "nothing logged" is the answer a person
+                            // opening it came for.
+                            let session = tabs
+                                .active()
+                                .and_then(|tab| tab.connection.session())
+                                .map(str::to_string);
+                            let entries = session
+                                .as_deref()
+                                .map(|session| {
+                                    console.opened(session);
+                                    console.entries(session)
+                                })
+                                .unwrap_or_default();
+                            chrome.list = Some(Overlay::Console(ConsoleList::open(entries)));
+                            chrome.list_first.set(0);
+                            open_list_screen(pane, chrome)?;
+                        }
+                    }
+                    redraw_row(pane, tabs, chrome)?;
+                }
                 Some(Command::Reload) => {
                     // A page that did not come has no document to reload, and
                     // `Page.reload` of the error page says nothing about why it
@@ -5142,6 +5299,9 @@ enum Command {
     /// `ctrl+shift+h` or `alt+h`: the history list. See
     /// [`crate::historylist`].
     History,
+    /// `ctrl+shift+j` or `alt+j`: the page's console. See
+    /// [`crate::consolelist`].
+    Console,
     /// `alt+s`: the page in front as a PDF, in the downloads directory. See
     /// [`crate::save`].
     SavePdf,
@@ -5180,6 +5340,8 @@ enum Command {
 /// the person is meant to be reading, which is the url bar's reason. Nor does
 /// the history list, although the tab list does: what it picks is a page to
 /// load, and here that would be a navigation queued behind the question.
+/// The console does, for the tab list's reason: it reads what this program
+/// already holds and sends the page nothing.
 ///
 /// Saving the page does not survive either: a page stopped behind a dialog
 /// answers neither `Page.printToPDF` nor `Page.getLayoutMetrics` until it
@@ -5218,6 +5380,7 @@ fn survives_dialog(command: Command) -> bool {
         | Command::ToggleNormal
         | Command::Bookmark
         | Command::ReopenTab
+        | Command::Console
         | Command::Block => true,
         Command::EditUrl
         | Command::Reload
@@ -6114,6 +6277,8 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// | `alt+a` | free | free | free | free |
 /// | `ctrl+shift+h` | free | scrollback in a pager | free | free |
 /// | `alt+h` | free | free | free | free |
+/// | `ctrl+shift+j` | free | scrolls a line down | free | writes the screen to a file and pastes its path |
+/// | `alt+j` | free | free | free | free |
 ///
 /// So `ctrl+shift+pageup`/`pagedown`, which move the tab in front in Chrome,
 /// reach the pane in none of the four, and `ctrl+shift+a`, Chrome's tab
@@ -6124,7 +6289,9 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// is nobody's. The history list is the same pair on `h`: `ctrl+shift+h`
 /// after the tab list's chord, and `alt+h`, which is the one that arrives
 /// in Kitty and in a legacy terminal, where `ctrl+h` is the byte backspace
-/// sends and `ctrl+shift+h` is that byte too. `alt+9` is the last tab rather than the ninth, as it is in
+/// sends and `ctrl+shift+h` is that byte too. The console is the pair on
+/// `j`: `ctrl+shift+j` is Chrome's console chord, kept by Kitty and Ghostty,
+/// and `alt+j` arrives in all four. `alt+9` is the last tab rather than the ninth, as it is in
 /// Chrome, Firefox and Ghostty — whose own `alt+9` means the same, so the
 /// meaning agrees even where the key does not arrive.
 ///
@@ -6160,6 +6327,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('f') => Some(Command::Find),
             Key::Char('a' | 'A') if key.mods.shift() => Some(Command::ListTabs),
             Key::Char('h' | 'H') if key.mods.shift() => Some(Command::History),
+            Key::Char('j' | 'J') if key.mods.shift() => Some(Command::Console),
             Key::PageUp if key.mods.shift() => Some(Command::MoveTab(-1)),
             Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Tab if key.mods.shift() => Some(Command::PreviousTab),
@@ -6179,6 +6347,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char(digit @ '1'..='8') => Some(Command::SelectTab(digit as usize - '0' as usize)),
             Key::Char('a') if !key.mods.shift() => Some(Command::ListTabs),
             Key::Char('h') if !key.mods.shift() => Some(Command::History),
+            Key::Char('j') if !key.mods.shift() => Some(Command::Console),
             Key::PageUp if key.mods.shift() => Some(Command::MoveTab(-1)),
             Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Char('c') => Some(Command::CopySelection),
@@ -6237,6 +6406,7 @@ fn command_of(action: Action) -> Command {
         Action::LastTab => Command::LastTab,
         Action::ListTabs => Command::ListTabs,
         Action::History => Command::History,
+        Action::Console => Command::Console,
         Action::MoveTabLeft => Command::MoveTab(-1),
         Action::MoveTabRight => Command::MoveTab(1),
         Action::ZoomIn => Command::ZoomIn,
@@ -7287,8 +7457,8 @@ fn open_list_screen(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> 
     pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())
 }
 
-/// Close the tab list or the history list and give the page its rows back. The caller redraws
-/// the row.
+/// Close the tab list, the history list or the console and give the page
+/// its rows back. The caller redraws the row.
 ///
 /// The same three things a resize does: the rows are cleared, and the
 /// motion clock is reset with no still out, so that a page at rest gets its
@@ -7304,8 +7474,8 @@ fn close_list(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> {
     pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())
 }
 
-/// Type into the tab list or the history list. Returns `false` only if the
-/// person quit.
+/// Type into the tab list, the history list or the console. Returns
+/// `false` only if the person quit.
 ///
 /// Every key comes here first while the list is open, as it does to the url
 /// bar and the find prompt: the program's other keys do nothing until it
@@ -7349,6 +7519,15 @@ fn edit_list(
             };
             history_step(pane, tabs, browser, chrome, step)
         }
+        Some(Overlay::Console(list)) => {
+            let step = match list.step(&key, page) {
+                consolelist::Step::Quit if !quits(&chrome.bindings, &key) => {
+                    consolelist::Step::Typing
+                }
+                step => step,
+            };
+            console_step(pane, tabs, chrome, step)
+        }
     }
 }
 
@@ -7388,6 +7567,11 @@ fn click_list(
             let window = list.window(list.matches().len(), rows, first);
             let step = list.click(row, &window, report.button == Some(1));
             history_step(pane, tabs, browser, chrome, step)
+        }
+        Some(Overlay::Console(list)) => {
+            let window = list.window(list.matches().len(), rows, first);
+            let step = list.click(row, &window);
+            console_step(pane, tabs, chrome, step)
         }
     }
 }
@@ -7474,6 +7658,23 @@ fn history_step(
                 }
             }
         }
+    }
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
+/// What a key or a click did to the console: it closes or it does not,
+/// since a row is nothing to open.
+fn console_step(
+    pane: &mut Pane,
+    tabs: &Tabs<Client>,
+    chrome: &mut Chrome,
+    step: consolelist::Step,
+) -> Result<bool, String> {
+    match step {
+        consolelist::Step::Typing => {}
+        consolelist::Step::Quit => return Ok(false),
+        consolelist::Step::Close => close_list(pane, chrome)?,
     }
     redraw_row(pane, tabs, chrome)?;
     Ok(true)
@@ -8394,6 +8595,22 @@ mod tests {
         ] {
             assert_eq!(command(&key(k, mods)), Some(Command::History), "{k:?}");
         }
+        // The console: the same pair on `j`.
+        for (k, mods) in [
+            (Key::Char('j'), Mods::CTRL | Mods::SHIFT),
+            (Key::Char('J'), Mods::CTRL | Mods::SHIFT),
+            (Key::Char('j'), Mods::ALT),
+        ] {
+            assert_eq!(command(&key(k, mods)), Some(Command::Console), "{k:?}");
+        }
+        // `ctrl+j` is a line feed's byte and the page's, and `alt+shift+j`
+        // is nobody's.
+        for (k, mods) in [
+            (Key::Char('j'), Mods::CTRL),
+            (Key::Char('j'), Mods::ALT | Mods::SHIFT),
+        ] {
+            assert_eq!(command(&key(k, mods)), None, "{k:?} {mods}");
+        }
         // `ctrl+h` is backspace's byte in a legacy terminal, the page's
         // anyway, and `alt+shift+h` is nobody's.
         for (k, mods) in [
@@ -8459,6 +8676,13 @@ mod tests {
         assert_eq!(survives(Key::PageUp, Mods::ALT | Mods::SHIFT), Some(true));
         assert_eq!(
             survives(Key::PageDown, Mods::CTRL | Mods::SHIFT),
+            Some(true)
+        );
+        // The console reads what this program holds and sends the page
+        // nothing.
+        assert_eq!(survives(Key::Char('j'), Mods::ALT), Some(true));
+        assert_eq!(
+            survives(Key::Char('j'), Mods::CTRL | Mods::SHIFT),
             Some(true)
         );
         // Things done to the page that is asking wait until it has an answer.
@@ -8878,6 +9102,7 @@ mod tests {
             Allowed::in_memory(),
             None,
             Unblocked::in_memory(),
+            Some(Arc::new(Recorder::new())),
         );
         let local = Route::local(true);
         chrome.take_route(local);
@@ -8887,6 +9112,136 @@ mod tests {
             ..local
         });
         assert!(chrome.cast.png, "the PNG route's frames, as without it");
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    /// A `Chrome` for a test that draws, on a temporary profile, with its
+    /// downloads directory to remove.
+    fn drawing_chrome(what: &str, console: Arc<Recorder>) -> (Chrome, PathBuf) {
+        let options = crate::options::resolve(
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+        )
+        .expect("the defaults");
+        let profile = Profile::temporary().expect("a temporary profile");
+        let downloads =
+            std::env::temp_dir().join(format!("blinkterm-app-{what}-{}", std::process::id()));
+        let chrome = Chrome::new(
+            Metrics {
+                cols: 80,
+                rows: 6,
+                cell: (8, 16),
+            },
+            &options,
+            &profile,
+            downloads.clone(),
+            Appearance::new(
+                crate::appearance::Choice::default(),
+                false,
+                crate::appearance::Alpha::Off,
+            ),
+            Identity::new(None, None, "C"),
+            Allowed::in_memory(),
+            None,
+            Unblocked::in_memory(),
+            Some(console),
+        );
+        (chrome, downloads)
+    }
+
+    #[test]
+    fn the_console_panel_draws_its_rows_with_the_level_first_and_says_nothing_logged_when_empty() {
+        use crate::console::{Entry, Level, Source};
+        let (chrome, downloads) = drawing_chrome("console", Arc::new(Recorder::new()));
+        let entry = |level, source, text: &str, place: &str| Entry {
+            level,
+            source,
+            text: text.to_string(),
+            place: place.to_string(),
+        };
+        let list = ConsoleList::open(vec![
+            entry(Level::Log, Source::Console, "hello 1 {a: 2}", "data:x:1"),
+            entry(
+                Level::Info,
+                Source::Navigation,
+                "navigated to https://b.example/",
+                "",
+            ),
+            entry(
+                Level::Error,
+                Source::Exception,
+                "Uncaught Error: boom",
+                "https://b.example/app.js:3",
+            ),
+        ]);
+        let drawn = String::from_utf8(console_list_screen(&chrome, &list)).expect("text");
+        assert!(
+            drawn.contains("  log    hello 1 {a: 2}  —  data:x:1"),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn.contains("  --     navigated to https://b.example/\x1b["),
+            "a separator has no place: {drawn:?}"
+        );
+        assert!(
+            drawn.contains("\x1b[7m  error  Uncaught Error: boom  —  https://b.example/app.js:3"),
+            "the newest is picked: {drawn:?}"
+        );
+        // Reverse video for the pick and nothing else: no colour.
+        for sequence in drawn.split("\x1b[").skip(1) {
+            let end = sequence
+                .find(|c: char| c.is_ascii_alphabetic())
+                .expect("a final byte");
+            if sequence.as_bytes()[end] == b'm' {
+                assert!(
+                    matches!(&sequence[..end], "7" | "0"),
+                    "no colour: {drawn:?}"
+                );
+            }
+        }
+        let overlay = Overlay::Console(list);
+        let tabs: Tabs<()> = Tabs::new(Tab::new("a", (), "https://b.example/"));
+        let row = String::from_utf8(owned_row(80, &tabs, RowOwner::List(&overlay))).expect("text");
+        assert!(row.contains("console: "), "{row:?}");
+        assert!(row.contains("3/3"), "{row:?}");
+
+        let empty = Overlay::Console(ConsoleList::open(Vec::new()));
+        let row = String::from_utf8(owned_row(80, &tabs, RowOwner::List(&empty))).expect("text");
+        assert!(row.contains("nothing logged"), "{row:?}");
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn the_row_says_how_many_errors_arrived_since_the_panel_was_opened() {
+        use crate::console::{Entry, Level, Source};
+        use std::os::unix::io::IntoRawFd;
+        let (commands, ours_write) = std::io::pipe().expect("a pipe");
+        let (ours_read, replies) = std::io::pipe().expect("a pipe");
+        let exchange =
+            crate::cdp::Exchange::over(ours_read.into_raw_fd(), ours_write.into_raw_fd());
+        let client = Client::on(&exchange, Some("S1".to_string())).expect("a page client");
+        let tabs = Tabs::new(Tab::new("a", client, "https://a.example/"));
+        let recorder = Arc::new(Recorder::new());
+        let (chrome, downloads) = drawing_chrome("console-words", Arc::clone(&recorder));
+        let error = || Entry {
+            level: Level::Error,
+            source: Source::Exception,
+            text: "Uncaught Error: boom".to_string(),
+            place: String::new(),
+        };
+        assert_eq!(console_words(&tabs, &chrome), None);
+        recorder.record("S1", error());
+        assert_eq!(console_words(&tabs, &chrome).as_deref(), Some("1 error"));
+        recorder.record("S1", error());
+        recorder.record("S2", error());
+        assert_eq!(console_words(&tabs, &chrome).as_deref(), Some("2 errors"));
+        recorder.opened("S1");
+        assert_eq!(console_words(&tabs, &chrome), None);
+        drop(tabs);
+        drop(commands);
+        drop(replies);
+        exchange.shutdown();
         std::fs::remove_dir_all(&downloads).ok();
     }
 
@@ -8982,6 +9337,7 @@ mod tests {
             Allowed::in_memory(),
             None,
             Unblocked::in_memory(),
+            Some(Arc::new(Recorder::new())),
         );
         chrome.find = Some(Find {
             target: "a".to_string(),
@@ -9218,6 +9574,7 @@ mod tests {
             Some(Command::Block)
         );
         assert_eq!(command_of(Action::Block), Command::Block);
+        assert_eq!(command_of(Action::Console), Command::Console);
         // It sends the page nothing, so a question on it does not stop it.
         assert!(survives_dialog(Command::Block));
         // `ctrl+b` and a bare `b` stay the page's.

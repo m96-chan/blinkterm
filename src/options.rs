@@ -136,6 +136,10 @@ pub struct Options {
     /// `--password-command` and `--password-command-terminal`: what
     /// `fill-login` runs. See [`crate::login`].
     pub logins: login::Programs,
+    /// `false` with `--no-console` or `console = false`: the page's console
+    /// is not listened to, and `ctrl+shift+j` says so. See
+    /// [`crate::console`].
+    pub console: bool,
 }
 
 /// What `main` was asked to do, once the command line has been read.
@@ -221,6 +225,8 @@ pub struct Settings {
     pub block_lists: Vec<PathBuf>,
     /// `false` with `--no-block` or `block = false`.
     pub block: Option<bool>,
+    /// `false` with `--no-console` or `console = false`.
+    pub console: Option<bool>,
     pub password_command: Option<picker::Command>,
     pub password_command_terminal: Option<picker::Command>,
     /// File only: a binding is not a one-run thing.
@@ -278,6 +284,7 @@ impl Settings {
                 .or(under.file_picker_terminal_multiple),
             block_lists,
             block: self.block.or(under.block),
+            console: self.console.or(under.console),
             password_command: self.password_command.or(under.password_command),
             password_command_terminal: self
                 .password_command_terminal
@@ -604,6 +611,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             "--normal-mode" => once(&mut s.normal_mode, true, "--normal-mode once is enough")?,
             "--no-probe" => once(&mut s.probe, false, "--no-probe once is enough")?,
             "--no-block" => once(&mut s.block, false, "--no-block once is enough")?,
+            "--no-console" => once(&mut s.console, false, "--no-console once is enough")?,
             "--no-config" => config_choice(&mut s, ConfigChoice::None)?,
             "--print-engine" => what(&mut s, What::PrintEngine)?,
             "--doctor" => what(&mut s, What::Doctor)?,
@@ -684,7 +692,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 29] = [
+const KEYS: [&str; 30] = [
     "home",
     "profile",
     "temp-profile",
@@ -712,6 +720,7 @@ const KEYS: [&str; 29] = [
     "file-picker-terminal-multiple",
     "block-list",
     "block",
+    "console",
     "password-command",
     "password-command-terminal",
 ];
@@ -830,6 +839,7 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             }
             "block-list" => s.block_lists.push(PathBuf::from(value)),
             "block" => s.block = Some(parse_bool(key, value).map_err(at)?),
+            "console" => s.console = Some(parse_bool(key, value).map_err(at)?),
             "password-command" => {
                 s.password_command = Some(picker::Command::parse(key, value).map_err(at)?)
             }
@@ -958,6 +968,7 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
             gui: s.password_command,
             terminal: s.password_command_terminal,
         },
+        console: s.console.unwrap_or(true),
     })
 }
 
@@ -2150,6 +2161,32 @@ mod tests {
         let home = Some(Path::new("/h"));
         let expanded = home_expanded(file("block-list = ~/lists/hosts").expect("a file"), home);
         assert_eq!(expanded.block_lists, [PathBuf::from("/h/lists/hosts")]);
+    }
+
+    #[test]
+    fn the_console_is_listened_to_unless_no_console_or_the_file_says_not() {
+        assert!(resolved(&[]).expect("resolves").console);
+        let off = parsed(&["--no-console"]).expect("a flag");
+        assert_eq!(off.console, Some(false));
+        assert_eq!(
+            parsed(&["--no-console", "--no-console"]),
+            Err("--no-console once is enough".to_string())
+        );
+        let options = resolve(
+            off,
+            Settings::default(),
+            file("console = true").expect("a file"),
+        )
+        .expect("resolves");
+        assert!(!options.console, "the command line's word wins");
+        assert_eq!(file("console = false").map(|s| s.console), Ok(Some(false)));
+        let options = resolve(
+            Settings::default(),
+            Settings::default(),
+            file("console = false").expect("a file"),
+        )
+        .expect("resolves");
+        assert!(!options.console);
     }
 
     #[test]
