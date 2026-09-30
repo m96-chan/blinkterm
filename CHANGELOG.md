@@ -12,6 +12,19 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- Site styles and scripts: a file `<host>.css` or `<host>.js` in
+  `~/.config/blinkterm/sites/` (`$XDG_CONFIG_HOME/blinkterm/sites/`) is put
+  on every page of that host — `*.<host>` for a site and every host under
+  it, `all` for every page — the general ones first, so the most specific
+  file has the last word. A style is adopted at document start, and is
+  nothing the page can see in its own sheets; a script runs at document
+  start in an isolated world that shares only the DOM, or in the page's own
+  when its first line is `// @world main`. `alt+r` (`reload-sites`) reads the
+  directory again: styles change where the page stands, scripts from the
+  next load. `--sites-dir <dir>` (`sites-dir =`) reads another directory,
+  and `--no-sites` (`sites = false`) none. A file or directory that another
+  user could write is refused by name
+  ([#66](https://github.com/m96-chan/blinkterm/issues/66)).
 - `--alpha [<1-100>]` (`alpha = true|false|<1-100>` in the config file) lets
   the terminal's background show through a page: the engine paints nothing
   behind it, and the page's own `html` and `body` backgrounds are forced

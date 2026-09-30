@@ -123,3 +123,10 @@ does. It also costs five to six times the memory: 13 processes and 1.6 GB
 against the headless shell's 4 and 282 MB, measured on one page. That is why
 the headless shell stays first in the search. The measurements are in
 [#48](https://github.com/m96-chan/blinkterm/issues/48).
+
+What you add yourself is told as little. A site style (see
+[Site styles and scripts](features.md#site-styles-and-scripts)) is one entry
+more in `document.adoptedStyleSheets` per file that fits, and nothing in
+`document.styleSheets` or on `window`. A site script is invisible to the page
+— it runs in a world of its own that shares only the DOM — unless its first
+line asked for the page's world, and then it is the page's own code.
