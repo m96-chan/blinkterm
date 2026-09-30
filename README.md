@@ -65,27 +65,32 @@ keyboard protocol and SGR mouse reporting: Kitty, WezTerm, Ghostty, or a
 [tOS](https://github.com/m96-chan/tOS) pane. It runs on Linux and macOS,
 inside tmux (with `set -g allow-passthrough on`) and over ssh.
 
-| | |
-| --- | --- |
-| `ctrl+l` | type a url |
-| `ctrl+t` / `ctrl+w` | new tab / close tab |
-| `ctrl+tab`, `alt+1` … `alt+9` | switch tabs |
-| `alt+left` / `alt+right` | back / forward |
-| `ctrl+r` | reload |
-| `ctrl+f` | find in the page |
-| `alt+r` | reader mode |
-| `alt+=` / `alt+-` / `alt+0` | zoom in / out / reset |
-| `ctrl+q` | quit |
+| | Linux (and elsewhere) | Mac |
+| --- | --- | --- |
+| type a url | `ctrl+l` | `ctrl+l` |
+| new tab / close tab | `ctrl+t` / `ctrl+w` | `ctrl+t` / `ctrl+w` |
+| switch tabs | `ctrl+tab`, `alt+1` … `alt+9` | `cmd+alt+right`, `ctrl+1` … `ctrl+9` |
+| back / forward | `alt+left` / `alt+right` | `cmd+[` / `cmd+]` |
+| reload | `ctrl+r` | `ctrl+r` |
+| find in the page | `ctrl+f` | `ctrl+f` |
+| reader mode | `alt+r` | `cmd+shift+r` |
+| zoom in / out / reset | `alt+=` / `alt+-` / `alt+0` | `ctrl+=` / `ctrl+-` / `ctrl+0` |
+| quit | `ctrl+q` | `ctrl+q` |
+
+The Mac keys arrive in a stock Kitty on macOS, where Kitty keeps most `cmd`
+chords and Option is not `alt`; they are the default there (`keymap = mac`),
+and [On a Mac](docs/usage.md#on-a-mac) has the rest.
 
 Everything else — profiles, history, bookmarks, downloads, ad blocking,
-password managers, rebinding keys — is in the docs.
+password managers, the page's console, site styles and scripts, rebinding
+keys — is in the docs.
 
 ## Docs
 
 - [Installing](docs/install.md): the engine, per platform, and Homebrew
 - [Using blinkterm](docs/usage.md): every key, the status row, opening urls from other programs
 - [Settings and profiles](docs/configuration.md): the config file, rebinding keys, profiles, history, the session
-- [Features](docs/features.md): ad blocking, downloads, uploads, password managers, sound and permissions, site styles and scripts
+- [Features](docs/features.md): ad blocking, downloads, the console, uploads, password managers, the desktop browser, reader mode, sound and permissions, site styles and scripts
 - [How it works](docs/design.md): the numbers, terminals, tmux and ssh, what a page is told
 - [Development](docs/development.md): the tests and the checks
 

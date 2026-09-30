@@ -155,7 +155,8 @@ later line for the same chord replaces an earlier one; binding a chord the
 program already used moves nothing else, so `key.ctrl+t = quit` leaves
 `new-tab` on no key. Normal mode's letters are not affected by `key.` lines:
 `key.ctrl+r = none` leaves `r` as reload. `blinkterm --help` lists the
-actions too, with the keymap of the platform it runs on, and
+actions too, with the keymap of the platform it runs on (the settings file
+is not read for it; `blinkterm --keymap linux --help` lists the other), and
 `blinkterm --doctor` says which keymap is in effect and names each `key.`
 line on a chord Kitty or macOS keeps. In Kitty, such a line is also named
 on the status row at start, with the `kitty.conf` line that frees it.
