@@ -99,6 +99,17 @@ jobs:
       # DSL rules (description length, licence, branch on the head url), and
       # that the urls answer.
       - run: brew audit --strict --online m96-chan/tap/blinkterm
+      # The hosted macOS image has an `openssl` in /opt/homebrew/bin that is
+      # not Homebrew's, and `rust` (the build dependency) brings openssl@3
+      # with it: the upgrade pours and then fails to link over that file,
+      # which failed the first macOS run of this job ("Could not symlink
+      # bin/openssl"). So on macOS it is upgraded first and linked over the
+      # image's copy. Nothing about the formula; everything about the runner.
+      - name: Link openssl@3 over the runner's own (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew upgrade openssl@3 || true
+          brew link --overwrite openssl@3
       # The stable spec. The step looks for the sha256 line rather than
       # assuming one, so a formula that goes back to head-only still passes.
       - name: brew install (stable), if there is a stable
