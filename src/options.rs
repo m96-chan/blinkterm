@@ -34,7 +34,9 @@
 //! the option names without their `--`, so `--help` documents the file too.
 //! The one family that is not an option is `key.<chord> = <action>`
 //! (`key.f5 = reload`), which rebinds one of the program's keys and may be
-//! written as often as there are keys; see [`crate::bindings`].
+//! written as often as there are keys; see [`crate::bindings`]. Which keys
+//! they apply on top of is `keymap = mac | linux`, whose default is the
+//! platform's ([`Keymap::platform`]).
 //!
 //! TOML was the alternative, and it is a dependency or a second parser the
 //! size of `json.rs` for a file of ten lines. `key value` without the `=`
@@ -50,7 +52,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::appearance;
-use crate::bindings::{Binding, Bindings};
+use crate::bindings::{Binding, Bindings, Keymap};
 use crate::block;
 use crate::download;
 use crate::engine;
@@ -59,6 +61,7 @@ use crate::picker;
 use crate::profile;
 use crate::route;
 use crate::save;
+use crate::sites;
 use crate::zoom::Scale;
 
 /// The largest settings file that is read. Nothing here needs a tenth of
@@ -117,8 +120,12 @@ pub struct Options {
     /// `--normal-mode`: start in normal mode rather than insert: the letters
     /// are the program's keys from the first one. See [`crate::normal`].
     pub normal_mode: bool,
-    /// `key.<chord> = <action>` lines from the file, in file order; the loop
-    /// asks them before its own table. See [`crate::bindings`].
+    /// `--keymap`: which built-in keys the run answers, mac or linux. Kept
+    /// for `--doctor`; the loop asks [`Options::bindings`], which has it.
+    pub keymap: Keymap,
+    /// The keymap's rows under the file's `key.<chord> = <action>` lines,
+    /// in file order; the loop asks them before its own table. See
+    /// [`crate::bindings`].
     pub bindings: Bindings,
     /// `--tmux`, `--frames`, `--fps` and `--no-probe`: what overrides the
     /// route a run's frames take. See [`crate::route`].
@@ -133,9 +140,19 @@ pub struct Options {
     /// `--block-list` and `--no-block`: the host lists requests are blocked
     /// by, and whether to. See [`crate::block`].
     pub block: block::Lists,
+    /// `--sites-dir` and `--no-sites`: where the site styles and scripts are
+    /// read from, and whether. See [`crate::sites`].
+    pub sites: sites::Location,
     /// `--password-command` and `--password-command-terminal`: what
     /// `fill-login` runs. See [`crate::login`].
     pub logins: login::Programs,
+    /// `--external-browser`: what `open-external` runs; none for the
+    /// platform's own. See [`crate::external`].
+    pub external_browser: Option<picker::Command>,
+    /// `false` with `--no-console` or `console = false`: the page's console
+    /// is not listened to, and `ctrl+shift+j` says so. See
+    /// [`crate::console`].
+    pub console: bool,
 }
 
 /// What `main` was asked to do, once the command line has been read.
@@ -163,6 +180,9 @@ pub struct Provenance {
     /// Which source named the engine: `--engine`, `$BLINKTERM_ENGINE`,
     /// `config`, or `None` for the `PATH` search.
     pub engine_from: Option<&'static str>,
+    /// Which source said the keymap: `--keymap`, `config`, or `None` for
+    /// the platform's.
+    pub keymap_from: Option<&'static str>,
 }
 
 /// `--help`, `--version`, `--print-engine` or `--doctor`: the command-line
@@ -207,6 +227,7 @@ pub struct Settings {
     pub mute: Option<bool>,
     pub restore: Option<bool>,
     pub normal_mode: Option<bool>,
+    pub keymap: Option<Keymap>,
     pub tmux: Option<route::Choice>,
     pub frames: Option<route::Frames>,
     pub fps: Option<u32>,
@@ -221,8 +242,15 @@ pub struct Settings {
     pub block_lists: Vec<PathBuf>,
     /// `false` with `--no-block` or `block = false`.
     pub block: Option<bool>,
+    /// `--sites-dir`, `sites-dir`.
+    pub sites_dir: Option<PathBuf>,
+    /// `false` with `--no-sites` or `sites = false`.
+    pub sites: Option<bool>,
+    /// `false` with `--no-console` or `console = false`.
+    pub console: Option<bool>,
     pub password_command: Option<picker::Command>,
     pub password_command_terminal: Option<picker::Command>,
+    pub external_browser: Option<picker::Command>,
     /// File only: a binding is not a one-run thing.
     pub bindings: Vec<Binding>,
     /// Command line only.
@@ -266,6 +294,7 @@ impl Settings {
             mute: self.mute.or(under.mute),
             restore: self.restore.or(under.restore),
             normal_mode: self.normal_mode.or(under.normal_mode),
+            keymap: self.keymap.or(under.keymap),
             tmux: self.tmux.or(under.tmux),
             frames: self.frames.or(under.frames),
             fps: self.fps.or(under.fps),
@@ -278,10 +307,14 @@ impl Settings {
                 .or(under.file_picker_terminal_multiple),
             block_lists,
             block: self.block.or(under.block),
+            sites_dir: self.sites_dir.or(under.sites_dir),
+            sites: self.sites.or(under.sites),
+            console: self.console.or(under.console),
             password_command: self.password_command.or(under.password_command),
             password_command_terminal: self
                 .password_command_terminal
                 .or(under.password_command_terminal),
+            external_browser: self.external_browser.or(under.external_browser),
             bindings,
             config: self.config.or(under.config),
             what: self.what.or(under.what),
@@ -455,6 +488,14 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             )?;
             continue;
         }
+        if let Some(text) = value_of(arg, "--keymap", &mut args) {
+            once(
+                &mut s.keymap,
+                Keymap::parse(text).map_err(|why| format!("--{why}"))?,
+                "--keymap once is enough",
+            )?;
+            continue;
+        }
         if let Some(text) = value_of(arg, "--frames", &mut args) {
             once(
                 &mut s.frames,
@@ -503,6 +544,15 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             s.block_lists.push(PathBuf::from(path));
             continue;
         }
+        if let Some(dir) = value_of(arg, "--sites-dir", &mut args) {
+            let dir = needed(dir, "--sites-dir needs a directory: --sites-dir <dir>")?;
+            once(
+                &mut s.sites_dir,
+                PathBuf::from(dir),
+                "one sites directory at a time",
+            )?;
+            continue;
+        }
         if let Some(agent) = value_of(arg, "--user-agent", &mut args) {
             let agent = needed(agent, "--user-agent needs text")?;
             once(
@@ -522,6 +572,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             "--file-picker",
             "--password-command-terminal",
             "--password-command",
+            "--external-browser",
         ];
         if let Some((name, text)) = pickers
             .iter()
@@ -533,6 +584,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
                 "--file-picker-multiple" => &mut s.file_picker_multiple,
                 "--password-command-terminal" => &mut s.password_command_terminal,
                 "--password-command" => &mut s.password_command,
+                "--external-browser" => &mut s.external_browser,
                 _ => &mut s.file_picker,
             };
             let text = needed(text, &format!("{name} needs a command: {name} <command>"))?;
@@ -604,6 +656,8 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             "--normal-mode" => once(&mut s.normal_mode, true, "--normal-mode once is enough")?,
             "--no-probe" => once(&mut s.probe, false, "--no-probe once is enough")?,
             "--no-block" => once(&mut s.block, false, "--no-block once is enough")?,
+            "--no-sites" => once(&mut s.sites, false, "--no-sites once is enough")?,
+            "--no-console" => once(&mut s.console, false, "--no-console once is enough")?,
             "--no-config" => config_choice(&mut s, ConfigChoice::None)?,
             "--print-engine" => what(&mut s, What::PrintEngine)?,
             "--doctor" => what(&mut s, What::Doctor)?,
@@ -684,7 +738,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 29] = [
+const KEYS: [&str; 34] = [
     "home",
     "profile",
     "temp-profile",
@@ -702,6 +756,7 @@ const KEYS: [&str; 29] = [
     "mute",
     "restore",
     "normal-mode",
+    "keymap",
     "tmux",
     "frames",
     "fps",
@@ -712,8 +767,12 @@ const KEYS: [&str; 29] = [
     "file-picker-terminal-multiple",
     "block-list",
     "block",
+    "sites-dir",
+    "sites",
+    "console",
     "password-command",
     "password-command-terminal",
+    "external-browser",
 ];
 
 /// One file's text. `path` is only for the sentences, every one of which is
@@ -813,6 +872,7 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             "mute" => s.mute = Some(parse_bool(key, value).map_err(at)?),
             "restore" => s.restore = Some(parse_bool(key, value).map_err(at)?),
             "normal-mode" => s.normal_mode = Some(parse_bool(key, value).map_err(at)?),
+            "keymap" => s.keymap = Some(Keymap::parse(value).map_err(at)?),
             "tmux" => s.tmux = Some(route::Choice::parse(value).map_err(at)?),
             "frames" => s.frames = Some(route::Frames::parse(value).map_err(at)?),
             "fps" => s.fps = Some(route::parse_fps(key, value).map_err(at)?),
@@ -830,11 +890,17 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             }
             "block-list" => s.block_lists.push(PathBuf::from(value)),
             "block" => s.block = Some(parse_bool(key, value).map_err(at)?),
+            "sites-dir" => s.sites_dir = Some(PathBuf::from(value)),
+            "sites" => s.sites = Some(parse_bool(key, value).map_err(at)?),
+            "console" => s.console = Some(parse_bool(key, value).map_err(at)?),
             "password-command" => {
                 s.password_command = Some(picker::Command::parse(key, value).map_err(at)?)
             }
             "password-command-terminal" => {
                 s.password_command_terminal = Some(picker::Command::parse(key, value).map_err(at)?)
+            }
+            "external-browser" => {
+                s.external_browser = Some(picker::Command::parse(key, value).map_err(at)?)
             }
             _ => unreachable!("every key in KEYS has an arm"),
         }
@@ -914,6 +980,7 @@ pub fn from_env(engine: Option<&OsStr>) -> Settings {
 /// and the function the precedence tests call.
 pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, String> {
     let s = cli.over(env).over(file);
+    let keymap = s.keymap.unwrap_or_else(Keymap::platform);
     Ok(Options {
         urls: s.urls,
         home: s.home.unwrap_or_else(|| "about:blank".to_string()),
@@ -936,7 +1003,8 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
         },
         restore: s.restore.unwrap_or(false),
         normal_mode: s.normal_mode.unwrap_or(false),
-        bindings: Bindings::from_rows(s.bindings),
+        keymap,
+        bindings: Bindings::on(keymap, s.bindings),
         route: route::Choices {
             tmux: s.tmux.unwrap_or_default(),
             frames: s.frames.unwrap_or_default(),
@@ -954,10 +1022,16 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
             paths: s.block_lists,
             enabled: s.block.unwrap_or(true),
         },
+        sites: sites::Location {
+            dir: s.sites_dir,
+            enabled: s.sites.unwrap_or(true),
+        },
         logins: login::Programs {
             gui: s.password_command,
             terminal: s.password_command_terminal,
         },
+        external_browser: s.external_browser,
+        console: s.console.unwrap_or(true),
     })
 }
 
@@ -968,6 +1042,7 @@ fn read_config(choice: Option<&ConfigChoice>) -> Result<(Settings, Provenance), 
         found: false,
         settings: 0,
         engine_from: None,
+        keymap_from: None,
     };
     let (path, named) = match choice {
         Some(ConfigChoice::None) => return Ok((Settings::default(), provenance)),
@@ -1012,6 +1087,7 @@ fn home_expanded(mut settings: Settings, home: Option<&Path>) -> Settings {
     });
     settings.download_dir = settings.download_dir.map(|dir| expand_home(dir, home));
     settings.engine = settings.engine.map(|path| expand_home(path, home));
+    settings.sites_dir = settings.sites_dir.map(|dir| expand_home(dir, home));
     settings.block_lists = std::mem::take(&mut settings.block_lists)
         .into_iter()
         .map(|path| expand_home(path, home))
@@ -1023,6 +1099,7 @@ fn home_expanded(mut settings: Settings, home: Option<&Path>) -> Settings {
         &mut settings.file_picker_terminal_multiple,
         &mut settings.password_command,
         &mut settings.password_command_terminal,
+        &mut settings.external_browser,
     ] {
         *command = command.take().map(|command| command.expand_home(home));
     }
@@ -1048,6 +1125,13 @@ pub fn invocation(args: &[String]) -> Result<Invocation, String> {
     } else if env.engine.is_some() {
         Some("$BLINKTERM_ENGINE")
     } else if file.engine.is_some() {
+        Some("config")
+    } else {
+        None
+    };
+    provenance.keymap_from = if cli.keymap.is_some() {
+        Some("--keymap")
+    } else if file.keymap.is_some() {
         Some("config")
     } else {
         None
@@ -2088,6 +2172,63 @@ mod tests {
     }
 
     #[test]
+    fn the_external_browser_is_read_from_the_line_and_the_file() {
+        let words = |c: Option<picker::Command>| c.map(|c| c.words);
+        let strings = |w: &[&str]| Some(w.iter().map(|w| w.to_string()).collect::<Vec<_>>());
+        let cli = parsed(&["--external-browser", "firefox --new-tab {url}"]).expect("cli");
+        assert_eq!(
+            words(cli.external_browser),
+            strings(&["firefox", "--new-tab", "{url}"])
+        );
+        let cli = parsed(&["--external-browser=open -a 'Google Chrome'"]).expect("cli");
+        assert_eq!(
+            words(cli.external_browser),
+            strings(&["open", "-a", "Google Chrome"])
+        );
+        assert_eq!(
+            parsed(&["--external-browser=a", "--external-browser=b"]),
+            Err("--external-browser once is enough".to_string())
+        );
+        assert_eq!(
+            parsed(&["--external-browser"]),
+            Err("--external-browser needs a command: --external-browser <command>".to_string())
+        );
+        assert_eq!(
+            parsed(&["--external-browser", "x 'y"]),
+            Err("--external-browser has a quote that is never closed".to_string())
+        );
+
+        let from_file = home_expanded(
+            file("external-browser = ~/bin/open-it {url}").expect("a file"),
+            Some(Path::new("/h")),
+        );
+        assert_eq!(
+            words(from_file.external_browser.clone()),
+            strings(&["/h/bin/open-it", "{url}"])
+        );
+        assert_eq!(
+            file("external-browser = a\nexternal-browser = b"),
+            Err("/c:2: external-browser is already set on line 1".to_string())
+        );
+
+        // The line's wins over the file's.
+        let options = resolve(
+            parsed(&["--external-browser=chromium"]).expect("cli"),
+            Settings::default(),
+            from_file.clone(),
+        )
+        .expect("resolves");
+        assert_eq!(words(options.external_browser), strings(&["chromium"]));
+        let options =
+            resolve(parsed(&[]).expect("cli"), Settings::default(), from_file).expect("resolves");
+        assert_eq!(
+            words(options.external_browser),
+            strings(&["/h/bin/open-it", "{url}"])
+        );
+        assert_eq!(resolved(&[]).expect("resolves").external_browser, None);
+    }
+
+    #[test]
     fn a_tilde_starting_a_picker_from_the_file_is_home_and_from_the_command_line_is_not() {
         let home = Some(Path::new("/h"));
         let from_file = home_expanded(
@@ -2150,6 +2291,95 @@ mod tests {
         let home = Some(Path::new("/h"));
         let expanded = home_expanded(file("block-list = ~/lists/hosts").expect("a file"), home);
         assert_eq!(expanded.block_lists, [PathBuf::from("/h/lists/hosts")]);
+    }
+
+    #[test]
+    fn a_sites_directory_comes_from_either_source_no_sites_turns_it_off_and_the_command_line_wins()
+    {
+        let s = parsed(&["--sites-dir", "/a"]).expect("a directory");
+        assert_eq!(s.sites_dir, Some(PathBuf::from("/a")));
+        let s = parsed(&["--sites-dir=/b"]).expect("the = spelling");
+        assert_eq!(s.sites_dir, Some(PathBuf::from("/b")));
+        assert_eq!(
+            parsed(&["--sites-dir"]),
+            Err("--sites-dir needs a directory: --sites-dir <dir>".to_string())
+        );
+        assert_eq!(
+            parsed(&["--sites-dir", "/a", "--sites-dir", "/b"]),
+            Err("one sites directory at a time".to_string())
+        );
+        let options = resolve(
+            parsed(&["--sites-dir", "/cli"]).expect("cli"),
+            Settings::default(),
+            file("sites-dir = /file").expect("a file"),
+        )
+        .expect("resolves");
+        assert_eq!(
+            options.sites,
+            sites::Location {
+                dir: Some(PathBuf::from("/cli")),
+                enabled: true,
+            },
+            "the command line's directory wins"
+        );
+
+        let off = parsed(&["--no-sites"]).expect("a flag");
+        assert_eq!(off.sites, Some(false));
+        assert_eq!(
+            parsed(&["--no-sites", "--no-sites"]),
+            Err("--no-sites once is enough".to_string())
+        );
+        let options = resolve(
+            off,
+            Settings::default(),
+            file("sites = true").expect("a file"),
+        )
+        .expect("resolves");
+        assert!(!options.sites.enabled, "the command line's word wins");
+        assert_eq!(file("sites = false").map(|s| s.sites), Ok(Some(false)));
+        let maybe = file("sites = maybe").expect_err("not a bool");
+        assert!(maybe.starts_with("/c:1: "), "{maybe}");
+        assert_eq!(
+            file("sites = true\nsites = false"),
+            Err("/c:2: sites is already set on line 1".to_string())
+        );
+        assert_eq!(
+            resolved(&[]).expect("resolves").sites,
+            sites::Location {
+                dir: None,
+                enabled: true,
+            }
+        );
+
+        let home = Some(Path::new("/h"));
+        let expanded = home_expanded(file("sites-dir = ~/my-sites").expect("a file"), home);
+        assert_eq!(expanded.sites_dir, Some(PathBuf::from("/h/my-sites")));
+    }
+
+    #[test]
+    fn the_console_is_listened_to_unless_no_console_or_the_file_says_not() {
+        assert!(resolved(&[]).expect("resolves").console);
+        let off = parsed(&["--no-console"]).expect("a flag");
+        assert_eq!(off.console, Some(false));
+        assert_eq!(
+            parsed(&["--no-console", "--no-console"]),
+            Err("--no-console once is enough".to_string())
+        );
+        let options = resolve(
+            off,
+            Settings::default(),
+            file("console = true").expect("a file"),
+        )
+        .expect("resolves");
+        assert!(!options.console, "the command line's word wins");
+        assert_eq!(file("console = false").map(|s| s.console), Ok(Some(false)));
+        let options = resolve(
+            Settings::default(),
+            Settings::default(),
+            file("console = false").expect("a file"),
+        )
+        .expect("resolves");
+        assert!(!options.console);
     }
 
     #[test]
@@ -2297,7 +2527,10 @@ mod tests {
         };
         let options =
             resolve(Settings::default(), Settings::default(), from_file).expect("resolves");
-        assert_eq!(options.bindings, Bindings::from_rows(vec![row]));
+        assert_eq!(
+            options.bindings,
+            Bindings::on(Keymap::platform(), vec![row])
+        );
         assert!(parsed(&["--key.alt+b=back"]).is_err(), "not an option");
     }
 
@@ -2357,6 +2590,111 @@ mod tests {
         assert_eq!(
             resolved(&[]).expect("defaults").route,
             route::Choices::default()
+        );
+    }
+
+    #[test]
+    fn keymap_is_read_from_the_file_and_the_command_line_and_the_command_line_wins() {
+        assert_eq!(
+            parsed(&["--keymap", "mac"]).expect("mac").keymap,
+            Some(Keymap::Mac)
+        );
+        assert_eq!(
+            parsed(&["--keymap=Linux"]).expect("linux").keymap,
+            Some(Keymap::Linux)
+        );
+        assert_eq!(
+            file("keymap = mac").expect("file").keymap,
+            Some(Keymap::Mac)
+        );
+        let options = resolve(
+            parsed(&["--keymap", "linux"]).expect("cli"),
+            Settings::default(),
+            file("keymap = mac").expect("file"),
+        )
+        .expect("folded");
+        assert_eq!(options.keymap, Keymap::Linux, "the line wins");
+        let options = resolve(
+            Settings::default(),
+            Settings::default(),
+            file("keymap = mac").expect("file"),
+        )
+        .expect("folded");
+        assert_eq!(options.keymap, Keymap::Mac, "the file over the platform");
+    }
+
+    #[test]
+    fn keymap_refuses_anything_but_mac_and_linux_and_names_both() {
+        assert_eq!(
+            parsed(&["--keymap", "windows"]),
+            Err("--keymap is mac or linux, not \"windows\"".to_string())
+        );
+        assert_eq!(
+            file("keymap = windows"),
+            Err("/c:1: keymap is mac or linux, not \"windows\"".to_string())
+        );
+        assert!(parsed(&["--keymap"]).is_err());
+    }
+
+    #[test]
+    fn keymap_twice_is_refused_on_the_line_and_in_the_file() {
+        assert_eq!(
+            parsed(&["--keymap", "mac", "--keymap=linux"]),
+            Err("--keymap once is enough".to_string())
+        );
+        assert_eq!(
+            file("keymap = mac\nkeymap = linux"),
+            Err("/c:2: keymap is already set on line 1".to_string())
+        );
+    }
+
+    #[test]
+    fn with_no_keymap_said_the_platform_s_is_used() {
+        let options = resolved(&[]).expect("defaults");
+        assert_eq!(options.keymap, Keymap::platform());
+        assert_eq!(options.bindings, Bindings::on(Keymap::platform(), vec![]));
+        assert!(
+            options.bindings.is_empty(),
+            "the keymap's rows are not the file's"
+        );
+    }
+
+    #[test]
+    fn the_keymap_s_rows_sit_under_the_file_s_key_lines() {
+        use crate::bindings::Lookup;
+        use crate::input::{Key, KeyAction, KeyInput, Mods};
+        let press = |key, mods| KeyInput {
+            key,
+            mods: Mods(mods),
+            action: KeyAction::Press,
+            text: None,
+        };
+        let options = resolve(
+            parsed(&["--keymap", "mac"]).expect("cli"),
+            Settings::default(),
+            file("key.cmd+d = none\nkey.cmd+y = find").expect("file"),
+        )
+        .expect("folded");
+        let lookup = |key, mods| options.bindings.lookup(&press(key, mods));
+        assert_eq!(lookup(Key::Char('d'), Mods::SUPER), Lookup::Unbound);
+        assert_eq!(
+            lookup(Key::Char('y'), Mods::SUPER),
+            Lookup::Bound(Action::Find)
+        );
+        assert_eq!(
+            lookup(Key::Char('['), Mods::SUPER),
+            Lookup::Bound(Action::Back)
+        );
+        assert_eq!(options.bindings.iter().count(), 2);
+        let options = resolve(
+            parsed(&["--keymap", "linux"]).expect("cli"),
+            Settings::default(),
+            Settings::default(),
+        )
+        .expect("folded");
+        assert_eq!(
+            options.bindings.lookup(&press(Key::Char('['), Mods::SUPER)),
+            Lookup::Default
         );
     }
 }

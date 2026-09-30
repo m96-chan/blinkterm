@@ -31,6 +31,7 @@
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,9 +46,12 @@ use crate::bookmarks::{Bookmarks, Toggled};
 use crate::cdp::{Client, Event, Notifier, Pending};
 use crate::chroma;
 use crate::clipboard;
+use crate::console::Recorder;
+use crate::consolelist::{self, ConsoleList};
 use crate::dialog::{Answer, Dialog, Kind};
 use crate::download::{self, Downloads};
 use crate::engine::Engine;
+use crate::external;
 use crate::find;
 use crate::fullscreen::{self, Heard, Layout};
 use crate::graphics::{self, Painter, Raw};
@@ -68,12 +72,14 @@ use crate::options::Options;
 use crate::permissions::{self, Allowed, Permission};
 use crate::picker::{self, Pickers};
 use crate::profile::Profile;
+use crate::reader::{self, Answered};
 use crate::remote::{self, Delivered, Listener};
 use crate::route::{self, Payload, Route, Wrap};
 use crate::save;
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::session::{self, Offer, Reply, Session, Snapshot};
+use crate::sites::{self, Sites};
 use crate::tablist::{self, TabList};
 use crate::tabs::{Counted, Outcome, Tab, Tabs};
 use crate::upload::{self, Upload};
@@ -206,6 +212,11 @@ const HINT_TIMEOUT: Duration = Duration::from_secs(5);
 /// the page's own `input` listeners, which are the page's. Five, like the
 /// hints'.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the reader's answer is waited for. The walk is find's kind of
+/// cost: milliseconds on an article, longer on a page nobody reads (see
+/// [`crate::reader`] for the numbers). Five, like the hints'.
+const READER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the question after a click in normal mode — did focus land in
 /// something editable? — may be out. The hover ask's, which it is the same
@@ -507,6 +518,13 @@ struct Chrome {
     /// The login being fetched or filled for one tab: one at a time. See
     /// [`start_login`].
     login: Option<LoginState>,
+    /// `external-browser`; none, and the platform's own is run. See
+    /// [`crate::external`].
+    external: Option<picker::Command>,
+    /// The desktop browsers started by `alt+o` and not yet gone, asked once a
+    /// pass whether they have, so that none is left a zombie; never
+    /// signalled — a browser outlives this program on purpose.
+    launched: Vec<Child>,
     /// Where the pointer is and what is under it, for the tab in front only.
     /// See [`crate::hover`].
     hover: hover::Tracker,
@@ -536,11 +554,12 @@ struct Chrome {
     /// The terminal's answer to `CSI 16 t`, for a pane whose kernel window
     /// size has no pixels in it. See [`crate::screen::ASK_CELL_SIZE`].
     cell_hint: Option<(u32, u32)>,
-    /// `Some` while the tab list or the history list is open. The person's,
+    /// `Some` while the tab list, the history list or the console is open. The person's,
     /// like the bar and the find prompt, and exclusive with them by the
     /// keyboard: whichever is open takes every key, so the other cannot be
     /// opened until it closes. See [`crate::tablist`] and
-    /// [`crate::historylist`], and [`Overlay`] for why one field holds both.
+    /// [`crate::historylist`] and [`crate::consolelist`], and [`Overlay`] for
+    /// why one field holds all three.
     list: Option<Overlay>,
     /// The first match on the screen while the list is open, so that the
     /// rows scroll only when the pick leaves them. See [`TabList::window`].
@@ -564,6 +583,8 @@ struct Chrome {
     hinting: Option<Hinting>,
     /// The question out after a click in normal mode.
     focus: Option<Focus>,
+    /// The reader's question out with the page in front.
+    reader: Option<Reading>,
     /// The person's bookmarks, one file for every profile; see
     /// [`crate::bookmarks`].
     bookmarks: Bookmarks,
@@ -612,6 +633,21 @@ struct Chrome {
     /// What the row last said about blocking on the page in front, so that
     /// it is drawn again when the count moves and not otherwise.
     blocked_words: Option<String>,
+    /// The site styles and scripts: read once as the run starts, read again
+    /// by `reload-sites`, and told to every session as it is made
+    /// ([`connect_tab`]). See [`crate::sites`].
+    sites: Sites,
+    /// Where they are read from, so that `reload-sites` reads the same
+    /// directory the run started with.
+    sites_location: sites::Location,
+    /// Every page's console, shared with the pipe's reader thread, which
+    /// records every entry as it is read; `None` with `console = false` or
+    /// `--no-console`, and then no page is asked for its console at all. See
+    /// [`crate::console`].
+    console: Option<Arc<Recorder>>,
+    /// What the row last said about the console's errors on the page in
+    /// front: the twin of `blocked_words`.
+    console_words: Option<String>,
 }
 
 /// A screencast frame this program has not acknowledged yet: which tab's,
@@ -640,6 +676,8 @@ impl Chrome {
         allowed: Allowed,
         blocker: Option<Arc<Blocker>>,
         unblocked: Unblocked,
+        sites: Sites,
+        console: Option<Arc<Recorder>>,
     ) -> Chrome {
         Chrome {
             identity,
@@ -673,6 +711,8 @@ impl Chrome {
             remote: None,
             logins: options.logins.clone(),
             login: None,
+            external: options.external_browser.clone(),
+            launched: Vec::new(),
             hover: hover::Tracker::default(),
             asking: None,
             shape: Shape::Default,
@@ -693,6 +733,7 @@ impl Chrome {
             bindings: options.bindings.clone(),
             hinting: None,
             focus: None,
+            reader: None,
             // The same file under every profile, a temporary one
             // included: a bookmark is the person's, not the engine's.
             bookmarks: match Profile::data_dir() {
@@ -717,6 +758,10 @@ impl Chrome {
             blocker,
             unblocked,
             blocked_words: None,
+            sites,
+            sites_location: options.sites.clone(),
+            console,
+            console_words: None,
         }
     }
 
@@ -821,8 +866,8 @@ impl UrlBar {
     }
 }
 
-/// The list over the screen: the tabs (`ctrl+shift+a`) or the pages visited
-/// (`ctrl+shift+h`).
+/// The list over the screen: the tabs (`ctrl+shift+a`), the pages visited
+/// (`ctrl+shift+h`), or the console of the page in front (`ctrl+shift+j`).
 ///
 /// One field on [`Chrome`] for both rather than one each, because
 /// everything about a list having the screen is the same whichever it is:
@@ -836,6 +881,7 @@ impl UrlBar {
 enum Overlay {
     Tabs(TabList),
     History(HistoryList),
+    Console(ConsoleList),
 }
 
 impl Overlay {
@@ -844,6 +890,7 @@ impl Overlay {
         match self {
             Overlay::Tabs(list) => list.line(),
             Overlay::History(list) => list.line(),
+            Overlay::Console(list) => list.line(),
         }
     }
 
@@ -852,6 +899,7 @@ impl Overlay {
         match self {
             Overlay::Tabs(list) => list.line_mut(),
             Overlay::History(list) => list.line_mut(),
+            Overlay::Console(list) => list.line_mut(),
         }
     }
 }
@@ -913,6 +961,14 @@ struct Hinting {
     hints: Option<hints::Hints>,
     /// Whether a stale world has been remade once already.
     remade: bool,
+}
+
+/// The reader's question out with the engine: which tab, the reply, and
+/// when it went. One at a time; see [`toggle_reader`].
+struct Reading {
+    target: String,
+    pending: Pending,
+    sent: Instant,
 }
 
 /// The one question asked after a click in normal mode: did focus land in
@@ -1087,6 +1143,7 @@ pub struct Booted {
 /// `--engine-arg`s, user agent, proxy — on the same profile. An `Err` drops
 /// the engine, and the profile with it. Public so that the engine tests boot
 /// the way the program does.
+#[allow(clippy::too_many_arguments)]
 pub fn boot(
     profile: Profile,
     launch: &crate::engine::Launch,
@@ -1094,14 +1151,27 @@ pub fn boot(
     appearance: &Appearance,
     allowed: &Allowed,
     blocker: Option<&Arc<Blocker>>,
+    sites: &Sites,
+    console: Option<&Arc<Recorder>>,
 ) -> Result<Booted, String> {
     let engine = Engine::launch_with(profile, ENGINE_TIMEOUT, launch)?;
     // Before anything is attached, because the hook is what gives every
     // page's session `Fetch.enable` as it is attached, the first included;
     // and it forgets the dead engine's pages, whose counts meant nothing now.
+    // The console's recorder wants the same: in place before the first page
+    // says anything, and nothing kept from pages that are gone. The blocker
+    // first, because its pauses hold a page up. See [`crate::cdp::Hooks`].
+    let mut hooks: Vec<Arc<dyn crate::cdp::Intercept>> = Vec::new();
     if let Some(blocker) = blocker {
         blocker.forget_all();
-        engine.intercept(Some(Arc::clone(blocker) as Arc<dyn crate::cdp::Intercept>));
+        hooks.push(Arc::clone(blocker) as Arc<dyn crate::cdp::Intercept>);
+    }
+    if let Some(console) = console {
+        console.forget_all();
+        hooks.push(Arc::clone(console) as Arc<dyn crate::cdp::Intercept>);
+    }
+    if !hooks.is_empty() {
+        engine.intercept(Some(Arc::new(crate::cdp::Hooks(hooks))));
     }
     // Before the first tab is connected, because connecting one is where a
     // session is told who is asking.
@@ -1110,7 +1180,9 @@ pub fn boot(
         launch.user_agent.as_deref(),
         &crate::identity::locale(),
     )
-    .with_accept_language(crate::identity::accept_lang_arg(&launch.args));
+    .with_accept_language(crate::identity::accept_lang_arg(&launch.args))
+    // Only with a recorder to take what `Runtime` and `Log` send.
+    .with_console(console.is_some());
     let mut browser = engine.browser()?;
     browser.call(
         "Target.setDiscoverTargets",
@@ -1144,9 +1216,29 @@ pub fn boot(
     // that the first page is not a tab with less known about it than the
     // rest — its main frame's id above all, which is what its loading is
     // told apart from an iframe's by. See [`connect_tab`].
-    let (client, frame) = connect_tab(&mut browser, &first, appearance, &identity)?;
+    let (mut client, frame, scripts) =
+        connect_tab(&mut browser, &first, appearance, &identity, sites)?;
+    // The engine's first page is not the person's, and `Runtime.enable`
+    // replays what a page said before it was asked: on a Mac that page is
+    // the directory listing Cocoa's `NO` opens (see
+    // [`crate::engine::flags`]), whose script throws twenty-one times, and
+    // the row would start at `21 errors`. A second enable is answered by
+    // the renderer after the first one's replay, which the reader has
+    // recorded by then in pipe order; so once it is answered, what the log
+    // holds is that page's, and it goes.
+    if let Some(console) = console {
+        if client
+            .call_within("Runtime.enable", Json::empty(), SWITCH_TIMEOUT)
+            .is_ok()
+        {
+            if let Some(session) = client.session() {
+                console.forget(session);
+            }
+        }
+    }
     let mut first = Tab::new(first, client, "about:blank");
     first.frame = frame;
+    first.site_scripts = scripts;
     Ok(Booted {
         engine,
         browser,
@@ -1238,6 +1330,17 @@ pub fn run(options: Options) -> Result<(), String> {
         return Err(why);
     }
     let route = route::choose(&env, options.route, verdict, Painter::shm_usable());
+    // What the row says once the first page is up: a `key.` line on a chord
+    // Kitty keeps, which would otherwise do nothing and say nothing, and a
+    // `--remote` socket that could not be bound, below. See
+    // [`crate::taken`].
+    let mut problems: Vec<String> = Vec::new();
+    if env.kitty {
+        problems.extend(crate::taken::conflicts(
+            &options.bindings,
+            cfg!(target_os = "macos"),
+        ));
+    }
     install_signals();
     std::panic::set_hook(Box::new(|info| {
         // A release build aborts here, so this is the only chance to put the
@@ -1258,12 +1361,17 @@ pub fn run(options: Options) -> Result<(), String> {
     // the lock. Not being able to listen is not a reason not to browse: it is
     // a note on the row. A temporary profile is this run's alone and never
     // listens.
-    let (mut listener, mut remote_problem) = if profile.is_temporary() {
-        (None, None)
+    let mut listener = if profile.is_temporary() {
+        None
     } else {
         match Listener::bind(profile.dir()) {
-            Ok(listener) => (Some(listener), None),
-            Err(why) => (None, Some(format!("not listening for --remote: {why}"))),
+            Ok(listener) => Some(listener),
+            Err(why) => {
+                // First, so that the "more" after it are the key lines,
+                // which are what `--doctor` lists.
+                problems.insert(0, format!("not listening for --remote: {why}"));
+                None
+            }
         }
     };
     // What pages are told about light and dark, before there is a page to
@@ -1293,6 +1401,14 @@ pub fn run(options: Options) -> Result<(), String> {
         Unblocked::load(profile.dir())
     };
     let blocker = block::load(&options.block, &unblocked)?;
+    // The site files, likewise before the pane: a named directory that is
+    // not there ends the run with a sentence, and a file refused is said in
+    // the shell, where it stays to be read.
+    let sites = sites::load(&options.sites)?;
+    for why in &sites.skipped {
+        eprintln!("blinkterm: site file {why}");
+    }
+    let console = options.console.then(|| Arc::new(Recorder::new()));
     let first = boot(
         profile,
         &options.engine,
@@ -1300,6 +1416,8 @@ pub fn run(options: Options) -> Result<(), String> {
         &appearance,
         &allowed,
         blocker.as_ref(),
+        &sites,
+        console.as_ref(),
     )?;
 
     let mut pane = Pane::enter(0, 1, route.wrap == Wrap::None, route.wrap)
@@ -1327,6 +1445,8 @@ pub fn run(options: Options) -> Result<(), String> {
                 allowed,
                 blocker,
                 unblocked,
+                sites,
+                console,
             );
             chrome.cell_hint = heard.cell;
             chrome.take_route(route);
@@ -1350,9 +1470,9 @@ pub fn run(options: Options) -> Result<(), String> {
                 // the tabs that were there when it died.
                 let opened = if std::mem::take(&mut opening) {
                     open_first(&mut pane, tabs, browser, &mut chrome, &options).and_then(|()| {
-                        match remote_problem.take() {
-                            Some(why) => {
-                                note(tabs, why);
+                        match summary(&std::mem::take(&mut problems)) {
+                            Some(said) => {
+                                note(tabs, said);
                                 redraw_row(&mut pane, tabs, &chrome)
                             }
                             None => Ok(()),
@@ -1481,6 +1601,7 @@ fn open_first(
             browser,
             &chrome.appearance,
             &chrome.identity,
+            &chrome.sites,
             snapshot,
         );
         restored = true;
@@ -1497,7 +1618,7 @@ fn open_first(
     if restored && !options.urls.is_empty() {
         let appearance = chrome.appearance;
         let identity = chrome.identity.clone();
-        match open_tab(tabs, browser, &appearance, &identity, &url) {
+        match open_tab(tabs, browser, &appearance, &identity, &chrome.sites, &url) {
             Ok(()) => {
                 if let Some(tab) = tabs.active_mut() {
                     tab.note = Some(format!("loading {url}"));
@@ -1632,6 +1753,8 @@ fn relaunch(
         &chrome.appearance,
         &chrome.allowed,
         chrome.blocker.as_ref(),
+        &chrome.sites,
+        chrome.console.as_ref(),
     ) {
         Ok(booted) => booted,
         Err(failure) => return Err(died(could_not_restart(why, failure), &chrome.session)),
@@ -1646,6 +1769,7 @@ fn relaunch(
         &mut browser,
         &chrome.appearance,
         &identity,
+        &chrome.sites,
         snapshot,
     );
     // A failure here is put on the tab rather than returned: whether the
@@ -1759,6 +1883,15 @@ fn drive(
         let blocked = blocked_words(tabs, chrome);
         if blocked != chrome.blocked_words {
             chrome.blocked_words = blocked;
+            redraw_row(pane, tabs, chrome)?;
+        }
+        // The errors the page in front logged since its console was last
+        // opened: counted on the reader thread, which consumes the console's
+        // events and wakes nobody, so read here for the same reason and a
+        // pass late at most, 50 ms.
+        let errors = console_words(tabs, chrome);
+        if errors != chrome.console_words {
+            chrome.console_words = errors;
             redraw_row(pane, tabs, chrome)?;
         }
         // The whole pane for a page that is fullscreen, unless something
@@ -1875,6 +2008,8 @@ fn drive(
         // A password command that has answered, or a page that has answered
         // the fill.
         pump_login(pane, tabs, chrome, &ready)?;
+        // A desktop browser started by alt+o that has exited, forgotten.
+        external::reap(&mut chrome.launched);
         // Whatever the pointer did in all the reports just read, told to the
         // page and asked about once: see [`crate::hover`].
         tick_hover(pane, tabs, chrome)?;
@@ -1930,7 +2065,8 @@ fn drive(
         }
         // The same for the hints' collect, and for the question after a
         // click in normal mode: whether it landed in a field.
-        if pump_hints(tabs, chrome) | pump_focus(tabs, chrome) {
+        // And for the reader's toggle.
+        if pump_hints(tabs, chrome) | pump_focus(tabs, chrome) | pump_reader(tabs, chrome) {
             redraw_row(pane, tabs, chrome)?;
         }
         // The fullscreen watch on the page in front: its answer, and the
@@ -2469,9 +2605,10 @@ fn open_dormant(
     browser: &mut Client,
     appearance: &Appearance,
     identity: &Identity,
+    sites: &Sites,
     entry: session::Entry,
 ) -> Result<(), String> {
-    open_tab(tabs, browser, appearance, identity, "about:blank")?;
+    open_tab(tabs, browser, appearance, identity, sites, "about:blank")?;
     if let Some(tab) = tabs.active_mut() {
         tab.url = entry.url;
         tab.title = entry.title;
@@ -2521,6 +2658,7 @@ pub fn restore_tabs(
     browser: &mut Client,
     appearance: &Appearance,
     identity: &Identity,
+    sites: &Sites,
     snapshot: Snapshot,
 ) {
     let untouched = tabs.len() == 1
@@ -2542,7 +2680,7 @@ pub fn restore_tabs(
             }
             continue;
         }
-        if let Err(why) = open_dormant(tabs, browser, appearance, identity, entry) {
+        if let Err(why) = open_dormant(tabs, browser, appearance, identity, sites, entry) {
             note(tabs, format!("not every tab came back: {why}"));
             return;
         }
@@ -2570,6 +2708,7 @@ fn decline_or_restore(
                 browser,
                 &chrome.appearance,
                 &chrome.identity,
+                &chrome.sites,
                 saved.snapshot,
             );
             switched(pane, tabs, browser, chrome, was)?;
@@ -2605,6 +2744,7 @@ fn decline_or_restore(
 /// Public so that the engine tests send what this program sends. At the
 /// pane less the row: a page coming back from a crash is a new document,
 /// and a new document is not fullscreen.
+#[allow(clippy::too_many_arguments)]
 pub fn revive(
     client: &mut Client,
     appearance: &Appearance,
@@ -2612,12 +2752,21 @@ pub fn revive(
     metrics: Metrics,
     cast: motion::Cast,
     identity: &Identity,
+    sites: &Sites,
+    scripts: &mut Vec<String>,
 ) {
     let _ = client.notify(
         "Page.setInterceptFileChooserDialog",
         Json::object(vec![("enabled", Json::Bool(true))]),
     );
     prepare_session(client, appearance, identity);
+    // The site files again: nothing registered was measured to survive a
+    // crash, the old identifiers are taken back in case they did — a
+    // notification, whose error for a registration that is gone nobody
+    // reads — and the scripts wait for the next document, as on
+    // `reload-sites`.
+    sites::remove(client, scripts);
+    *scripts = sites::install(client, sites, false);
     let _ = emulate(client, viewport, true);
     let _ = restart_screencast(client, Layout::default().pixels(metrics), true, cast);
 }
@@ -2798,7 +2947,14 @@ fn switched(
 fn open_the_rest(tabs: &mut Tabs<Client>, browser: &mut Client, chrome: &Chrome, urls: &[String]) {
     for url in urls.iter().skip(1) {
         let url = normalise(url);
-        if let Err(why) = open_behind(tabs, browser, &chrome.appearance, &chrome.identity, &url) {
+        if let Err(why) = open_behind(
+            tabs,
+            browser,
+            &chrome.appearance,
+            &chrome.identity,
+            &chrome.sites,
+            &url,
+        ) {
             if let Some(first) = tabs.active_mut() {
                 first.note = Some(format!("couldn't open {url}: {why}"));
             }
@@ -2812,9 +2968,10 @@ fn open_tab(
     browser: &mut Client,
     appearance: &Appearance,
     identity: &Identity,
+    sites: &Sites,
     url: &str,
 ) -> Result<(), String> {
-    create_tab(tabs, browser, appearance, identity, url, false).map(|_| ())
+    create_tab(tabs, browser, appearance, identity, sites, url, false).map(|_| ())
 }
 
 /// Open `url` in a tab behind the one in front, and say where it went.
@@ -2839,9 +2996,10 @@ pub fn open_behind(
     browser: &mut Client,
     appearance: &Appearance,
     identity: &Identity,
+    sites: &Sites,
     url: &str,
 ) -> Result<usize, String> {
-    create_tab(tabs, browser, appearance, identity, url, true)
+    create_tab(tabs, browser, appearance, identity, sites, url, true)
 }
 
 /// The body of [`open_tab`] and [`open_behind`], which differ only in the
@@ -2855,6 +3013,7 @@ fn create_tab(
     browser: &mut Client,
     appearance: &Appearance,
     identity: &Identity,
+    sites: &Sites,
     url: &str,
     behind: bool,
 ) -> Result<usize, String> {
@@ -2868,9 +3027,10 @@ fn create_tab(
         .and_then(Json::as_str)
         .ok_or_else(|| "the engine opened a page and did not say which".to_string())?
         .to_string();
-    let (connection, frame) = connect_tab(browser, &target, appearance, identity)?;
+    let (connection, frame, scripts) = connect_tab(browser, &target, appearance, identity, sites)?;
     let mut tab = Tab::new(target, connection, url);
     tab.frame = frame;
+    tab.site_scripts = scripts;
     Ok(if behind {
         tabs.open_behind(tab)
     } else {
@@ -3043,7 +3203,8 @@ fn frame_detached(tab: &mut Tab<Client>, event: &Event) -> bool {
 /// [`crate::upload`].
 ///
 /// Then [`prepare_session`], which is everything else a session is told once
-/// for its whole life: sent and not waited for, so it costs the new tab
+/// for its whole life — the scheme, the identity, the console's two domains:
+/// sent and not waited for, so it costs the new tab
 /// nothing, and ahead of the frame tree only because it is the one of these
 /// the page will be looked at through.
 ///
@@ -3064,6 +3225,13 @@ fn frame_detached(tab: &mut Tab<Client>, event: &Event) -> bool {
 /// nothing answering its paused requests is a page whose every request
 /// hangs — and it covers a target attached by any path, not only this one.
 ///
+/// The site styles and scripts ([`crate::sites`]) are registered here too,
+/// after `Page.enable` and before the frame tree: asked rather than told,
+/// because the identifiers the engine gives are what `reload-sites` takes
+/// them back by — they come back third — and run on the document already
+/// there, since this session is new and a popup's first document would
+/// otherwise be missed.
+///
 /// Every tab is made here, the first one included: a session made any other
 /// way would be a page that was never told what the rest were.
 fn connect_tab(
@@ -3071,7 +3239,8 @@ fn connect_tab(
     target: &str,
     appearance: &Appearance,
     identity: &Identity,
-) -> Result<(Client, Option<String>), String> {
+    sites: &Sites,
+) -> Result<(Client, Option<String>, Vec<String>), String> {
     let mut connection = browser.attach(target, CONNECT_TIMEOUT)?;
     connection.call_within("Page.enable", Json::empty(), SWITCH_TIMEOUT)?;
     connection.call_within(
@@ -3086,15 +3255,19 @@ fn connect_tab(
     // tab, which without it is a tab whose ordinary file inputs still work.
     let _ = watch_frames(&mut connection, None);
     prepare_session(&mut connection, appearance, identity);
+    let scripts = sites::install(&mut connection, sites, true);
     let frame = connection
         .call_within("Page.getFrameTree", Json::empty(), SWITCH_TIMEOUT)
         .ok()
         .and_then(|tree| load::main_frame(&tree));
-    Ok((connection, frame))
+    Ok((connection, frame, scripts))
 }
 
 /// Tell a new session what every session is told and nothing resets: the
-/// colour scheme a page is to see, and whether it is to be painted dark.
+/// colour scheme a page is to see, whether it is to be painted dark, who is
+/// asking, and that its console is to be reported (`Runtime.enable` and
+/// `Log.enable`, whose events [`crate::console::Recorder`] takes on the
+/// reader thread before any mailbox sees them).
 ///
 /// This is where every per-session `Emulation` command that is not about the
 /// size belongs. The size is not here because it changes with the pane and
@@ -3120,6 +3293,16 @@ pub fn prepare_session(client: &mut Client, appearance: &Appearance, identity: &
     // still calling itself headless. See [`crate::identity`].
     if let Some((method, params)) = identity.command() {
         let _ = client.notify(method, params);
+    }
+    // The console: what the page logs, throws and fails to fetch, recorded on
+    // the reader thread by [`crate::console::Recorder`]. Per session for the
+    // reason the scheme is, and told rather than asked for the same reason;
+    // both are idempotent on a session that already has them. Not with
+    // `console = false`, and never without a recorder in front of the
+    // routing: see [`Identity::console`].
+    if identity.console {
+        let _ = client.notify("Runtime.enable", Json::empty());
+        let _ = client.notify("Log.enable", Json::empty());
     }
 }
 
@@ -3291,6 +3474,8 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         .then(|| load::loading_hint(active.loading_for(now)));
     let marker = active.zoom.marker();
     let blocked = blocked_words(tabs, chrome);
+    let reader = active.reader.then_some("reader");
+    let errors = console_words(tabs, chrome);
     let mode = mode_words(&chrome.mode, chrome.hinting.as_ref());
     let owner = row_owner(
         tabs,
@@ -3316,6 +3501,8 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
             downloading.or(loading).as_deref(),
             marker.as_deref(),
             blocked.as_deref(),
+            reader,
+            errors.as_deref(),
             mode.as_deref(),
         ]) {
             Some(right) => screen::split_line(cols, &left, &right),
@@ -3345,12 +3532,16 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
                 Some(&news),
                 marker.as_deref(),
                 blocked.as_deref(),
+                reader,
+                errors.as_deref(),
                 mode.as_deref(),
             ]),
             None => words(&[
                 mode.as_deref(),
                 marker.as_deref(),
                 blocked.as_deref(),
+                reader,
+                errors.as_deref(),
                 active.trust.words(),
                 Some(&active.url),
             ]),
@@ -3376,6 +3567,13 @@ fn blocked_words(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<String> {
     chrome.blocker.as_ref()?.words(session)
 }
 
+/// What the row says about the console of the page in front: `1 error`,
+/// `2 errors`, or nothing. See [`Recorder::words`].
+fn console_words(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<String> {
+    let session = tabs.active()?.connection.session();
+    chrome.console.as_ref()?.words(session)
+}
+
 /// The tab list's rows under the status row, for the list as it is now,
 /// keeping the window it chose for the next draw.
 ///
@@ -3386,6 +3584,7 @@ fn list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &Overlay) -> Vec<u8> 
     match list {
         Overlay::Tabs(list) => tab_list_screen(tabs, chrome, list),
         Overlay::History(list) => history_list_screen(chrome, list),
+        Overlay::Console(list) => console_list_screen(chrome, list),
     }
 }
 
@@ -3477,6 +3676,44 @@ fn history_list_screen(chrome: &Chrome, list: &HistoryList) -> Vec<u8> {
     screen::list_rows(chrome.metrics.cols, chrome.layout.page_row(), rows, &items)
 }
 
+/// [`list_screen`] for the console: each row led by its level, `--` for a
+/// landing, padded on the right to the widest among the rows shown so that
+/// the messages start in one column, and the place after the text where the
+/// history list has its url. Nothing here says the level in colour: the
+/// rows are drawn without it on purpose ([`screen::list_rows`]).
+fn console_list_screen(chrome: &Chrome, list: &ConsoleList) -> Vec<u8> {
+    let rows = chrome.metrics.usable_rows();
+    let matches = list.matches();
+    let window = list.window(matches.len(), rows as usize, chrome.list_first.get());
+    chrome.list_first.set(window.first);
+    let picked = list.picked(matches.len());
+    let shown: Vec<&crate::console::Entry> = matches[window.first..window.first + window.shown]
+        .iter()
+        .map(|&index| list.entry(index))
+        .collect();
+    let widest = shown
+        .iter()
+        .map(|entry| entry.lead().chars().count())
+        .max()
+        .unwrap_or(0);
+    let leads: Vec<String> = shown
+        .iter()
+        .map(|entry| format!("{:<widest$}", entry.lead()))
+        .collect();
+    let items: Vec<screen::ListItem> = shown
+        .iter()
+        .zip(&leads)
+        .enumerate()
+        .map(|(at, (entry, lead))| screen::ListItem {
+            lead,
+            title: &entry.text,
+            url: &entry.place,
+            picked: picked == Some(window.first + at),
+        })
+        .collect();
+    screen::list_rows(chrome.metrics.cols, chrome.layout.page_row(), rows, &items)
+}
+
 /// The word for the keyboard's mode: the hints' count while they show,
 /// else the mode's own, else nothing — insert mode says nothing, so a person
 /// who never presses `ctrl+.` sees the row exactly as it was.
@@ -3503,6 +3740,12 @@ fn owned_row<C>(cols: u32, tabs: &Tabs<C>, owner: RowOwner<'_>) -> Vec<u8> {
         RowOwner::List(Overlay::History(list)) => typing_row_beside(
             cols,
             "history: ",
+            list.line(),
+            &list.count_text(list.matches().len()),
+        ),
+        RowOwner::List(Overlay::Console(list)) => typing_row_beside(
+            cols,
+            "console: ",
             list.line(),
             &list.count_text(list.matches().len()),
         ),
@@ -3539,9 +3782,9 @@ enum RowOwner<'a> {
     Bar(&'a UrlBar),
     /// `ctrl+f`'s prompt: the person's, like the bar, and not any page's.
     Find(&'a Find),
-    /// `ctrl+shift+a`'s tab list or `ctrl+shift+h`'s history list: the
-    /// person's, like the two before it, and the one of them that has the
-    /// rows under the row as well.
+    /// `ctrl+shift+a`'s tab list, `ctrl+shift+h`'s history list or
+    /// `ctrl+shift+j`'s console: the person's, like the two before it, and
+    /// the one of them that has the rows under the row as well.
     List(&'a Overlay),
     /// `alt+p`'s allow line: the person's, like the three before it.
     Allow(&'a Allow),
@@ -3655,12 +3898,17 @@ fn handle_target_events(
         }
         let appearance = chrome.appearance;
         let identity = chrome.identity.clone();
+        let sites = &chrome.sites;
         let mut frame = None;
+        let mut scripts = Vec::new();
         let outcome = tabs.take(event, |target| {
-            connect_tab(browser, target, &appearance, &identity).map(|(connection, main)| {
-                frame = main;
-                connection
-            })
+            connect_tab(browser, target, &appearance, &identity, sites).map(
+                |(connection, main, registered)| {
+                    frame = main;
+                    scripts = registered;
+                    connection
+                },
+            )
         });
         match outcome {
             Outcome::Ignored => {}
@@ -3670,8 +3918,11 @@ fn handle_target_events(
             // the target in front did not change, which is the whole of
             // "behind".
             Outcome::Opened { index } | Outcome::OpenedBehind { index } => {
-                if let (Some(frame), Some(tab)) = (frame, tabs.get_mut(index)) {
-                    tab.frame = Some(frame);
+                if let Some(tab) = tabs.get_mut(index) {
+                    if frame.is_some() {
+                        tab.frame = frame;
+                    }
+                    tab.site_scripts = scripts;
                 }
                 redraw = true;
             }
@@ -3968,6 +4219,16 @@ fn handle_page_events(
                         if chrome.unwatched.as_deref() == Some(tab.target.as_str()) {
                             chrome.unwatched = None;
                         }
+                        // The reader's frame went with the document
+                        // ([`Tab::landed`] has said it is off), and an
+                        // answer about it would be about a page not there.
+                        if chrome
+                            .reader
+                            .as_ref()
+                            .is_some_and(|reading| reading.target == tab.target)
+                        {
+                            chrome.reader = None;
+                        }
                         // A page lands at its host's level, as it would in a
                         // browser: a link from a zoomed site to another lands
                         // at that one's. The tab in front is told now — told,
@@ -4133,6 +4394,8 @@ fn handle_page_events(
                 chrome.metrics,
                 chrome.cast,
                 &chrome.identity,
+                &chrome.sites,
+                &mut tab.site_scripts,
             );
             chrome.motion.reset(Instant::now());
             chrome.still = None;
@@ -5035,6 +5298,7 @@ fn handle_input(
                 Some(
                     Command::CopySelection
                     | Command::Find
+                    | Command::Reader
                     | Command::SavePdf
                     | Command::SaveScreenshot,
                 ) if tabs.active().is_some_and(Tab::is_crashed) => {
@@ -5070,8 +5334,16 @@ fn handle_input(
                     toggle_block(tabs, chrome);
                     redraw_row(pane, tabs, chrome)?;
                 }
+                Some(Command::ReloadSites) => {
+                    reload_sites(tabs, chrome);
+                    redraw_row(pane, tabs, chrome)?;
+                }
                 Some(Command::FillLogin) => {
                     start_login(pane, tabs, chrome)?;
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(Command::Reader) => {
+                    toggle_reader(tabs, chrome);
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(Command::ListTabs) => {
@@ -5091,6 +5363,31 @@ fn handle_input(
                         chrome.list = Some(Overlay::History(list));
                         chrome.list_first.set(0);
                         open_list_screen(pane, chrome)?;
+                    }
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(Command::Console) => {
+                    match chrome.console.clone() {
+                        None => note(tabs, consolelist::OFF),
+                        Some(console) => {
+                            // Opened even on nothing, unlike the history
+                            // list: "nothing logged" is the answer a person
+                            // opening it came for.
+                            let session = tabs
+                                .active()
+                                .and_then(|tab| tab.connection.session())
+                                .map(str::to_string);
+                            let entries = session
+                                .as_deref()
+                                .map(|session| {
+                                    console.opened(session);
+                                    console.entries(session)
+                                })
+                                .unwrap_or_default();
+                            chrome.list = Some(Overlay::Console(ConsoleList::open(entries)));
+                            chrome.list_first.set(0);
+                            open_list_screen(pane, chrome)?;
+                        }
                     }
                     redraw_row(pane, tabs, chrome)?;
                 }
@@ -5138,7 +5435,14 @@ fn handle_input(
                 Some(Command::NewTab) => {
                     let appearance = chrome.appearance;
                     let identity = chrome.identity.clone();
-                    match open_tab(tabs, browser, &appearance, &identity, "about:blank") {
+                    match open_tab(
+                        tabs,
+                        browser,
+                        &appearance,
+                        &identity,
+                        &chrome.sites,
+                        "about:blank",
+                    ) {
                         Ok(()) => {
                             switched(pane, tabs, browser, chrome, was)?;
                             // A new tab is a tab somebody is about to type an
@@ -5177,6 +5481,7 @@ fn handle_input(
                                 browser,
                                 &chrome.appearance,
                                 &chrome.identity,
+                                &chrome.sites,
                                 entry,
                             ) {
                                 note(tabs, why);
@@ -5224,6 +5529,10 @@ fn handle_input(
                 Some(Command::CopyUrl) => {
                     let url = tabs.active().map(|tab| tab.url.clone()).unwrap_or_default();
                     copy_out(pane, tabs, &url, Copied::Url)?;
+                    redraw_row(pane, tabs, chrome)?;
+                }
+                Some(Command::OpenExternal) => {
+                    open_external(tabs, chrome);
                     redraw_row(pane, tabs, chrome)?;
                 }
                 Some(what @ (Command::ZoomIn | Command::ZoomOut | Command::ZoomReset)) => {
@@ -5457,6 +5766,9 @@ enum Command {
     CopySelection,
     /// `alt+u`: the current url to the host's clipboard.
     CopyUrl,
+    /// `alt+o`: the page in front's url handed to the desktop browser. See
+    /// [`crate::external`].
+    OpenExternal,
     /// `ctrl+f`: find in the page. See [`crate::find`].
     Find,
     /// `alt+p`: the allow line for the page in front's origin. See
@@ -5479,6 +5791,9 @@ enum Command {
     /// `ctrl+shift+h` or `alt+h`: the history list. See
     /// [`crate::historylist`].
     History,
+    /// `ctrl+shift+j` or `alt+j`: the page's console. See
+    /// [`crate::consolelist`].
+    Console,
     /// `alt+s`: the page in front as a PDF, in the downloads directory. See
     /// [`crate::save`].
     SavePdf,
@@ -5490,6 +5805,12 @@ enum Command {
     /// `alt+l`: the login form filled from the password command. See
     /// [`crate::login`].
     FillLogin,
+    /// `alt+shift+r`: the site styles and scripts read again and told to every
+    /// tab. See [`crate::sites`].
+    ReloadSites,
+    /// `alt+r`: the article without the page around it. See
+    /// [`crate::reader`].
+    Reader,
 }
 
 /// Whether a key the program keeps for itself still works while the page in
@@ -5517,6 +5838,11 @@ enum Command {
 /// the person is meant to be reading, which is the url bar's reason. Nor does
 /// the history list, although the tab list does: what it picks is a page to
 /// load, and here that would be a navigation queued behind the question.
+/// The console does, for the tab list's reason: it reads what this program
+/// already holds and sends the page nothing.
+///
+/// Reader mode does not survive: it asks the page, and a page stopped
+/// behind a dialog would hold its answer until the deadline.
 ///
 /// Saving the page does not survive either: a page stopped behind a dialog
 /// answers neither `Page.printToPDF` nor `Page.getLayoutMetrics` until it
@@ -5529,6 +5855,10 @@ enum Command {
 /// Bookmarking survives, for the reason copying the url does: it reads the
 /// tab's url and title, which this program already has. So does reopening a
 /// closed tab, which opens another tab, as a new tab does.
+///
+/// Opening the page in the desktop browser survives for the same reason: it
+/// reads the tab's url and touches no page. And a page stuck behind a
+/// question it cannot get past here is the very page one wants elsewhere.
 ///
 /// A zoom waits too. The page is stopped, so it would not lay itself out
 /// again or be photographed at the new level until it was answered, and the
@@ -5552,10 +5882,13 @@ fn survives_dialog(command: Command) -> bool {
         | Command::ListTabs
         | Command::MoveTab(_)
         | Command::CopyUrl
+        | Command::OpenExternal
         | Command::ToggleNormal
         | Command::Bookmark
         | Command::ReopenTab
-        | Command::Block => true,
+        | Command::Console
+        | Command::Block
+        | Command::ReloadSites => true,
         Command::EditUrl
         | Command::Reload
         | Command::Back
@@ -5564,6 +5897,7 @@ fn survives_dialog(command: Command) -> bool {
         | Command::Find
         | Command::Permissions
         | Command::FillLogin
+        | Command::Reader
         | Command::ZoomIn
         | Command::ZoomOut
         | Command::ZoomReset
@@ -5855,6 +6189,7 @@ fn pump_remote(
             browser,
             &chrome.appearance,
             &chrome.identity,
+            &chrome.sites,
             &delivery.lines,
         );
         delivery.answer(&opened);
@@ -5875,6 +6210,7 @@ pub fn open_delivered(
     browser: &mut Client,
     appearance: &Appearance,
     identity: &Identity,
+    sites: &Sites,
     lines: &[remote::Checked],
 ) -> Vec<remote::Checked> {
     let mut in_front = false;
@@ -5883,9 +6219,9 @@ pub fn open_delivered(
         .map(|line| {
             let url = line.as_ref().map_err(String::clone)?;
             let opened = if in_front {
-                open_behind(tabs, browser, appearance, identity, url).map(|_| ())
+                open_behind(tabs, browser, appearance, identity, sites, url).map(|_| ())
             } else {
-                open_tab(tabs, browser, appearance, identity, url).map(|()| {
+                open_tab(tabs, browser, appearance, identity, sites, url).map(|()| {
                     in_front = true;
                     if let Some(tab) = tabs.active_mut() {
                         tab.note = Some(format!("loading {url}"));
@@ -6009,6 +6345,52 @@ enum LoginState {
         pending: Pending,
         sent: Instant,
     },
+}
+
+/// `open-external`: the page in front's url handed to the desktop browser
+/// ([`crate::external`]).
+///
+/// The url is the one this program has for the tab, and nothing is asked of
+/// the page, so it works on a crashed page and behind a dialog. What is
+/// refused is refused on the row with nothing run: a page that is not
+/// `http`, `https` or `file`, and — with no `external-browser` set — a
+/// machine with no desktop to open it on. What is started is left to run and
+/// only ever reaped ([`external::reap`]).
+fn open_external(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    let Some(url) = tabs.active().map(|tab| tab.url.clone()) else {
+        return;
+    };
+    if let Err(why) = external::openable(&url) {
+        note(tabs, why);
+        return;
+    }
+    let browser = std::env::var("BROWSER").ok();
+    let plan = external::plan(
+        chrome.external.as_ref(),
+        cfg!(target_os = "macos"),
+        browser.as_deref(),
+        chrome.display,
+    );
+    let command = match plan {
+        external::Plan::Run(command) => command,
+        external::Plan::NoDesktop => {
+            note(tabs, external::NO_DESKTOP);
+            return;
+        }
+    };
+    let argv = external::argv(&command, &url);
+    let mut process = external::process(
+        &argv,
+        external::browser_to_pass(browser.as_deref()).as_deref(),
+        upload::home().as_deref(),
+    );
+    match external::launch(&mut process, &argv[0]) {
+        Ok(child) => {
+            chrome.launched.push(child);
+            note(tabs, external::sent(chrome.external.as_ref()));
+        }
+        Err(why) => note(tabs, why),
+    }
 }
 
 /// `fill-login`: run the password command for the page in front, and fill
@@ -6396,6 +6778,17 @@ pub fn stop(tab: &mut Tab<Client>) {
     }
 }
 
+/// What the row says for the problems `run` found before the first page:
+/// the first sentence, and how many more there are, which `--doctor` lists.
+/// `None` for none.
+fn summary(problems: &[String]) -> Option<String> {
+    let first = problems.first()?;
+    Some(match problems.len() {
+        1 => first.clone(),
+        n => format!("{first}; {} more (--doctor lists them)", n - 1),
+    })
+}
+
 /// Which keys this program answers, and which it hands to the page.
 ///
 /// The tab keys are the ones a browser has taught everybody — `ctrl+t`,
@@ -6473,6 +6866,8 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// | `alt+a` | free | free | free | free |
 /// | `ctrl+shift+h` | free | scrollback in a pager | free | free |
 /// | `alt+h` | free | free | free | free |
+/// | `ctrl+shift+j` | free | scrolls a line down | free | writes the screen to a file and pastes its path |
+/// | `alt+j` | free | free | free | free |
 ///
 /// So `ctrl+shift+pageup`/`pagedown`, which move the tab in front in Chrome,
 /// reach the pane in none of the four, and `ctrl+shift+a`, Chrome's tab
@@ -6483,7 +6878,9 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// is nobody's. The history list is the same pair on `h`: `ctrl+shift+h`
 /// after the tab list's chord, and `alt+h`, which is the one that arrives
 /// in Kitty and in a legacy terminal, where `ctrl+h` is the byte backspace
-/// sends and `ctrl+shift+h` is that byte too. `alt+9` is the last tab rather than the ninth, as it is in
+/// sends and `ctrl+shift+h` is that byte too. The console is the pair on
+/// `j`: `ctrl+shift+j` is Chrome's console chord, kept by Kitty and Ghostty,
+/// and `alt+j` arrives in all four. `alt+9` is the last tab rather than the ninth, as it is in
 /// Chrome, Firefox and Ghostty — whose own `alt+9` means the same, so the
 /// meaning agrees even where the key does not arrive.
 ///
@@ -6499,9 +6896,18 @@ pub fn stop(tab: &mut Tab<Client>) {
 /// the precedent the zoom keys set; what that shadows is an `accesskey` on
 /// `t`.
 ///
-/// This is the built-in table, and the one the README documents; the settings
-/// file's `key.` lines are asked before it, by [`keyed`], and every caller
-/// goes through that. What the file may name is [`crate::bindings::ACTIONS`],
+/// Opening the page in the desktop browser is `alt+o`, on the modifier the
+/// program already uses; none of tOS, Kitty, WezTerm or Ghostty binds it in
+/// its default table, and what it shadows is an `accesskey` on `o`. Normal
+/// mode's bare `o`, the url bar, is another key and is unaffected.
+///
+/// This is the built-in table — the Linux keymap — and the one the docs
+/// document first; the settings file's `key.` lines are asked before it, by
+/// [`keyed`], and every caller goes through that. The Mac keymap is not
+/// another `match`: it is [`crate::bindings::Keymap::Mac`]'s rows, which
+/// `Bindings` asks after the file's lines and before this, because Kitty on
+/// macOS keeps most `cmd` chords and Option composes rather than being alt,
+/// so that most of the alt chords here never arrive there. What the file may name is [`crate::bindings::ACTIONS`],
 /// which the tests hold to this `match` in both directions.
 fn command(key: &KeyInput) -> Option<Command> {
     if key.action == KeyAction::Release {
@@ -6519,6 +6925,7 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('f') => Some(Command::Find),
             Key::Char('a' | 'A') if key.mods.shift() => Some(Command::ListTabs),
             Key::Char('h' | 'H') if key.mods.shift() => Some(Command::History),
+            Key::Char('j' | 'J') if key.mods.shift() => Some(Command::Console),
             Key::PageUp if key.mods.shift() => Some(Command::MoveTab(-1)),
             Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Tab if key.mods.shift() => Some(Command::PreviousTab),
@@ -6538,10 +6945,12 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char(digit @ '1'..='8') => Some(Command::SelectTab(digit as usize - '0' as usize)),
             Key::Char('a') if !key.mods.shift() => Some(Command::ListTabs),
             Key::Char('h') if !key.mods.shift() => Some(Command::History),
+            Key::Char('j') if !key.mods.shift() => Some(Command::Console),
             Key::PageUp if key.mods.shift() => Some(Command::MoveTab(-1)),
             Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
             Key::Char('c') => Some(Command::CopySelection),
             Key::Char('u') => Some(Command::CopyUrl),
+            Key::Char('o') => Some(Command::OpenExternal),
             // `ESC S` is how a terminal without the Kitty protocol says
             // alt+shift+s: the capital, with no shift bit.
             Key::Char('S') => Some(Command::SaveScreenshot),
@@ -6550,6 +6959,11 @@ fn command(key: &KeyInput) -> Option<Command> {
             Key::Char('p') => Some(Command::Permissions),
             Key::Char('b') => Some(Command::Block),
             Key::Char('l') => Some(Command::FillLogin),
+            // `ESC R`, as with `ESC S`: alt+shift+r from a terminal without
+            // the Kitty protocol.
+            Key::Char('R') => Some(Command::ReloadSites),
+            Key::Char('r') if key.mods.shift() => Some(Command::ReloadSites),
+            Key::Char('r') => Some(Command::Reader),
             Key::Char('t') => Some(Command::ReopenTab),
             Key::Char('=' | '+') => Some(Command::ZoomIn),
             Key::Char('-' | '_') => Some(Command::ZoomOut),
@@ -6596,6 +7010,7 @@ fn command_of(action: Action) -> Command {
         Action::LastTab => Command::LastTab,
         Action::ListTabs => Command::ListTabs,
         Action::History => Command::History,
+        Action::Console => Command::Console,
         Action::MoveTabLeft => Command::MoveTab(-1),
         Action::MoveTabRight => Command::MoveTab(1),
         Action::ZoomIn => Command::ZoomIn,
@@ -6604,12 +7019,15 @@ fn command_of(action: Action) -> Command {
         Action::Find => Command::Find,
         Action::Permissions => Command::Permissions,
         Action::FillLogin => Command::FillLogin,
+        Action::Reader => Command::Reader,
         Action::Copy => Command::CopySelection,
         Action::CopyUrl => Command::CopyUrl,
+        Action::OpenExternal => Command::OpenExternal,
         Action::SavePdf => Command::SavePdf,
         Action::SaveScreenshot => Command::SaveScreenshot,
         Action::ToggleNormal => Command::ToggleNormal,
         Action::Block => Command::Block,
+        Action::ReloadSites => Command::ReloadSites,
     }
 }
 
@@ -6947,6 +7365,150 @@ fn toggle_block(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
         Err(why) => format!("{}; {why}", block::toggled(&site, now)),
     };
     note(tabs, sentence);
+}
+
+/// `alt+shift+r`: the site files read again, from the directory the run started
+/// with, and every tab that can answer told — its old registrations taken
+/// back by identifier and the new ones made. The styles change where each
+/// page stands; the scripts run from each page's next load, because a
+/// script run again on a live document would double what it set up. A tab
+/// stopped behind a dialog or crashed answers nothing, so it keeps the old
+/// files (a crashed one is given the new ones when it comes back, in
+/// [`revive`]), and the row says how many. A directory that has gone is said
+/// on the row, and the files already told stay.
+fn reload_sites(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    chrome.sites = match sites::load(&chrome.sites_location) {
+        Ok(read) => read,
+        Err(why) => {
+            note(tabs, why);
+            return;
+        }
+    };
+    let mut waiting = 0;
+    for index in 0..tabs.len() {
+        let Some(tab) = tabs.get_mut(index) else {
+            continue;
+        };
+        if tab.is_crashed() || tab.dialog.is_some() {
+            waiting += 1;
+            continue;
+        }
+        let old = std::mem::take(&mut tab.site_scripts);
+        sites::remove(&mut tab.connection, &old);
+        tab.site_scripts = sites::install(&mut tab.connection, &chrome.sites, false);
+    }
+    note(tabs, reloaded_words(&chrome.sites, waiting));
+}
+
+/// What the row says after `reload-sites`: what was read, that the scripts
+/// wait for a load, how many tabs kept the old files, and why each refused
+/// file was.
+fn reloaded_words(read: &Sites, waiting: usize) -> String {
+    let mut sentence = read.words();
+    if !read.scripts().is_empty() {
+        sentence.push_str("; scripts apply on the next load");
+    }
+    match waiting {
+        0 => {}
+        1 => sentence.push_str("; 1 tab behind a dialog or crashed keeps the old ones"),
+        n => sentence.push_str(&format!(
+            "; {n} tabs behind a dialog or crashed keep the old ones"
+        )),
+    }
+    for why in &read.skipped {
+        sentence.push_str("; ");
+        sentence.push_str(&crate::text::sanitize(why));
+    }
+    sentence
+}
+
+/// `alt+r`: the article in front alone, or the page back
+/// ([`crate::reader`]).
+///
+/// Sent like the hints' collect, into the shared world, and heard by
+/// [`pump_reader`]; one question at a time, and none to a page that has not
+/// come, to a dead renderer, or to a page with nothing in it to read. The
+/// tab says whether it is on, so the key asks for the other; the page's own
+/// state decides what that does, so a key pressed twice is two toggles.
+fn toggle_reader(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    if chrome.reader.is_some() {
+        return;
+    }
+    // Not a dead renderer or a dormant tab, which are sent nothing; the key
+    // that asks says why ([`handle_input`]).
+    let Some(tab) = tabs.active_mut().filter(|tab| accepts_input(tab)) else {
+        return;
+    };
+    if tab.loading && !tab.committed {
+        tab.note = Some(reader::NOT_YET.to_string());
+        return;
+    }
+    if tab.url.is_empty()
+        || tab.url == "about:blank"
+        || matches!(tab.problem, Some(Problem::Unreachable { .. }))
+    {
+        tab.note = Some(reader::NOTHING.to_string());
+        return;
+    }
+    let on = !tab.reader;
+    let alpha = chrome.appearance.alpha.on();
+    let pending = make_world(&mut tab.connection).and_then(|context| {
+        tab.connection
+            .send(
+                "Runtime.callFunctionOn",
+                reader::call_params(context, on, alpha),
+            )
+            .ok()
+    });
+    let Some(pending) = pending else {
+        tab.note = Some(reader::NOT_ANSWERED.to_string());
+        return;
+    };
+    chrome.reader = Some(Reading {
+        target: tab.target.clone(),
+        pending,
+        sent: Instant::now(),
+    });
+}
+
+/// Take the reader's answer, once a pass: on, off, or no article. A
+/// question for a tab no longer in front is dropped, as the hints' is; so is
+/// one to a renderer that died. No answer in [`READER_TIMEOUT`], an
+/// exception, or a world gone with its document is "the page did not answer
+/// the reader", and the person presses again on the new document. Returns
+/// whether the row should be drawn again.
+fn pump_reader(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
+    let Some(reading) = chrome.reader.as_ref() else {
+        return false;
+    };
+    let Some(tab) = tabs.active_mut().filter(|tab| tab.target == reading.target) else {
+        chrome.reader = None;
+        return false;
+    };
+    if tab.is_crashed() {
+        chrome.reader = None;
+        return true;
+    }
+    let answer = match tab.connection.take_reply(&reading.pending) {
+        None if reading.sent.elapsed() < READER_TIMEOUT => return false,
+        None | Some(Err(_)) => None,
+        Some(Ok(reply)) => reader::answered(&reply),
+    };
+    chrome.reader = None;
+    match answer {
+        Some(Answered::On) => tab.reader = true,
+        Some(Answered::Off) => tab.reader = false,
+        Some(Answered::Nothing) => {
+            tab.reader = false;
+            tab.note = Some(reader::NOTHING.to_string());
+        }
+        None => {
+            // What the page is showing is not known; the tab keeps what it
+            // said, so the next press asks for the same thing again.
+            tab.note = Some(reader::NOT_ANSWERED.to_string());
+        }
+    }
+    true
 }
 
 /// Type into the allow line. Returns `false` only if the person quit.
@@ -7294,7 +7856,14 @@ fn follow_hint(
     if new_tab && hint.kind == hints::Kind::Link && !hint.href.is_empty() {
         let appearance = chrome.appearance;
         let identity = chrome.identity.clone();
-        match open_behind(tabs, browser, &appearance, &identity, &hint.href) {
+        match open_behind(
+            tabs,
+            browser,
+            &appearance,
+            &identity,
+            &chrome.sites,
+            &hint.href,
+        ) {
             Ok(_) => {}
             Err(why) => note(tabs, why),
         }
@@ -7646,8 +8215,8 @@ fn open_list_screen(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> 
     pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())
 }
 
-/// Close the tab list or the history list and give the page its rows back. The caller redraws
-/// the row.
+/// Close the tab list, the history list or the console and give the page
+/// its rows back. The caller redraws the row.
 ///
 /// The same three things a resize does: the rows are cleared, and the
 /// motion clock is reset with no still out, so that a page at rest gets its
@@ -7663,8 +8232,8 @@ fn close_list(pane: &mut Pane, chrome: &mut Chrome) -> Result<(), String> {
     pane.write(b"\x1b[2;1H\x1b[J").map_err(|e| e.to_string())
 }
 
-/// Type into the tab list or the history list. Returns `false` only if the
-/// person quit.
+/// Type into the tab list, the history list or the console. Returns
+/// `false` only if the person quit.
 ///
 /// Every key comes here first while the list is open, as it does to the url
 /// bar and the find prompt: the program's other keys do nothing until it
@@ -7708,6 +8277,15 @@ fn edit_list(
             };
             history_step(pane, tabs, browser, chrome, step)
         }
+        Some(Overlay::Console(list)) => {
+            let step = match list.step(&key, page) {
+                consolelist::Step::Quit if !quits(&chrome.bindings, &key) => {
+                    consolelist::Step::Typing
+                }
+                step => step,
+            };
+            console_step(pane, tabs, chrome, step)
+        }
     }
 }
 
@@ -7747,6 +8325,11 @@ fn click_list(
             let window = list.window(list.matches().len(), rows, first);
             let step = list.click(row, &window, report.button == Some(1));
             history_step(pane, tabs, browser, chrome, step)
+        }
+        Some(Overlay::Console(list)) => {
+            let window = list.window(list.matches().len(), rows, first);
+            let step = list.click(row, &window);
+            console_step(pane, tabs, chrome, step)
         }
     }
 }
@@ -7819,7 +8402,7 @@ fn history_step(
             let was = tabs.active_target().map(str::to_string);
             let appearance = chrome.appearance;
             let identity = chrome.identity.clone();
-            match open_tab(tabs, browser, &appearance, &identity, &url) {
+            match open_tab(tabs, browser, &appearance, &identity, &chrome.sites, &url) {
                 Ok(()) => switched(pane, tabs, browser, chrome, was)?,
                 Err(why) => note(tabs, why),
             }
@@ -7833,6 +8416,23 @@ fn history_step(
                 }
             }
         }
+    }
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
+/// What a key or a click did to the console: it closes or it does not,
+/// since a row is nothing to open.
+fn console_step(
+    pane: &mut Pane,
+    tabs: &Tabs<Client>,
+    chrome: &mut Chrome,
+    step: consolelist::Step,
+) -> Result<bool, String> {
+    match step {
+        consolelist::Step::Typing => {}
+        consolelist::Step::Quit => return Ok(false),
+        consolelist::Step::Close => close_list(pane, chrome)?,
     }
     redraw_row(pane, tabs, chrome)?;
     Ok(true)
@@ -8413,6 +9013,7 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::Keymap;
     use crate::input::Mods;
 
     /// The bytes a terminal actually sends for a ctrl+wheel reach [`zooms`]
@@ -8584,20 +9185,68 @@ mod tests {
     #[test]
     fn every_chord_the_built_in_table_answers_has_a_name_and_the_name_answers_it() {
         let every = Action::every();
+        let mac = Bindings::on(Keymap::Mac, vec![]);
         for press in every_press() {
-            let Some(wanted) = command(&press) else {
-                continue;
-            };
-            let named = every.iter().find(|action| command_of(**action) == wanted);
-            let Some(action) = named else {
-                panic!("{wanted:?}, on {press:?}, has no name in bindings::ACTIONS");
-            };
-            assert_eq!(
-                Action::parse(&action.name()).map(command_of),
-                Ok(wanted),
-                "{press:?}"
-            );
+            for wanted in [command(&press), keyed(&mac, &press)].into_iter().flatten() {
+                let named = every.iter().find(|action| command_of(**action) == wanted);
+                let Some(action) = named else {
+                    panic!("{wanted:?}, on {press:?}, has no name in bindings::ACTIONS");
+                };
+                assert_eq!(
+                    Action::parse(&action.name()).map(command_of),
+                    Ok(wanted),
+                    "{press:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn on_the_mac_keymap_every_action_s_documented_chords_are_answered() {
+        let mac = Bindings::on(Keymap::Mac, vec![]);
+        for action in Action::every() {
+            let chords = crate::bindings::defaults_on(Keymap::Mac, action);
+            assert!(!chords.is_empty(), "{action:?} has a Mac key");
+            for chord in chords {
+                let press = KeyInput {
+                    key: chord.key,
+                    mods: chord.mods,
+                    action: KeyAction::Press,
+                    text: None,
+                };
+                assert_eq!(
+                    keyed(&mac, &press),
+                    Some(command_of(action)),
+                    "{} for {action:?}",
+                    chord.spell()
+                );
+            }
+        }
+        // The Linux chords still answer underneath.
+        assert_eq!(keyed(&mac, &key(Key::Left, Mods::ALT)), Some(Command::Back));
+    }
+
+    #[test]
+    fn ctrl_q_still_quits_from_a_line_on_the_mac_keymap() {
+        let ctrl_q = key(Key::Char('q'), Mods::CTRL);
+        let mac = Bindings::on(Keymap::Mac, vec![]);
+        assert!(quits(&mac, &ctrl_q));
+        assert_eq!(row_command(&mac, &ctrl_q), Some(Command::Quit));
+        assert_eq!(
+            row_command(&mac, &key(Key::Char('c'), Mods::SUPER)),
+            Some(Command::CopySelection),
+            "cmd+c copies from the url bar too"
+        );
+    }
+
+    #[test]
+    fn the_row_says_the_first_problem_and_counts_the_rest() {
+        assert_eq!(summary(&[]), None);
+        assert_eq!(summary(&["a".to_string()]), Some("a".to_string()));
+        assert_eq!(
+            summary(&["a".to_string(), "b".to_string(), "c".to_string()]),
+            Some("a; 2 more (--doctor lists them)".to_string())
+        );
     }
 
     #[test]
@@ -8668,8 +9317,13 @@ mod tests {
         );
         assert_eq!(command(&key(Key::Left, Mods::ALT)), Some(Command::Back));
         assert_eq!(command(&key(Key::Right, Mods::ALT)), Some(Command::Forward));
+        assert_eq!(
+            command(&key(Key::Char('o'), Mods::ALT)),
+            Some(Command::OpenExternal)
+        );
 
         // Everything else belongs to the page.
+        assert_eq!(command(&key(Key::Char('o'), 0)), None);
         assert_eq!(command(&key(Key::Char('q'), 0)), None);
         assert_eq!(command(&key(Key::Char('z'), Mods::ALT)), None);
         assert_eq!(command(&key(Key::Left, Mods::CTRL)), None);
@@ -8753,6 +9407,22 @@ mod tests {
         ] {
             assert_eq!(command(&key(k, mods)), Some(Command::History), "{k:?}");
         }
+        // The console: the same pair on `j`.
+        for (k, mods) in [
+            (Key::Char('j'), Mods::CTRL | Mods::SHIFT),
+            (Key::Char('J'), Mods::CTRL | Mods::SHIFT),
+            (Key::Char('j'), Mods::ALT),
+        ] {
+            assert_eq!(command(&key(k, mods)), Some(Command::Console), "{k:?}");
+        }
+        // `ctrl+j` is a line feed's byte and the page's, and `alt+shift+j`
+        // is nobody's.
+        for (k, mods) in [
+            (Key::Char('j'), Mods::CTRL),
+            (Key::Char('j'), Mods::ALT | Mods::SHIFT),
+        ] {
+            assert_eq!(command(&key(k, mods)), None, "{k:?} {mods}");
+        }
         // `ctrl+h` is backspace's byte in a legacy terminal, the page's
         // anyway, and `alt+shift+h` is nobody's.
         for (k, mods) in [
@@ -8818,6 +9488,13 @@ mod tests {
         assert_eq!(survives(Key::PageUp, Mods::ALT | Mods::SHIFT), Some(true));
         assert_eq!(
             survives(Key::PageDown, Mods::CTRL | Mods::SHIFT),
+            Some(true)
+        );
+        // The console reads what this program holds and sends the page
+        // nothing.
+        assert_eq!(survives(Key::Char('j'), Mods::ALT), Some(true));
+        assert_eq!(
+            survives(Key::Char('j'), Mods::CTRL | Mods::SHIFT),
             Some(true)
         );
         // Things done to the page that is asking wait until it has an answer.
@@ -9239,6 +9916,8 @@ mod tests {
             Allowed::in_memory(),
             None,
             Unblocked::in_memory(),
+            Sites::none(),
+            Some(Arc::new(Recorder::new())),
         );
         let local = Route::local(true);
         chrome.take_route(local);
@@ -9248,6 +9927,137 @@ mod tests {
             ..local
         });
         assert!(chrome.cast.png, "the PNG route's frames, as without it");
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    /// A `Chrome` for a test that draws, on a temporary profile, with its
+    /// downloads directory to remove.
+    fn drawing_chrome(what: &str, console: Arc<Recorder>) -> (Chrome, PathBuf) {
+        let options = crate::options::resolve(
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+        )
+        .expect("the defaults");
+        let profile = Profile::temporary().expect("a temporary profile");
+        let downloads =
+            std::env::temp_dir().join(format!("blinkterm-app-{what}-{}", std::process::id()));
+        let chrome = Chrome::new(
+            Metrics {
+                cols: 80,
+                rows: 6,
+                cell: (8, 16),
+            },
+            &options,
+            &profile,
+            downloads.clone(),
+            Appearance::new(
+                crate::appearance::Choice::default(),
+                false,
+                crate::appearance::Alpha::Off,
+            ),
+            Identity::new(None, None, "C"),
+            Allowed::in_memory(),
+            None,
+            Unblocked::in_memory(),
+            Sites::none(),
+            Some(console),
+        );
+        (chrome, downloads)
+    }
+
+    #[test]
+    fn the_console_panel_draws_its_rows_with_the_level_first_and_says_nothing_logged_when_empty() {
+        use crate::console::{Entry, Level, Source};
+        let (chrome, downloads) = drawing_chrome("console", Arc::new(Recorder::new()));
+        let entry = |level, source, text: &str, place: &str| Entry {
+            level,
+            source,
+            text: text.to_string(),
+            place: place.to_string(),
+        };
+        let list = ConsoleList::open(vec![
+            entry(Level::Log, Source::Console, "hello 1 {a: 2}", "data:x:1"),
+            entry(
+                Level::Info,
+                Source::Navigation,
+                "navigated to https://b.example/",
+                "",
+            ),
+            entry(
+                Level::Error,
+                Source::Exception,
+                "Uncaught Error: boom",
+                "https://b.example/app.js:3",
+            ),
+        ]);
+        let drawn = String::from_utf8(console_list_screen(&chrome, &list)).expect("text");
+        assert!(
+            drawn.contains("  log    hello 1 {a: 2}  —  data:x:1"),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn.contains("  --     navigated to https://b.example/\x1b["),
+            "a separator has no place: {drawn:?}"
+        );
+        assert!(
+            drawn.contains("\x1b[7m  error  Uncaught Error: boom  —  https://b.example/app.js:3"),
+            "the newest is picked: {drawn:?}"
+        );
+        // Reverse video for the pick and nothing else: no colour.
+        for sequence in drawn.split("\x1b[").skip(1) {
+            let end = sequence
+                .find(|c: char| c.is_ascii_alphabetic())
+                .expect("a final byte");
+            if sequence.as_bytes()[end] == b'm' {
+                assert!(
+                    matches!(&sequence[..end], "7" | "0"),
+                    "no colour: {drawn:?}"
+                );
+            }
+        }
+        let overlay = Overlay::Console(list);
+        let tabs: Tabs<()> = Tabs::new(Tab::new("a", (), "https://b.example/"));
+        let row = String::from_utf8(owned_row(80, &tabs, RowOwner::List(&overlay))).expect("text");
+        assert!(row.contains("console: "), "{row:?}");
+        assert!(row.contains("3/3"), "{row:?}");
+
+        let empty = Overlay::Console(ConsoleList::open(Vec::new()));
+        let row = String::from_utf8(owned_row(80, &tabs, RowOwner::List(&empty))).expect("text");
+        assert!(row.contains("nothing logged"), "{row:?}");
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn the_row_says_how_many_errors_arrived_since_the_panel_was_opened() {
+        use crate::console::{Entry, Level, Source};
+        use std::os::unix::io::IntoRawFd;
+        let (commands, ours_write) = std::io::pipe().expect("a pipe");
+        let (ours_read, replies) = std::io::pipe().expect("a pipe");
+        let exchange =
+            crate::cdp::Exchange::over(ours_read.into_raw_fd(), ours_write.into_raw_fd());
+        let client = Client::on(&exchange, Some("S1".to_string())).expect("a page client");
+        let tabs = Tabs::new(Tab::new("a", client, "https://a.example/"));
+        let recorder = Arc::new(Recorder::new());
+        let (chrome, downloads) = drawing_chrome("console-words", Arc::clone(&recorder));
+        let error = || Entry {
+            level: Level::Error,
+            source: Source::Exception,
+            text: "Uncaught Error: boom".to_string(),
+            place: String::new(),
+        };
+        assert_eq!(console_words(&tabs, &chrome), None);
+        recorder.record("S1", error());
+        assert_eq!(console_words(&tabs, &chrome).as_deref(), Some("1 error"));
+        recorder.record("S1", error());
+        recorder.record("S2", error());
+        assert_eq!(console_words(&tabs, &chrome).as_deref(), Some("2 errors"));
+        recorder.opened("S1");
+        assert_eq!(console_words(&tabs, &chrome), None);
+        drop(tabs);
+        drop(commands);
+        drop(replies);
+        exchange.shutdown();
         std::fs::remove_dir_all(&downloads).ok();
     }
 
@@ -9343,6 +10153,8 @@ mod tests {
             Allowed::in_memory(),
             None,
             Unblocked::in_memory(),
+            Sites::none(),
+            Some(Arc::new(Recorder::new())),
         );
         chrome.find = Some(Find {
             target: "a".to_string(),
@@ -9539,6 +10351,22 @@ mod tests {
             words(&[Some("150%"), Some("https://example.com")]).as_deref(),
             Some("150%  https://example.com")
         );
+        // Reader mode's word comes after the blocked count and before the
+        // mode, whatever of them there is.
+        assert_eq!(
+            words(&[
+                Some("150%"),
+                Some("12 blocked"),
+                Some("reader"),
+                Some("normal")
+            ])
+            .as_deref(),
+            Some("150%  12 blocked  reader  normal")
+        );
+        assert_eq!(
+            words(&[None, None, Some("reader"), None]).as_deref(),
+            Some("reader")
+        );
     }
 
     #[test]
@@ -9561,6 +10389,7 @@ mod tests {
         // The url is this program's to copy whatever the page is doing; the
         // selection has to be asked of a page that may be stopped.
         assert!(survives_dialog(Command::CopyUrl));
+        assert!(survives_dialog(Command::OpenExternal));
         assert!(!survives_dialog(Command::CopySelection));
     }
 
@@ -9608,12 +10437,60 @@ mod tests {
     }
 
     #[test]
+    fn alt_shift_r_reads_the_site_files_again_and_survives_a_dialog() {
+        assert_eq!(
+            command(&key(Key::Char('r'), Mods::ALT | Mods::SHIFT)),
+            Some(Command::ReloadSites)
+        );
+        // `ESC R`: the capital with no shift bit.
+        assert_eq!(
+            command(&key(Key::Char('R'), Mods::ALT)),
+            Some(Command::ReloadSites)
+        );
+        // Plain `alt+r` is the reader's.
+        assert_eq!(
+            command(&key(Key::Char('r'), Mods::ALT)),
+            Some(Command::Reader)
+        );
+        assert_eq!(command_of(Action::ReloadSites), Command::ReloadSites);
+        // It sends nothing to a page that has a dialog up.
+        assert!(survives_dialog(Command::ReloadSites));
+        // `ctrl+r` is still a reload, and a bare `r` is the page's.
+        assert_eq!(
+            command(&key(Key::Char('r'), Mods::CTRL)),
+            Some(Command::Reload)
+        );
+        assert_eq!(command(&key(Key::Char('r'), 0)), None);
+    }
+
+    #[test]
+    fn the_row_after_reload_sites_says_what_was_read_what_waits_and_what_was_refused() {
+        let none = Sites::none();
+        assert_eq!(reloaded_words(&none, 0), "no site files");
+        assert_eq!(
+            reloaded_words(&none, 2),
+            "no site files; 2 tabs behind a dialog or crashed keep the old ones"
+        );
+        let mut refused = Sites::none();
+        refused
+            .skipped
+            .push("a b.css: \x1b[2Jnot a host".to_string());
+        let words = reloaded_words(&refused, 1);
+        assert!(
+            words.starts_with("no site files; skipped 1; 1 tab"),
+            "{words}"
+        );
+        assert!(!words.contains('\x1b'), "sanitized: {words:?}");
+    }
+
+    #[test]
     fn alt_b_toggles_blocking_survives_a_dialog_and_leaves_the_url_bar_its_word_back() {
         assert_eq!(
             command(&key(Key::Char('b'), Mods::ALT)),
             Some(Command::Block)
         );
         assert_eq!(command_of(Action::Block), Command::Block);
+        assert_eq!(command_of(Action::Console), Command::Console);
         // It sends the page nothing, so a question on it does not stop it.
         assert!(survives_dialog(Command::Block));
         // `ctrl+b` and a bare `b` stay the page's.
@@ -9677,6 +10554,33 @@ mod tests {
             if command(&press) == Some(Command::FillLogin) {
                 assert_eq!(press.key, Key::Char('l'), "{press:?}");
                 assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn alt_r_toggles_the_reader_and_waits_for_a_dialog_like_the_other_page_questions() {
+        assert_eq!(
+            command(&key(Key::Char('r'), Mods::ALT)),
+            Some(Command::Reader)
+        );
+        assert_eq!(command_of(Action::Reader), Command::Reader);
+        // It asks the page, which a dialog has stopped.
+        assert!(!survives_dialog(Command::Reader));
+        // `ctrl+r` is still reload, and a bare `r` the page's.
+        assert_eq!(
+            command(&key(Key::Char('r'), Mods::CTRL)),
+            Some(Command::Reload)
+        );
+        assert_eq!(command(&key(Key::Char('r'), 0)), None);
+        for press in every_press() {
+            if command(&press) == Some(Command::Reader) {
+                assert_eq!(press.key, Key::Char('r'), "{press:?}");
+                assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
+                assert!(
+                    !press.mods.shift(),
+                    "alt+shift+r is reload-sites: {press:?}"
+                );
             }
         }
     }

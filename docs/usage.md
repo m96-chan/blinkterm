@@ -16,6 +16,7 @@
 | `alt+1` … `alt+8`, `alt+9` | the nth tab, the last tab |
 | `ctrl+shift+a` (or `alt+a`) | the tab list: type to filter by title or url, `↑`/`↓` to pick, `enter` to switch, `esc` to close |
 | `ctrl+shift+h` (or `alt+h`) | the history list: every page visited, newest first, `title — url` and when; type words in any order to filter by title or url, `↑`/`↓` to pick, `enter` opens it here, `alt+enter`/`ctrl+enter` (or a middle click) in a new tab, `shift+delete` forgets it, `esc` closes. See [History](configuration.md#history) |
+| `ctrl+shift+j` (or `alt+j`) | the page's console: `console.*` calls, uncaught exceptions and requests that failed (status 400 and up, or a network error), newest last, each row `level  text — url:line`; type words in any order to filter, `↑`/`↓` scroll, `esc` or `enter` closes. Kept per tab, the last 1000, across navigations with a `-- navigated to …` row between. `ctrl+shift+j` is Kitty's and Ghostty's own by default; `alt+j` reaches every terminal. See [The console](features.md#the-console) |
 | `ctrl+shift+pageup` / `pagedown` (or `alt+shift+pageup` / `pagedown`) | move this tab left or right |
 | middle click or `ctrl`+click on a link | open it in a tab behind this one |
 | `alt+=` / `alt+-` | zoom in and out (`ctrl+=` / `ctrl+-` where your terminal lets them through) |
@@ -23,16 +24,23 @@
 | your terminal's paste key | pastes into the page, the url bar, the find prompt, a `prompt()` or a file input's path — whichever has the cursor |
 | `alt+c` | copy the page's selection to your clipboard; with the url bar, the find prompt, a `prompt()` or a file input's path open, copy that line |
 | `alt+u` | copy the page's url to your clipboard |
+| `alt+o` | open this page in the desktop browser — `open` on a Mac, `xdg-open` or `$BROWSER` on Linux, or `external-browser`; nothing of your login goes with it. Over ssh with no display the row says so; `alt+u` copies the url. See [Opening a page in the desktop browser](features.md#opening-a-page-in-the-desktop-browser) |
 | `alt+s` | save this page as a PDF in the download directory, named after its title; the row says `saved ~/Downloads/<title>.pdf`. See [Saving a page](features.md#saving-a-page) |
 | `alt+shift+s` | save the whole page, top to bottom, as a PNG there. A page past sixteen million pixels is cut to its top, and the row says how much |
 | `alt+p` | allow this site something: the row says `allow https://site: ` and the words it is allowed now, all selected; type any of `camera` `microphone` `location` `notifications` `clipboard`, `enter` sets exactly those (an empty line takes them all back), `esc` leaves it. See [Sound, permissions and fullscreen](features.md#sound-permissions-and-fullscreen) |
 | `alt+b` | stop blocking ads and trackers on this site, or start again: the row says `blocking off for example.com`, and `unblocked` while you are on it. Reload to get what was blocked. In the url bar `alt+b` is still a word back |
+| `alt+shift+r` | read the site styles and scripts again: the row says `site files: 2 styles, 1 script`; styles change the page where it stands, scripts from the next load. See [Site styles and scripts](features.md#site-styles-and-scripts) |
 | `alt+l` | fill the login form from your password manager: runs `password-command` for this page's host and puts what it printed into the password field and the user-name field before it, in the page or a same-origin frame; never submits; only on https or localhost. See [Filling a login from your password manager](features.md#filling-a-login-from-your-password-manager) |
+| `alt+r` | reader mode: the article alone — its title, byline, text, pictures and links — at a readable width, in the page's colour scheme; `alt+r` again puts the page back where it was. The row says `reader` while it is on, and a page with no article says `no article on this page`. See [Reader mode](features.md#reader-mode) |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
 | `esc` | while a page is fullscreen and nothing else has the row, leave fullscreen; while a page is loading, stop it |
 | `ctrl+.` | normal mode on or off. In normal mode the letters are keys of their own and the row says `normal`: `f` labels everything clickable on the screen and typing a label clicks it (`F` opens a link in a tab behind this one); `j`/`k` scroll a notch, `d`/`u` half a screen, `gg`/`G` to the top and bottom; `H`/`L` back and forward, `r` reload, `o` the url bar, `O` a new tab, `/` find; `i` goes back to typing into the page, as does clicking into a field. Off by default: nothing changes until you press it |
+
+These are the keys of `keymap = linux`, the default everywhere but macOS;
+on a Mac the default is `keymap = mac`, whose keys are in
+[On a Mac](#on-a-mac) below.
 
 Everything else goes to the page, including the mouse, unless a `key.` line
 in the [settings](configuration.md#rebinding-keys) takes it. A link that asks for a
@@ -41,11 +49,14 @@ new window gets a new tab, and the tab is switched to.
 With more tabs than the row can name, the strip shows a run of them around
 the one in front and `+N` at either end for how many are past it; it scrolls
 when the tab in front reaches an edge. The list (`ctrl+shift+a`) shows all of
-them. Kitty and Ghostty keep `ctrl+shift+a` for themselves and every terminal
-keeps `ctrl+shift+pageup`/`pagedown` — Kitty and tOS for the scrollback,
+them. Kitty and Ghostty keep `ctrl+shift+a` and `ctrl+shift+j` (the
+console) for themselves and every terminal keeps
+`ctrl+shift+pageup`/`pagedown` — Kitty and tOS for the scrollback,
 WezTerm and Ghostty for their own tabs — so each has an `alt` form that
 reaches the program everywhere. Ghostty also keeps `alt+1`..`alt+9` for its
-tabs; its `alt+9` is its last tab, as it is here. A middle or `ctrl` click
+tabs; its `alt+9` is its last tab, as it is here. Kitty on macOS keeps far
+more, and Option is not `alt` there, which is what [On a Mac](#on-a-mac) is
+about. A middle or `ctrl` click
 opens a link behind the current tab, as a desktop browser does; a link that
 asks for a window (`target=_blank`) still comes to the front.
 
@@ -82,6 +93,105 @@ page: the highlights are the CSS Custom Highlight API from a world of their
 own, and the page's selection is left alone. A page that navigates closes the
 prompt.
 
+### On a Mac
+
+On macOS the built-in keys are `keymap = mac`, because the Linux ones mostly
+never arrive there. Kitty on macOS keeps `cmd+t`, `cmd+w`, `cmd+l` (clear
+the last command), `cmd+r` (resize the window), `cmd+f` (search the
+scrollback), `cmd+1` … `cmd+9` (its windows), `cmd+=`, `cmd+-`, `cmd+0`,
+`cmd+k`, `cmd+n`, `cmd+m`, `cmd+h`, `cmd+q`, `cmd+enter`, `cmd+,`, the
+`cmd` arrows and page keys, `` cmd+` ``, `shift+cmd+[`/`]`, and on every
+platform `ctrl+tab`, `ctrl+shift+tab` and its `ctrl+shift` keys — a key that
+hits one of Kitty's mappings never reaches the program. And Option is not
+`alt`: with Kitty's default `macos_option_as_alt no` it makes a character,
+so Option+= arrives as `≠` and is not `alt+=`. So the Mac keymap puts the
+keys on `cmd` where Kitty leaves it free and Chrome or Safari use it, and on
+`ctrl` elsewhere, and needs nothing in `kitty.conf`. It is the default on
+macOS and can be chosen anywhere with `keymap = mac` or `--keymap mac` — over
+ssh from a Mac, say; `keymap = linux` is the other. These are the keys that
+differ:
+
+| action | linux | mac |
+| --- | --- | --- |
+| `back` | `alt+left` | `cmd+[` |
+| `forward` | `alt+right` | `cmd+]` |
+| `reopen-tab` | `ctrl+shift+t`, `alt+t` | `cmd+shift+t` |
+| `bookmark` | `ctrl+d` | `cmd+d` |
+| `next-tab` | `ctrl+tab` | `cmd+alt+right`, `ctrl+pagedown` |
+| `previous-tab` | `ctrl+shift+tab` | `cmd+alt+left`, `ctrl+pageup` |
+| `tab-1` … `tab-8` | `alt+1` … `alt+8` | `ctrl+1` … `ctrl+8` |
+| `last-tab` | `alt+9` | `ctrl+9` |
+| `list-tabs` | `ctrl+shift+a`, `alt+a` | `cmd+shift+a` |
+| `history` | `ctrl+shift+h`, `alt+h` | `cmd+y` |
+| `console` | `ctrl+shift+j`, `alt+j` | `cmd+alt+j` |
+| `move-tab-left` | `ctrl+shift+pageup`, `alt+shift+pageup` | `cmd+shift+pageup` |
+| `move-tab-right` | `ctrl+shift+pagedown`, `alt+shift+pagedown` | `cmd+shift+pagedown` |
+| `zoom-in` | `alt+=`, `ctrl+=` | `ctrl+=` |
+| `zoom-out` | `alt+-`, `ctrl+-` | `ctrl+-` |
+| `zoom-reset` | `alt+0`, `ctrl+0` | `ctrl+0` |
+| `reader` | `alt+r` | `cmd+shift+r` |
+| `permissions` | `alt+p` | `cmd+p` |
+| `block` | `alt+b` | `cmd+b` |
+| `reload-sites` | `alt+shift+r` | `cmd+alt+shift+r` |
+| `fill-login` | `alt+l` | `cmd+shift+l` |
+| `copy` | `alt+c` | `cmd+c`, `cmd+shift+c` |
+| `copy-url` | `alt+u` | `cmd+u` |
+| `open-external` | `alt+o` | `cmd+shift+o` |
+| `save-pdf` | `alt+s` | `cmd+s` |
+| `save-screenshot` | `alt+shift+s` | `cmd+shift+s` |
+
+`ctrl+q`, `ctrl+l`, `ctrl+r`, `ctrl+t`, `ctrl+w`, `ctrl+f` and `ctrl+.` are
+the same on both. `cmd+c` copies because Kitty's own `cmd+c` copies only a
+selection Kitty made and passes the key on when there is none — and with the
+mouse given to the page, there is none. The Linux keys still answer under
+the Mac ones, so with `macos_option_as_alt left` in `kitty.conf` the `alt`
+chords above work too. `ctrl+1` … `ctrl+9`, `ctrl+=` and the other `ctrl`
+chords need a terminal speaking the Kitty keyboard protocol, which Kitty,
+WezTerm and Ghostty do; without it they arrive as the bare key.
+`cmd+shift+r` is Safari's Reader and `cmd+alt+j` Chrome's console on a Mac;
+`reload-sites` is `cmd+alt+shift+r` because Kitty keeps `cmd+r` and
+`cmd+alt+r`.
+
+A `key.` line on a chord Kitty keeps would do nothing, so in Kitty the
+status row says so at start, with the `kitty.conf` line that frees it, and
+`blinkterm --doctor` lists every such line in any terminal, with the ones
+on a chord macOS keeps for itself (Mission Control's `ctrl+←`/`→`, Spotlight's
+`cmd+space`). For the browser's own keys anyway, give them back to the
+program in `kitty.conf` and bind them in blinkterm's settings:
+
+```
+# kitty.conf
+macos_option_as_alt left
+map cmd+t no_op
+map cmd+w no_op
+map cmd+l no_op
+map cmd+r no_op
+map cmd+f no_op
+map cmd+1 no_op   # … cmd+9
+map cmd+equal no_op
+map cmd+minus no_op
+map cmd+0 no_op
+map ctrl+tab no_op
+map ctrl+shift+tab no_op
+```
+
+```
+# ~/.config/blinkterm/config
+key.cmd+t = new-tab
+key.cmd+w = close-tab
+key.cmd+l = url
+key.cmd+r = reload
+key.cmd+f = find
+key.cmd+1 = tab-1
+# … key.cmd+8 = tab-8, key.cmd+9 = last-tab
+key.cmd+= = zoom-in
+key.cmd+- = zoom-out
+key.cmd+0 = zoom-reset
+```
+
+`ctrl+tab` and `ctrl+shift+tab` need no `key.` line once Kitty lets them
+through: they are the Linux keys, which still answer.
+
 ### Searching
 
 Nothing you type in the url bar is sent anywhere but where it names. With
@@ -117,7 +227,9 @@ answered.
 `alt+=` and `alt+-` zoom the page in and out through Chrome's own steps
 (25% to 300%), `alt+0` puts it back; `ctrl+=`, `ctrl+-` and `ctrl+0` do the
 same where your terminal lets them through — Kitty and tOS do, WezTerm and
-Ghostty keep them for their own font size. The level is remembered per
+Ghostty keep them for their own font size. On a Mac the zoom keys are the
+`ctrl` ones, since Option does not make `alt` (see [On a Mac](#on-a-mac)).
+The level is remembered per
 site, in the profile's `zoom` file (0600, a list of hosts; `--temp-profile`
 keeps none), and shows on the row as `150%` while it is not 100%. Zooming
 reflows the page as a browser's zoom does — `devicePixelRatio` and
@@ -190,9 +302,13 @@ link and an I-beam over a text field; the rest ignore it. A zoom that is not
 100% is a word at the right too, `150%`, after the loading hint, and after
 it how many requests a [block list](features.md#blocking-ads-and-trackers) stopped on
 this page, `12 blocked` — counted from the page's last landing, per tab —
-or `unblocked` on a site you turned blocking off for.
+or `unblocked` on a site you turned blocking off for, and `reader` while
+the page is in [reader mode](features.md#reader-mode). After that,
+`2 errors`: the errors the page logged, threw or failed to fetch since you
+last opened its [console](features.md#the-console) (`ctrl+shift+j`) on
+this tab.
 
-The url bar, the find prompt, the tab list or the history list, the allow
+The url bar, the find prompt, the tab list, the history list or the console, the allow
 line (`alt+p`), a page's dialog and a file input's path take the whole row while they are
 open, and `esc` goes to whichever of them has it before it leaves
 fullscreen or stops a load; no link is shown while one of them is there.
@@ -249,6 +365,11 @@ and it must come out as an `http`, `https`, `file` or `about` url. Anything
 else (`javascript:`, `data:`, `chrome://`, `mailto:`) is refused: the sender
 prints one line per refused url on stderr and exits 1, and the urls that were
 fine are opened anyway.
+
+The other direction is `alt+o`, which opens the page in front in the desktop
+browser. A `$BROWSER` that is `blinkterm --remote` is not what `alt+o` runs,
+and is taken out of the environment of what it runs instead (see
+[Opening a page in the desktop browser](features.md#opening-a-page-in-the-desktop-browser)).
 
 How it works: a running `blinkterm` listens on a Unix socket,
 `blinkterm.sock`, next to `blinkterm.lock` in its profile, made 0600 inside the

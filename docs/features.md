@@ -108,6 +108,65 @@ its forced-transparent backgrounds included — keyed, locally, the way the
 screen is, so the file is not magenta; a number after `--alpha` is not
 applied to it, so the file is the page at full opacity.
 
+## The console
+
+`ctrl+shift+j` (or `alt+j`, which every terminal lets through; Kitty keeps
+`ctrl+shift+j` for scrolling and Ghostty for writing the screen to a file)
+shows the console of the page in front over the screen, the way the history
+list is shown: one row each, newest last, the pick on the newest.
+
+    log    hello 1 {a: 2}  —  https://example.com/app.js:12
+    error  Uncaught TypeError: x is undefined  —  https://example.com/app.js:40
+    error  Failed to load resource: the server responded with a status of 404 (Not Found)  —  https://example.com/logo.png
+    --     navigated to https://example.com/next
+
+Three things go in it. What the page's scripts say with `console.log`,
+`console.error` and the rest, their arguments on one line — a string as
+itself, an object as a short preview, `{a: 1, b: "x", …}`, an array as
+`[1, 2, …]`. Exceptions nobody caught, as `Uncaught Error: …` with where
+they were thrown. And requests that failed: a status of 400 and up, a
+refused connection, a request the [blocker](#blocking-ads-and-trackers)
+stopped (`net::ERR_BLOCKED_BY_CLIENT`), in the engine's own words with the
+url beside them. The level leads each row — `error`, `warn`, `info`, `log`,
+`debug` — as a word rather than a colour, so that typing `error` narrows the
+list to the errors; words typed in any order filter it by level, text and
+place. `↑`/`↓` and the page keys move the pick, and `esc` or `enter` closes
+it: there is nothing on a row to open. What it shows is what the page had
+said when it was opened; open it again for what came since.
+
+Each tab keeps its last 1000, in memory only, across navigations with a
+`-- navigated to …` row between pages, and a tab's console goes when the
+tab does. The row says `2 errors` at the right — errors since you last
+opened the console on this tab — so a page that failed quietly says so.
+`console = false` (or `--no-console`) turns all of it off, and then no page
+is asked for its console at all.
+
+How: every page's session is given `Runtime.enable`, which reports the
+console calls and the exceptions, and `Log.enable`, which reports the failed
+requests. What they send is recorded on the thread that reads the engine's
+pipe and never reaches the tab's mailbox, which holds 512 events and drops
+the oldest: a page that logs two thousand lines as it loads would otherwise
+push its own landing and load out of it. The `Network` domain, which would
+say more about a failed request, is not enabled, for the numbers in
+`src/load.rs`: 341 events and 212 kB for one page of 51 requests. Measured
+against chrome-headless-shell 153, with the page loaded from its landing to
+its load event and the console off and on: a page of links 109 ms either
+way, a page that logs 500 lines with an object each 51 ms and 59 ms. The
+objects a page logs are let go of on every landing and every thousand
+calls, since the engine otherwise keeps them for as long as the console is
+heard (10 000 logged objects: 3.0 MB of the page's heap kept, against
+0.4 MB unheard).
+
+What is not shown: `%c` styles and `%s` substitution (the format string is
+shown as written, followed by its arguments); an object past its preview;
+anything a worker logs, or an iframe the engine runs in a process of its
+own; a failed request's status except in the text the engine writes; and
+whatever a page logged before its tab was attached, other than what the
+engine replays. A single line of more than 64 MB — a page that logs a
+string that long on purpose — ends the engine's pipe, which the program
+survives by starting the engine again, as it does for a page title that
+long; `console = false` is the answer to a page that does it.
+
 ## Uploading a file
 
 A click on a page's file input — an "attach", a "choose file" — takes the
@@ -266,6 +325,97 @@ on the row, in the history, in the session or in any file, and what held
 it is overwritten once it has been handed over. See
 [SECURITY.md](../SECURITY.md) for the details and the limits.
 
+## Opening a page in the desktop browser
+
+Some pages cannot be finished in a terminal: a reCAPTCHA that wants its
+pictures clicked ([#57](https://github.com/m96-chan/blinkterm/issues/57)), a
+file input in a frame of another site, a passkey that wants the machine's
+authenticator, a video behind DRM. `alt+o` (`open-external`) takes the page
+in front to the desktop's own browser, and the row says `sent to the desktop
+browser` ([#61](https://github.com/m96-chan/blinkterm/issues/61)).
+
+With nothing set it runs `open <url>` on a Mac, and on Linux `$BROWSER` when
+it is set (a `%s` in it is where the url goes) or else `xdg-open <url>`. Those
+are only run where there is a desktop to open a window on — `$DISPLAY` or
+`$WAYLAND_DISPLAY` set, or a Mac not reached over ssh, the same rule the file
+picker has. Anywhere else nothing is run and the row says `no desktop here;
+alt+u copies the url`. Over ssh with X forwarding `$DISPLAY` is set, and the
+browser opens on the forwarded display.
+
+A `$BROWSER` that is `blinkterm` itself — `blinkterm --remote`, as
+[Opening a url from another program](usage.md#opening-a-url-from-another-program)
+suggests — is not run, since the page would come straight back as a tab
+here, and it is taken out of the environment of what is run instead, so that
+`xdg-open` on a desktop it does not know cannot fall back to it. On GNOME or
+KDE, `xdg-open` asks the desktop and never reads `$BROWSER` at all.
+
+To name the program yourself:
+
+    external-browser = firefox --new-tab {url}
+    external-browser = open -a Safari {url}
+    external-browser = chromium
+
+`{url}` is where the url goes; a command without it gets the url as its last
+argument. The command is split into words the way the file picker's is and
+run without a shell. A command you named is run wherever you are, display or
+not: you said so. It is an option too, `--external-browser`.
+
+**Nothing of your login goes with it.** Cookies, logins, the tab's history
+and whatever you typed stay here: the other browser is another browser, on
+its own profile, and opens the url afresh — signed in if it already was
+there, and otherwise not. What is handed over is the url, query string
+included, and nothing else.
+
+Only `http`, `https` and `file` pages are opened. A blank tab says `nothing
+to open here`, and `about:`, `chrome:`, `data:`, `javascript:` and `blob:`
+pages say `a <scheme>: page is not opened outside`. The url is the one this
+program has for the tab — the one `alt+u` copies — so the key works on a
+page that has crashed and on one behind a dialog. A `file:` url on a Mac is
+opened by `open` with whatever the desktop opens that file with — Preview for
+a PDF — and `external-browser = open -a Safari {url}` says otherwise.
+
+The program is started on its own, with nothing on its input or output, and
+left alone: quitting `blinkterm` does not close the browser.
+
+## Reader mode
+
+`alt+r` shows the article on the page alone
+([#64](https://github.com/m96-chan/blinkterm/issues/64)): its title, the
+byline and date when the page gives them, its text, pictures and links, in
+one column at a width a line can be read at, and `alt+r` again puts the
+page back where you were. The row says `reader` while it is on. What goes
+is everything around the article — navigation, sidebars, footers, cookie
+boxes, share buttons, comments, forms, videos and embeds — and whatever the
+page had hidden. A page with nothing to read (a login page, a search page,
+a front page of headlines) is left alone, and the row says
+`no article on this page`.
+
+The article is found by scoring the page's paragraphs and the blocks that
+hold them, in the manner of Readability, and it is shown in the page
+itself: `blinkterm` puts one frame of the page's own origin at the end of
+the page's `<body>`, writes the article into it, and hides the rest with a
+stylesheet. Nothing is reloaded and nothing navigates, so the url, the
+history, the cookies and whatever you had typed into the page stay as they
+were, and the pictures load as they did for the page. A separate page
+(a `data:` url) would have been a history entry you never visited, a url
+that is not the page's, and pictures without the site's cookies. A page can
+see the frame and the stylesheet while the mode is on; it cannot see the
+script that made them, which runs apart from the page's own, as find's
+does.
+
+Inside it everything still works: find, link hints, the pointer over a
+link, zoom (the reader's text size), saving as a PDF or a picture,
+`--alpha` and `--force-dark`. Its colours follow what the page is told —
+`--color-scheme`, or the terminal's own — light or dark. A link followed
+from it loads in the tab, and the new page, like a reload or a crash,
+arrives without the reader.
+
+The limits: a page whose scripts rebuild the whole page can take the
+reader away while the row still says `reader` (`alt+r` twice brings it
+back); an article inside a frame from another site cannot be read; video
+is not kept. The article is looked for when you press `alt+r` and not on
+the next page.
+
 ## Sound, permissions and fullscreen
 
 **Sound** comes out of the machine `blinkterm` runs on, through the
@@ -315,3 +465,110 @@ the allow line, a dialog the page opens, a file input's path — the row comes
 back and the page is a row shorter until it closes: a `confirm()` in a
 fullscreen video is still answered on the row. Link hints and normal mode
 work in fullscreen as anywhere.
+
+## Site styles and scripts
+
+A terminal pane is narrow, its font is not the one a site was designed
+with, and a cookie banner or a sticky header takes more of it than of a
+desktop window. A file of your own fixes a site for good: CSS or JavaScript,
+named after the host, in a directory beside the settings file.
+
+```text
+~/.config/blinkterm/sites/         ($XDG_CONFIG_HOME/blinkterm/sites/)
+  all.css                          every page
+  *.github.com.css                 github.com and every host under it
+  news.ycombinator.com.css         that host only
+  example.com.js                   a script, on that host only
+```
+
+| name | the pages it is put on |
+| --- | --- |
+| `all.css`, `all.js` | every page, a `data:` page and `about:blank` included |
+| `example.com.css` | `example.com` and no other host |
+| `*.example.com.css` | `example.com`, `www.example.com`, `a.b.example.com` — not `notexample.com` |
+| `127.0.0.1.css` | that address |
+
+Names are matched without regard to case. A name that is not a host —
+anything but letters, digits, `.` and `-` after an optional `*.` — is
+refused, and said: in the shell as blinkterm starts, and on the row after
+`alt+shift+r`. Other files (`notes.txt`, an editor's `x.css.swp`), dotfiles and
+subdirectories are passed over. Hosts only: a path, a port or an IPv6
+address is not a pattern.
+
+When several files fit a page they go on in order: `all` first, then the
+`*.` patterns with the fewest labels, then the exact host, and files of the
+same rank by name. A later style wins by the cascade and a later script runs
+later, so the most specific file has the last word.
+
+**Styles** are adopted as constructed stylesheets at the start of every
+document, in the page and in its same-process iframes (a `srcdoc` or
+`about:blank` frame goes by its page's host). A page's CSP does not stop
+them, and the page's DOM is not changed. Use `!important` to beat a page's
+own rules:
+
+```css
+/* *.github.com.css: no banner, no sticky header */
+.flash-global, .js-notice { display: none !important; }
+header.AppHeader { position: static !important; }
+```
+
+```css
+/* all.css: a larger font for a narrow pane */
+html { font-size: 18px !important; }
+```
+
+**Scripts** run at the start of every document, before any of the page's
+own. By default in an isolated world: the page's DOM is shared, its
+JavaScript is not, so the page cannot see the script's variables and the
+script cannot call the page's functions. A file whose first line is
+`// @world main` runs in the page's own world instead, as the page's code.
+At document start the page's elements do not exist yet — even
+`document.documentElement` is `null` — so a script that changes the page
+waits for them:
+
+```js
+// example.com.js
+addEventListener('DOMContentLoaded', () => {
+  for (const el of document.querySelectorAll('.cookie-banner')) el.remove();
+});
+```
+
+Each script is registered on its own, so a file with a syntax error stops
+only itself; its top-level declarations are its own, as in a userscript
+manager.
+
+**`alt+shift+r`** (`reload-sites`) reads the directory again and tells every tab.
+The row says what was read, `site files: 2 styles, 1 script`. Styles change
+on the page where it stands. Scripts apply from each page's next load — a
+script run again on a live page would do its work twice. A tab stopped
+behind a dialog, or crashed, keeps the files it had, and the row says how
+many did. If `alt+shift+r` is taken by your terminal, bind another key:
+`key.f9 = reload-sites` (see [Rebinding keys](configuration.md#rebinding-keys)).
+
+**The directory** is read once as blinkterm starts. `--sites-dir <dir>` (or
+`sites-dir = <dir>` in the config file) reads another one, which must
+exist; `--no-sites` (or `sites = false`) reads none. The files are read as
+they are and never written. A file larger than 1 MiB or not UTF-8 is
+refused, and so is a file, or the directory, that group or others can
+write: a script runs with the page's powers, and one that another user can
+change is a way into every page (see [SECURITY.md](../SECURITY.md)).
+`chmod go-w` it.
+
+What a page can see: of a style, `document.adoptedStyleSheets` one entry
+longer; of a script in the isolated world, what it does to the DOM; a
+`// @world main` script is the page's own code. What is not reached: an
+iframe from another site that the engine runs in a process of its own, a
+page that assigns `document.adoptedStyleSheets` wholesale, and a page's
+inline `style="…!important"`.
+
+Measured against `chrome-headless-shell` 153:
+
+| | |
+| --- | --- |
+| a host's style, on load, after a navigation, after a reload | applied |
+| a script, before the page's first inline script | ran first |
+| a `// @world main` script under `script-src 'none'` | ran |
+| a style after `alt+shift+r` | in place, on the same document |
+| the old script after `alt+shift+r` | never ran again |
+| five script files, registered on a new tab | 0.5 to 10 ms |
+| 210 KB of CSS, to `domInteractive` | +7 ms on a page it fits, +1 ms on one it does not |

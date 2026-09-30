@@ -353,6 +353,23 @@ pub trait Intercept: Send + Sync {
     fn intercept(&self, message: &Json, wire: &Notifier) -> bool;
 }
 
+/// Several hooks in front of the routing, asked in order; the first that
+/// consumes a message wins, and the ones after it never see it.
+///
+/// The exchange holds one hook, and two things want one: the
+/// [`crate::block::Blocker`], when a block list is set, and the
+/// [`crate::console::Recorder`], always. Neither consumes what the other
+/// needs — the blocker keeps only `Fetch.requestPaused`, the recorder only
+/// the console's own events — so the order matters for speed alone: the
+/// blocker, whose pauses hold a page up, goes first.
+pub struct Hooks(pub Vec<Arc<dyn Intercept>>);
+
+impl Intercept for Hooks {
+    fn intercept(&self, message: &Json, wire: &Notifier) -> bool {
+        self.0.iter().any(|hook| hook.intercept(message, wire))
+    }
+}
+
 /// Where the reader delivers: a mailbox per session, and whether the pipe has
 /// ended.
 ///
@@ -934,7 +951,10 @@ impl Client {
         Client::on(exchange, None)
     }
 
-    fn on(exchange: &Arc<Exchange>, session: Option<String>) -> Result<Client, String> {
+    /// A client for `session`'s messages, or the browser's for `None`.
+    /// [`Client::attach`] is how a page's is made outside this crate; the
+    /// crate's own tests make one straight onto a pipe they write.
+    pub(crate) fn on(exchange: &Arc<Exchange>, session: Option<String>) -> Result<Client, String> {
         let wake = Wake::new()?;
         let wake_read = wake.read;
         let mailbox = Mailbox {
@@ -2067,6 +2087,55 @@ mod tests {
         );
         drop(page);
         drop(browser);
+        exchange.shutdown();
+    }
+
+    /// Counts what it is shown and consumes the one method it is given.
+    struct Keeps {
+        method: &'static str,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Intercept for Keeps {
+        fn intercept(&self, message: &Json, _wire: &Notifier) -> bool {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            message.get("method").and_then(Json::as_str) == Some(self.method)
+        }
+    }
+
+    #[test]
+    fn the_first_hook_to_consume_a_message_keeps_it_from_the_rest_and_from_the_mailbox() {
+        let (exchange, _commands, mut replies) = exchange();
+        let page = Client::on(&exchange, Some("S1".to_string())).expect("a page client");
+        let first = Arc::new(Keeps {
+            method: "Runtime.consoleAPICalled",
+            seen: Default::default(),
+        });
+        let second = Arc::new(Keeps {
+            method: "Log.entryAdded",
+            seen: Default::default(),
+        });
+        exchange.intercept(Some(Arc::new(Hooks(vec![
+            Arc::clone(&first) as Arc<dyn Intercept>,
+            Arc::clone(&second) as Arc<dyn Intercept>,
+        ]))));
+        let logged = r#"{"method":"Runtime.consoleAPICalled","sessionId":"S1","params":{}}"#;
+        let failed = r#"{"method":"Log.entryAdded","sessionId":"S1","params":{}}"#;
+        let loaded = r#"{"method":"Page.loadEventFired","sessionId":"S1","params":{}}"#;
+        replies
+            .write_all(format!("{logged}\0{failed}\0{loaded}\0").as_bytes())
+            .expect("the events go");
+        assert_eq!(
+            events_until(&page, "Page.loadEventFired"),
+            ["Page.loadEventFired"]
+        );
+        assert_eq!(first.seen.load(Ordering::SeqCst), 3, "the first sees all");
+        assert_eq!(
+            second.seen.load(Ordering::SeqCst),
+            2,
+            "the second never sees what the first kept"
+        );
+        drop(page);
         exchange.shutdown();
     }
 

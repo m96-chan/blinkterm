@@ -73,6 +73,7 @@ inside tmux (with `set -g allow-passthrough on`) and over ssh.
 | `alt+left` / `alt+right` | back / forward |
 | `ctrl+r` | reload |
 | `ctrl+f` | find in the page |
+| `alt+r` | reader mode |
 | `alt+=` / `alt+-` / `alt+0` | zoom in / out / reset |
 | `ctrl+q` | quit |
 
@@ -84,7 +85,7 @@ password managers, rebinding keys — is in the docs.
 - [Installing](docs/install.md): the engine, per platform, and Homebrew
 - [Using blinkterm](docs/usage.md): every key, the status row, opening urls from other programs
 - [Settings and profiles](docs/configuration.md): the config file, rebinding keys, profiles, history, the session
-- [Features](docs/features.md): ad blocking, downloads, uploads, password managers, sound and permissions
+- [Features](docs/features.md): ad blocking, downloads, uploads, password managers, sound and permissions, site styles and scripts
 - [How it works](docs/design.md): the numbers, terminals, tmux and ssh, what a page is told
 - [Development](docs/development.md): the tests and the checks
 

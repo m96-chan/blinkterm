@@ -87,9 +87,13 @@ machine. It prints a warning when it does. Do not browse as root.
   hand your clipboard back ([#9](https://github.com/m96-chan/blinkterm/issues/9)).
 
   The hover url is the page's string and goes through the same sanitizer as
-  the title (#28). The tab list (`ctrl+shift+a`) is the one other text this
-  program writes, on the rows under the status row while it is open: its rows
-  are titles and urls and go through the same sanitizer as the row. The pointer shape sent to the terminal is one of a fixed
+  the title (#28). The tab list (`ctrl+shift+a`), the history list
+  (`ctrl+shift+h`) and the console (`ctrl+shift+j`) are the other text this
+  program writes, on the rows under the status row while one is open: titles,
+  urls, and the console's lines, which are the most page-controlled text of
+  all — a `console.log` is anything a script likes. Every one goes through
+  `text::sanitize` twice: as it is kept, and again as the row is drawn. The
+  console is kept in memory only, per tab, and never written to disk. The pointer shape sent to the terminal is one of a fixed
   table of names this program owns — the page's `cursor` value chooses among
   them and is never itself written
   ([#15](https://github.com/m96-chan/blinkterm/issues/15)).
@@ -159,6 +163,34 @@ machine. It prints a warning when it does. Do not browse as root.
   already been compromised can read its own form, as in any browser. The
   user name printed by the command is treated exactly as the password
   ([#65](https://github.com/m96-chan/blinkterm/issues/65)).
+
+- **The page in the desktop browser.** `alt+o` hands the url of the page in
+  front — query string included — to a program of yours as one argument:
+  `open` on a Mac, `$BROWSER` or `xdg-open` on Linux, or what
+  `external-browser` names. Only on the key, run without a shell, with
+  nothing else from the page: no cookie, no login, nothing the page said.
+  The url is the one this program has for the tab; the page is not asked.
+  A `$BROWSER` whose program is `blinkterm` is not run, and is taken out of
+  the environment of what is run, so the url cannot come back here. Nothing
+  is opened for a page that is not `http`, `https` or `file` (`about:`,
+  `chrome:`, `data:`, `javascript:`, `blob:` …). The program is started in
+  a process group of its own with its standard input, output and error on
+  `/dev/null`, and is never signalled
+  ([#61](https://github.com/m96-chan/blinkterm/issues/61)).
+
+- **Site styles and scripts.** The files in `~/.config/blinkterm/sites/`
+  (or `--sites-dir`) are yours: read from your configuration directory as
+  they are and never written by this program. A `.js` file is code put on
+  every page its name matches. By default it runs in an isolated world that
+  shares the page's DOM and not its JavaScript; a file whose first line is
+  `// @world main` runs as the page's own code, with everything the page can
+  do — its cookies, its storage, its network access — and a page's CSP does
+  not stop it (measured with `script-src 'none'`). So a file another local
+  user could change is a way into every page you open, and a file, or the
+  directory itself, that group or others can write (`mode & 0o022`) is
+  refused by name, in the shell at start and on the row after `alt+shift+r`.
+  Nothing in the files leaves the machine unless a script you wrote sends it
+  ([#66](https://github.com/m96-chan/blinkterm/issues/66)).
 
 - **Shared memory.** Frames go through POSIX shared memory objects named
   `blinkterm-<pid>-...` and unlinked by the terminal as it reads them — a

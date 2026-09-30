@@ -28,6 +28,64 @@ flag, a different default, a raised Rust floor all do.
   on a dark terminal
   ([#79](https://github.com/m96-chan/blinkterm/issues/79),
   [#84](https://github.com/m96-chan/blinkterm/issues/84)).
+- `alt+o` (`open-external`) opens the page in front in the desktop browser —
+  `open` on a Mac, `$BROWSER` or `xdg-open` on Linux, or
+  `external-browser = <command>` with `{url}` where the url goes — started
+  detached and left running when `blinkterm` quits. Only `http`, `https` and
+  `file` pages are opened, and over ssh with no display the row says so and
+  points at `alt+u`. Cookies and logins do not travel: the other browser opens
+  the url on its own profile
+  ([#61](https://github.com/m96-chan/blinkterm/issues/61)).
+- `alt+r` (the action `reader`) shows the article on the page alone: its
+  title, byline, text, pictures and links in one readable column, in the
+  page's colour scheme, with find, hints, zoom, the saves, `--alpha` and
+  `--force-dark` still working in it; `alt+r` again puts the page back where
+  it was. Nothing is reloaded: the article is shown in a frame in the page
+  itself. The row says `reader` while it is on, and
+  `no article on this page` on a page with nothing to read
+  ([#64](https://github.com/m96-chan/blinkterm/issues/64)).
+- Site styles and scripts: a file `<host>.css` or `<host>.js` in
+  `~/.config/blinkterm/sites/` (`$XDG_CONFIG_HOME/blinkterm/sites/`) is put
+  on every page of that host — `*.<host>` for a site and every host under
+  it, `all` for every page — the general ones first, so the most specific
+  file has the last word. A style is adopted at document start, and is
+  nothing the page can see in its own sheets; a script runs at document
+  start in an isolated world that shares only the DOM, or in the page's own
+  when its first line is `// @world main`. `alt+shift+r` (`reload-sites`)
+  reads the directory again: styles change where the page stands, scripts
+  from the next load. `--sites-dir <dir>` (`sites-dir =`) reads another
+  directory, and `--no-sites` (`sites = false`) none. A file or directory
+  that another user could write is refused by name
+  ([#66](https://github.com/m96-chan/blinkterm/issues/66)).
+- The page's console: `ctrl+shift+j` (or `alt+j`, which arrives where Kitty
+  or Ghostty keeps `ctrl+shift+j`) shows what the page in front logged,
+  threw and failed to fetch over the screen, newest last, each row the
+  level, the text and where it came from, with a `-- navigated to` row
+  between pages. Words typed in any order filter it; `esc` or `enter`
+  closes it. The row says `2 errors` until you look. The last 1000 per tab,
+  in memory only; `console = false` or `--no-console` turns it off.
+  `console` in a `key.` line
+  ([#67](https://github.com/m96-chan/blinkterm/issues/67)).
+- Keys that work on a Mac. `keymap = mac|linux` (or `--keymap`) picks the
+  built-in keys, and on macOS the default is now `mac`: a table that arrives
+  in a stock Kitty, with no change to `kitty.conf`, because Kitty on macOS
+  keeps most `cmd` chords and Option makes characters rather than `alt`.
+  `cmd+[`/`cmd+]` back and forward, `cmd+d` bookmark, `cmd+shift+t` reopen,
+  `cmd+alt+left`/`right` or `ctrl+pageup`/`pagedown` the tabs, `ctrl+1` …
+  `ctrl+9` a tab by number, `cmd+shift+a` the tab list, `cmd+y` history,
+  `cmd+c` copy, `cmd+s` save a PDF, `cmd+shift+o` the desktop browser,
+  `cmd+shift+r` reader mode, `cmd+alt+shift+r` the site files again,
+  `cmd+alt+j` the console, and `ctrl` where Kitty lets the Linux
+  chord through (`ctrl+l`, `ctrl+t`, `ctrl+w`, `ctrl+r`, `ctrl+f`, `ctrl+=`,
+  `ctrl+q`). The Linux keys still answer underneath, so `alt` chords work on a
+  Mac with `macos_option_as_alt left`. `key.<chord>` lines apply on top of
+  either keymap. `--doctor` prints a `keys:` line saying which keymap is in
+  effect, and names every `key.` line on a chord Kitty or macOS keeps by
+  default; in Kitty such a line is also named on the status row at start,
+  with the `map <chord> no_op` line for `kitty.conf` that frees it. The Linux
+  keys are unchanged
+  ([#80](https://github.com/m96-chan/blinkterm/issues/80),
+  [#78](https://github.com/m96-chan/blinkterm/issues/78)).
 
 ### Changed
 

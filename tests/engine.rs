@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use blinkterm::bindings::{Bindings, Keymap, Lookup};
 use blinkterm::cdp::{Client, Pending};
 use blinkterm::engine::{self, Engine};
 use blinkterm::find::{self, Matches};
@@ -42,6 +43,7 @@ use blinkterm::motion::{self, Motion};
 use blinkterm::profile::{Choice, Profile};
 use blinkterm::route::{Payload, Placement, Route, Wrap};
 use blinkterm::scroll::{self, Animator, Dispatch, Step, Wheel};
+use blinkterm::sites::{self, Sites};
 use blinkterm::tabs::{Outcome, Tab, Tabs};
 
 // tOS's `t=s` reader, the one a real tOS pane installs, copied from
@@ -519,6 +521,51 @@ fn a_key_arrives_as_the_key_the_page_expects() {
         let seen = wait_for_title(&mut client, "key ", Duration::from_secs(5));
         assert_eq!(&seen, expected, "for {input:?}");
     }
+
+    client.close();
+    engine.kill();
+}
+
+/// A `cmd` chord the Mac keymap leaves alone reaches the page as the key
+/// with Meta held, and types nothing: the contract the Mac keymap depends
+/// on for every `cmd` chord it does not take — `cmd+a`, `cmd+z`, `cmd+x` —
+/// which a page's editor expects to see as `metaKey`.
+#[test]
+fn a_cmd_chord_the_mac_keymap_leaves_alone_reaches_the_page_with_meta_held() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    form(&mut client);
+    evaluate(
+        &mut client,
+        "window.seen=[];t.addEventListener('keydown',function(e){\
+         seen.push([e.key,e.metaKey,e.ctrlKey,e.altKey].join(' '))});t.focus()",
+    );
+    let press = KeyInput {
+        key: Key::Char('a'),
+        mods: Mods(Mods::SUPER),
+        action: KeyAction::Press,
+        text: None,
+    };
+    let bindings = Bindings::on(Keymap::Mac, vec![]);
+    assert_eq!(
+        bindings.lookup(&press),
+        Lookup::Default,
+        "cmd+a is not the Mac keymap's"
+    );
+    let params = keys::dispatch(&press).expect("a key with a name");
+    client
+        .call("Input.dispatchKeyEvent", params)
+        .expect("the key is dispatched");
+    assert_eq!(
+        evaluate(&mut client, "seen.join(',')").as_str(),
+        Some("a true false false")
+    );
+    assert_eq!(
+        evaluate(&mut client, "t.value").as_str(),
+        Some(""),
+        "a chord with meta held types nothing"
+    );
 
     client.close();
     engine.kill();
@@ -1271,6 +1318,7 @@ fn a_tab_opened_behind_by_this_program_loads_without_being_looked_at() {
         &mut browser,
         &appearance,
         &Identity::new(None, None, "C"),
+        &Sites::none(),
         &format!("{base}plain"),
     )
     .expect("the engine opens a page behind");
@@ -1356,6 +1404,7 @@ fn a_tab_whose_queued_events_went_in_the_bin_still_says_its_page_finished() {
         &mut browser,
         &appearance,
         &Identity::new(None, None, "C"),
+        &Sites::none(),
         "data:text/html,<title>plain</title><body>plain",
     )
     .expect("the engine opens a page");
@@ -3470,6 +3519,18 @@ fn serve_troubles() -> (String, u16) {
                             .to_string(),
                     ),
                     "/links" => ("200 OK", String::new(), LINKS.to_string()),
+                    // Something in each of the ways a console hears.
+                    "/console" => (
+                        "200 OK",
+                        String::new(),
+                        format!(
+                            "<!doctype html><title>start</title><script>\
+                         console.log('hello',1,{{a:2}});\
+                         setTimeout(function(){{throw new Error('boom')}},0);\
+                         onload=function(){{setTimeout(function(){{document.title='done'}},100)}};\
+                         </script><img src='/404'><img src='{dead}x.png'>"
+                        ),
+                    ),
                     _ => (
                         "200 OK",
                         String::new(),
@@ -4945,6 +5006,7 @@ fn a_file_typed_on_the_row_reaches_an_input_in_a_cross_site_iframe() {
         &mut browser,
         &appearance,
         &Identity::new(None, None, "C"),
+        &Sites::none(),
         &[Ok(format!("http://holder.test:{port}/holder"))],
     );
     assert!(opened.iter().all(Result::is_ok), "{opened:?}");
@@ -8890,6 +8952,8 @@ fn a_crashed_page_keeps_its_tab_and_a_reload_brings_it_back_casting() {
         },
         motion::Cast::default(),
         &Identity::new(None, None, "C"),
+        &Sites::none(),
+        &mut Vec::new(),
     );
     let after = frames_in(&mut tab.connection, Duration::from_secs(1));
     eprintln!("frames in a second after revive: {after}");
@@ -9274,6 +9338,8 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &appearance,
         &Allowed::in_memory(),
         None,
+        &Sites::none(),
+        None,
     )
     .expect("the engine boots");
     let base = serve();
@@ -9301,6 +9367,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
             &mut browser,
             &appearance,
             &identity,
+            &Sites::none(),
             &format!("{base}{name}"),
         )
         .expect("a tab behind");
@@ -9358,6 +9425,8 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &appearance,
         &Allowed::in_memory(),
         None,
+        &Sites::none(),
+        None,
     )
     .expect("a second engine on the same profile");
     blinkterm::app::restore_tabs(
@@ -9365,6 +9434,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
         &mut browser,
         &appearance,
         &identity,
+        &Sites::none(),
         snapshot.clone(),
     );
     let took = started.elapsed();
@@ -9655,6 +9725,8 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
         &appearance,
         &allowed,
         None,
+        &Sites::none(),
+        None,
     )
     .expect("the engine boots");
     let names = [
@@ -9683,6 +9755,7 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
         &mut browser,
         &appearance,
         &Identity::new(None, None, "C"),
+        &Sites::none(),
         &format!("{origin}/fs"),
     )
     .expect("a tab behind");
@@ -10407,6 +10480,8 @@ fn a_url_handed_over_the_socket_becomes_the_tab_in_front() {
         &appearance,
         &Allowed::in_memory(),
         None,
+        &Sites::none(),
+        None,
     )
     .expect("the engine boots");
     let base = serve();
@@ -10431,6 +10506,7 @@ fn a_url_handed_over_the_socket_becomes_the_tab_in_front() {
         &mut browser,
         &appearance,
         &identity,
+        &Sites::none(),
         &delivery.lines,
     );
     assert_eq!(opened[0], Ok(format!("{base}second")));
@@ -10505,6 +10581,11 @@ const HEAVY: usize = 300;
 /// The engine booted as the program boots it, with `--host-resolver-rules`
 /// sending `*.test` to this machine and the blocker given or not.
 fn booted_blocking(blocker: Option<&Arc<Blocker>>) -> Booted {
+    booted_with(blocker, None)
+}
+
+/// The same, with the console's recorder given or not.
+fn booted_with(blocker: Option<&Arc<Blocker>>, console: Option<&Arc<Recorder>>) -> Booted {
     let downloads = temp_dir("block-downloads");
     let appearance = blinkterm::appearance::Appearance::new(
         blinkterm::appearance::Choice::Auto,
@@ -10522,6 +10603,8 @@ fn booted_blocking(blocker: Option<&Arc<Blocker>>) -> Booted {
         &appearance,
         &Allowed::in_memory(),
         blocker,
+        &Sites::none(),
+        console,
     )
     .expect("the engine boots")
 }
@@ -11082,5 +11165,1404 @@ fn the_form_with_the_focus_is_the_one_filled() {
     assert_eq!(values(&mut client), "me,secret,,,,,");
 
     client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Site styles and scripts
+// ---------------------------------------------------------------------------
+
+/// A directory of site files, written afresh with the modes the program
+/// accepts: the directory 0755, each file 0644.
+fn site_files(what: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir(what);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a directory");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    write_site_files(&dir, files);
+    dir
+}
+
+/// Write (or overwrite) files in a site directory, 0644.
+fn write_site_files(dir: &std::path::Path, files: &[(&str, &str)]) {
+    use std::os::unix::fs::PermissionsExt;
+    for (name, text) in files {
+        let path = dir.join(name);
+        std::fs::write(&path, text).expect("a site file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    }
+}
+
+/// A session set up the way `connect_tab` sets one up, with the site files
+/// registered on it as a new session's are; the identifiers come back.
+fn told_sites(client: &mut Client, sites: &Sites) -> Vec<String> {
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(client);
+    let appearance = blinkterm::appearance::Appearance::new(
+        blinkterm::appearance::Choice::Auto,
+        false,
+        blinkterm::appearance::Alpha::Off,
+    );
+    blinkterm::app::prepare_session(client, &appearance, &Identity::new(None, None, "C"));
+    sites::install(client, sites, true)
+}
+
+/// The pages the site tests are served, on 127.0.0.1: `/plain`, which says
+/// `ready`; `/sites`, whose own inline script writes what it could see into
+/// its title; `/framed`, with a `srcdoc` iframe that has a script of its
+/// own; and `/csp`, which forbids every script of its own.
+fn serve_site_pages() -> String {
+    let port = serve_pages(|_| {
+        vec![
+            (
+                "/plain".to_string(),
+                "<!doctype html><body>plain<script>document.title='ready'</script></body>"
+                    .to_string(),
+            ),
+            (
+                "/again".to_string(),
+                "<!doctype html><body>again<script>document.title='ready'</script></body>"
+                    .to_string(),
+            ),
+            (
+                "/sites".to_string(),
+                "<!doctype html><body><script>const s = sessionStorage;\
+                 document.title = 'ready ' + s.site + typeof hidden + window.fromMain + ' ' + s.order\
+                 </script></body>"
+                    .to_string(),
+            ),
+            (
+                "/framed".to_string(),
+                "<!doctype html><body style='margin:0'>\
+                 <iframe srcdoc='<body>framed<script>1</script></body>'></iframe>\
+                 <script>document.title='ready'</script></body>"
+                    .to_string(),
+            ),
+            (
+                "/csp".to_string(),
+                "<!doctype html><meta http-equiv=Content-Security-Policy content=\"script-src 'none'\">\
+                 <title>ready</title><body>csp<script>window.pageRan = 1</script></body>"
+                    .to_string(),
+            ),
+        ]
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Evaluate `expression` until it is `wanted`, for five seconds, and say
+/// what it was last.
+fn wait_for_value(client: &mut Client, expression: &str, wanted: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = evaluate(client, expression)
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if now == wanted || Instant::now() >= deadline {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+const BODY_BACKGROUND: &str = "getComputedStyle(document.body).backgroundColor";
+const ALL_MARK: &str =
+    "getComputedStyle(document.documentElement).getPropertyValue('--blinkterm-all').trim()";
+
+/// A host's style is on that host's pages from document start, through a
+/// navigation and a reload, and not on another; `all` is on every page, a
+/// `data:` one included. What the page can see of it is
+/// `adoptedStyleSheets`, and nothing else.
+#[test]
+fn a_site_style_changes_its_host_on_load_and_after_a_navigation_and_leaves_another_host_alone() {
+    let dir = site_files(
+        "sites-style",
+        &[
+            ("127.0.0.1.css", "body{background:rgb(1,2,3)!important}"),
+            ("all.css", "html{--blinkterm-all:1}"),
+        ],
+    );
+    let sites = Sites::read(&dir);
+    assert_eq!(sites.styles().len(), 2, "{:?}", sites.skipped);
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let identifiers = told_sites(&mut client, &sites);
+    assert_eq!(identifiers.len(), 1, "every style in one registration");
+    let base = serve_site_pages();
+
+    go_to(&mut client, &format!("{base}/plain"));
+    let check_host = |client: &mut Client, when: &str| {
+        assert_eq!(
+            evaluate(client, BODY_BACKGROUND).as_str(),
+            Some("rgb(1, 2, 3)"),
+            "{when}"
+        );
+        assert_eq!(evaluate(client, ALL_MARK).as_str(), Some("1"), "{when}");
+        assert_eq!(
+            evaluate(client, "document.adoptedStyleSheets.length").as_f64(),
+            Some(2.0),
+            "{when}"
+        );
+        assert_eq!(
+            evaluate(client, "document.styleSheets.length").as_f64(),
+            Some(0.0),
+            "{when}: nothing in the page's own sheets"
+        );
+        assert_eq!(
+            evaluate(client, "typeof __blinktermSiteSheets").as_str(),
+            Some("undefined"),
+            "{when}: nothing on the page's window"
+        );
+    };
+    check_host(&mut client, "on load");
+    go_to(&mut client, &format!("{base}/again"));
+    check_host(&mut client, "after a navigation");
+    evaluate(&mut client, "document.title='leaving'");
+    client
+        .call("Page.reload", Json::empty())
+        .expect("the page reloads");
+    assert_eq!(
+        wait_for_title(&mut client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+    check_host(&mut client, "after a reload");
+
+    go_to(
+        &mut client,
+        "data:text/html,<body><script>document.title='ready'</script></body>",
+    );
+    assert_eq!(
+        evaluate(&mut client, BODY_BACKGROUND).as_str(),
+        Some("rgba(0, 0, 0, 0)"),
+        "another host is left alone"
+    );
+    assert_eq!(
+        evaluate(&mut client, ALL_MARK).as_str(),
+        Some("1"),
+        "all is every page"
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(1.0)
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// A script runs before the page's own first script, in a world the page
+/// cannot see into — unless the file asked for the page's — in the order
+/// the files are ranked; and the page's CSP does not stop one in the page's
+/// world.
+///
+/// What the scripts leave for the page is in `sessionStorage`, which both
+/// worlds share, and not on `document.documentElement`: at the start of a
+/// document after the first there is no `<html>` yet, and a script that
+/// reaches for it throws. (The first document of a new session is the
+/// exception, because its context is made late; a test that used the
+/// element passed on the first page and failed on every one after it.)
+#[test]
+fn a_site_script_runs_at_document_start_in_a_world_the_page_cannot_see_unless_it_asked_for_the_page_s(
+) {
+    let dir = site_files(
+        "sites-script",
+        &[
+            (
+                "all.js",
+                "sessionStorage.site = 'yes'; sessionStorage.order = 'a'; globalThis.hidden = 1",
+            ),
+            ("*.0.0.1.js", "sessionStorage.order += 'b'"),
+            (
+                "127.0.0.1.js",
+                "// @world main\nwindow.fromMain = 2;\nsessionStorage.order += 'c'",
+            ),
+            ("example.com.js", "window.notHere = 1"),
+            ("example.org.js", "window.notHere = 1"),
+        ],
+    );
+    let sites = Sites::read(&dir);
+    assert_eq!(sites.scripts().len(), 5, "{:?}", sites.skipped);
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let started = Instant::now();
+    let identifiers = told_sites(&mut client, &sites);
+    eprintln!(
+        "{} registrations, and the session's setup, in {:?}",
+        identifiers.len(),
+        started.elapsed()
+    );
+    assert_eq!(identifiers.len(), 5);
+    let again = Instant::now();
+    let more = sites::install(&mut client, &sites, false);
+    eprintln!("five scripts registered alone: {:?}", again.elapsed());
+    sites::remove(&mut client, &more);
+    let base = serve_site_pages();
+
+    evaluate(&mut client, "document.title='leaving'");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(format!("{base}/sites")))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(&mut client, "ready ", Duration::from_secs(10)),
+        "ready yesundefined2 abc",
+        "at document start, isolated unless asked, in rank order"
+    );
+    go_to(&mut client, &format!("{base}/plain"));
+    assert_eq!(
+        evaluate(&mut client, "sessionStorage.order + window.fromMain").as_str(),
+        Some("abc2"),
+        "and on the next document"
+    );
+    assert_eq!(
+        evaluate(&mut client, "typeof notHere").as_str(),
+        Some("undefined")
+    );
+
+    go_to(&mut client, &format!("{base}/csp"));
+    assert_eq!(
+        evaluate(&mut client, "typeof pageRan").as_str(),
+        Some("undefined"),
+        "the page's own script was refused"
+    );
+    let under_csp = evaluate(&mut client, "window.fromMain");
+    eprintln!("a main-world site script under script-src 'none': fromMain = {under_csp}");
+    assert_eq!(under_csp.as_f64(), Some(2.0));
+
+    client.close();
+    engine.kill();
+}
+
+/// `reload-sites`, as the program does it: the old registrations taken back,
+/// the new ones made without running the scripts. The style changes on the
+/// document where it stands, one sheet and not two; the old script never
+/// runs again, and the new one runs from the next load.
+#[test]
+fn reload_sites_replaces_the_styles_where_the_page_stands_and_the_old_script_never_runs_again() {
+    const VERSION: &str = "sessionStorage.v = (sessionStorage.v || '') + ";
+    let dir = site_files(
+        "sites-reload",
+        &[
+            ("127.0.0.1.css", "body{background:rgb(255,0,0)!important}"),
+            ("127.0.0.1.js", &format!("{VERSION}'1'")),
+        ],
+    );
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let old = told_sites(&mut client, &Sites::read(&dir));
+    assert_eq!(old.len(), 2);
+    let base = serve_site_pages();
+    go_to(&mut client, &format!("{base}/plain"));
+    assert_eq!(
+        evaluate(&mut client, BODY_BACKGROUND).as_str(),
+        Some("rgb(255, 0, 0)")
+    );
+    assert_eq!(
+        evaluate(&mut client, "sessionStorage.v").as_str(),
+        Some("1")
+    );
+    evaluate(&mut client, "window.kept = 1");
+
+    write_site_files(
+        &dir,
+        &[
+            ("127.0.0.1.css", "body{background:rgb(0,0,255)!important}"),
+            ("127.0.0.1.js", &format!("{VERSION}'2'")),
+        ],
+    );
+    let sites = Sites::read(&dir);
+    let started = Instant::now();
+    sites::remove(&mut client, &old);
+    let new = sites::install(&mut client, &sites, false);
+    assert_eq!(new.len(), sites.params(false).len());
+    let blue = wait_for_value(&mut client, BODY_BACKGROUND, "rgb(0, 0, 255)");
+    eprintln!("the new style in place after {:?}", started.elapsed());
+    assert_eq!(blue, "rgb(0, 0, 255)", "in place");
+    assert_eq!(
+        evaluate(&mut client, "window.kept").as_f64(),
+        Some(1.0),
+        "the same document"
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(1.0),
+        "replaced, not added to"
+    );
+    assert_eq!(
+        evaluate(&mut client, "sessionStorage.v").as_str(),
+        Some("1"),
+        "the new script waits for the next document"
+    );
+
+    go_to(&mut client, &format!("{base}/plain"));
+    assert_eq!(
+        evaluate(&mut client, "sessionStorage.v").as_str(),
+        Some("12"),
+        "the new script, and the old one never again"
+    );
+    assert_eq!(
+        evaluate(&mut client, BODY_BACKGROUND).as_str(),
+        Some("rgb(0, 0, 255)")
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// A same-process iframe is a frame of the same target, so the style
+/// reaches it; and a `srcdoc` frame, whose own `location` has no host, is
+/// matched by the host of the page it inherited its base url from.
+#[test]
+fn a_site_style_reaches_a_same_process_iframe_of_the_page() {
+    let dir = site_files(
+        "sites-frame",
+        &[
+            ("all.css", "body{background:rgb(4,5,6)!important}"),
+            ("127.0.0.1.css", "body{color:rgb(7,8,9)!important}"),
+        ],
+    );
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    told_sites(&mut client, &Sites::read(&dir));
+    let base = serve_site_pages();
+
+    let inside = |what: &str| {
+        format!(
+            "(() => {{ const d = document.querySelector('iframe').contentDocument; \
+             return d && d.body ? getComputedStyle(d.body).{what} : ''; }})()"
+        )
+    };
+    go_to(&mut client, &format!("{base}/framed"));
+    assert_eq!(
+        wait_for_value(&mut client, &inside("backgroundColor"), "rgb(4, 5, 6)"),
+        "rgb(4, 5, 6)",
+        "all, in the iframe"
+    );
+    let color = wait_for_value(&mut client, &inside("color"), "rgb(7, 8, 9)");
+    eprintln!("a srcdoc iframe of 127.0.0.1, its colour: {color}");
+    assert_eq!(color, "rgb(7, 8, 9)", "the parent's host, by its base url");
+
+    go_to(&mut client, &framed(true));
+    assert_eq!(
+        wait_for_value(&mut client, &inside("backgroundColor"), "rgb(4, 5, 6)"),
+        "rgb(4, 5, 6)",
+        "a data: page's iframe too"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// One registration per script file, so a file that does not parse is that
+/// file's problem and nobody else's.
+#[test]
+fn a_syntax_error_in_one_site_script_does_not_stop_the_others() {
+    let dir = site_files(
+        "sites-syntax",
+        &[
+            ("all.js", "this is not js"),
+            ("127.0.0.1.js", "sessionStorage.ok = '1'"),
+        ],
+    );
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let identifiers = told_sites(&mut client, &Sites::read(&dir));
+    eprintln!(
+        "registrations accepted, one of them not JavaScript: {}",
+        identifiers.len()
+    );
+    let base = serve_site_pages();
+    go_to(&mut client, &format!("{base}/plain"));
+    assert_eq!(
+        evaluate(&mut client, "sessionStorage.ok").as_str(),
+        Some("1")
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// What a large style costs every document, on a page it fits and on one it
+/// does not — the table is carried into both: measured, not asserted. The
+/// page's own clock, from the start of the navigation to its
+/// `domInteractive`, averaged over five loads.
+#[test]
+fn a_large_site_style_is_measured_at_document_start() {
+    let rules: String = (0..8000)
+        .map(|i| format!(".rule-{i} {{ color: red; }}\n"))
+        .collect();
+    let fits = site_files("sites-large", &[("all.css", &rules)]);
+    let elsewhere = site_files("sites-large-elsewhere", &[("example.com.css", &rules)]);
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    let base = serve_site_pages();
+    let url = format!("{base}/plain");
+    let loads = |client: &mut Client| {
+        go_to(client, &url);
+        let mut total = 0.0;
+        for _ in 0..5 {
+            go_to(client, &url);
+            total += evaluate(
+                client,
+                "performance.getEntriesByType('navigation')[0].domInteractive",
+            )
+            .as_f64()
+            .unwrap_or(f64::NAN);
+        }
+        total / 5.0
+    };
+    let bare = loads(&mut client);
+    let registered = sites::install(&mut client, &Sites::read(&elsewhere), true);
+    let other_host = loads(&mut client);
+    sites::remove(&mut client, &registered);
+    sites::install(&mut client, &Sites::read(&fits), true);
+    let this_host = loads(&mut client);
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(1.0)
+    );
+    eprintln!(
+        "{} bytes of css; to domInteractive: {bare:.1} ms bare, {other_host:.1} ms carried \
+         to a page it does not fit, {this_host:.1} ms adopted",
+        rules.len()
+    );
+
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Reader mode: the article alone, in a frame of its own in the page.
+// ---------------------------------------------------------------------------
+
+use blinkterm::reader::{self, Answered};
+
+/// A page with an article in the middle of what a page mostly is: a nav of
+/// twelve links, a sidebar of six, a footer of links, and a fixed cookie
+/// box. The article has a title, a byline, eight paragraphs with `quokka`
+/// once, a picture and a relative link; the footer has `quokka` too, which
+/// must not be found once the reader is on.
+fn reader_page() -> String {
+    let nav: String = (0..12)
+        .map(|i| format!("<a href='/n{i}'>Section {i}</a> "))
+        .collect();
+    let side: String = (0..6)
+        .map(|i| format!("<li><a href='/s{i}'>Related story number {i}</a></li>"))
+        .collect();
+    let paragraphs: String = (0..8)
+        .map(|i| {
+            let animal = if i == 3 { "a quokka" } else { "an animal" };
+            format!(
+                "<p>Paragraph {i} of the article, about {animal}, written at length so that \
+                 it reads as prose, with commas, clauses, and a full stop.</p>"
+            )
+        })
+        .collect();
+    format!(
+        "<!doctype html><meta charset=utf-8><title>loading</title>\
+         <body style='margin:8px;font:16px sans-serif;background:#fff'>\
+         <nav id=nav>{nav}</nav>\
+         <aside class=sidebar><ul>{side}</ul></aside>\
+         <article><h1>The article</h1><p class=byline>By Someone</p>\
+         {paragraphs}\
+         <img src=/pic.png alt=pic width=40 height=30>\
+         <a id=more href=/more>more</a></article>\
+         <footer><a href='/about'>About</a> <a href='/terms'>Terms</a> \
+         <p>A footer line that mentions the quokka again, with a link or two.</p></footer>\
+         <div id=cookie style='position:fixed;left:0;bottom:0;width:100%;background:#ccc'>cookies</div>\
+         <div style='height:2000px'></div>\
+         <script>onload=function(){{document.title='ready'}}</script></body>"
+    )
+}
+
+/// A page with nothing to read: a nav and a login form.
+fn nothing_page() -> String {
+    "<!doctype html><meta charset=utf-8><title>loading</title><body>\
+     <nav><a href=/a>Home</a> <a href=/b>About</a></nav>\
+     <form><input name=user><input type=password><button>Sign in</button></form>\
+     <script>onload=function(){document.title='ready'}</script></body>"
+        .to_string()
+}
+
+/// The reader's pages, served, and an engine on one of them with the shared
+/// world made in it, and the port they are served on.
+fn reading(path: &str) -> Option<(Engine, Client, i64, u16)> {
+    let port = serve_pages(|_| {
+        vec![
+            ("/".to_string(), reader_page()),
+            ("/none".to_string(), nothing_page()),
+            ("/more".to_string(), "<title>more</title>".to_string()),
+        ]
+    });
+    let (engine, client, context) = finding(&format!("http://localhost:{port}{path}"), "ready")?;
+    Some((engine, client, context, port))
+}
+
+/// The toggle, as the program sends it, waited for.
+fn toggle(client: &mut Client, context: i64, on: bool, alpha: bool) -> Option<Answered> {
+    let reply = client
+        .call_within(
+            "Runtime.callFunctionOn",
+            reader::call_params(context, on, alpha),
+            Duration::from_secs(5),
+        )
+        .expect("the page answers the reader");
+    reader::answered(&reply)
+}
+
+/// Something about the reader's own document, `d`, asked in the page.
+fn in_reader(client: &mut Client, expression: &str) -> Json {
+    evaluate(
+        client,
+        &format!(
+            "(function(){{var d=document.getElementById('{}').contentDocument;return {expression};}})()",
+            reader::FRAME_ID
+        ),
+    )
+}
+
+/// A list of numbers the page answered.
+fn numbers(json: &Json) -> Vec<f64> {
+    json.as_array()
+        .map(|all| all.iter().filter_map(Json::as_f64).collect())
+        .unwrap_or_default()
+}
+
+/// On: the article is in the frame, cleaned, its urls absolute, and
+/// everything else hidden, the page at the top. On again changes nothing.
+/// Off: the page exactly as it was, at the same place. A wheel over the
+/// frame moves the page, and a reload is the page without it.
+#[test]
+fn reader_mode_keeps_the_article_hides_the_rest_and_comes_off_leaving_the_page_as_it_was() {
+    let Some((mut engine, mut client, context, port)) = reading("/") else {
+        return;
+    };
+    evaluate(&mut client, "scrollTo(0, 300)");
+    assert_eq!(scroll_y(&mut client), 300.0);
+    let sheets = evaluate(&mut client, "document.adoptedStyleSheets.length")
+        .as_f64()
+        .expect("a count");
+
+    let started = Instant::now();
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::On)
+    );
+    eprintln!("reader on: {:?}", started.elapsed());
+    assert_eq!(
+        evaluate(&mut client, "!!document.getElementById('blinkterm-reader')").as_bool(),
+        Some(true)
+    );
+    for hidden in ["nav", "cookie"] {
+        assert_eq!(
+            evaluate(
+                &mut client,
+                &format!("getComputedStyle(document.getElementById('{hidden}')).display")
+            )
+            .as_str(),
+            Some("none"),
+            "{hidden} is hidden"
+        );
+    }
+    assert_eq!(
+        evaluate(&mut client, "typeof __blinktermReader").as_str(),
+        Some("undefined"),
+        "the page does not see the script's state"
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(sheets + 1.0)
+    );
+    assert_eq!(scroll_y(&mut client), 0.0, "the article from its top");
+
+    assert_eq!(
+        in_reader(&mut client, "d.querySelectorAll('p').length").as_f64(),
+        Some(9.0),
+        "eight paragraphs and the line under the title; the byline is not repeated"
+    );
+    assert_eq!(
+        in_reader(&mut client, "d.querySelector('.meta').textContent").as_str(),
+        Some("By Someone")
+    );
+    assert_eq!(
+        in_reader(
+            &mut client,
+            "d.querySelectorAll('nav, footer, aside').length"
+        )
+        .as_f64(),
+        Some(0.0)
+    );
+    assert_eq!(
+        in_reader(
+            &mut client,
+            "d.querySelectorAll('h1').length + ':' + d.querySelector('h1').textContent"
+        )
+        .as_str(),
+        Some("1:The article"),
+        "the title, once"
+    );
+    assert_eq!(
+        in_reader(
+            &mut client,
+            "d.querySelector('a[href]').getAttribute('href')"
+        )
+        .as_str(),
+        Some(format!("http://localhost:{port}/more").as_str()),
+        "a link made absolute"
+    );
+    assert_eq!(
+        in_reader(&mut client, "d.querySelector('img').getAttribute('src')").as_str(),
+        Some(format!("http://localhost:{port}/pic.png").as_str())
+    );
+    assert_eq!(
+        in_reader(&mut client, "d.querySelector('base').target").as_str(),
+        Some("_top")
+    );
+    assert_eq!(
+        in_reader(
+            &mut client,
+            "d.body.querySelectorAll('[style], [class]:not(.meta), [id]').length"
+        )
+        .as_f64(),
+        Some(0.0),
+        "no attribute but the ones that mean something"
+    );
+    let heights = numbers(&evaluate(
+        &mut client,
+        "(function(){var f=document.getElementById('blinkterm-reader');\
+         return [f.getBoundingClientRect().height, f.contentDocument.documentElement.scrollHeight]})()",
+    ));
+    eprintln!(
+        "frame {} tall for a document {} tall",
+        heights[0], heights[1]
+    );
+    assert!(
+        heights[0] >= heights[1] && heights[0] > HEIGHT as f64,
+        "{heights:?}"
+    );
+
+    // What the frame holds growing — an image arriving late — grows the
+    // frame, through the observer on its body.
+    let tall = |client: &mut Client| {
+        evaluate(
+            client,
+            "document.getElementById('blinkterm-reader').getBoundingClientRect().height",
+        )
+        .as_f64()
+        .unwrap_or_default()
+    };
+    let before = tall(&mut client);
+    in_reader(
+        &mut client,
+        "d.querySelector('article').appendChild(d.createElement('div')).style.height='500px'",
+    );
+    assert!(
+        wait_until(&mut client, true, |client| tall(client) > before + 400.0),
+        "the frame follows what it holds: {before} then {}",
+        tall(&mut client)
+    );
+
+    // A wheel over the frame moves the page: the frame's own document does
+    // not scroll, and the page is as tall as the article.
+    client
+        .call(
+            "Input.dispatchMouseEvent",
+            Json::object(vec![
+                ("type", Json::string("mouseWheel")),
+                ("x", Json::number(WIDTH / 2)),
+                ("y", Json::number(HEIGHT / 2)),
+                ("deltaX", Json::number(0)),
+                ("deltaY", Json::number(200)),
+            ]),
+        )
+        .expect("the wheel is dispatched");
+    let moved = wait_until(&mut client, true, |client| scroll_y(client) > 0.0);
+    eprintln!(
+        "a wheel over the frame: the page at {}",
+        scroll_y(&mut client)
+    );
+    assert!(moved, "a wheel over the reader scrolls the page");
+
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::On),
+        "on again is on"
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.querySelectorAll('iframe').length").as_f64(),
+        Some(1.0),
+        "and adds nothing"
+    );
+
+    let started = Instant::now();
+    assert_eq!(
+        toggle(&mut client, context, false, false),
+        Some(Answered::Off)
+    );
+    eprintln!("reader off: {:?}", started.elapsed());
+    assert_eq!(
+        evaluate(&mut client, "!!document.getElementById('blinkterm-reader')").as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length").as_f64(),
+        Some(sheets)
+    );
+    assert_eq!(
+        evaluate(
+            &mut client,
+            "getComputedStyle(document.getElementById('nav')).display"
+        )
+        .as_str(),
+        Some("block")
+    );
+    assert_eq!(scroll_y(&mut client), 300.0, "back where the page was");
+    assert_eq!(
+        toggle(&mut client, context, false, false),
+        Some(Answered::Off),
+        "off again is off"
+    );
+
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::On)
+    );
+    evaluate(&mut client, "document.title='leaving'");
+    client
+        .call("Page.reload", Json::empty())
+        .expect("the page reloads");
+    assert_eq!(
+        wait_for_title(&mut client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+    assert_eq!(
+        evaluate(&mut client, "!!document.getElementById('blinkterm-reader')").as_bool(),
+        Some(false),
+        "a reload is the page without the reader"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// A login page: nothing to read, nothing changed, and the row's sentence.
+#[test]
+fn a_page_with_no_article_is_left_alone_and_the_reader_says_so() {
+    let Some((mut engine, mut client, context, _)) = reading("/none") else {
+        return;
+    };
+    let sheets = evaluate(&mut client, "document.adoptedStyleSheets.length");
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::Nothing)
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.querySelectorAll('iframe').length").as_f64(),
+        Some(0.0)
+    );
+    assert_eq!(
+        evaluate(&mut client, "document.adoptedStyleSheets.length"),
+        sheets
+    );
+    assert_eq!(reader::NOTHING, "no article on this page");
+
+    client.close();
+    engine.kill();
+}
+
+/// Find, and the hover, reach into the reader's frame as they reach into
+/// any same-origin frame: the article's `quokka` is found and the hidden
+/// footer's is not, and the link under the pointer is the absolute one.
+#[test]
+fn the_reader_document_is_searched_by_find_and_its_links_are_hovered_and_resolved() {
+    let Some((mut engine, mut client, context, port)) = reading("/") else {
+        return;
+    };
+    assert_eq!(search(&mut client, context, "quokka", 0).count, 2);
+    search(&mut client, context, "", 0);
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::On)
+    );
+    assert_eq!(
+        search(&mut client, context, "quokka", 0).count,
+        1,
+        "the article's, and not the footer's, which is hidden"
+    );
+    search(&mut client, context, "", 0);
+
+    let centre = numbers(&evaluate(
+        &mut client,
+        "(function(){var f=document.getElementById('blinkterm-reader');\
+         var a=f.contentDocument.querySelector('a[href]');a.scrollIntoView({block:'center'});\
+         var o=f.getBoundingClientRect(),r=a.getBoundingClientRect();\
+         return [o.left+r.left+r.width/2, o.top+r.top+r.height/2]})()",
+    ));
+    let (hover, _) = hover_at(&mut client, centre[0] as i32, centre[1] as i32);
+    assert_eq!(hover.href, format!("http://localhost:{port}/more"));
+    assert_eq!(hover.shape, hover::Shape::Pointer, "a hand");
+
+    // Followed, the link loads in the tab, not in the frame; and back is the
+    // page as it loads, without the reader.
+    in_reader(&mut client, "d.querySelector('a[href]').click()");
+    assert_eq!(
+        wait_for_title(&mut client, "more", Duration::from_secs(10)),
+        "more"
+    );
+    let history = client
+        .call("Page.getNavigationHistory", Json::empty())
+        .expect("the history");
+    let current = history
+        .get("currentIndex")
+        .and_then(Json::as_i64)
+        .expect("an index") as usize;
+    let back = history
+        .get("entries")
+        .and_then(Json::as_array)
+        .and_then(|entries| entries.get(current.checked_sub(1)?))
+        .and_then(|entry| entry.get("id"))
+        .and_then(Json::as_i64)
+        .expect("an entry before");
+    client
+        .call(
+            "Page.navigateToHistoryEntry",
+            Json::object(vec![("entryId", Json::number(back as f64))]),
+        )
+        .expect("back");
+    assert_eq!(
+        wait_for_title(&mut client, "ready", Duration::from_secs(10)),
+        "ready"
+    );
+    assert_eq!(
+        evaluate(
+            &mut client,
+            "document.querySelectorAll('iframe').length + document.adoptedStyleSheets.length"
+        )
+        .as_f64(),
+        Some(0.0),
+        "the page came back without the reader"
+    );
+
+    client.close();
+    engine.kill();
+}
+
+/// The reader takes the page's scheme: light by default, dark when the page
+/// is told dark; and under `--alpha` it paints no background in either.
+#[test]
+fn the_reader_is_dark_when_the_page_is_told_dark_and_light_otherwise() {
+    let Some((mut engine, mut client, context, _)) = reading("/") else {
+        return;
+    };
+    assert_eq!(
+        toggle(&mut client, context, true, false),
+        Some(Answered::On)
+    );
+    let light = corner_luminance(&mut client);
+    eprintln!("the reader, light: {light}");
+    assert!(light > 0.9, "{light}");
+
+    client
+        .call(
+            "Emulation.setEmulatedMedia",
+            blinkterm::appearance::media_params(blinkterm::appearance::Scheme::Dark),
+        )
+        .expect("the scheme is told");
+    assert!(prefers_dark(&mut client));
+    let dark = wait_until(&mut client, true, |client| corner_luminance(client) < 0.184);
+    eprintln!("the reader, dark: {}", corner_luminance(&mut client));
+    assert!(dark, "the reader follows the page's scheme");
+
+    assert_eq!(
+        toggle(&mut client, context, false, false),
+        Some(Answered::Off)
+    );
+    transparent(&mut client, false);
+    assert_eq!(toggle(&mut client, context, true, true), Some(Answered::On));
+    let corner = |client: &mut Client| {
+        let (rgba, width, _) = still(client);
+        rgba[(5 * width as usize + 5) * 4 + 3]
+    };
+    assert_eq!(wait_until(&mut client, 0, corner), 0, "see-through, dark");
+    client
+        .call(
+            "Emulation.setEmulatedMedia",
+            blinkterm::appearance::media_params(blinkterm::appearance::Scheme::Light),
+        )
+        .expect("the scheme is told");
+    assert_eq!(wait_until(&mut client, 0, corner), 0, "and light");
+
+    client.close();
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// The console
+// ---------------------------------------------------------------------------
+//
+// What `ctrl+shift+j` shows, recorded the way the program records it: a
+// `console::Recorder` in front of the routing on the pipe's reader thread,
+// and `Runtime.enable` and `Log.enable` on the page's session, as
+// `app::prepare_session` sends them.
+
+use blinkterm::console::{self as page_console, Level, Recorder, Source};
+
+/// The console's hook on this engine and its two domains on this page's
+/// session, as the program has them; the recorder, to read back.
+fn consoled(engine: &Engine, client: &mut Client) -> Arc<Recorder> {
+    let recorder = Arc::new(Recorder::new());
+    engine.intercept(Some(
+        Arc::clone(&recorder) as Arc<dyn blinkterm::cdp::Intercept>
+    ));
+    for method in ["Page.enable", "Runtime.enable", "Log.enable"] {
+        client.call(method, Json::empty()).expect(method);
+    }
+    // What the engine's own first page said, replayed by the enable, as
+    // `app::boot` forgets it.
+    recorder.forget(client.session().expect("a page's session"));
+    recorder
+}
+
+/// The entries on `session` once `count` of them are there, or whatever is
+/// there when `timeout` runs out.
+fn entries_when(
+    recorder: &Recorder,
+    session: &str,
+    count: usize,
+    timeout: Duration,
+) -> Vec<page_console::Entry> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let entries = recorder.entries(session);
+        if entries.len() >= count || Instant::now() >= deadline {
+            return entries;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The methods the console's domains send, none of which a mailbox should
+/// ever hold.
+const CONSOLE_EVENTS: [&str; 5] = [
+    "Runtime.consoleAPICalled",
+    "Runtime.exceptionThrown",
+    "Log.entryAdded",
+    "Runtime.executionContextCreated",
+    "Runtime.executionContextDestroyed",
+];
+
+/// A page that says something in each of the ways a console hears: a
+/// `console.log` of a string, a number and an object, an exception nobody
+/// caught, an image the server answers 404 for and an image on a port
+/// nobody listens on. One entry each, and none of it in the page's mailbox.
+#[test]
+fn a_page_that_logs_throws_and_404s_an_image_fills_the_console_with_one_entry_each() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let recorder = consoled(&engine, &mut client);
+    let session = client.session().expect("a page's session").to_string();
+    viewport(&mut client);
+    let (base, closed) = serve_troubles();
+    let broken = format!("{base}/404");
+    let refused = format!("http://127.0.0.1:{closed}/x.png");
+    let page = format!("{base}/console");
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(&page))]),
+        )
+        .expect("the page loads");
+    assert_eq!(
+        wait_for_title(&mut client, "done", Duration::from_secs(10)),
+        "done"
+    );
+    let entries = entries_when(&recorder, &session, 4, Duration::from_secs(3));
+    // Anything late would have come by now.
+    std::thread::sleep(Duration::from_millis(300));
+    let entries = if entries.len() < recorder.entries(&session).len() {
+        recorder.entries(&session)
+    } else {
+        entries
+    };
+    for entry in &entries {
+        eprintln!(
+            "{:?} {:?} {:?} {:?}",
+            entry.level, entry.source, entry.text, entry.place
+        );
+    }
+
+    let logged: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == Source::Console)
+        .collect();
+    assert_eq!(logged.len(), 1, "{entries:?}");
+    assert_eq!(logged[0].level, Level::Log);
+    assert_eq!(logged[0].text, "hello 1 {a: 2}");
+    assert_eq!(logged[0].place, format!("{page}:1"));
+
+    let thrown: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == Source::Exception)
+        .collect();
+    assert_eq!(thrown.len(), 1, "{entries:?}");
+    assert_eq!(thrown[0].level, Level::Error);
+    assert!(
+        thrown[0].text.starts_with("Uncaught Error: boom"),
+        "{:?}",
+        thrown[0].text
+    );
+    assert_eq!(thrown[0].place, format!("{page}:1"));
+
+    let failed: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == Source::Network)
+        .collect();
+    let not_found: Vec<_> = failed
+        .iter()
+        .filter(|entry| entry.place == broken)
+        .collect();
+    assert_eq!(not_found.len(), 1, "{entries:?}");
+    assert_eq!(not_found[0].level, Level::Error);
+    assert!(not_found[0].text.contains("404"), "{:?}", not_found[0].text);
+    let refusal: Vec<_> = failed
+        .iter()
+        .filter(|entry| entry.place == refused)
+        .collect();
+    assert_eq!(refusal.len(), 1, "{entries:?}");
+    assert_eq!(refusal[0].level, Level::Error);
+    assert!(
+        refusal[0].text.contains("ERR_CONNECTION_REFUSED"),
+        "{:?}",
+        refusal[0].text
+    );
+    assert_eq!(
+        entries.len(),
+        4,
+        "one entry each and nothing twice: {entries:?}"
+    );
+
+    let heard: Vec<String> = client
+        .events()
+        .into_iter()
+        .map(|event| event.method)
+        .filter(|method| CONSOLE_EVENTS.contains(&method.as_str()))
+        .collect();
+    assert!(heard.is_empty(), "the mailbox heard {heard:?}");
+
+    assert_eq!(recorder.words(Some(&session)).as_deref(), Some("3 errors"));
+    recorder.opened(&session);
+    assert_eq!(recorder.words(Some(&session)), None);
+
+    // Told again, as a revived page or a colour re-learn tells it: nothing
+    // is reported twice.
+    for method in ["Runtime.enable", "Log.enable"] {
+        client.call(method, Json::empty()).expect(method);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(recorder.entries(&session).len(), entries.len());
+    client.close();
+    engine.kill();
+}
+
+/// Two thousand lines logged by the document's own script, between its
+/// landing and its load: without the recorder they are two thousand events
+/// in a mailbox that keeps 512, and the landing would be the first to go.
+#[test]
+fn a_burst_of_two_thousand_logs_keeps_the_newest_thousand_and_loses_no_page_event() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let recorder = consoled(&engine, &mut client);
+    let session = client.session().expect("a page's session").to_string();
+    viewport(&mut client);
+    let mut tab = Tab::new("t", client, "about:blank");
+    let page = "data:text/html,<title>burst</title><script>\
+for(var i=0;i<2000;i++){console.log('line '+i)}</script>";
+    navigate_tab(&mut tab, page);
+    let landings = follow(&mut tab, Duration::from_secs(10));
+    assert!(!landings.is_empty(), "the landing came");
+    let entries = entries_when(
+        &recorder,
+        &session,
+        page_console::CAP,
+        Duration::from_secs(3),
+    );
+    assert_eq!(entries.len(), page_console::CAP);
+    assert_eq!(entries[0].text, "line 1000");
+    assert_eq!(
+        entries.last().map(|entry| entry.text.as_str()),
+        Some("line 1999")
+    );
+    tab.connection.close();
+    engine.kill();
+}
+
+/// Whether a page can tell its console is being listened to — the checks
+/// pages use to find an open DevTools: a getter that notes it was read, on
+/// an error's `stack` (a), an element's `id` and `className` (b), a plain
+/// accessor (c), a proxy's traps (d), `Symbol.toStringTag` (e), a regexp's
+/// `toString` (f), an object's `toString` and `valueOf` under `%s` and `%d`
+/// (g). Measured with the two domains off and on; what it finds is what
+/// `docs/design.md` says. The time is printed and not held to anything: it
+/// is the one difference, and it is noise-sized.
+#[test]
+fn no_getter_a_page_sets_tells_it_the_console_is_heard() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    let page = "data:text/html,<title>start</title><script>\
+var seen='';function mark(c){if(seen.indexOf(c)<0)seen+=c}\
+var e=new Error('x');\
+Object.defineProperty(e,'stack',{get:function(){mark('a');return 'x'}});\
+console.log(e);\
+var d=document.createElement('div');\
+Object.defineProperty(d,'id',{get:function(){mark('b');return 'x'}});\
+Object.defineProperty(d,'className',{get:function(){mark('b');return 'x'}});\
+console.log(d);\
+console.log({get x(){mark('c');return 1}});\
+console.log(new Proxy({},{get:function(){mark('d')},ownKeys:function(){mark('d');return []},\
+getOwnPropertyDescriptor:function(){mark('d')},getPrototypeOf:function(){mark('d');return null}}));\
+var t={};Object.defineProperty(t,Symbol.toStringTag,{get:function(){mark('e');return 'T'}});\
+console.log(t);\
+var r=/a/;r.toString=function(){mark('f');return ''};console.log(r);\
+var o={toString:function(){mark('g');return ''},valueOf:function(){mark('g');return 1}};\
+console.log(o);console.log('%s',o);console.log('%d',o);\
+var big=[];for(var i=0;i<1000;i++){big.push({i:i,s:'text',n:[1,2,3]})}\
+var t0=performance.now();for(var j=0;j<200;j++){console.log(big)}\
+var took=Math.round(performance.now()-t0);\
+setTimeout(function(){document.title='seen ['+seen+'] '+took+' ms'},200)</script>";
+    let look = |client: &mut Client| {
+        client
+            .call(
+                "Page.navigate",
+                Json::object(vec![("url", Json::string(page))]),
+            )
+            .expect("the page loads");
+        wait_for_title(client, "seen", Duration::from_secs(10))
+    };
+    let off = look(&mut client);
+    let recorder = Arc::new(Recorder::new());
+    engine.intercept(Some(
+        Arc::clone(&recorder) as Arc<dyn blinkterm::cdp::Intercept>
+    ));
+    for method in ["Runtime.enable", "Log.enable"] {
+        client.call(method, Json::empty()).expect(method);
+    }
+    let on = look(&mut client);
+    eprintln!("the console not heard: {off:?}; heard: {on:?}");
+    let marks = |title: &str| {
+        title
+            .split(['[', ']'])
+            .nth(1)
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("the page did not finish: {title:?}"))
+    };
+    // Blink's own formatting reads these whoever is listening.
+    assert_eq!(marks(&off), "efg");
+    assert_eq!(marks(&on), marks(&off), "a getter told the page");
+    client.close();
+    engine.kill();
+}
+
+/// A message from the page with an escape sequence, a bell and a direction
+/// override in it, through the recorder and the panel's rows into the
+/// compositor's own terminal: letters, and nothing a terminal would do.
+#[test]
+fn a_console_message_with_an_escape_sequence_cannot_reach_the_terminal() {
+    use blinkterm::screen::{self, ListItem};
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    let recorder = consoled(&engine, &mut client);
+    let session = client.session().expect("a page's session").to_string();
+    let page = "data:text/html,<title>start</title><script>\
+console.log(String.fromCharCode(27)+']0;pwned'+String.fromCharCode(7)\
++String.fromCharCode(0x202e)+'moc');document.title='done'</script>";
+    client
+        .call(
+            "Page.navigate",
+            Json::object(vec![("url", Json::string(page))]),
+        )
+        .expect("the page loads");
+    wait_for_title(&mut client, "done", Duration::from_secs(10));
+    let entries = entries_when(&recorder, &session, 1, Duration::from_secs(3));
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].text, "]0;pwnedmoc");
+    let items = [ListItem {
+        lead: entries[0].lead(),
+        title: &entries[0].text,
+        url: &entries[0].place,
+        picked: true,
+    }];
+    let rows = screen::list_rows(80, 2, 3, &items);
+    let text = a_terminal_reads_only_text_in_rows(&rows);
+    assert!(text.starts_with("  log  ]0;pwnedmoc"), "{text:?}");
+    client.close();
+    engine.kill();
+}
+
+/// [`a_terminal_reads_only_text_in`] for the rows under the status row: no
+/// title set, no question answered, and nothing below a space between the
+/// rows' own framing. Returns what the first of them reads as.
+fn a_terminal_reads_only_text_in_rows(rows: &[u8]) -> String {
+    let mut terminal = tos_term::Terminal::new(80, 24, tos_term::TerminalConfig::default());
+    terminal.advance(&blinkterm::screen::enter_sequence());
+    let _ = terminal.take_output();
+    terminal.advance(rows);
+    assert_eq!(
+        terminal.title(),
+        "",
+        "the rows set the window title: {rows:?}"
+    );
+    assert!(
+        terminal.take_output().is_empty(),
+        "the rows asked the terminal something: {rows:?}"
+    );
+    let mut body = String::from_utf8_lossy(rows)
+        .replace("\x1b[7m", "")
+        .replace("\x1b[0m", "");
+    for row in 1..=24 {
+        body = body.replace(&format!("\x1b[{row};1H\x1b[K"), "");
+    }
+    assert!(body.bytes().all(|b| b >= 0x20 && b != 0x7f), "{body:?}");
+    terminal.grid().row(1).to_text()
+}
+
+/// What recording the console costs a page, from its landing to its load:
+/// a page of links and a page that logs five hundred lines, with the two
+/// domains off and on, alternately, three times each. Printed, and held to
+/// no worse than twice as slow, which is loose on purpose: the assertion is
+/// that nobody would see it, and the numbers are for the docs.
+#[test]
+fn the_console_costs_a_heavy_page_nothing_a_person_can_see() {
+    if skip_timing_on_shared_runner("the_console_costs_a_heavy_page_nothing_a_person_can_see") {
+        return;
+    }
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    viewport(&mut client);
+    let recorder = Arc::new(Recorder::new());
+    engine.intercept(Some(
+        Arc::clone(&recorder) as Arc<dyn blinkterm::cdp::Intercept>
+    ));
+    let (base, _) = serve_troubles();
+    let links = format!("{base}/links");
+    let loud = "data:text/html,<title>loud</title><script>\
+for(var i=0;i<500;i++){console.log('line',i,{i:i,s:'some text'})}</script>";
+    let mut tab = Tab::new("t", client, "about:blank");
+    let mut times = [[Duration::MAX; 2]; 2];
+    for round in 0..6 {
+        let on = round % 2 == 1;
+        for method in if on {
+            ["Runtime.enable", "Log.enable"]
+        } else {
+            ["Runtime.disable", "Log.disable"]
+        } {
+            tab.connection.call(method, Json::empty()).expect(method);
+        }
+        for (which, url) in [links.as_str(), loud].into_iter().enumerate() {
+            let started = Instant::now();
+            navigate_tab(&mut tab, url);
+            follow(&mut tab, Duration::from_secs(10));
+            let took = started.elapsed();
+            let best = &mut times[which][usize::from(on)];
+            *best = (*best).min(took);
+        }
+    }
+    for (which, name) in ["links", "500 lines"].into_iter().enumerate() {
+        let [off, on] = times[which];
+        eprintln!("{name}: {off:?} with the console off, {on:?} with it on");
+        assert!(
+            on <= off * 2 + Duration::from_millis(20),
+            "{name}: {on:?} against {off:?}"
+        );
+    }
+    tab.connection.close();
+    engine.kill();
+}
+
+/// The console as `app::boot` installs it, beside the blocker: the engine's
+/// own first page leaves nothing behind (on a Mac it is a directory listing
+/// whose script throws, and the enable replays that), a page's requests the
+/// blocker fails are in the console as what they are, and the blocker's
+/// count is untouched by the hook in front of it.
+#[test]
+fn the_console_booted_beside_the_blocker_starts_empty_and_hears_what_was_blocked() {
+    if !engine_named() {
+        return;
+    }
+    let port = serve_pages(|port| {
+        let mut pages = vec![("/".to_string(), page_with_ads(port))];
+        pages.extend((0..6).map(|i| (format!("/s{i}.js"), "0;".to_string())));
+        pages
+    });
+    let page = format!("http://127.0.0.1:{port}/");
+    let mut hosts = std::collections::HashSet::new();
+    block::parse("0.0.0.0 ads.test\n", &mut hosts);
+    let blocker = Arc::new(Blocker::new(hosts, Vec::new()));
+    let recorder = Arc::new(Recorder::new());
+    let Booted {
+        mut engine,
+        browser,
+        mut tabs,
+        identity,
+    } = booted_with(Some(&blocker), Some(&recorder));
+    assert!(identity.console, "the sessions are told to report");
+    let first = tabs.active_mut().expect("the first tab");
+    let session = first.connection.session().expect("a page").to_string();
+    assert!(
+        recorder.entries(&session).is_empty(),
+        "the engine's own page: {:?}",
+        recorder.entries(&session)
+    );
+    assert_eq!(recorder.words(Some(&session)), None);
+
+    assert_eq!(
+        load_titled(&mut first.connection, &page, "done"),
+        "done ok=3 er=3"
+    );
+    assert_eq!(blocker.words(Some(&session)).as_deref(), Some("3 blocked"));
+    let entries = entries_when(&recorder, &session, 3, Duration::from_secs(3));
+    let blocked: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == Source::Network && entry.text.contains("BLOCKED_BY_CLIENT"))
+        .collect();
+    assert_eq!(blocked.len(), 3, "{entries:?}");
+    assert!(blocked.iter().all(|entry| entry.place.contains("ads.test")));
+    assert_eq!(recorder.words(Some(&session)).as_deref(), Some("3 errors"));
+    let heard: Vec<String> = first
+        .connection
+        .events()
+        .into_iter()
+        .map(|event| event.method)
+        .filter(|method| CONSOLE_EVENTS.contains(&method.as_str()))
+        .collect();
+    assert!(heard.is_empty(), "the mailbox heard {heard:?}");
+    drop(tabs);
+    drop(browser);
     engine.kill();
 }

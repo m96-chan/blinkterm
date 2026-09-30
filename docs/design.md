@@ -110,6 +110,18 @@ navigator.languages   ja-JP, ja, en
   are sent beside it. `navigator.userAgentData.brands` then comes back
   empty, since nothing this program could write there would match a string it
   did not write.
+- **The console is heard.** Every page's session has `Runtime` and `Log`
+  enabled, for [the console](features.md#the-console). That is how a
+  debugger listens, and a page looking for one cannot find it the usual
+  ways: measured on `chrome-headless-shell` 153, none of the getters pages
+  set to catch an open DevTools — on an error's `stack`, an element's `id`
+  or `className`, an accessor, a proxy's traps — is read with the console
+  heard or unheard, and the three that are read (`Symbol.toStringTag`, a
+  regexp's `toString`, an object's `toString` and `valueOf` under `%s` and
+  `%d`) are read either way, by Blink's own formatting. What does differ is
+  time: 200 `console.log`s of a 1000-object array took 36 ms unheard and
+  53 ms heard, which a page could measure. `console = false` (or
+  `--no-console`) leaves `Runtime` and `Log` off.
 
 Three things still say "headless", and nothing here changes them:
 `navigator.plugins` is empty, `window.chrome` is missing, and
@@ -123,3 +135,10 @@ does. It also costs five to six times the memory: 13 processes and 1.6 GB
 against the headless shell's 4 and 282 MB, measured on one page. That is why
 the headless shell stays first in the search. The measurements are in
 [#48](https://github.com/m96-chan/blinkterm/issues/48).
+
+What you add yourself is told as little. A site style (see
+[Site styles and scripts](features.md#site-styles-and-scripts)) is one entry
+more in `document.adoptedStyleSheets` per file that fits, and nothing in
+`document.styleSheets` or on `window`. A site script is invisible to the page
+— it runs in a world of its own that shares only the DOM — unless its first
+line asked for the page's world, and then it is the page's own code.

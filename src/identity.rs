@@ -73,6 +73,15 @@ pub struct Identity {
     /// string was not one this could read, in which case no hints are sent
     /// and only the string is overridden.
     pub chromium_major: Option<String>,
+    /// Whether the page's console is listened to: `Runtime.enable` and
+    /// `Log.enable` on every session, for [`crate::console`]. Here because
+    /// it is what a page is told too — `Runtime` is how a page can find out
+    /// it is heard, if only by the clock — and because this is what every
+    /// session's preparation is already handed. `false` from [`Identity::new`];
+    /// `app::boot` turns it on only when there is a recorder to take the
+    /// events, since a session with `Runtime` on and nothing taking them is
+    /// a mailbox full of console.
+    pub console: bool,
 }
 
 impl Identity {
@@ -89,6 +98,7 @@ impl Identity {
                 user_agent: agent.to_string(),
                 accept_language,
                 chromium_major: None,
+                console: false,
             };
         }
         let engine = engine_agent.unwrap_or_default();
@@ -104,7 +114,14 @@ impl Identity {
             user_agent,
             accept_language,
             chromium_major: major,
+            console: false,
         }
+    }
+
+    /// The same, with the console listened to or not. See
+    /// [`Identity::console`].
+    pub fn with_console(self, console: bool) -> Identity {
+        Identity { console, ..self }
     }
 
     /// The languages the person asked the engine for with an

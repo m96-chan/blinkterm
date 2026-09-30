@@ -577,7 +577,7 @@ pub fn too_much(what: &str) -> String {
 /// Why a program could not be started, for the row: what it is, the
 /// program's name, as plain text since it is the person's own words from a
 /// file, and the system's reason in a few of its own.
-fn cannot_start(what: &str, program: &str, error: &std::io::Error) -> String {
+pub(crate) fn cannot_start(what: &str, program: &str, error: &std::io::Error) -> String {
     let why = match error.kind() {
         std::io::ErrorKind::NotFound => "no such program".to_string(),
         kind => kind.to_string(),

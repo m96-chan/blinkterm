@@ -1173,15 +1173,16 @@ fn number_width(n: usize) -> usize {
     }
 }
 
-/// One row of a list over the screen: a tab as the tab list shows it, or a
-/// page visited as the history list does.
+/// One row of a list over the screen: a tab as the tab list shows it, a
+/// page visited as the history list does, or a line of the page's console.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListItem<'a> {
     /// What comes before the title: the tab's number and the `!` of one
     /// waiting on a dialog or a path, as the strip marks it (`9!`), or when a
     /// page was visited (`3 hours ago`). Text rather than a number because
-    /// it is the one part the two lists do not share. The history list pads
-    /// it so that the titles under each other start in one column.
+    /// it is the one part the lists do not share. The history list and the
+    /// console pad it so that the titles under each other start in one
+    /// column; the console's is the level, `error`, `warn`, `log`.
     pub lead: &'a str,
     pub title: &'a str,
     pub url: &'a str,
