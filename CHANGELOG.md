@@ -10,6 +10,16 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Added
+
+- `--alpha` (`alpha = true` in the config file) has the engine paint nothing
+  behind a page, so where a page has no background of its own the terminal's
+  shows through; a page with a background is unchanged. The frames while a
+  page moves are then PNG on every route, slower for the engine than JPEG,
+  and a page's default black text sits on the terminal's colour, so
+  `--force-dark` goes with it on a dark terminal
+  ([#79](https://github.com/m96-chan/blinkterm/issues/79)).
+
 ## [0.2.0] - 2026-09-30
 
 ### Added

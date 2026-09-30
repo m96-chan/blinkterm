@@ -84,6 +84,9 @@ three-eighths, of the pane until the link catches up, and the still of a
 page at rest is always full size. `--fps <n>` caps it (15 by default over
 ssh), and `--frames raw|png` overrides the choice.
 
+`--alpha` (see [Transparent pages](#transparent-pages)) makes the frames PNG
+on every route, locally too, since a JPEG cannot carry the transparency.
+
 ## Installing
 
 Rust 1.87 or newer; see [Checks](#checks):
@@ -385,10 +388,10 @@ The command line wins over the file, and `$BLINKTERM_ENGINE` sits between
 the two for `engine`. `--config <path>` reads another file, `--no-config`
 none. A line the program does not understand stops it with the file and
 line number; a missing file is nothing. A flag is `true` or `false`
-(`force-dark = true`), and a path may start with `~/`. There is no `url`
-setting: the page to open is what the command line is for, and
-`home = <url>` is the page opened when none is given. `normal-mode = true`
-starts in normal mode (`ctrl+.`), `restore = true`
+(`force-dark = true`, `alpha = true`), and a path may start with `~/`.
+There is no `url` setting: the page to open is what the command line is
+for, and `home = <url>` is the page opened when none is given.
+`normal-mode = true` starts in normal mode (`ctrl+.`), `restore = true`
 reopens the last session's tabs (see [The session](#the-session)), and
 `mute = true` (or `--mute`) starts the engine silent (see
 [Sound](#sound-permissions-and-fullscreen)). `tmux = on|off|auto`,
@@ -572,7 +575,7 @@ the pane's scale, as sharp as the page is on screen, and at most sixteen
 million pixels: a page taller than that is saved to that depth and the row
 says `saved …png, the top 12500 of 40000 px`. Neither touches the page —
 it stays where it was scrolled, at the size it was — and neither is opened
-afterwards.
+afterwards. Under `--alpha` the PNG is transparent wherever the page is.
 
 ## Uploading a file
 
@@ -869,6 +872,20 @@ calls it dark below mid-grey; a terminal that does not answer gets light. A
 page with no dark style stays white; `--force-dark` has the engine paint
 every page dark regardless, which is Chromium's auto dark mode and is off
 unless you ask.
+
+### Transparent pages
+
+`--alpha` (`alpha = true` in the file) has the engine paint nothing behind a
+page: where the page has no background of its own, the terminal's shows
+through — its colour, and its opacity or blur if it has them. A page that
+paints a background is unchanged. Two costs. The frames while a page moves
+are PNG rather than JPEG, because a JPEG would paint the transparent parts
+black, and the engine encodes PNG more slowly (on a slow machine, around 34
+frames a second where JPEG is near 60). And a page that says nothing about
+its colours is black text on your background, which on a dark terminal is
+unreadable: use `--force-dark` with it, which makes the text light and keeps
+the transparency, or a light terminal. There is no key to turn it off while
+running.
 
 ## The status row
 
