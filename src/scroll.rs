@@ -1148,7 +1148,13 @@ mod tests {
 
         let before = Instant::now();
         wheel.notch("t", recorder, (1, 1), (0.0, WHEEL_PIXELS));
-        std::thread::sleep(Duration::from_millis(60));
+        // Waited for rather than slept on: the first tick is due within a
+        // frame, but a shared CI VM can be descheduled for longer than that
+        // (#46), and this test is about what is claimed, not when.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while wheel.activity().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let at = wheel.activity().expect("something went out");
         assert!(at > before && at <= Instant::now());
 

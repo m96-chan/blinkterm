@@ -2598,13 +2598,17 @@ fn a_still_photographs_itself_into_the_screencast_exactly_once() {
     let Some((mut engine, mut client)) = connect() else {
         return;
     };
+    // How many frames a still provokes is the engine's behaviour; where
+    // they are stamped is a measurement of time, which the shared macOS VM
+    // cannot be trusted with (#46). There the count is still asserted.
+    let timed = !skip_timing_on_shared_runner("the shutter frame's stamp");
     for (requested, replied, stamps) in shutter_rounds(&mut client, 1.0) {
         assert_eq!(stamps.len(), 1, "a still provoked {} frames", stamps.len());
         // And it is stamped inside the still's own window, which is what
         // makes crediting the still with its reply enough to keep it off the
         // screen.
         assert!(
-            stamps[0] >= requested && stamps[0] <= replied,
+            !timed || (stamps[0] >= requested && stamps[0] <= replied),
             "the shutter frame is stamped outside the still it belongs to"
         );
     }
@@ -2621,6 +2625,9 @@ fn at_scale_two_a_still_photographs_itself_at_most_twice_and_within_its_window()
     let Some((mut engine, mut client)) = connect() else {
         return;
     };
+    // The count is the engine's; the window is time, skipped on the shared
+    // macOS VM (#46), where a frame was once stamped 184 ms late.
+    let timed = !skip_timing_on_shared_runner("the shutter frames' window");
     for (requested, replied, stamps) in shutter_rounds(&mut client, 2.0) {
         assert!(
             stamps.len() <= motion::SHUTTER_FRAMES as usize,
@@ -2630,7 +2637,7 @@ fn at_scale_two_a_still_photographs_itself_at_most_twice_and_within_its_window()
         let took = (replied - requested).max(motion::SHUTTER_GRACE.as_secs_f64());
         for stamp in stamps {
             assert!(
-                stamp >= requested && stamp <= replied + took,
+                !timed || (stamp >= requested && stamp <= replied + took),
                 "a shutter frame at {:+.0} ms, past the window",
                 (stamp - requested) * 1000.0
             );
