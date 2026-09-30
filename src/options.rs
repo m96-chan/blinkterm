@@ -105,6 +105,9 @@ pub struct Options {
     pub scheme: appearance::Choice,
     /// `--force-dark`: every page painted dark, dark style or none.
     pub force_dark: bool,
+    /// `--alpha`: the engine paints no default background, and the
+    /// terminal's shows through. See [`crate::appearance`].
+    pub alpha: bool,
     /// How the engine is started; see [`crate::engine::Launch`].
     pub engine: engine::Launch,
     /// `--restore`: reopen the last session's tabs at start. See
@@ -193,6 +196,7 @@ pub struct Settings {
     pub scale: Option<Scale>,
     pub scheme: Option<appearance::Choice>,
     pub force_dark: Option<bool>,
+    pub alpha: Option<bool>,
     pub engine: Option<PathBuf>,
     /// Appended across sources, never replaced.
     pub engine_args: Vec<String>,
@@ -253,6 +257,7 @@ impl Settings {
             scale: self.scale.or(under.scale),
             scheme: self.scheme.or(under.scheme),
             force_dark: self.force_dark.or(under.force_dark),
+            alpha: self.alpha.or(under.alpha),
             engine: self.engine.or(under.engine),
             engine_args,
             user_agent: self.user_agent.or(under.user_agent),
@@ -373,7 +378,7 @@ fn needed<'a>(value: &'a str, needed: &str) -> Result<&'a str, String> {
 /// thing twice was put together by something that meant two different
 /// things. `--profile` and `--temp-profile` together is the same refusal,
 /// since they are one setting with three values. The flags — `--force-dark`,
-/// `--temp-profile`, `--restore`, `--normal-mode` and the rest — take
+/// `--alpha`, `--temp-profile`, `--restore`, `--normal-mode` and the rest — take
 /// nothing after them, and `--force-dark=yes` is an unknown option.
 ///
 /// Every word that is not an option is a url, one tab each; `--` ends the
@@ -563,6 +568,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
                 "one profile at a time",
             )?,
             "--force-dark" => once(&mut s.force_dark, true, "--force-dark once is enough")?,
+            "--alpha" => once(&mut s.alpha, true, "--alpha once is enough")?,
             "--restore" => once(&mut s.restore, true, "--restore once is enough")?,
             "--mute" => once(&mut s.mute, true, "--mute once is enough")?,
             "--normal-mode" => once(&mut s.normal_mode, true, "--normal-mode once is enough")?,
@@ -648,7 +654,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 28] = [
+const KEYS: [&str; 29] = [
     "home",
     "profile",
     "temp-profile",
@@ -658,6 +664,7 @@ const KEYS: [&str; 28] = [
     "scale",
     "color-scheme",
     "force-dark",
+    "alpha",
     "engine",
     "engine-arg",
     "user-agent",
@@ -766,6 +773,7 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             "scale" => s.scale = Some(Scale::parse(value).map_err(at)?),
             "color-scheme" => s.scheme = Some(appearance::Choice::parse(value).map_err(at)?),
             "force-dark" => s.force_dark = Some(parse_bool(key, value).map_err(at)?),
+            "alpha" => s.alpha = Some(parse_bool(key, value).map_err(at)?),
             "engine" => s.engine = Some(PathBuf::from(value)),
             "engine-arg" => s
                 .engine_args
@@ -888,6 +896,7 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
         scale: s.scale.unwrap_or(Scale::Auto),
         scheme: s.scheme.unwrap_or_default(),
         force_dark: s.force_dark.unwrap_or(false),
+        alpha: s.alpha.unwrap_or(false),
         engine: engine::Launch {
             path: s.engine,
             args: s.engine_args,
@@ -1228,6 +1237,33 @@ mod tests {
         )
         .expect("folded");
         assert!(options.engine.mute, "the file's word reaches the launch");
+    }
+
+    #[test]
+    fn alpha_is_a_flag_with_nothing_after_it_and_a_file_boolean() {
+        let s = parsed(&["--alpha", "example.com"]).expect("a flag");
+        assert_eq!(s.alpha, Some(true));
+        assert_eq!(s.urls, ["example.com"], "what follows is the page");
+        let why = parsed(&["--alpha=yes"]).expect_err("refused");
+        assert!(why.contains("--alpha=yes"), "{why}");
+        assert_eq!(
+            parsed(&["--alpha", "--alpha"]),
+            Err("--alpha once is enough".to_string())
+        );
+        assert_eq!(file("alpha = true").map(|s| s.alpha), Ok(Some(true)));
+        assert_eq!(
+            file("alpha = loud"),
+            Err("/c:1: alpha is true or false, not \"loud\"".to_string())
+        );
+        let options = resolved(&[]).expect("the defaults");
+        assert!(!options.alpha, "the engine paints its white unless asked");
+        let options = resolve(
+            Settings::default(),
+            Settings::default(),
+            file("alpha = true").expect("a file"),
+        )
+        .expect("folded");
+        assert!(options.alpha, "the file's word reaches the options");
     }
 
     #[test]
@@ -2073,7 +2109,8 @@ mod tests {
         let from_file = file(
             "home = f.example\nprofile = /fp\ndownload-dir = /fd\nsearch-url = f%s\n\
              scale = 1\ncolor-scheme = light\nforce-dark = false\nengine = /fe\n\
-             user-agent = fa\nproxy = f:1\nrestore = false\nnormal-mode = false",
+             user-agent = fa\nproxy = f:1\nrestore = false\nnormal-mode = false\n\
+             alpha = false",
         )
         .expect("file");
         let cli = parsed(&[
@@ -2084,6 +2121,7 @@ mod tests {
             "--scale=2",
             "--color-scheme=dark",
             "--force-dark",
+            "--alpha",
             "--engine=/ce",
             "--user-agent=ca",
             "--proxy=c:1",
@@ -2099,6 +2137,7 @@ mod tests {
         assert_eq!(options.scale, Scale::Fixed(2.0));
         assert_eq!(options.scheme, appearance::Choice::Dark);
         assert!(options.force_dark);
+        assert!(options.alpha);
         assert_eq!(options.engine.path, Some(PathBuf::from("/ce")));
         assert_eq!(options.engine.user_agent.as_deref(), Some("ca"));
         assert_eq!(options.engine.proxy.as_deref(), Some("c:1"));
@@ -2108,13 +2147,15 @@ mod tests {
 
     #[test]
     fn the_file_fills_what_the_command_line_did_not_say() {
-        let from_file = file("scale = 2\ncolor-scheme = dark\nhome = h.example").expect("file");
+        let from_file =
+            file("scale = 2\ncolor-scheme = dark\nhome = h.example\nalpha = true").expect("file");
         let cli = parsed(&["--force-dark", "a.example"]).expect("cli");
         let options = resolve(cli, Settings::default(), from_file).expect("resolves");
         assert_eq!(options.scale, Scale::Fixed(2.0));
         assert_eq!(options.scheme, appearance::Choice::Dark);
         assert_eq!(options.home, "h.example");
         assert!(options.force_dark);
+        assert!(options.alpha);
         assert_eq!(options.urls, ["a.example"]);
     }
 

@@ -654,10 +654,11 @@ impl Chrome {
     }
 
     /// The route [`run`] chose for this run's frames: the painter that sends
-    /// them and the cast that asks for them. Once, before the first frame.
+    /// them and the cast that asks for them — PNG on every route under
+    /// `--alpha`. Once, before the first frame.
     fn take_route(&mut self, route: Route) {
         self.painter = Painter::with_route(route);
-        self.cast = motion::Cast::for_route(&route);
+        self.cast = motion::Cast::for_route(&route, self.appearance.alpha);
         self.throttle = motion::Throttle::default();
     }
 
@@ -1201,7 +1202,7 @@ pub fn run(options: Options) -> Result<(), String> {
     };
     // What pages are told about light and dark, before there is a page to
     // tell: the flags now, the terminal's answer when it comes.
-    let appearance = Appearance::new(options.scheme, options.force_dark);
+    let appearance = Appearance::new(options.scheme, options.force_dark, options.alpha);
     // Once for the run, and before the pane is taken, so that a directory
     // which is a file is a sentence in the shell. Every engine is told it.
     let downloads_dir = download::prepare(options.download.clone())?;
@@ -3824,16 +3825,26 @@ fn handle_page_events(
         if chrome.painter.route().payload == Payload::Png {
             return paint_png(pane, tabs, chrome, &frame);
         }
-        let jpeg = frame;
         // Ordered above, decoded here: a frame that lost to the still on
         // screen is eight milliseconds of work not done.
+        //
+        // A raw route's frame is JPEG, decoded to RGB — or, under `--alpha`,
+        // PNG decoded to RGBA, so the transparency the page left reaches the
+        // terminal while it moves as well as at rest. Either way it goes at
+        // the size it came, with no `zoom::fit`: a moving frame is the
+        // terminal's to scale.
         //
         // A frame that will not decode is dropped on the same rule as one that
         // would not base64: one of them is nothing. A run of them is a page
         // that looks frozen, which is what the engine test comparing the two
         // formats through both decoders exists to catch before a person meets
         // it.
-        if let Ok(image) = crate::jpeg::decode(&jpeg, FRAME_BUDGET) {
+        if chrome.cast.png {
+            if let Ok(image) = crate::png::decode(&frame, FRAME_BUDGET) {
+                let raw = Raw::rgba(&image.rgba, image.width, image.height);
+                paint(pane, tabs, chrome, raw)?;
+            }
+        } else if let Ok(image) = crate::jpeg::decode(&frame, FRAME_BUDGET) {
             let raw = Raw::rgb(&image.rgb, image.width, image.height);
             paint(pane, tabs, chrome, raw)?;
         }
@@ -8824,7 +8835,7 @@ mod tests {
             &options,
             &profile,
             downloads.clone(),
-            Appearance::new(crate::appearance::Choice::default(), false),
+            Appearance::new(crate::appearance::Choice::default(), false, false),
             Identity::new(None, None, "C"),
             Allowed::in_memory(),
             None,

@@ -36,6 +36,27 @@
 //! same reason. A page that never moves costs one still and then nothing at
 //! all — no screencast frames, no polling, no repainting.
 //!
+//! # PNG all the way, in alpha mode
+//!
+//! Under `--alpha` the engine paints no default background
+//! ([`crate::appearance`]), and what the page leaves bare is transparent. A
+//! JPEG has nowhere to keep that. Chromium encodes the screencast from a
+//! premultiplied bitmap and drops the alpha, so a transparent pixel comes out
+//! 0, 0, 0 — measured, the same pixel that is 0, 0, 0, 0 in a PNG frame of
+//! the same page. JPEG while it moves would be a black pane while it scrolls
+//! and a transparent one when it stops: the format flash above, at its worst.
+//! So the cast is PNG on every route in alpha mode ([`Cast::for_route`]), and
+//! each frame is decoded here to RGBA and sent as `f=32`, as a still is.
+//!
+//! It costs what the table above says PNG costs the engine: 33.8 frames a
+//! second at 320 kB against 57.8 at 185 kB on two cores. On an Apple M3,
+//! 1280x768, the scrolling article of the engine tests, it was 55.2 fps at
+//! 292 kB against 59.7 at 234 kB, and decoding a frame here took 8.3 ms as
+//! PNG against 6.1 as JPEG — well inside a frame, so the cast is not thinned
+//! (`every_nth` stays the route's). Each frame is 3.9 MB of RGBA through
+//! `/dev/shm` rather than 2.9 of RGB. It is the price of the option, and the
+//! option is off unless asked for.
+//!
 //! # When a still is worth asking for
 //!
 //! The first version of this asked for a still 150 ms after the last frame,
@@ -356,6 +377,11 @@ impl Motion {
 /// what JPEG does on text, 60 fps at 35 kB a frame against 59 at 110 kB on an
 /// animating page — every nth frame for the route's cap, and at a width
 /// [`Throttle`] steps down when the link cannot keep up.
+///
+/// Under `--alpha` it is PNG on every route, the local one included, because
+/// a JPEG has nowhere to keep the transparency and the pane would go black
+/// whenever the page moved: see the module's "PNG all the way, in alpha
+/// mode".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cast {
     /// `format: "png"` and no quality, rather than JPEG at [`QUALITY`].
@@ -368,10 +394,11 @@ pub struct Cast {
 }
 
 impl Cast {
-    /// The cast for a route, at the pane's full size.
-    pub fn for_route(route: &crate::route::Route) -> Cast {
+    /// The cast for a route, at the pane's full size; PNG whatever the route
+    /// under `alpha`.
+    pub fn for_route(route: &crate::route::Route, alpha: bool) -> Cast {
         Cast {
-            png: route.payload == crate::route::Payload::Png,
+            png: route.payload == crate::route::Payload::Png || alpha,
             every_nth: route.every_nth.max(1),
             step: 1,
         }
@@ -829,7 +856,27 @@ mod tests {
         assert_eq!(at(3).size((1, 1)), (1, 1));
         assert_eq!(
             Cast::default(),
-            Cast::for_route(&crate::route::Route::local(true))
+            Cast::for_route(&crate::route::Route::local(true), false)
         );
+    }
+
+    #[test]
+    fn alpha_makes_the_local_cast_png_and_leaves_the_rest_alone() {
+        let local = crate::route::Route::local(true);
+        let plain = Cast::for_route(&local, false);
+        let alpha = Cast::for_route(&local, true);
+        assert!(!plain.png, "JPEG while it moves, as always");
+        assert!(alpha.png, "a JPEG would paint the transparency black");
+        assert_eq!((alpha.every_nth, alpha.step), (plain.every_nth, plain.step));
+        let png = crate::route::Route {
+            payload: crate::route::Payload::Png,
+            every_nth: 3,
+            ..local
+        };
+        for alpha in [false, true] {
+            let cast = Cast::for_route(&png, alpha);
+            assert!(cast.png, "PNG on the PNG route either way");
+            assert_eq!((cast.every_nth, cast.step), (3, 1));
+        }
     }
 }

@@ -75,7 +75,9 @@
 //! frames are the ones scrolling past, which nobody reads. A page that never
 //! moves costs one still and then nothing. [`motion`] has the table, the
 //! reason quality 85 rather than 70 or 95, and the rule that decides which of
-//! two frames arriving out of order is the one to keep.
+//! two frames arriving out of order is the one to keep. `--alpha`, which lets
+//! the terminal's background show through a page, makes the moving frames PNG
+//! as well, because a JPEG paints the transparency black.
 //!
 //! The frames are decoded here rather than by the terminal, which is the
 //! other half of the change and the reason the compositor needed none: the
