@@ -10,6 +10,17 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Added
+
+- **Prebuilt binaries.** Every release has an archive for x86-64 and arm64
+  Linux (a glibc build and a static musl one) and for Apple silicon and
+  Intel Macs on its GitHub Release, with a `SHA256SUMS` and a build
+  provenance attestation `gh attestation verify` checks, and
+  `cargo binstall blinkterm` installs the one for your machine without
+  compiling. The release binaries are stripped
+  ([#22](https://github.com/m96-chan/blinkterm/issues/22),
+  [#34](https://github.com/m96-chan/blinkterm/issues/34)).
+
 ## [0.3.0] - 2026-10-01
 
 ### Added

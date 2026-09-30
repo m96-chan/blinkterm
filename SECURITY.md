@@ -17,6 +17,15 @@ somewhere private.
 There is no release cadence to promise a fix against yet, and one person
 maintains this. Expect a first reply rather than a patch.
 
+## What you download
+
+The archives on a GitHub Release are built by GitHub's runners from the tagged
+commit, in `.github/workflows/release.yml`, and each carries a build provenance
+attestation signed through Sigstore; nobody's laptop is in between.
+`gh attestation verify <archive> --repo m96-chan/blinkterm` checks it, and
+[docs/install.md](docs/install.md#prebuilt-binaries) has that and the
+`SHA256SUMS` check spelled out.
+
 ## What is whose problem
 
 **The engine's.** Everything about parsing and executing the page: HTML, CSS,

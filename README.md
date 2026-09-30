@@ -41,6 +41,10 @@ Rust 1.87 or newer:
 cargo install --locked blinkterm
 ```
 
+Or a prebuilt binary: `cargo binstall blinkterm`, or an archive from the
+[releases page](https://github.com/m96-chan/blinkterm/releases);
+[docs/install.md](docs/install.md#prebuilt-binaries) says how to check one.
+
 Then a browser engine, which blinkterm does not ship. The one it is tested
 against is `chrome-headless-shell` from
 [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/).

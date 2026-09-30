@@ -1,20 +1,37 @@
-# Publishing to crates.io, from a tag and from nothing else.
+# A release, from a tag and from nothing else: six prebuilt archives on the
+# GitHub Release, and the package on crates.io.
 #
 # A version on crates.io cannot be replaced, only yanked, so the upload is the
-# last step of a job whose other steps are reasons not to: the tag has to name
+# last step of a run whose other steps are reasons not to: the tag has to name
 # the version `Cargo.toml` says, the tagged commit has to be on `main` (which
 # CI has already run in full, the engine job included), and the package has
-# to build as crates.io will build it. Any of those failing stops the job with
+# to build as crates.io will build it. Any of those failing stops the run with
 # nothing sent.
 #
-# The token is the `CRATESIO_KEY` repository secret, handed to cargo in the
-# one step that needs it and nowhere else. RELEASING.md has the rest of a
-# release around this.
+# The archives are built before either upload, and both uploads wait for all
+# six: a tree that cannot build for every target goes neither to the GitHub
+# Release nor to crates.io, so `cargo binstall blinkterm` never finds a
+# version on crates.io with no archive for its host. Each target is built
+# natively, on a runner of its own architecture -- no `cross`, no zig, no
+# emulation -- so the binary that is smoke-tested is the binary that ships,
+# run by the CPU it was built for. The Linux archives are then run once more
+# in a bare Debian or Alpine container, with nothing installed, which is what
+# "it runs anywhere" has to mean before anybody downloads it.
+#
+# A `workflow_dispatch` is always a dry run: it checks, builds and packs all
+# six, uploads them as one workflow artifact with their `SHA256SUMS` and the
+# release notes it would have written, and publishes nothing. It is how this
+# file is tried on a branch; RELEASING.md says how.
+#
+# The crates.io token is the `CRATESIO_KEY` repository secret, handed to cargo
+# in the one step that needs it and nowhere else. RELEASING.md has the rest of
+# a release around this.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,15 +39,18 @@ env:
 permissions:
   contents: read
 
-# Two tags pushed at once publish one after the other, never side by side.
+# Two tags pushed at once release one after the other, never side by side. A
+# dry run queues behind a release, and the other way round.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: publish to crates.io
+  verify:
+    name: the tag names the version and sits on main
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -40,23 +60,180 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - name: The tag names the version in Cargo.toml
+      - name: The version in Cargo.toml
+        id: version
         run: |
           version=$(cargo metadata --no-deps --format-version 1 --locked \
             | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "blinkterm"))')
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::the tag is $GITHUB_REF_NAME but Cargo.toml says $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: The tag names the version in Cargo.toml
+        if: github.event_name == 'push'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "::error::the tag is $GITHUB_REF_NAME but Cargo.toml says $VERSION"
             exit 1
           fi
       - name: The tagged commit is on main
+        if: github.event_name == 'push'
         run: |
           git fetch --no-tags origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "::error::$GITHUB_REF_NAME is not on main; tag the commit main ended up on"
             exit 1
           fi
+      # Here rather than in `publish`, so that a package crates.io would refuse
+      # fails the run before six builds rather than after them.
       - name: The package builds as crates.io will build it
         run: cargo publish --dry-run --locked
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    strategy:
+      # One target failing says nothing about the others; let them finish so
+      # the log shows every failure at once. Nothing is published either way.
+      fail-fast: false
+      matrix:
+        # gnu on ubuntu-22.04, so the archives need glibc 2.35 and no newer.
+        # musl is static and needs nothing; its runner's age does not matter.
+        # tests/release.rs holds this list to docs/install.md's table.
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, smoke: "debian:bookworm" }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, smoke: "debian:bookworm" }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, smoke: "alpine:3" }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, smoke: "alpine:3" }
+          - { target: aarch64-apple-darwin, os: macos-15, smoke: "" }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, smoke: "" }
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the stable toolchain for ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$TARGET"
+      # One cache per target, or the six jobs overwrite one another's.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # musl needs no `musl-tools`: there is no C in the tree, and every libc
+      # symbol the crate calls is POSIX and in musl. Rust's musl targets carry
+      # their own crt and link statically.
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+      - name: The binary answers as a built one should
+        run: |
+          out=$("target/$TARGET/release/blinkterm" --version)
+          if [ "$out" != "blinkterm $VERSION" ]; then
+            echo "::error::--version said '$out', not 'blinkterm $VERSION'"
+            exit 1
+          fi
+          "target/$TARGET/release/blinkterm" --help | grep -q -- '--profile'
+      # tests/release.rs holds this name to Cargo.toml's binstall template.
+      - name: Pack
+        run: |
+          archive="blinkterm-${VERSION}-${TARGET}"
+          mkdir -p "dist/$archive"
+          cp "target/$TARGET/release/blinkterm" README.md LICENSE CHANGELOG.md "dist/$archive/"
+          tar -C dist -czf "dist/$archive.tar.gz" "$archive"
+          rm -r "dist/$archive"
+          ls -l dist
+      # `--version` answers before an engine is looked for, so an image with
+      # no Chromium in it is enough to say the binary loads and runs there.
+      - name: The archive runs on a bare ${{ matrix.smoke }}
+        if: matrix.smoke != ''
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" "${{ matrix.smoke }}" sh -c \
+            'tar -xzf /dist/*.tar.gz -C /tmp && /tmp/blinkterm-*/blinkterm --version'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: blinkterm-${{ env.VERSION }}-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          # A re-run of a failed job replaces what the first attempt left.
+          overwrite: true
+
+  release:
+    name: GitHub release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the release and its assets
+      id-token: write # the provenance signature
+      attestations: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: blinkterm-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        run: (cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+      # The changelog section for this version, without its heading, up to the
+      # next `## [`; tests/release.rs does the same in Rust and checks the
+      # section is there before anybody tags. Then the one line RELEASING.md
+      # used to ask for by hand: the Chromium CI's engine jobs pin.
+      - name: The release notes are the changelog section
+        run: |
+          awk -v v="$VERSION" '/^## \[/ { p = ($2 == "[" v "]"); next } p' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no [$VERSION] section"
+            exit 1
+          fi
+          shell=$(grep -m1 -oE 'SHELL_VERSION: [0-9.]+' .github/workflows/ci.yml | cut -d' ' -f2)
+          if [ -n "$shell" ]; then
+            printf '\nThe engine tests passed against chrome-headless-shell %s.\n' "$shell" >> notes.md
+          fi
+          cat notes.md
+      # A dry run and a real one alike: what went, or would have gone, up.
+      # Named so that the download above, on a re-run, does not pick it up.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ env.VERSION }}
+          overwrite: true
+          path: |
+            dist/
+            notes.md
+          if-no-files-found: error
+      - uses: actions/attest-build-provenance@v4
+        if: github.event_name == 'push'
+        with:
+          subject-path: dist/*.tar.gz
+      # Idempotent: a re-run, or a release somebody made by hand before the
+      # workflow got to it, is edited and has its assets replaced.
+      - name: Create or update the release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "blinkterm $VERSION" --notes-file notes.md
+            gh release upload "$tag" --clobber dist/*.tar.gz dist/SHA256SUMS
+          else
+            gh release create "$tag" --verify-tag --title "blinkterm $VERSION" \
+              --notes-file notes.md dist/*.tar.gz dist/SHA256SUMS
+          fi
+
+  publish:
+    name: publish to crates.io
+    needs: [verify, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATESIO_KEY }}
