@@ -175,11 +175,20 @@ impl std::fmt::Debug for Pending {
     }
 }
 
-/// An event as it arrived: the method and its parameters.
+/// An event as it arrived: the method, its parameters, and the session it
+/// came in on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     pub method: String,
     pub params: Json,
+    /// The `sessionId` at the top level of the message: the client's own for
+    /// most of them, `None` for the browser's, and — for a client that has
+    /// adopted sessions ([`Client::adopt`]) — one of those. An
+    /// out-of-process iframe's events arrive in its page's mailbox under the
+    /// iframe's session, and what is sent back has to go to that same
+    /// session, so the answer is kept beside the question. See
+    /// [`crate::upload`].
+    pub session: Option<String>,
 }
 
 /// The pipe the reader knocks on to wake the main loop: one per client.
@@ -355,6 +364,11 @@ struct Routes {
     /// `None` is the browser's own mailbox, for the messages with no
     /// `sessionId`; every other key is a session a page was attached on.
     mailboxes: HashMap<Option<String>, Slot>,
+    /// Sessions that have no mailbox of their own and are delivered to
+    /// somebody else's: an out-of-process iframe's, which belongs to the tab
+    /// the frame is in. The key is the session the engine addresses, the
+    /// value the mailbox's key. See [`Client::adopt`].
+    adopted: HashMap<String, Option<String>>,
     ended: Option<String>,
     /// What looks at every message before it is routed; see [`Intercept`].
     intercept: Option<Arc<dyn Intercept>>,
@@ -515,6 +529,11 @@ impl Exchange {
 
     /// Stop delivering to a mailbox — this one, and not one registered since
     /// under the same session.
+    ///
+    /// Whatever that mailbox had adopted goes with it: a tab that closes
+    /// takes its frames' sessions off the table, so a message from a frame
+    /// the engine has not finished tearing down is dropped rather than
+    /// delivered to whoever registers that key next.
     fn deregister(&self, session: &Option<String>, slot: &Slot) {
         if let Ok(mut routes) = self.routes.lock() {
             if routes
@@ -523,7 +542,33 @@ impl Exchange {
                 .is_some_and(|held| Arc::ptr_eq(held, slot))
             {
                 routes.mailboxes.remove(session);
+                routes.adopted.retain(|_, owner| owner != session);
             }
+        }
+    }
+
+    /// Deliver `child`'s messages to `owner`'s mailbox. See [`Client::adopt`].
+    fn adopt(&self, child: &str, owner: &Option<String>) -> Result<(), String> {
+        let mut routes = self
+            .routes
+            .lock()
+            .map_err(|_| "the pipe is poisoned".to_string())?;
+        if let Some(ended) = &routes.ended {
+            return Err(ended.clone());
+        }
+        // A session with a client of its own is that client's; two readers of
+        // one stream would be one reader and one that hears nothing.
+        if routes.mailboxes.contains_key(&Some(child.to_string())) {
+            return Err(format!("session {child} has a client of its own"));
+        }
+        routes.adopted.insert(child.to_string(), owner.clone());
+        Ok(())
+    }
+
+    /// Stop delivering `child`'s messages anywhere.
+    fn disown(&self, child: &str) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.adopted.remove(child);
         }
     }
 }
@@ -693,9 +738,9 @@ fn read_loop(read: RawFd, routes: &Mutex<Routes>, stop: &AtomicBool, wire: &Noti
                     .is_none_or(|hook| !hook.intercept(value, wire))
             })
             .collect();
-        if let Ok(routes) = routes.lock() {
+        if let Ok(mut routes) = routes.lock() {
             for value in values {
-                route(&routes.mailboxes, value);
+                route(&mut routes, value);
             }
         }
     };
@@ -754,7 +799,8 @@ pub fn split_messages(buf: &mut Vec<u8>) -> Result<Vec<String>, String> {
 /// Deliver one message to the mailbox it is for.
 ///
 /// Addressed by the string `sessionId` at the top level of the message, and
-/// by nothing else: no `sessionId` is the browser's own mailbox, and a
+/// by nothing else: no `sessionId` is the browser's own mailbox, a session
+/// somebody has adopted goes to that somebody's ([`Client::adopt`]), and a
 /// session nobody has a mailbox for — a client that has closed, a target
 /// attached by something else — is dropped here. Not the `sessionId` in a
 /// `Page.screencastFrame`'s `params`, which is an integer and belongs to the
@@ -766,21 +812,41 @@ pub fn split_messages(buf: &mut Vec<u8>) -> Result<Vec<String>, String> {
 /// on it hears that its page is gone the way it used to hear a socket close.
 /// That is what keeps the tab list's two ways of hearing about a closed tab —
 /// its client ending, and `Target.targetDestroyed` — two ways rather than one.
-fn route(mailboxes: &HashMap<Option<String>, Slot>, value: Json) {
+///
+/// An adopted session is the exception, and it matters: an iframe leaving its
+/// page is not the page's mailbox ending. The adoption is undone and the
+/// event goes on to the mailbox that held it, which is how the tab hears that
+/// a frame it was talking to has gone.
+fn route(routes: &mut Routes, value: Json) {
     let session = value
         .get("sessionId")
         .and_then(Json::as_str)
         .map(str::to_string);
     if value.get("method").and_then(Json::as_str) == Some("Target.detachedFromTarget") {
-        let detached = value
+        if let Some(detached) = value
             .path(&["params", "sessionId"])
             .and_then(Json::as_str)
-            .map(str::to_string);
-        if let Some(slot) = detached.and_then(|detached| mailboxes.get(&Some(detached))) {
-            end(slot, "the engine detached from the target");
+            .map(str::to_string)
+        {
+            if routes.adopted.remove(&detached).is_none() {
+                if let Some(slot) = routes.mailboxes.get(&Some(detached)) {
+                    end(slot, "the engine detached from the target");
+                }
+            }
         }
     }
-    let Some(slot) = mailboxes.get(&session) else {
+    let key = if routes.mailboxes.contains_key(&session) {
+        session
+    } else {
+        match session
+            .as_deref()
+            .and_then(|session| routes.adopted.get(session))
+        {
+            Some(owner) => owner.clone(),
+            None => return,
+        }
+    };
+    let Some(slot) = routes.mailboxes.get(&key) else {
         return;
     };
     let (lock, signal) = &**slot;
@@ -925,6 +991,38 @@ impl Client {
         self.session.as_deref()
     }
 
+    /// Take a session the engine opened underneath this one into this
+    /// client's mailbox: its events arrive here, tagged with it
+    /// ([`Event::session`]), and commands for it go out through
+    /// [`Client::call_on`] and [`Client::notify_on`].
+    ///
+    /// What this is for is an out-of-process iframe. A cross-site frame is a
+    /// target of its own in a process of its own, and nothing it does comes
+    /// through its page's session — which is why a click on a file input
+    /// inside one reached nobody (issue #57). `Target.setAutoAttach` on the
+    /// page's session makes the engine attach to each such frame and say so,
+    /// and what it gives is a `sessionId` and no client.
+    ///
+    /// A client of its own, per frame, is what the shape of this module
+    /// suggests, and it is what a page with twenty advertisements would make
+    /// twenty of: twenty mailboxes and forty descriptors for a session that
+    /// says nothing from one week to the next. So a frame's session is a key
+    /// into the mailbox of the page it is a frame of, and the page's client
+    /// is the one client there is. The tab that owns the mailbox lets go of
+    /// them all when it closes (`Exchange::deregister`), and the engine's
+    /// `Target.detachedFromTarget` for one is the frame leaving and not the
+    /// page's session ending (see `route`).
+    ///
+    /// Refused for a session that already has a client of its own.
+    pub fn adopt(&self, session: &str) -> Result<(), String> {
+        self.exchange.adopt(session, &self.session)
+    }
+
+    /// Give an adopted session back: its messages go nowhere from now on.
+    pub fn disown(&self, session: &str) {
+        self.exchange.disown(session);
+    }
+
     /// A handle another thread may send notifications on. See [`Notifier`].
     pub fn notifier(&self) -> Notifier {
         Notifier {
@@ -967,8 +1065,22 @@ impl Client {
         params: Json,
         timeout: Duration,
     ) -> Result<Json, String> {
+        self.call_on(None, method, params, timeout)
+    }
+
+    /// The same, said on a session this client has adopted: `None` is this
+    /// client's own. The reply comes back to this mailbox, because that is
+    /// where the engine's messages for an adopted session are delivered.
+    pub fn call_on(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Json,
+        timeout: Duration,
+    ) -> Result<Json, String> {
+        let session = session.or(self.session.as_deref());
         let id = self.exchange.next_id();
-        let message = message(id, self.session.as_deref(), method, params);
+        let message = message(id, session, method, params);
 
         self.want(id)?;
         if let Err(why) = self.exchange.transmit(&message) {
@@ -1071,12 +1183,19 @@ impl Client {
     /// the same is read off the pipe and dropped. This is the command that
     /// runs all day, and nothing it does is kept.
     pub fn notify(&mut self, method: &str, params: Json) -> Result<(), String> {
-        let message = message(
-            self.exchange.next_id(),
-            self.session.as_deref(),
-            method,
-            params,
-        );
+        self.notify_on(None, method, params)
+    }
+
+    /// The same, said on a session this client has adopted: `None` is this
+    /// client's own. See [`Client::adopt`].
+    pub fn notify_on(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Json,
+    ) -> Result<(), String> {
+        let session = session.or(self.session.as_deref());
+        let message = message(self.exchange.next_id(), session, method, params);
         self.exchange
             .transmit(&message)
             .map_err(|why| format!("cannot send {method}: {why}"))
@@ -1213,6 +1332,12 @@ fn outcome(method: &str, reply: &Json) -> Result<Json, String> {
 /// as it was parsed rather than copied: a picture of a whole page is a reply
 /// of up to sixty megabytes.
 fn sort(mailbox: &mut Mailbox, value: Json) {
+    // Read before the message is taken apart below: which session it came in
+    // on, which for an adopted one is not the mailbox's own.
+    let session = value
+        .get("sessionId")
+        .and_then(Json::as_str)
+        .map(str::to_string);
     if let Some(id) = value.get("id").and_then(Json::as_i64) {
         // The one lookup that stands between an hour of browsing and a map of
         // hundreds of thousands of answers to questions nobody asked.
@@ -1233,6 +1358,7 @@ fn sort(mailbox: &mut Mailbox, value: Json) {
         let event = Event {
             method,
             params: params.unwrap_or(Json::Null),
+            session,
         };
         // A page that is repainting can produce events faster than a pane can
         // draw them. The queue is bounded so that a slow frame cannot become
@@ -1522,11 +1648,19 @@ mod tests {
         mailbox.events.iter().map(|e| e.method.clone()).collect()
     }
 
+    /// A routing table with these mailboxes and nothing adopted.
+    fn table(mailboxes: HashMap<Option<String>, Slot>) -> Routes {
+        Routes {
+            mailboxes,
+            ..Routes::default()
+        }
+    }
+
     /// Route a message the test wrote as text, the way the reader thread
     /// would once it had parsed it; text that is not JSON goes nowhere.
-    fn route_text(mailboxes: &HashMap<Option<String>, Slot>, text: &str) {
+    fn route_text(routes: &mut Routes, text: &str) {
         if let Ok(value) = Json::parse(text) {
-            route(mailboxes, value);
+            route(routes, value);
         }
     }
 
@@ -1541,26 +1675,27 @@ mod tests {
         mailboxes.insert(None, Arc::clone(&browser));
         mailboxes.insert(Some("S1".to_string()), Arc::clone(&page));
         mailboxes.insert(Some("S2".to_string()), Arc::clone(&other));
+        let mut routes = table(mailboxes);
         page.0.lock().expect("a mailbox").want(5);
 
         route_text(
-            &mailboxes,
+            &mut routes,
             r#"{"id":5,"sessionId":"S1","result":{"ok":true}}"#,
         );
         route_text(
-            &mailboxes,
+            &mut routes,
             r#"{"method":"Page.loadEventFired","sessionId":"S1","params":{}}"#,
         );
         route_text(
-            &mailboxes,
+            &mut routes,
             r#"{"method":"Target.targetCreated","params":{"targetInfo":{}}}"#,
         );
         // A session nobody holds, and something that is not JSON at all.
         route_text(
-            &mailboxes,
+            &mut routes,
             r#"{"method":"Page.loadEventFired","sessionId":"S9","params":{}}"#,
         );
-        route_text(&mailboxes, "not json at all");
+        route_text(&mut routes, "not json at all");
 
         assert!(page.0.lock().expect("a mailbox").take(5).is_some());
         assert_eq!(methods(&page), ["Page.loadEventFired"]);
@@ -1576,8 +1711,9 @@ mod tests {
         let mut mailboxes = HashMap::new();
         mailboxes.insert(None, Arc::clone(&browser));
         mailboxes.insert(Some("S1".to_string()), Arc::clone(&page));
+        let mut routes = table(mailboxes);
         route_text(
-            &mailboxes,
+            &mut routes,
             r#"{"method":"Page.screencastFrame","sessionId":"S1","params":{"sessionId":3,"data":"x"}}"#,
         );
         assert_eq!(methods(&page), ["Page.screencastFrame"]);
@@ -1591,8 +1727,9 @@ mod tests {
         mailboxes.insert(None, Arc::clone(&browser));
         mailboxes.insert(Some("S1".to_string()), Arc::clone(&page));
         mailboxes.insert(Some("S2".to_string()), Arc::clone(&other));
+        let mut routes = table(mailboxes);
         route_text(
-            &mailboxes,
+            &mut routes,
             r#"{"method":"Target.detachedFromTarget","params":{"sessionId":"S1","targetId":"T1"}}"#,
         );
         assert_eq!(
@@ -1602,6 +1739,76 @@ mod tests {
         assert_eq!(ended_of(&other), None);
         assert_eq!(ended_of(&browser), None);
         assert_eq!(methods(&browser), ["Target.detachedFromTarget"]);
+    }
+
+    /// Issue #57: a cross-site iframe's session has no client of its own.
+    /// Its messages are read in the mailbox of the page it is a frame of, the
+    /// answer to a command sent on it comes back there too, and the frame
+    /// leaving is the frame leaving and not the page's session ending.
+    #[test]
+    fn an_adopted_sessions_news_is_its_owners_and_its_detach_is_not_an_ending() {
+        let (browser, page, other) = (slot(), slot(), slot());
+        let mut mailboxes = HashMap::new();
+        mailboxes.insert(None, Arc::clone(&browser));
+        mailboxes.insert(Some("S1".to_string()), Arc::clone(&page));
+        mailboxes.insert(Some("S2".to_string()), Arc::clone(&other));
+        let mut routes = table(mailboxes);
+        routes
+            .adopted
+            .insert("F1".to_string(), Some("S1".to_string()));
+        page.0.lock().expect("a mailbox").want(9);
+
+        route_text(
+            &mut routes,
+            r#"{"method":"Page.fileChooserOpened","sessionId":"F1","params":{"backendNodeId":4}}"#,
+        );
+        route_text(
+            &mut routes,
+            r#"{"id":9,"sessionId":"F1","result":{"ok":true}}"#,
+        );
+        assert_eq!(methods(&page), ["Page.fileChooserOpened"]);
+        assert_eq!(
+            page.0
+                .lock()
+                .expect("a mailbox")
+                .events
+                .front()
+                .and_then(|event| event.session.clone()),
+            Some("F1".to_string()),
+            "the answer has to go back to the session the question came in on"
+        );
+        assert!(
+            page.0.lock().expect("a mailbox").take(9).is_some(),
+            "a reply to a command sent on the frame's session is the page's"
+        );
+        assert!(methods(&other).is_empty() && methods(&browser).is_empty());
+
+        // The frame goes. The page does not.
+        route_text(
+            &mut routes,
+            r#"{"method":"Target.detachedFromTarget","sessionId":"S1","params":{"sessionId":"F1"}}"#,
+        );
+        assert_eq!(
+            ended_of(&page),
+            None,
+            "the page's session was ended with it"
+        );
+        assert!(!routes.adopted.contains_key("F1"));
+        assert_eq!(
+            methods(&page),
+            ["Page.fileChooserOpened", "Target.detachedFromTarget"],
+            "the tab is not told its frame has gone"
+        );
+
+        // And nothing of that frame's is delivered anywhere afterwards.
+        route_text(
+            &mut routes,
+            r#"{"method":"Page.loadEventFired","sessionId":"F1","params":{}}"#,
+        );
+        assert_eq!(
+            methods(&page),
+            ["Page.fileChooserOpened", "Target.detachedFromTarget"]
+        );
     }
 
     #[test]
