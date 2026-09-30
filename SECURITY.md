@@ -233,6 +233,17 @@ machine. It prints a warning when it does. Do not browse as root.
   and with `chromium-shell` an open debugging port — would be a security
   problem, so failures of that machinery count here.
 
+- **The engine download.** `blinkterm --install-engine` is the only network
+  access the program makes of its own, and it happens only when that switch
+  is typed: no setting, key or page can start it. It runs `curl` over https
+  only, with redirects to https only, fetches the one `chrome-headless-shell`
+  version the tests pass against from Chrome for Testing, and checks the zip
+  against a SHA-256 compiled into `blinkterm` before anything is unpacked; a
+  mismatch installs nothing. The engine is unpacked under the 0700
+  `$XDG_DATA_HOME/blinkterm/engine/`. A way to make it run code that is not
+  the zip the maintainer hashed counts here
+  ([#91](https://github.com/m96-chan/blinkterm/issues/91)).
+
 ## Out of scope
 
 - Bugs in Chromium itself — report upstream.

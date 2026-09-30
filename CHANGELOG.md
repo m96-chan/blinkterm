@@ -10,6 +10,18 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Added
+
+- **`--install-engine`.** Fetches `chrome-headless-shell` 153.0.8010.52 —
+  the build the tests pass against — from Chrome for Testing for this
+  machine (`linux64`, `mac-arm64`, `mac-x64`), checks it against a SHA-256
+  compiled into the program, unpacks it under
+  `$XDG_DATA_HOME/blinkterm/engine/`, starts it once and says where it is
+  and how to remove it. It is found before `PATH` from then on; `--engine`,
+  `$BLINKTERM_ENGINE` and `engine =` still win. Nothing is downloaded unless
+  asked, and a second run of the same version does nothing
+  ([#91](https://github.com/m96-chan/blinkterm/issues/91)).
+
 ## [0.3.0] - 2026-10-01
 
 ### Added

@@ -41,22 +41,20 @@ Rust 1.87 or newer:
 cargo install --locked blinkterm
 ```
 
-Then a browser engine, which blinkterm does not ship. The one it is tested
-against is `chrome-headless-shell` from
-[Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/).
-On a Mac with Apple silicon:
+Then a browser engine, which blinkterm does not ship but will fetch:
 
 ```sh
-curl -fsSLO https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.52/mac-arm64/chrome-headless-shell-mac-arm64.zip
-unzip chrome-headless-shell-mac-arm64.zip -d ~/engine
-mkdir -p ~/.config/blinkterm
-echo "engine = $HOME/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell" >> ~/.config/blinkterm/config
+blinkterm --install-engine
 ```
 
-On x86-64 Linux, the same with `linux64` in place of `mac-arm64`. Any
-Chromium on `PATH` (`chromium`, `google-chrome`, …) is found too.
-[docs/install.md](docs/install.md) has the rest: Homebrew, Intel Macs, fonts,
-and how the engine is looked for.
+That downloads the `chrome-headless-shell` the tests pass against from
+[Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/)
+for x86-64 Linux or either kind of Mac, checks it against a SHA-256 compiled
+into blinkterm, unpacks it under `~/.local/share/blinkterm/engine/` and starts
+it once. Nothing is downloaded unless you ask. Any Chromium on `PATH`
+(`chromium`, `google-chrome`, …) is found too.
+[docs/install.md](docs/install.md) has the rest: Homebrew, installing the
+engine by hand, fonts, and how the engine is looked for.
 
 ## Using it
 

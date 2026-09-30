@@ -193,6 +193,10 @@ jobs:
         # bookworm package names. The CJK fonts are not decoration: without
         # them a page of Japanese renders as boxes and the frames still look
         # fine to an assertion.
+        #
+        # src/install.rs carries the same version and checksums, for
+        # --install-engine; the_pin_is_the_one_ci_installs_and_the_docs_tell_
+        # people_to_fetch fails the check job when these drift from it.
         env:
           SHELL_VERSION: 153.0.8010.52
           SHELL_SHA256: 944dc1eae654637fed4d57650198774f9c43b45f34e48febb84f43c541b5de76
@@ -231,9 +235,14 @@ jobs:
       # The job runs as root in the container, which the engine notices: it
       # adds --no-sandbox itself, because Chromium refuses to start as root
       # without it. See src/engine.rs.
+      #
+      # BLINKTERM_NETWORK lets tests/install.rs run --install-engine for real:
+      # it fetches the same zip again into a scratch directory and finds it
+      # with BLINKTERM_ENGINE removed. curl and unzip are installed above.
       - run: cargo test --release --locked -- --test-threads=1
         env:
           BLINKTERM_ENGINE: /opt/chrome-headless-shell-linux64/chrome-headless-shell
+          BLINKTERM_NETWORK: 1
 
   mac:
     name: macOS, clippy, test, engine tests
@@ -265,6 +274,8 @@ jobs:
         # version the Linux job pins, by checksum. `curl` sets no quarantine
         # attribute, so Gatekeeper has no opinion about it. No apt: the
         # frameworks are in the zip and the fonts are the system's.
+        # src/install.rs carries the same version and checksum, held to these
+        # by a unit test, as on Linux.
         env:
           SHELL_VERSION: 153.0.8010.52
           SHELL_SHA256: 47fe02eae3a1b6e9ba298c7a8aea4ca1be87741ef8fa2da55b8a6f76d636e894
@@ -282,4 +293,10 @@ jobs:
       - run: cargo test --release --locked --test engine -- --test-threads=1
         env:
           BLINKTERM_ENGINE: ${{ runner.temp }}/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell
+          BLINKTERM_SHARED_RUNNER: 1
+      # --install-engine for real, into a scratch directory, with the engine
+      # above out of the environment: named explicitly for the same reason.
+      - run: cargo test --release --locked --test install -- --test-threads=1
+        env:
+          BLINKTERM_NETWORK: 1
           BLINKTERM_SHARED_RUNNER: 1

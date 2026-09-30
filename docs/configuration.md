@@ -81,7 +81,9 @@ tmux — and prints one line per answer and the route frames will take,
 exiting 1 when the engine did not answer or the terminal cannot draw. In
 tmux without `allow-passthrough` it says the graphics query went unanswered
 raw and through tmux. `--print-engine` prints the path the search finds and
-nothing else, for scripts.
+nothing else, for scripts. `--install-engine` fetches the engine the tests
+pass against, checks it, and starts it once, like `--doctor`
+([Installing](install.md#the-engine)).
 
 ### Rebinding keys
 
