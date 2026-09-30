@@ -116,6 +116,10 @@ pub struct Options {
     /// `--file-picker` and its three siblings: the programs that answer a
     /// page's file input instead of the row. See [`crate::picker`].
     pub pickers: picker::Pickers,
+    /// `--remote`: hand the urls to the blinkterm already running on this
+    /// profile and exit, starting as usual only when none is. Command line
+    /// only. See [`crate::remote`].
+    pub remote: bool,
 }
 
 /// What `main` was asked to do, once the command line has been read.
@@ -200,6 +204,9 @@ pub struct Settings {
     pub config: Option<ConfigChoice>,
     /// Command line only.
     pub what: Option<What>,
+    /// `--remote`. Command line only: it says what this one run is for, and
+    /// a settings file that made every run a sender would never start one.
+    pub remote: Option<bool>,
 }
 
 impl Settings {
@@ -243,6 +250,7 @@ impl Settings {
             bindings,
             config: self.config.or(under.config),
             what: self.what.or(under.what),
+            remote: self.remote.or(under.remote),
         }
     }
 }
@@ -516,10 +524,25 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             "--no-config" => config_choice(&mut s, ConfigChoice::None)?,
             "--print-engine" => what(&mut s, What::PrintEngine)?,
             "--doctor" => what(&mut s, What::Doctor)?,
+            "--remote" => once(&mut s.remote, true, "--remote once is enough")?,
             _ if arg.starts_with('-') && arg.len() > 1 => {
                 return Err(format!("unknown option: {arg}"));
             }
             _ => s.urls.push(arg.clone()),
+        }
+    }
+    if s.remote == Some(true) {
+        if s.urls.is_empty() {
+            return Err("--remote needs a url to open: blinkterm --remote <url>".to_string());
+        }
+        // Only the command line's own --temp-profile: `temp-profile = true`
+        // in the file with --remote simply starts as usual, so that a
+        // setting nobody is thinking about does not break `gh browse`.
+        if s.profile == Some(profile::Choice::Temporary) {
+            return Err("--remote and --temp-profile together is a contradiction: \
+                 a temporary profile is its run's alone, so there is no blinkterm \
+                 to reach on it"
+                .to_string());
         }
     }
     Ok(s)
@@ -825,6 +848,7 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
             terminal: s.file_picker_terminal,
             terminal_multiple: s.file_picker_terminal_multiple,
         },
+        remote: s.remote.unwrap_or(false),
     })
 }
 
@@ -958,6 +982,44 @@ mod tests {
         assert_eq!(options.engine, engine::Launch::default());
         assert!(!options.restore && !options.normal_mode);
         assert!(options.bindings.is_empty());
+        assert!(!options.remote);
+    }
+
+    #[test]
+    fn remote_is_a_flag_that_needs_a_url_and_a_profile_somebody_else_could_be_on() {
+        let options = resolved(&["--remote", "a.example", "b.example"]).expect("a sender");
+        assert!(options.remote);
+        assert_eq!(options.urls, ["a.example", "b.example"]);
+        let options = resolved(&["--profile", "/p", "--remote", "a.example"]).expect("sender");
+        assert_eq!(options.profile, Choice::At(PathBuf::from("/p")));
+        let why = parsed(&["--remote"]).unwrap_err();
+        assert!(why.contains("needs a url"), "{why}");
+        let why = parsed(&["--remote", "--temp-profile", "a.example"]).unwrap_err();
+        assert!(why.contains("contradiction"), "{why}");
+        assert_eq!(
+            parsed(&["--remote", "--remote", "a.example"]),
+            Err("--remote once is enough".to_string())
+        );
+        assert!(parsed(&["--remote=yes", "a.example"]).is_err());
+        // A temporary profile from the file is not the command line's
+        // contradiction: the run starts as usual, and listens nowhere.
+        let options = resolve(
+            parsed(&["--remote", "a.example"]).expect("sender"),
+            Settings::default(),
+            file("temp-profile = true").expect("a file"),
+        )
+        .expect("folded");
+        assert!(options.remote);
+        assert_eq!(options.profile, Choice::Temporary);
+    }
+
+    #[test]
+    fn remote_is_off_unless_asked() {
+        assert!(!resolved(&["a.example"]).expect("a page").remote);
+        assert!(
+            file("remote = true").is_err(),
+            "a file cannot make a sender"
+        );
     }
 
     #[test]

@@ -8823,3 +8823,94 @@ fn an_accept_lang_of_the_persons_own_survives_the_override() {
     page.close();
     engine.kill();
 }
+
+/// `blinkterm --remote`: what a sender hands over the socket is opened as
+/// the running program opens it — the first url accepted in a tab in front,
+/// loaded, and counted once when the engine announces it — and a url that is
+/// not one to open is answered as refused and opens nothing.
+#[test]
+fn a_url_handed_over_the_socket_becomes_the_tab_in_front() {
+    use blinkterm::remote::{self, Delivered, Listener};
+    if !engine_named() {
+        return;
+    }
+    let root = temp_dir("remote");
+    let dir = root.join("profile");
+    let downloads = root.join("downloads");
+    std::fs::create_dir_all(&downloads).expect("a download directory");
+    let appearance =
+        blinkterm::appearance::Appearance::new(blinkterm::appearance::Choice::Auto, false);
+    let profile = Profile::take(Choice::At(dir.clone())).expect("a kept profile");
+    // Bound where the program binds it: under the lock, before the engine.
+    let mut listener = Listener::bind(&dir).expect("listening");
+    let Booted {
+        mut engine,
+        mut browser,
+        mut tabs,
+        identity,
+    } = blinkterm::app::boot(
+        profile,
+        &engine::Launch::default(),
+        &downloads,
+        &appearance,
+        &Allowed::in_memory(),
+    )
+    .expect("the engine boots");
+    let base = serve();
+    assert_eq!(tabs.len(), 1);
+
+    let sender = {
+        let dir = dir.clone();
+        let urls = vec![format!("{base}second"), "javascript:x".to_string()];
+        std::thread::spawn(move || remote::deliver(&dir, &urls))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let delivery = loop {
+        let mut deliveries = listener.accept_ready().expect("accepting");
+        if !deliveries.is_empty() {
+            break deliveries.remove(0);
+        }
+        assert!(Instant::now() < deadline, "the sender never connected");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let opened = blinkterm::app::open_delivered(
+        &mut tabs,
+        &mut browser,
+        &appearance,
+        &identity,
+        &delivery.lines,
+    );
+    assert_eq!(opened[0], Ok(format!("{base}second")));
+    assert!(opened[1].is_err());
+    delivery.answer(&opened);
+
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(tabs.active_index(), 1, "the url from outside is in front");
+    {
+        let tab = tabs.active_mut().expect("the tab in front");
+        assert!(tab.loading, "it is loading, as a first url is");
+        assert_eq!(
+            wait_for_title(&mut tab.connection, "second", Duration::from_secs(10)),
+            "second"
+        );
+    }
+    assert!(
+        !pump(&mut browser, &mut tabs, Duration::from_secs(3), |tabs| tabs
+            .len()
+            > 2),
+        "the engine's announcement of the tab made a second one"
+    );
+    match sender.join().expect("the sender") {
+        Ok(Delivered::Refused(reasons)) => {
+            assert_eq!(reasons.len(), 1, "{reasons:?}");
+            assert!(reasons[0].contains("javascript"), "{reasons:?}");
+        }
+        other => panic!("the sender heard {other:?}"),
+    }
+
+    drop(listener);
+    browser.close();
+    drop(tabs);
+    engine.kill();
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -145,13 +145,8 @@ impl Profile {
     /// Resolve `choice` to a directory, make it if it is not there, and take
     /// it for this process.
     pub fn take(choice: Choice) -> Result<Profile, String> {
-        let dir = match choice {
-            Choice::Temporary => return Profile::temporary(),
-            Choice::Default => Profile::default_dir()?,
-            Choice::At(dir) if dir.is_absolute() => dir,
-            Choice::At(dir) => std::env::current_dir()
-                .map_err(|e| format!("cannot tell where {} is: {e}", dir.display()))?
-                .join(dir),
+        let Some(dir) = Profile::locate(&choice)? else {
+            return Profile::temporary();
         };
         make_private_dir(&dir)?;
         let lock = lock(&dir)?;
@@ -160,6 +155,25 @@ impl Profile {
             lock: Some(lock),
             temporary: false,
         })
+    }
+
+    /// Where `choice` points, without making it or taking it; `None` for a
+    /// temporary profile, which has no place until it is made.
+    ///
+    /// Factored out of [`Profile::take`] so that `blinkterm --remote` finds
+    /// the running blinkterm's socket in exactly the directory a start with
+    /// the same command line would have locked (see `crate::remote`). A
+    /// relative `--profile` is made absolute against the working directory
+    /// here, once, for both.
+    pub fn locate(choice: &Choice) -> Result<Option<PathBuf>, String> {
+        match choice {
+            Choice::Temporary => Ok(None),
+            Choice::Default => Profile::default_dir().map(Some),
+            Choice::At(dir) if dir.is_absolute() => Ok(Some(dir.clone())),
+            Choice::At(dir) => std::env::current_dir()
+                .map(|cwd| Some(cwd.join(dir)))
+                .map_err(|e| format!("cannot tell where {} is: {e}", dir.display())),
+        }
     }
 
     /// Where the profile goes when nobody says, from this process's
@@ -198,24 +212,9 @@ impl Profile {
     ///
     /// There is no lock: nobody else knows the name.
     pub fn temporary() -> Result<Profile, String> {
-        let parent = std::env::temp_dir();
-        sweep(&parent);
-        let template = parent.join(format!("blinkterm-{}-XXXXXX", std::process::id()));
-        let mut bytes = template.as_os_str().as_bytes().to_vec();
-        bytes.push(0);
-        // SAFETY: `bytes` is a NUL-terminated buffer this function owns, and
-        // `mkdtemp(3)` only rewrites the six `X`s before the NUL in place,
-        // never past it. The buffer outlives the call.
-        let made = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
-        if made.is_null() {
-            return Err(format!(
-                "cannot make a temporary profile in {}: {}",
-                parent.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        bytes.pop();
-        let dir = PathBuf::from(OsStr::from_bytes(&bytes));
+        sweep(&std::env::temp_dir());
+        let dir = make_temp_dir(&format!("blinkterm-{}-", std::process::id()))
+            .map_err(|why| format!("cannot make a temporary profile in {why}"))?;
         if let Ok(mut recorded) = TEMP_DIR.lock() {
             *recorded = Some(dir.clone());
         }
@@ -293,6 +292,33 @@ pub fn data_dir(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf, St
          use --profile <dir> or --temp-profile"
             .to_string(),
     )
+}
+
+/// A new, empty directory under the system's temporary directory, named
+/// `<prefix>` and six characters `mkdtemp(3)` chooses, made 0700.
+///
+/// The one `libc::mkdtemp` in the crate, shared by [`Profile::temporary`] and
+/// the `--remote` socket's fallback directory (`crate::remote`), so the
+/// unsafe count stays where it was. The error is "<parent>: <why>", for the
+/// caller to put its own words in front of.
+pub(crate) fn make_temp_dir(prefix: &str) -> Result<PathBuf, String> {
+    let parent = std::env::temp_dir();
+    let template = parent.join(format!("{prefix}XXXXXX"));
+    let mut bytes = template.as_os_str().as_bytes().to_vec();
+    bytes.push(0);
+    // SAFETY: `bytes` is a NUL-terminated buffer this function owns, and
+    // `mkdtemp(3)` only rewrites the six `X`s before the NUL in place,
+    // never past it. The buffer outlives the call.
+    let made = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+    if made.is_null() {
+        return Err(format!(
+            "{}: {}",
+            parent.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    bytes.pop();
+    Ok(PathBuf::from(OsStr::from_bytes(&bytes)))
 }
 
 /// Remove this process's temporary profile, from a place that owns nothing.
@@ -428,6 +454,7 @@ fn lock(dir: &Path) -> Result<File, String> {
         };
         return Err(format!(
             "the profile at {} is in use by another blinkterm{holder}; quit it, \
+             open the url there with blinkterm --remote <url>, \
              or run this one with --temp-profile or --profile <dir>",
             dir.display()
         ));
@@ -624,6 +651,7 @@ mod tests {
             "{why}"
         );
         assert!(why.contains("--temp-profile"), "{why}");
+        assert!(why.contains("blinkterm --remote <url>"), "{why}");
 
         drop(first);
         let again = Profile::take(Choice::At(dir.clone())).expect("free once let go");
@@ -639,6 +667,19 @@ mod tests {
         let why = Profile::take(Choice::At(file.clone())).unwrap_err();
         assert!(why.contains(&file.display().to_string()), "{why}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_temporary_profile_has_nowhere_to_listen() {
+        assert_eq!(Profile::locate(&Choice::Temporary), Ok(None));
+        assert_eq!(
+            Profile::locate(&Choice::At(PathBuf::from("/p"))),
+            Ok(Some(PathBuf::from("/p")))
+        );
+        let relative = Profile::locate(&Choice::At(PathBuf::from("rel")))
+            .expect("a working directory")
+            .expect("a place");
+        assert!(relative.is_absolute() && relative.ends_with("rel"));
     }
 
     #[test]

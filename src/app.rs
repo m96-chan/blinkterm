@@ -65,6 +65,7 @@ use crate::options::Options;
 use crate::permissions::{self, Allowed, Permission};
 use crate::picker::{self, Pickers};
 use crate::profile::Profile;
+use crate::remote::{self, Delivered, Listener};
 use crate::route::{self, Payload, Route, Wrap};
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
@@ -409,6 +410,15 @@ struct Chrome {
     /// The picker with a window that is open, if one is: one at a time, for
     /// whichever tab clicked. Dropping it ends it. See [`pump_picker`].
     picker: Option<picker::Gui>,
+    /// The socket `blinkterm --remote` hands urls over, bound under the
+    /// profile lock; none on a temporary profile, or when it could not be
+    /// made. Here, on the `Chrome`, so that an engine that dies and is
+    /// started again leaves it alone, and so that it goes — and its file with
+    /// it — before the engine is asked to close and the lock let go. A
+    /// sender in the second or two `Browser.close` takes then finds nobody
+    /// and is refused by the lock, which says what to do. See
+    /// [`pump_remote`].
+    remote: Option<Listener>,
     /// Where the pointer is and what is under it, for the tab in front only.
     /// See [`crate::hover`].
     hover: hover::Tracker,
@@ -553,6 +563,7 @@ impl Chrome {
             pickers: options.pickers.clone(),
             display: picker::has_display(|name| std::env::var(name).ok()),
             picker: None,
+            remote: None,
             hover: hover::Tracker::default(),
             asking: None,
             shape: Shape::Default,
@@ -1032,9 +1043,51 @@ enum Driven {
 /// a minute, or an engine that will not start again, ends the
 /// program — with the sentence that says the tabs are saved.
 pub fn run(options: Options) -> Result<(), String> {
+    // `--remote` first, before the terminal is looked at: a sender is often
+    // run by another program with no terminal at all, and a blinkterm that is
+    // running needs none from it. Only with nobody there does it go on to
+    // start, as a run without the flag would. See [`crate::remote`].
+    let remote_dir = if options.remote {
+        Profile::locate(&options.profile)?
+    } else {
+        None
+    };
+    if let Some(dir) = &remote_dir {
+        match remote::deliver(dir, &options.urls)? {
+            Delivered::NobodyThere => {}
+            Delivered::Opened => return Ok(()),
+            Delivered::NoAnswer => {
+                eprintln!(
+                    "blinkterm: {}",
+                    crate::text::sanitize(&format!(
+                        "the blinkterm on {} took the url and has not answered in {} s; \
+                         it may be busy in its terminal",
+                        dir.display(),
+                        remote::REPLY_TIMEOUT.as_secs()
+                    ))
+                );
+                return Ok(());
+            }
+            Delivered::Refused(mut reasons) => {
+                // One line each, as `xdg-open` would; the last is `main`'s,
+                // which prints it the same way and exits 1.
+                let last = reasons.pop().unwrap_or_default();
+                for why in reasons {
+                    eprintln!("blinkterm: {}", crate::text::sanitize(&why));
+                }
+                return Err(last);
+            }
+        }
+    }
     // SAFETY: `isatty(3)` takes a descriptor, reads no memory, and only
     // reports. 1 is stdout, which this program has by definition.
     if unsafe { libc::isatty(1) } != 1 {
+        if let Some(dir) = &remote_dir {
+            return Err(format!(
+                "no blinkterm is running on {}, and stdout is not a terminal to start one in",
+                dir.display()
+            ));
+        }
         return Err("stdout is not a terminal, so there is nowhere to put a page".to_string());
     }
     // The terminal is asked what it is before anything is started: a
@@ -1068,6 +1121,21 @@ pub fn run(options: Options) -> Result<(), String> {
     // Taken before the engine is started, so that a profile another blinkterm
     // is using is refused before anything has written to it.
     let profile = Profile::take(options.profile.clone())?;
+    // The `--remote` socket, bound now that the lock is held — which is what
+    // makes whatever a crash left at its path safe to remove — and before the
+    // engine is started, so that a sender that comes while it starts waits
+    // in the socket's queue rather than finding nobody and being refused by
+    // the lock. Not being able to listen is not a reason not to browse: it is
+    // a note on the row. A temporary profile is this run's alone and never
+    // listens.
+    let (mut listener, mut remote_problem) = if profile.is_temporary() {
+        (None, None)
+    } else {
+        match Listener::bind(profile.dir()) {
+            Ok(listener) => (Some(listener), None),
+            Err(why) => (None, Some(format!("not listening for --remote: {why}"))),
+        }
+    };
     // What pages are told about light and dark, before there is a page to
     // tell: the flags now, the terminal's answer when it comes.
     let appearance = Appearance::new(options.scheme, options.force_dark);
@@ -1116,6 +1184,7 @@ pub fn run(options: Options) -> Result<(), String> {
             );
             chrome.cell_hint = heard.cell;
             chrome.take_route(route);
+            chrome.remote = listener.take();
             booted = Some(first);
             let mut relaunches = Relaunches::default();
             let mut shrunk = Shrunk::default();
@@ -1134,7 +1203,15 @@ pub fn run(options: Options) -> Result<(), String> {
                 // for are opened once, on the first engine; a relaunch opens
                 // the tabs that were there when it died.
                 let opened = if std::mem::take(&mut opening) {
-                    open_first(&mut pane, tabs, browser, &mut chrome, &options)
+                    open_first(&mut pane, tabs, browser, &mut chrome, &options).and_then(|()| {
+                        match remote_problem.take() {
+                            Some(why) => {
+                                note(tabs, why);
+                                redraw_row(&mut pane, tabs, &chrome)
+                            }
+                            None => Ok(()),
+                        }
+                    })
                 } else {
                     Ok(())
                 };
@@ -1187,6 +1264,9 @@ pub fn run(options: Options) -> Result<(), String> {
             (Err(format!("cannot measure the pane: {e}")), None)
         }
     };
+    // A socket that never reached the `Chrome` — the pane could not be
+    // measured — goes now, while the lock that makes it ours is still held.
+    drop(listener.take());
     pane.leave();
     let mut downloads = downloads;
     if let Some(Booted {
@@ -1582,6 +1662,8 @@ fn drive(
         // A file picker's window, while it is printing its answer; see
         // [`pump_picker`].
         watching.extend(chrome.picker.as_ref().and_then(picker::Gui::fd));
+        // A `blinkterm --remote` knocking; see [`pump_remote`].
+        watching.extend(chrome.remote.as_ref().map(Listener::fd));
         // A frame owed an acknowledgement is acknowledged the pass after the
         // pane has written it ([`tick_frames`]), and nothing wakes this poll
         // when the writer finishes; so while one is owed the passes come
@@ -1626,6 +1708,10 @@ fn drive(
         // A file picker's window that has answered, or whose tab has gone
         // or gone somewhere else.
         pump_picker(pane, tabs, chrome, &ready)?;
+        // Urls from `blinkterm --remote`, opened now: before the engine's
+        // announcements of targets are read below, so that the tabs are in
+        // the list by then and those announcements are ignored as ours.
+        pump_remote(pane, tabs, browser, chrome, &ready)?;
         // Whatever the pointer did in all the reports just read, told to the
         // page and asked about once: see [`crate::hover`].
         tick_hover(pane, tabs, chrome)?;
@@ -5151,6 +5237,89 @@ fn pump_picker(
     chrome.picker = None;
     finish_picker(tabs, chrome, index, outcome);
     redraw_row(pane, tabs, chrome)
+}
+
+/// Urls from `blinkterm --remote`, once a pass: every sender that has
+/// connected read, its urls opened, and each told what became of every url.
+///
+/// The first url opened comes to the front, as a desktop browser brings a
+/// link from another program to the front, and the rest go behind it, as
+/// several urls on the command line do. The url bar, if it is open, is left
+/// as it is: it is somebody typing, and what they typed is theirs. A socket
+/// that has gone bad is let go, with a note, rather than woken for on every
+/// pass for ever.
+fn pump_remote(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &mut Chrome,
+    ready: &[std::os::fd::RawFd],
+) -> Result<(), String> {
+    let Some(listener) = chrome.remote.as_mut() else {
+        return Ok(());
+    };
+    if !ready.contains(&listener.fd()) {
+        return Ok(());
+    }
+    let deliveries = match listener.accept_ready() {
+        Ok(deliveries) => deliveries,
+        Err(why) => {
+            chrome.remote = None;
+            note(tabs, format!("stopped listening for --remote: {why}"));
+            return redraw_row(pane, tabs, chrome);
+        }
+    };
+    let was = tabs.active_target().map(str::to_string);
+    for delivery in deliveries {
+        let opened = open_delivered(
+            tabs,
+            browser,
+            &chrome.appearance,
+            &chrome.identity,
+            &delivery.lines,
+        );
+        delivery.answer(&opened);
+    }
+    switched(pane, tabs, browser, chrome, was)?;
+    redraw_row(pane, tabs, chrome)
+}
+
+/// Open what a `--remote` sender asked for: the first url that was
+/// accepted in a tab in front, loading as the first url on the command line
+/// is, and every other one in a tab behind; and, one for one with `lines`,
+/// what became of each — the url, or why it was not opened.
+///
+/// The caller follows the switch (`switched`) and redraws. Public for the
+/// test that runs it against a real engine.
+pub fn open_delivered(
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    appearance: &Appearance,
+    identity: &Identity,
+    lines: &[remote::Checked],
+) -> Vec<remote::Checked> {
+    let mut in_front = false;
+    lines
+        .iter()
+        .map(|line| {
+            let url = line.as_ref().map_err(String::clone)?;
+            let opened = if in_front {
+                open_behind(tabs, browser, appearance, identity, url).map(|_| ())
+            } else {
+                open_tab(tabs, browser, appearance, identity, url).map(|()| {
+                    in_front = true;
+                    if let Some(tab) = tabs.active_mut() {
+                        tab.note = Some(format!("loading {url}"));
+                        tab.loading = true;
+                        tab.since = Some(Instant::now());
+                    }
+                })
+            };
+            opened
+                .map(|()| url.clone())
+                .map_err(|why| format!("couldn't open {url}: {why}"))
+        })
+        .collect()
 }
 
 /// Give the terminal to a file picker that needs it, run it to the end, and

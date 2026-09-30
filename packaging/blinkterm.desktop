@@ -1,0 +1,15 @@
+# For xdg-open: a url reaches the blinkterm already running on the default
+# profile. Terminal=false on purpose: with one running no terminal is needed
+# and one would flash open and shut for every link; with none running there
+# is nowhere to draw, and blinkterm says so on stderr (the journal) and exits.
+# Install: cp packaging/blinkterm.desktop ~/.local/share/applications/ &&
+#          xdg-settings set default-web-browser blinkterm.desktop
+[Desktop Entry]
+Type=Application
+Name=blinkterm
+Comment=A real browser in a terminal pane
+Exec=blinkterm --remote %u
+Terminal=false
+NoDisplay=true
+Categories=Network;WebBrowser;
+MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;application/xhtml+xml;
