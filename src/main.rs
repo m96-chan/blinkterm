@@ -98,6 +98,12 @@ options:
                    block requests to the hosts in <path>, and to every host
                    under them (a hosts file, or one host per line); repeatable
   --no-block       block nothing, whatever block-list says
+  --sites-dir <dir>
+                   read site styles and scripts from <dir>: <host>.css and
+                   <host>.js, *.<host> for a site and everything under it,
+                   all.css for every page (default:
+                   $XDG_CONFIG_HOME/blinkterm/sites, ~/.config/blinkterm/sites)
+  --no-sites       read no site styles or scripts
   --home <url>     the page opened when no url is given (default: about:blank)
   --restore        reopen the tabs the last run had
   --normal-mode    start in normal mode (ctrl+., below)
@@ -196,6 +202,7 @@ keys:
                  (in the url bar alt+b is still a word back)
   alt+o          open this page in the desktop browser; cookies and logins
                  stay here
+  alt+r          read the site styles and scripts again
   esc            leave a page's fullscreen; stop a page that is loading
   ctrl+q         quit
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no

@@ -174,6 +174,20 @@ machine. It prints a warning when it does. Do not browse as root.
   `/dev/null`, and is never signalled
   ([#61](https://github.com/m96-chan/blinkterm/issues/61)).
 
+- **Site styles and scripts.** The files in `~/.config/blinkterm/sites/`
+  (or `--sites-dir`) are yours: read from your configuration directory as
+  they are and never written by this program. A `.js` file is code put on
+  every page its name matches. By default it runs in an isolated world that
+  shares the page's DOM and not its JavaScript; a file whose first line is
+  `// @world main` runs as the page's own code, with everything the page can
+  do — its cookies, its storage, its network access — and a page's CSP does
+  not stop it (measured with `script-src 'none'`). So a file another local
+  user could change is a way into every page you open, and a file, or the
+  directory itself, that group or others can write (`mode & 0o022`) is
+  refused by name, in the shell at start and on the row after `alt+r`.
+  Nothing in the files leaves the machine unless a script you wrote sends it
+  ([#66](https://github.com/m96-chan/blinkterm/issues/66)).
+
 - **Shared memory.** Frames go through POSIX shared memory objects named
   `blinkterm-<pid>-...` and unlinked by the terminal as it reads them — a
   frame is a picture of whatever you are looking at. On Linux they are files

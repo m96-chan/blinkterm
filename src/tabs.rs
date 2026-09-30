@@ -154,6 +154,10 @@ pub struct Tab<C> {
     /// then every frame's news is taken as the page's — see
     /// [`crate::load::is_main`].
     pub frame: Option<String>,
+    /// The identifiers `Page.addScriptToEvaluateOnNewDocument` gave this
+    /// session for the site files, so that `reload-sites` can take them back.
+    /// See [`crate::sites`].
+    pub site_scripts: Vec<String>,
     /// When the load in progress was asked for, typed or clicked; the seconds
     /// on the row count from here. `None` when nothing is loading.
     pub since: Option<Instant>,
@@ -210,6 +214,7 @@ impl<C> Tab<C> {
             upload: None,
             picking: None,
             frame: None,
+            site_scripts: Vec::new(),
             since: None,
             committed: true,
             trust: Trust::Plain,

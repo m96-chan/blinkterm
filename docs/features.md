@@ -367,3 +367,110 @@ the allow line, a dialog the page opens, a file input's path — the row comes
 back and the page is a row shorter until it closes: a `confirm()` in a
 fullscreen video is still answered on the row. Link hints and normal mode
 work in fullscreen as anywhere.
+
+## Site styles and scripts
+
+A terminal pane is narrow, its font is not the one a site was designed
+with, and a cookie banner or a sticky header takes more of it than of a
+desktop window. A file of your own fixes a site for good: CSS or JavaScript,
+named after the host, in a directory beside the settings file.
+
+```text
+~/.config/blinkterm/sites/         ($XDG_CONFIG_HOME/blinkterm/sites/)
+  all.css                          every page
+  *.github.com.css                 github.com and every host under it
+  news.ycombinator.com.css         that host only
+  example.com.js                   a script, on that host only
+```
+
+| name | the pages it is put on |
+| --- | --- |
+| `all.css`, `all.js` | every page, a `data:` page and `about:blank` included |
+| `example.com.css` | `example.com` and no other host |
+| `*.example.com.css` | `example.com`, `www.example.com`, `a.b.example.com` — not `notexample.com` |
+| `127.0.0.1.css` | that address |
+
+Names are matched without regard to case. A name that is not a host —
+anything but letters, digits, `.` and `-` after an optional `*.` — is
+refused, and said: in the shell as blinkterm starts, and on the row after
+`alt+r`. Other files (`notes.txt`, an editor's `x.css.swp`), dotfiles and
+subdirectories are passed over. Hosts only: a path, a port or an IPv6
+address is not a pattern.
+
+When several files fit a page they go on in order: `all` first, then the
+`*.` patterns with the fewest labels, then the exact host, and files of the
+same rank by name. A later style wins by the cascade and a later script runs
+later, so the most specific file has the last word.
+
+**Styles** are adopted as constructed stylesheets at the start of every
+document, in the page and in its same-process iframes (a `srcdoc` or
+`about:blank` frame goes by its page's host). A page's CSP does not stop
+them, and the page's DOM is not changed. Use `!important` to beat a page's
+own rules:
+
+```css
+/* *.github.com.css: no banner, no sticky header */
+.flash-global, .js-notice { display: none !important; }
+header.AppHeader { position: static !important; }
+```
+
+```css
+/* all.css: a larger font for a narrow pane */
+html { font-size: 18px !important; }
+```
+
+**Scripts** run at the start of every document, before any of the page's
+own. By default in an isolated world: the page's DOM is shared, its
+JavaScript is not, so the page cannot see the script's variables and the
+script cannot call the page's functions. A file whose first line is
+`// @world main` runs in the page's own world instead, as the page's code.
+At document start the page's elements do not exist yet — even
+`document.documentElement` is `null` — so a script that changes the page
+waits for them:
+
+```js
+// example.com.js
+addEventListener('DOMContentLoaded', () => {
+  for (const el of document.querySelectorAll('.cookie-banner')) el.remove();
+});
+```
+
+Each script is registered on its own, so a file with a syntax error stops
+only itself; its top-level declarations are its own, as in a userscript
+manager.
+
+**`alt+r`** (`reload-sites`) reads the directory again and tells every tab.
+The row says what was read, `site files: 2 styles, 1 script`. Styles change
+on the page where it stands. Scripts apply from each page's next load — a
+script run again on a live page would do its work twice. A tab stopped
+behind a dialog, or crashed, keeps the files it had, and the row says how
+many did. If `alt+r` is taken by your terminal, bind another key:
+`key.f9 = reload-sites` (see [Rebinding keys](configuration.md#rebinding-keys)).
+
+**The directory** is read once as blinkterm starts. `--sites-dir <dir>` (or
+`sites-dir = <dir>` in the config file) reads another one, which must
+exist; `--no-sites` (or `sites = false`) reads none. The files are read as
+they are and never written. A file larger than 1 MiB or not UTF-8 is
+refused, and so is a file, or the directory, that group or others can
+write: a script runs with the page's powers, and one that another user can
+change is a way into every page (see [SECURITY.md](../SECURITY.md)).
+`chmod go-w` it.
+
+What a page can see: of a style, `document.adoptedStyleSheets` one entry
+longer; of a script in the isolated world, what it does to the DOM; a
+`// @world main` script is the page's own code. What is not reached: an
+iframe from another site that the engine runs in a process of its own, a
+page that assigns `document.adoptedStyleSheets` wholesale, and a page's
+inline `style="…!important"`.
+
+Measured against `chrome-headless-shell` 153:
+
+| | |
+| --- | --- |
+| a host's style, on load, after a navigation, after a reload | applied |
+| a script, before the page's first inline script | ran first |
+| a `// @world main` script under `script-src 'none'` | ran |
+| a style after `alt+r` | in place, on the same document |
+| the old script after `alt+r` | never ran again |
+| five script files, registered on a new tab | 0.5 to 10 ms |
+| 210 KB of CSS, to `domInteractive` | +7 ms on a page it fits, +1 ms on one it does not |

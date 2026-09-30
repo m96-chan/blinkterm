@@ -28,6 +28,7 @@
 | `alt+shift+s` | save the whole page, top to bottom, as a PNG there. A page past sixteen million pixels is cut to its top, and the row says how much |
 | `alt+p` | allow this site something: the row says `allow https://site: ` and the words it is allowed now, all selected; type any of `camera` `microphone` `location` `notifications` `clipboard`, `enter` sets exactly those (an empty line takes them all back), `esc` leaves it. See [Sound, permissions and fullscreen](features.md#sound-permissions-and-fullscreen) |
 | `alt+b` | stop blocking ads and trackers on this site, or start again: the row says `blocking off for example.com`, and `unblocked` while you are on it. Reload to get what was blocked. In the url bar `alt+b` is still a word back |
+| `alt+r` | read the site styles and scripts again: the row says `site files: 2 styles, 1 script`; styles change the page where it stands, scripts from the next load. See [Site styles and scripts](features.md#site-styles-and-scripts) |
 | `alt+l` | fill the login form from your password manager: runs `password-command` for this page's host and puts what it printed into the password field and the user-name field before it, in the page or a same-origin frame; never submits; only on https or localhost. See [Filling a login from your password manager](features.md#filling-a-login-from-your-password-manager) |
 | `ctrl+q` | quit |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
