@@ -99,7 +99,7 @@ on `main` rather than the last release:
 cargo install --locked --git https://github.com/m96-chan/blinkterm
 ```
 
-Or, on Linux, with [Homebrew](https://brew.sh):
+Or with [Homebrew](https://brew.sh), on Linux or macOS:
 
 ```sh
 brew install m96-chan/tap/blinkterm
@@ -109,9 +109,8 @@ That builds from source too — the tap's formula asks Homebrew for a Rust and
 runs the same `cargo install --locked` — so it is the same binary by a shorter
 command, not a prebuilt one; prebuilt binaries are
 [#22](https://github.com/m96-chan/blinkterm/issues/22). The engine below is
-still yours to install, and `brew` says so when it is done. On macOS, use
-`cargo install` for now: the formula's release, v0.1.0, predates macOS
-support, and the formula opens to macOS with the first release that has it.
+still yours to install, and `brew` says so when it is done. It installs on
+macOS too, from v0.2.0 on.
 The formula lives
 in this repository, at `packaging/homebrew/blinkterm.rb`, and
 [m96-chan/homebrew-tap](https://github.com/m96-chan/homebrew-tap) carries a

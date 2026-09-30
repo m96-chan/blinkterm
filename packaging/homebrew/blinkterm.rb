@@ -8,8 +8,8 @@ class Blinkterm < Formula
   # GitHub's archive of the tag; RELEASING.md ("Homebrew") says how both lines
   # are made on each release. `head` stays below, so `--HEAD` keeps installing
   # main.
-  url "https://github.com/m96-chan/blinkterm/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "84cbea74248e2ec64ae57b8c06f181032c8528ea87c166ee6167b4236b64feef"
+  url "https://github.com/m96-chan/blinkterm/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "c41fd8d6218c499573734c264e12a522acb1537f8af824358b2769494616b43e"
   license "MIT"
   head "https://github.com/m96-chan/blinkterm.git", branch: "main"
 
@@ -17,13 +17,9 @@ class Blinkterm < Formula
   # `brew audit --strict` checks components in, and it refuses the other.
   depends_on "rust" => :build
 
-  # main runs on macOS now (#21: ci.yml's `mac` job runs the engine tests on
-  # macos-15), but the stable spec above is v0.1.0, which predates that and
-  # cannot draw a frame there. This line comes out, and macos goes into
-  # homebrew.yml's matrix, with the first release that carries macOS support
-  # (RELEASING.md, "Homebrew"); a macOS line in the caveats below goes in at
-  # the same time.
-  depends_on :linux
+  # No platform requirement: v0.2.0 is the first release that runs on macOS
+  # (ci.yml's `mac` job runs the engine tests on macos-15), and
+  # homebrew.yml builds this formula there as well as on Linux.
 
   def install
     # std_cargo_args is `--jobs N --locked --root=#{prefix} --path=.`.
@@ -45,6 +41,12 @@ class Blinkterm < Formula
       Unzip the linux64 chrome-headless-shell build somewhere and point at it:
 
         export BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell
+
+      On a Mac with Apple silicon, the same version's mac-arm64 build:
+
+        export BLINKTERM_ENGINE=~/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell
+
+      A Google Chrome or Chromium in /Applications is found without that.
 
       The README's "Installing" section has the exact download and the
       libraries it wants. Debian's chromium-shell package is Chromium's

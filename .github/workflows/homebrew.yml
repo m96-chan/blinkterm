@@ -62,16 +62,13 @@ env:
 jobs:
   formula:
     name: brew audit, install, test
-    # The platforms the formula installs on: Linux only while the stable spec
-    # is v0.1.0, which predates macOS support and so still says
-    # `depends_on :linux`. With the first release that carries macOS support,
-    # macos-15 joins this list and that line comes out of the formula
-    # (RELEASING.md, "Homebrew"). fail-fast off, so that then a Linux failure
-    # does not hide whether the macOS build works, or the other way.
+    # The platforms the formula installs on: Linux and, since v0.2.0 (the
+    # first release that runs there), macOS. fail-fast off, so that a Linux
+    # failure does not hide whether the macOS build works, or the other way.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       # The whole history, because Homebrew clones the head from this checkout
@@ -102,6 +99,17 @@ jobs:
       # DSL rules (description length, licence, branch on the head url), and
       # that the urls answer.
       - run: brew audit --strict --online m96-chan/tap/blinkterm
+      # The hosted macOS image has an `openssl` in /opt/homebrew/bin that is
+      # not Homebrew's, and `rust` (the build dependency) brings openssl@3
+      # with it: the upgrade pours and then fails to link over that file,
+      # which failed the first macOS run of this job ("Could not symlink
+      # bin/openssl"). So on macOS it is upgraded first and linked over the
+      # image's copy. Nothing about the formula; everything about the runner.
+      - name: Link openssl@3 over the runner's own (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew upgrade openssl@3 || true
+          brew link --overwrite openssl@3
       # The stable spec. The step looks for the sha256 line rather than
       # assuming one, so a formula that goes back to head-only still passes.
       - name: brew install (stable), if there is a stable
