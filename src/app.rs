@@ -1077,6 +1077,7 @@ pub struct Booted {
 /// `--engine-arg`s, user agent, proxy — on the same profile. An `Err` drops
 /// the engine, and the profile with it. Public so that the engine tests boot
 /// the way the program does.
+#[allow(clippy::too_many_arguments)]
 pub fn boot(
     profile: Profile,
     launch: &crate::engine::Launch,
