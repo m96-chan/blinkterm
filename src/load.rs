@@ -497,9 +497,14 @@ pub fn status_phrase(status: u16) -> String {
 /// `Runtime.evaluate` the title was already costing. The `try` is for a page
 /// that has replaced `performance` with something of its own; a page that
 /// breaks the status still gets its title read.
+///
+/// And whether the document has finished, which is the same question
+/// `Page.loadEventFired` answers and the only way to ask it of a page whose
+/// event nobody was listening for — a tab whose queue went in the bin when it
+/// came to the front. See [`crate::app`]'s `activate`.
 pub const LOADED: &str =
     "(function(){var s=0;try{var n=performance.getEntriesByType('navigation')[0];\
-s=n?n.responseStatus:0}catch(e){}return [document.title,s]})()";
+s=n?n.responseStatus:0}catch(e){}return [document.title,s,document.readyState==='complete']})()";
 
 /// What [`LOADED`] answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,6 +516,13 @@ pub struct Loaded {
     /// and a 0 is a page that had no response to have a status — an error
     /// page, `about:blank`, a `data:` url.
     pub status: Option<u16>,
+    /// Whether the document has finished loading (`document.readyState` is
+    /// `complete`), which is the load event asked for rather than waited
+    /// for. False for a page still loading, and — because the question is
+    /// only ever asked of the document on screen — false is also what an
+    /// engine too old to answer it would give, which is the safe way round:
+    /// nothing is recorded that did not say it had finished.
+    pub complete: bool,
 }
 
 /// Read the reply to a `Runtime.evaluate` of [`LOADED`], made with
@@ -526,7 +538,12 @@ pub fn loaded(reply: &Json) -> Option<Loaded> {
         .and_then(Json::as_f64)
         .filter(|status| (400.0..1000.0).contains(status))
         .map(|status| status as u16);
-    Some(Loaded { title, status })
+    let complete = value.get(2).and_then(Json::as_bool).unwrap_or(false);
+    Some(Loaded {
+        title,
+        status,
+        complete,
+    })
 }
 
 #[cfg(test)]
@@ -655,33 +672,47 @@ mod tests {
             )))
         };
         assert_eq!(
-            answer(r#"["nope",404]"#),
+            answer(r#"["nope",404,true]"#),
             Some(Loaded {
                 title: "nope".to_string(),
-                status: Some(404)
+                status: Some(404),
+                complete: true
             })
         );
         assert_eq!(
-            answer(r#"["fine",200]"#),
+            answer(r#"["fine",200,true]"#),
             Some(Loaded {
                 title: "fine".to_string(),
-                status: None
+                status: None,
+                complete: true
             })
         );
         assert_eq!(
-            answer(r#"["",0]"#),
+            answer(r#"["",0,true]"#),
             Some(Loaded {
                 title: String::new(),
-                status: None
+                status: None,
+                complete: true
             }),
             "an error page has no title and no status"
         );
         assert_eq!(
-            answer(r#"["t",null]"#),
+            answer(r#"["t",null,false]"#),
             Some(Loaded {
                 title: "t".to_string(),
-                status: None
-            })
+                status: None,
+                complete: false
+            }),
+            "a page still loading says so"
+        );
+        assert_eq!(
+            answer(r#"["t",200]"#),
+            Some(Loaded {
+                title: "t".to_string(),
+                status: None,
+                complete: false
+            }),
+            "an answer with no word on it is not a page that has finished"
         );
         assert_eq!(answer(r#""just a title""#), None);
         assert_eq!(loaded(&json(r#"{"exceptionDetails":{}}"#)), None);

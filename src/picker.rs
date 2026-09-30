@@ -1339,6 +1339,7 @@ mod tests {
             backend_node_id: 3,
             multiple,
             frame_id: "F".to_string(),
+            session: None,
         }
     }
 

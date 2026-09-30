@@ -31,7 +31,7 @@
 use std::borrow::Cow;
 use std::io::{self, Write};
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -201,6 +201,17 @@ pub fn pointer_shape(name: &'static str) -> Vec<u8> {
 /// without a reference to anything.
 static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
 
+/// The same settings again, as a pointer a signal handler may read.
+///
+/// [`SAVED`] is behind a mutex, and a mutex is the one thing a handler must
+/// not touch: a `SIGSEGV` that arrives while the lock is held would deadlock
+/// the restoration it came for. So the settings are also kept here, in a
+/// leaked box written once by [`Pane::enter`] and set back to null by
+/// [`Pane::leave`], and the handler's whole use of them is an atomic load and
+/// a `tcsetattr(3)` — both async-signal-safe. Null means there is nothing to
+/// put back.
+static SAVED_FOR_SIGNAL: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
+
 /// Whether the keyboard flags were pushed, for [`emergency`] to know whether
 /// to pop them. True until a pane says otherwise: a pop the terminal did not
 /// need is harmless, and the one that was needed is not.
@@ -215,6 +226,54 @@ pub fn emergency_sequence(keyboard: bool) -> Vec<u8> {
     let mut out = b"\x1b\\".to_vec();
     out.extend_from_slice(&leave_sequence_with(keyboard));
     out
+}
+
+/// [`emergency_sequence`] laid out at compile time, because a signal handler
+/// may not allocate and that one builds a `Vec`.
+///
+/// Two of them, for the two answers [`KEYBOARD`] can give. What keeps them
+/// from drifting away from the builder is the unit test below, which asserts
+/// each is exactly what `emergency_sequence` makes.
+const EMERGENCY_WITH_KEYBOARD: &[u8] = b"\x1b\\\x1b[<u\x1b[?2004l\x1b[?1016l\x1b[?1006l\
+\x1b[?1003l\x1b[?1000l\x1b]22;default\x1b\\\x1b[?25h\x1b[?1049l";
+
+/// [`EMERGENCY_WITH_KEYBOARD`] without the keyboard pop.
+const EMERGENCY_NO_KEYBOARD: &[u8] = b"\x1b\\\x1b[?2004l\x1b[?1016l\x1b[?1006l\
+\x1b[?1003l\x1b[?1000l\x1b]22;default\x1b\\\x1b[?25h\x1b[?1049l";
+
+/// [`emergency`], written so that a signal handler may run it: one atomic
+/// load, one `write(2)` of bytes that were already there, one atomic load and
+/// one `tcsetattr(3)`. Nothing allocated, nothing locked.
+///
+/// This is what stands between a death the panic hook never sees — `SIGSEGV`,
+/// `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGABRT` — and a shell left with mouse
+/// reporting on, the keyboard flags pushed and no line discipline, typing
+/// every mouse report and every key back as text. That is the state issue #78
+/// was reported from. See [`crate::app`]'s `on_fatal`.
+pub fn emergency_from_signal() {
+    let bytes = if KEYBOARD.load(Ordering::SeqCst) {
+        EMERGENCY_WITH_KEYBOARD
+    } else {
+        EMERGENCY_NO_KEYBOARD
+    };
+    // SAFETY: `bytes` is a `&'static [u8]` and `bytes.len()` is exactly how
+    // much of it there is, so `write(2)` reads nothing else. It is
+    // async-signal-safe, which is the property that matters here; the result
+    // is dropped because there is nothing left to report to.
+    unsafe {
+        libc::write(1, bytes.as_ptr() as *const libc::c_void, bytes.len());
+    }
+    let saved = SAVED_FOR_SIGNAL.load(Ordering::SeqCst);
+    if saved.is_null() {
+        return;
+    }
+    // SAFETY: `saved` is either null, handled above, or the leaked box
+    // `Pane::enter` put there — alive for the rest of the process, since
+    // nothing frees it. `tcsetattr(3)` only reads through the pointer and is
+    // async-signal-safe. 0 is stdin, which is where the settings came from.
+    unsafe {
+        libc::tcsetattr(0, libc::TCSANOW, saved);
+    }
 }
 
 /// Put the terminal back, from anywhere.
@@ -284,6 +343,13 @@ impl Pane {
         if let Ok(mut slot) = SAVED.lock() {
             *slot = Some(saved);
         }
+        // And a copy a signal handler may read without a lock. Leaked on
+        // purpose: it has to outlive everything, including a handler running
+        // while the program is on its way down. One pane at a time, and a
+        // second `enter` would leak one `termios` — 60 bytes, once, in a
+        // program that enters a pane at most twice (a picker's `release` and
+        // `resume` do not come through here).
+        SAVED_FOR_SIGNAL.store(Box::leak(Box::new(saved)), Ordering::SeqCst);
 
         KEYBOARD.store(keyboard, Ordering::SeqCst);
         let mut pane = Pane {
@@ -404,6 +470,10 @@ impl Pane {
         self.restored = true;
         let _ = self.write(&leave_sequence_with(self.keyboard));
         self.outbox.drain(LEAVE_DRAIN);
+        // The terminal is the shell's again from here, so a signal caught
+        // after this has nothing to put back and must not undo what the
+        // shell has done since.
+        SAVED_FOR_SIGNAL.store(std::ptr::null_mut(), Ordering::SeqCst);
         if let Ok(mut saved) = SAVED.lock() {
             if let Some(termios) = saved.take() {
                 // SAFETY: as in `emergency`: read-only through a pointer to a
@@ -2503,6 +2573,20 @@ mod tests {
         let err = outbox.write(b"again").expect_err("the writer has failed");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         assert!(outbox.write_frame(b"x".to_vec()).is_err());
+    }
+
+    /// Issue #78: the bytes a signal handler writes are the ones
+    /// [`emergency_sequence`] builds, because a handler may not build them.
+    /// If somebody changes what is turned off at the end, this is what says
+    /// the signal path was not left behind.
+    #[test]
+    fn what_a_signal_handler_writes_is_what_the_emergency_path_builds() {
+        assert_eq!(
+            EMERGENCY_WITH_KEYBOARD,
+            emergency_sequence(true),
+            "the signal path and the panic path have drifted apart"
+        );
+        assert_eq!(EMERGENCY_NO_KEYBOARD, emergency_sequence(false));
     }
 
     #[test]

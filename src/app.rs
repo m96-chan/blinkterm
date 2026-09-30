@@ -81,7 +81,7 @@ use crate::scroll::{self, Step};
 use crate::session::{self, Offer, Reply, Session, Snapshot};
 use crate::sites::{self, Sites};
 use crate::tablist::{self, TabList};
-use crate::tabs::{Outcome, Tab, Tabs};
+use crate::tabs::{Counted, Outcome, Tab, Tabs};
 use crate::upload::{self, Upload};
 use crate::zoom::{self, Scale, Viewport, Zoom, Zooms};
 
@@ -238,6 +238,40 @@ extern "C" fn on_quit(_signal: libc::c_int) {
     QUIT.store(true, Ordering::SeqCst);
 }
 
+/// A death this program cannot do anything about, on the way down: the
+/// terminal put back, and the engine stopped.
+///
+/// `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE` and `SIGABRT` are the ways out the
+/// panic hook never sees. A release build aborts on panic, so the hook covers
+/// every panic, but nothing in Rust covers a fault in the engine's client
+/// library, in a `mmap`ped frame store, or a `CHECK` that came from outside —
+/// and what the person is left with then is what issue #78 reported: a shell
+/// with mouse reporting still on and the keyboard flags still pushed, typing
+/// every report and every key back as text, and a Chromium still running.
+///
+/// What a handler may do bounds this exactly. [`screen::emergency_from_signal`]
+/// is one `write(2)` of bytes that were already there and one `tcsetattr(3)`;
+/// [`crate::engine::kill_engine`] is one atomic swap and one `kill(2)`. The
+/// temporary profile is *not* removed here — that is `opendir` and `unlink`
+/// over a tree, none of which a handler may do — so a crash leaves one
+/// behind, in `$TMPDIR`, where the next clean run's own removal does not
+/// reach it. A directory left in `/tmp` is the lesser of the two.
+///
+/// The handler was installed with `SA_RESETHAND`, so the signal's disposition
+/// is already the default by the time this runs: `raise` is the program dying
+/// of exactly what it was going to die of, with the status the shell expects
+/// (128 + n) and whatever crash report the system was going to write.
+extern "C" fn on_fatal(signal: libc::c_int) {
+    screen::emergency_from_signal();
+    crate::engine::kill_engine();
+    // SAFETY: `raise(3)` takes an integer and reads no memory, and is
+    // async-signal-safe. The disposition is the default already
+    // (`SA_RESETHAND`), so this does not come back here.
+    unsafe {
+        libc::raise(signal);
+    }
+}
+
 extern "C" fn on_winch(_signal: libc::c_int) {
     RESIZED.store(true, Ordering::SeqCst);
 }
@@ -359,6 +393,10 @@ impl Shrunk {
 /// Ask to be told about the three signals that matter, without `SA_RESTART`:
 /// a `poll` that is interrupted is a `poll` that comes back and looks at the
 /// flags, which is the whole point of setting them.
+///
+/// And about the five that mean the program is over whatever it does next,
+/// so that it can still put the terminal back on the way down: see
+/// [`on_fatal`].
 fn install_signals() {
     // SAFETY: every pointer handed over below points at a live local that
     // outlives its call -- `sigaction(2)` and `sigemptyset(3)` copy what they
@@ -382,6 +420,34 @@ fn install_signals() {
         // program before it has put the terminal back: with this, a write to
         // it is `EPIPE`, which `cdp` turns into a sentence.
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        // And the ways out that are not this program's decision.
+        //
+        // `SA_RESETHAND` so that the handler runs once and the signal's own
+        // default is back before it does: a fault inside the handler is then
+        // the program dying rather than the handler again, and the `raise` at
+        // the end is the death it was already having. `SA_NODEFER` beside it
+        // so that `raise` is delivered there and then rather than held until
+        // the handler returns. `SA_ONSTACK` because the Rust runtime has
+        // given each thread an alternate stack for exactly this, and a stack
+        // overflow is a `SIGSEGV` with no stack left to run a handler on.
+        //
+        // This does replace the runtime's own `SIGSEGV` handler, and with it
+        // the "has overflowed its stack" line it prints. That is the trade:
+        // a sentence nobody sees, against a terminal the person has to close
+        // the window to get back.
+        for signal in [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGFPE,
+            libc::SIGABRT,
+        ] {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_fatal as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER | libc::SA_ONSTACK;
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
     }
 }
 
@@ -2255,6 +2321,28 @@ pub fn page_title(client: &mut Client) -> Option<String> {
     page_loaded(client).map(|loaded| loaded.title)
 }
 
+/// Write the page now in `tab` into the history, once.
+///
+/// Called wherever this program learns that a page has finished loading, and
+/// the tab's [`Counted`] flag is what makes calling it twice for one document
+/// the same as calling it once: the news arrives by two roads — the engine's
+/// `Page.loadEventFired`, and the page asked directly in [`activate`] when
+/// the queue holding that event went in the bin — and before #70 the second
+/// road recorded nothing at all, so a page opened straight into a new tab
+/// that loaded before the switch was never a visit.
+///
+/// A page that did not come has a problem and is not a visit; `about:` and
+/// `data:` are refused by the history itself. What it costs is one line
+/// appended to a file, and a history that cannot be written is not a reason
+/// to stop.
+fn record_visit<C>(tab: &mut Tab<C>, history: &mut History) {
+    if tab.counted == Counted::Yes || tab.problem.is_some() || !History::records(&tab.url) {
+        return;
+    }
+    tab.counted = Counted::Yes;
+    let _ = history.visited(&tab.url, &tab.title, unix_now());
+}
+
 /// Send the active tab somewhere. The sentence, if it would not go.
 ///
 /// A navigation fails in one of two ways, and only one of them comes back as
@@ -2461,7 +2549,33 @@ fn activate(
     bin_events(tab, &base, chrome);
     if tab.dialog.is_none() && !tab.dormant {
         if let Some(loaded) = page_loaded(&mut tab.connection) {
+            let complete = loaded.complete;
             tab.loaded(loaded);
+            // The page says it has finished, which is the load event this
+            // tab's queue was holding when the bin took it — and the only
+            // word there will ever be for a tab created with a url that
+            // loaded before this program had attached and was switched to in
+            // the same pass (issue #70). Only of the document the last
+            // navigation asked for: while one is pending the page answering
+            // is still the last one, finished long ago, and counting it
+            // would be a second visit to the page being left.
+            if complete && tab.committed {
+                // The load is over, and nothing else is coming to say so:
+                // `Page.frameStoppedLoading` was in the bin too, and a tab
+                // left saying "loading" says it until its next navigation.
+                if tab.loading {
+                    tab.stopped_loading();
+                }
+                // The visit itself is owed rather than written: this runs
+                // from `handle_input`, and the tab's url is the one that was
+                // asked for until `handle_target_events` reads the engine's
+                // rename of the target later in this same pass, which after
+                // a redirect is the only word on where the page ended up.
+                // See [`Counted::Due`].
+                if tab.counted == Counted::No {
+                    tab.counted = Counted::Due;
+                }
+            }
         }
     }
     start_screencast(&mut tab.connection, pixels, stopped, cast)?;
@@ -2657,8 +2771,8 @@ pub fn revive(
     let _ = restart_screencast(client, Layout::default().pixels(metrics), true, cast);
 }
 
-/// Throw away what a tab has queued, except what it says about a dialog or a
-/// file input.
+/// Throw away what a tab has queued, except what it says about a dialog, a
+/// file input, or a frame of its own.
 ///
 /// A queue that is binned is binned for its frames, which are older than the
 /// moment they would be painted in. A dialog is not like that: the page opened
@@ -2669,10 +2783,24 @@ pub fn revive(
 /// person clicked an input, and a prompt that went in the bin would be a
 /// click that did nothing — which is what issue #11 was. `base` is where a
 /// prompt opened here starts.
+///
+/// A `Target.attachedToTarget` is not a question at all, and it is kept for
+/// the opposite reason: it is said once and never again, and a tab that
+/// binned it would be a tab whose file inputs work everywhere but in that one
+/// cross-site frame, for as long as the page is open. See [`frame_attached`].
 fn bin_events(tab: &mut Tab<Client>, base: &Path, chrome: &Chrome) {
     for event in tab.connection.events() {
         tab.dialog_event(&event);
         chooser_opened(tab, &event, base, chrome);
+        match event.method.as_str() {
+            "Target.attachedToTarget" => {
+                frame_attached(tab, &event);
+            }
+            "Target.detachedFromTarget" => {
+                frame_detached(tab, &event);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2685,8 +2813,12 @@ fn bin_events(tab: &mut Tab<Client>, base: &Path, chrome: &Chrome) {
 fn chooser_opened(tab: &mut Tab<Client>, event: &Event, base: &Path, chrome: &Chrome) -> bool {
     let use_picker = !chrome.pickers.is_empty();
     if use_picker && chrome.picker.is_some() && event.method == "Page.fileChooserOpened" {
-        if let Some(chooser) = upload::Chooser::opening(&event.params) {
-            cancel_chooser(&mut tab.connection, chooser.backend_node_id);
+        if let Some(chooser) = upload::Chooser::opening(event) {
+            cancel_chooser(
+                &mut tab.connection,
+                chooser.session.as_deref(),
+                chooser.backend_node_id,
+            );
             tab.note = Some("a file picker is already open".to_string());
             return true;
         }
@@ -2906,6 +3038,153 @@ fn create_tab(
     })
 }
 
+/// Ask the engine to attach to this session's out-of-process iframes and say
+/// so, so that a file input inside one can be answered (issue #57).
+///
+/// A cross-site iframe is an out-of-process iframe: a target of its own, in a
+/// renderer of its own, whose events do not come through the page's session.
+/// `Page.setInterceptFileChooserDialog` on the page therefore does nothing
+/// for an input inside one, and a click on it opened the engine's own picker,
+/// which headless does not have and cancels at once — measured against
+/// `chrome-headless-shell` 153, where `Page.fileChooserOpened` never arrived
+/// for such an input and arrived for every other shape of file input tried.
+///
+/// `Target.setAutoAttach` is how a session is told to attach to the targets
+/// underneath it. `flatten` is what this whole module speaks
+/// ([`crate::cdp`]); `waitForDebuggerOnStart` is **false**, which is the
+/// safer way round. True would hold each frame's renderer until this program
+/// said go, and a frame whose attach was read by nobody — the queue a tab
+/// coming to the front puts in the bin, a pass that took a page's events
+/// while a dialog was up — would be a frame that never ran at all. False
+/// leaves a window between the frame starting and the interception reaching
+/// it, and what is in that window is a click on an input in a frame the
+/// person has not been shown yet.
+///
+/// The `filter` is not decoration. Without one the engine attaches to every
+/// target underneath, workers included — measured, a page with one
+/// `new Worker` attached the worker too — and a page target, which
+/// [`crate::tabs`] already has a session on, would be attached twice: two
+/// sessions on one target, both with `Fetch` on from
+/// [`crate::block::Blocker`], each pausing the same request. Iframes and
+/// nothing else is what is wanted and what is asked for. An engine too old
+/// for `filter` refuses the command, and a refusal leaves the tab exactly as
+/// it was before this existed.
+///
+/// Sent on each frame's own session too, once it is attached, because a
+/// cross-site frame inside a cross-site frame is a target underneath *that*
+/// one.
+fn watch_frames(connection: &mut Client, session: Option<&str>) -> Result<Json, String> {
+    connection.call_on(
+        session,
+        "Target.setAutoAttach",
+        Json::object(vec![
+            ("autoAttach", Json::Bool(true)),
+            ("waitForDebuggerOnStart", Json::Bool(false)),
+            ("flatten", Json::Bool(true)),
+            (
+                "filter",
+                Json::Array(vec![
+                    Json::object(vec![
+                        ("type", Json::string("iframe")),
+                        ("exclude", Json::Bool(false)),
+                    ]),
+                    Json::object(vec![("exclude", Json::Bool(true))]),
+                ]),
+            ),
+        ]),
+        SWITCH_TIMEOUT,
+    )
+}
+
+/// A `Target.attachedToTarget` on a tab's session: an out-of-process iframe
+/// of that tab's page, which the engine has just attached to because
+/// `watch_frames` asked it to.
+///
+/// The session is taken into the tab's own mailbox ([`crate::cdp::Client::adopt`])
+/// rather than given a client of its own, and then told the two things a
+/// frame has to be told: `Page.enable`, without which the interception is
+/// accepted and does nothing, and the interception. Told and not asked — a
+/// frame that has just been made answers when it answers, and a round trip
+/// per frame would be paid on every advertisement on every page.
+///
+/// True when the tab is now listening to a frame it was not.
+///
+/// Public so that the engine test for #57 attaches a frame the way the loop
+/// does.
+pub fn frame_attached(tab: &mut Tab<Client>, event: &Event) -> bool {
+    if event
+        .params
+        .path(&["targetInfo", "type"])
+        .and_then(Json::as_str)
+        != Some("iframe")
+    {
+        return false;
+    }
+    let Some(session) = event
+        .params
+        .get("sessionId")
+        .and_then(Json::as_str)
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    if tab.connection.adopt(&session).is_err() {
+        return false;
+    }
+    let _ = tab
+        .connection
+        .notify_on(Some(&session), "Page.enable", Json::empty());
+    let _ = tab.connection.notify_on(
+        Some(&session),
+        "Page.setInterceptFileChooserDialog",
+        Json::object(vec![("enabled", Json::Bool(true))]),
+    );
+    let _ = tab.connection.notify_on(
+        Some(&session),
+        "Target.setAutoAttach",
+        Json::object(vec![
+            ("autoAttach", Json::Bool(true)),
+            ("waitForDebuggerOnStart", Json::Bool(false)),
+            ("flatten", Json::Bool(true)),
+            (
+                "filter",
+                Json::Array(vec![
+                    Json::object(vec![
+                        ("type", Json::string("iframe")),
+                        ("exclude", Json::Bool(false)),
+                    ]),
+                    Json::object(vec![("exclude", Json::Bool(true))]),
+                ]),
+            ),
+        ]),
+    );
+    true
+}
+
+/// A `Target.detachedFromTarget` on a tab's session: one of its frames has
+/// gone. The adoption is already undone by [`crate::cdp`]'s router; what is
+/// left is a prompt for an input in that frame, which is now a question about
+/// something that is not there.
+fn frame_detached(tab: &mut Tab<Client>, event: &Event) -> bool {
+    let Some(gone) = event.params.get("sessionId").and_then(Json::as_str) else {
+        return false;
+    };
+    let was = tab
+        .upload
+        .as_ref()
+        .is_some_and(|upload| upload.chooser.session.as_deref() == Some(gone))
+        || tab
+            .picking
+            .as_ref()
+            .is_some_and(|picking| picking.chooser.session.as_deref() == Some(gone));
+    if was {
+        tab.upload = None;
+        tab.picking = None;
+        tab.note = Some("the frame asking for a file has gone".to_string());
+    }
+    was
+}
+
 /// Attach to a target and start listening to its page, whether or not it is
 /// the tab in front; and its main frame's id, if the engine says.
 ///
@@ -2969,6 +3248,12 @@ fn connect_tab(
         Json::object(vec![("enabled", Json::Bool(true))]),
         SWITCH_TIMEOUT,
     )?;
+    // And the same interception on every out-of-process iframe the page has,
+    // which is a target of its own and hears none of the above: see
+    // [`watch_frames`]. Asked rather than told, because a refusal is the one
+    // way to know the engine will not do it — and not a reason to refuse the
+    // tab, which without it is a tab whose ordinary file inputs still work.
+    let _ = watch_frames(&mut connection, None);
     prepare_session(&mut connection, appearance, identity);
     let scripts = sites::install(&mut connection, sites, true);
     let frame = connection
@@ -3770,6 +4055,27 @@ fn handle_page_events(
         let Some(tab) = tabs.get_mut(index) else {
             continue;
         };
+        // A visit [`activate`] owed the history, written now: the engine's
+        // rename of the target has been read this pass (`handle_target_events`
+        // runs before this), so the url on the tab is the one the redirects
+        // ended at. Above the drain, because the tab that owes it is the one
+        // whose events went in the bin and it may have nothing queued at all.
+        if tab.counted == Counted::Due && !tab.dormant {
+            // That rename clears the title, on the sound reasoning that a tab
+            // which has gone somewhere has not got there yet and its own
+            // `Page` events will say what it is called — but those are the
+            // events that went in the bin, so nothing would. The page is
+            // asked once more, here rather than in [`activate`], because here
+            // is after the rename and the history wants the landed page's
+            // name beside its url.
+            if tab.title.is_empty() && tab.dialog.is_none() && !tab.is_crashed() {
+                if let Some(loaded) = page_loaded(&mut tab.connection) {
+                    tab.loaded(loaded);
+                    redraw |= index == active;
+                }
+            }
+            record_visit(tab, &mut chrome.history);
+        }
         let events = tab.connection.events();
         if events.is_empty() {
             continue;
@@ -3783,7 +4089,12 @@ fn handle_page_events(
         // Whether this tab's renderer died and has now landed a page again.
         let mut revived = false;
 
-        for Event { method, params } in events {
+        for Event {
+            method,
+            params,
+            session,
+        } in events
+        {
             match method.as_str() {
                 "Page.screencastFrame" => {
                     // While the whole page is being photographed the engine
@@ -3996,7 +4307,11 @@ fn handle_page_events(
                             .dialog
                             .as_ref()
                             .is_some_and(|dialog| dialog.kind == Kind::BeforeUnload);
-                    if tab.dialog_event(&Event { method, params }) {
+                    if tab.dialog_event(&Event {
+                        method,
+                        params,
+                        session,
+                    }) {
                         redraw = true;
                     }
                     if stay {
@@ -4014,7 +4329,11 @@ fn handle_page_events(
                     // a path to type on the row, answered by a key in
                     // `answer_upload`. The page is not stopped.
                     let base = chrome.upload_base();
-                    let event = Event { method, params };
+                    let event = Event {
+                        method,
+                        params,
+                        session,
+                    };
                     if chooser_opened(tab, &event, &base, chrome) {
                         redraw = true;
                     }
@@ -4034,6 +4353,29 @@ fn handle_page_events(
                 // page back: see [`Tab::reviving`].
                 "Inspector.targetReloadedAfterCrash" if tab.is_crashed() => {
                     tab.reviving = true;
+                }
+                // An out-of-process iframe of this page, attached because
+                // [`watch_frames`] asked the engine to, and going again when
+                // the frame does. See [`frame_attached`].
+                "Target.attachedToTarget" => {
+                    frame_attached(
+                        tab,
+                        &Event {
+                            method,
+                            params,
+                            session,
+                        },
+                    );
+                }
+                "Target.detachedFromTarget" => {
+                    redraw |= frame_detached(
+                        tab,
+                        &Event {
+                            method,
+                            params,
+                            session,
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -4066,15 +4408,10 @@ fn handle_page_events(
             if let Some(loaded) = page_loaded(&mut tab.connection) {
                 tab.loaded(loaded);
                 // The one moment the page's final url, after its redirects,
-                // and its title are both known: this is a visit. A page that
-                // did not come has a problem and is not one; `about:` and
-                // `data:` are refused by the history itself. A tab behind is
-                // in this loop too, so a page opened in a new window counts.
-                // What it costs is one line appended to a file, and a history
-                // that cannot be written is not a reason to stop.
-                if tab.problem.is_none() && History::records(&tab.url) {
-                    let _ = chrome.history.visited(&tab.url, &tab.title, unix_now());
-                }
+                // and its title are both known: this is a visit. A tab behind
+                // is in this loop too, so a page opened in a new window
+                // counts.
+                record_visit(tab, &mut chrome.history);
             }
         }
     }
@@ -5639,15 +5976,21 @@ fn answer_upload(
         upload::Outcome::Quit => {}
         upload::Outcome::Send => {
             let params = prompt.reply();
+            // The session the question came in on, which for an input inside
+            // a cross-site frame is that frame's and not the page's.
+            let session = prompt.chooser.session.clone();
             tab.note = Some(prompt.sentence());
             chrome.upload_dir = prompt.last_dir();
             tab.upload = None;
-            let _ = tab.connection.notify("DOM.setFileInputFiles", params);
+            let _ = tab
+                .connection
+                .notify_on(session.as_deref(), "DOM.setFileInputFiles", params);
         }
         upload::Outcome::Cancel => {
             let node = prompt.chooser.backend_node_id;
+            let session = prompt.chooser.session.clone();
             tab.upload = None;
-            cancel_chooser(&mut tab.connection, node);
+            cancel_chooser(&mut tab.connection, session.as_deref(), node);
         }
     }
     redraw_row(pane, tabs, chrome)?;
@@ -5667,9 +6010,15 @@ fn answer_upload(
 /// notifications. A page that does not answer in time does not hear its
 /// `cancel`, which is the one thing here this program can afford to lose.
 ///
+/// `session` is the one the question came in on — `None` for the client's
+/// own — because a node id belongs to the renderer that named it: a cancel
+/// for an input in a cross-site frame sent to the page would resolve nothing.
+/// See [`crate::upload::Chooser::session`].
+///
 /// Public so that the engine tests send what this program sends.
-pub fn cancel_chooser(client: &mut Client, backend_node_id: i64) {
-    let Ok(node) = client.call_within(
+pub fn cancel_chooser(client: &mut Client, session: Option<&str>, backend_node_id: i64) {
+    let Ok(node) = client.call_on(
+        session,
         "DOM.resolveNode",
         Json::object(vec![(
             "backendNodeId",
@@ -5686,14 +6035,16 @@ pub fn cancel_chooser(client: &mut Client, backend_node_id: i64) {
     else {
         return;
     };
-    let _ = client.notify(
+    let _ = client.notify_on(
+        session,
         "Runtime.callFunctionOn",
         Json::object(vec![
             ("objectId", Json::string(&object)),
             ("functionDeclaration", Json::string(Upload::CANCEL_FUNCTION)),
         ]),
     );
-    let _ = client.notify(
+    let _ = client.notify_on(
+        session,
         "Runtime.releaseObject",
         Json::object(vec![("objectId", Json::string(object))]),
     );
@@ -5753,7 +6104,11 @@ fn start_picker(
         // settings cannot make, no picker at all.
         _ => {
             tab.picking = None;
-            cancel_chooser(&mut tab.connection, chooser.backend_node_id);
+            cancel_chooser(
+                &mut tab.connection,
+                chooser.session.as_deref(),
+                chooser.backend_node_id,
+            );
         }
     }
     redraw_row(pane, tabs, chrome)
@@ -5945,6 +6300,8 @@ fn finish_picker(
         return;
     };
     let node = picking.chooser.backend_node_id;
+    let session = picking.chooser.session.clone();
+    let session = session.as_deref();
     match outcome {
         picker::Outcome::Files(paths) => {
             match picker::accept(paths, picking.chooser.multiple, &upload::Disk) {
@@ -5954,20 +6311,22 @@ fn finish_picker(
                         .first()
                         .and_then(|file| file.parent())
                         .map(Path::to_path_buf);
-                    let _ = tab
-                        .connection
-                        .notify("DOM.setFileInputFiles", upload::reply(node, &files));
+                    let _ = tab.connection.notify_on(
+                        session,
+                        "DOM.setFileInputFiles",
+                        upload::reply(node, &files),
+                    );
                 }
                 Err(refusal) => {
                     tab.note = Some(format!("upload refused: {}", refusal.sentence()));
-                    cancel_chooser(&mut tab.connection, node);
+                    cancel_chooser(&mut tab.connection, session, node);
                 }
             }
         }
-        picker::Outcome::Cancel => cancel_chooser(&mut tab.connection, node),
+        picker::Outcome::Cancel => cancel_chooser(&mut tab.connection, session, node),
         picker::Outcome::Failed(why) => {
             tab.note = Some(why);
-            cancel_chooser(&mut tab.connection, node);
+            cancel_chooser(&mut tab.connection, session, node);
         }
     }
 }
@@ -9220,6 +9579,7 @@ mod tests {
             backend_node_id: 3,
             multiple: false,
             frame_id: "F".to_string(),
+            session: None,
         };
         let tab = tabs.active_mut().expect("a tab");
         tab.upload = Some(Upload::new(chooser, PathBuf::from("/work"), None));
@@ -9285,6 +9645,7 @@ mod tests {
             backend_node_id: 3,
             multiple: false,
             frame_id: "F".to_string(),
+            session: None,
         };
         tabs.active_mut().expect("a tab").upload =
             Some(Upload::new(chooser, PathBuf::from("/work"), None));
@@ -9896,6 +10257,41 @@ mod tests {
         assert_eq!(bar.line.text(), "https://example.com/kept");
         bar_step(&mut bar, &history, &marks, &key(Key::Up, 0));
         assert_eq!(bar.line.text(), "https://example.com/visited");
+    }
+
+    /// Issue #70: the news that a page has finished reaches this module by
+    /// two roads, and the tab's [`Counted`] flag is what makes one document
+    /// one visit however many of them say so — and a new document a visit
+    /// again.
+    #[test]
+    fn one_document_is_one_visit_however_often_it_is_said_to_have_loaded() {
+        let mut history = History::in_memory();
+        let mut tab: Tab<u32> = Tab::new("a", 0, "https://example.com/");
+        tab.title = "Example".to_string();
+
+        record_visit(&mut tab, &mut history);
+        assert_eq!(tab.counted, Counted::Yes);
+        // The load event, and then a dialog answered on the same page, which
+        // asks the title again: the second is not a second visit.
+        record_visit(&mut tab, &mut history);
+        assert_eq!(history.entries()[0].visits, 1, "counted twice");
+
+        // A reload lands the same url again, and that is a visit of its own.
+        tab.landed(load::Landing::Document("https://example.com/".to_string()));
+        assert_eq!(tab.counted, Counted::No, "a landing is a document again");
+        tab.title = "Example".to_string();
+        record_visit(&mut tab, &mut history);
+        assert_eq!(history.entries()[0].visits, 2);
+
+        // A page that did not come is not a visit, and neither is a blank
+        // tab; the tab is still left saying nothing is owed.
+        let mut failed: Tab<u32> = Tab::new("b", 0, "https://example.cmo/");
+        failed.counted = Counted::Due;
+        failed.failed_to_reach("https://example.cmo/", "net::ERR_NAME_NOT_RESOLVED");
+        record_visit(&mut failed, &mut history);
+        let mut blank: Tab<u32> = Tab::new("c", 0, "about:blank");
+        record_visit(&mut blank, &mut history);
+        assert_eq!(history.entries().len(), 1, "{:?}", history.entries());
     }
 
     #[test]
@@ -10646,6 +11042,7 @@ mod tests {
             backend_node_id: 3,
             multiple: false,
             frame_id: "F".to_string(),
+            session: None,
         };
         let bar = UrlBar::new(Line::empty());
         let find = Find {

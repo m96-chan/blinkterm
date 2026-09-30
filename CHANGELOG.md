@@ -93,6 +93,32 @@ flag, a different default, a raised Rust floor all do.
   how to build. The full manual moved to `docs/`: installing, keys and use,
   settings and profiles, features, how it works, and development.
 
+### Fixed
+
+- A file input inside a **cross-site iframe** — the shape an embedded form
+  service, a support chat or a webmail attachment button usually has — now
+  asks for a path on the row like any other. Such a frame is a target of its
+  own in a renderer of its own, and its click never reached `blinkterm` at
+  all: the engine opened its own picker, which headless does not have and
+  cancels at once, so nothing happened and the page heard `cancel`. Each
+  tab now asks the engine to attach to its frames
+  (`Target.setAutoAttach`, filtered to iframes), and the file goes back to
+  the frame that asked
+  ([#57](https://github.com/m96-chan/blinkterm/issues/57)).
+- A page opened straight into a new tab — `alt+enter` in the history list,
+  a url from `blinkterm --remote`, a pick opened in a new tab — is recorded
+  in the history again. A page quick enough finished loading before the
+  program was listening, or while the queue the switch puts in the bin was
+  holding the news, and neither road counted the visit; the page is now
+  asked directly whether it has finished. A page counts once per document,
+  so answering a dialog on a loaded page no longer counts it twice
+  ([#70](https://github.com/m96-chan/blinkterm/issues/70)).
+- A death `blinkterm` cannot catch — `SIGSEGV`, `SIGBUS`, `SIGILL`,
+  `SIGFPE`, `SIGABRT` — now puts the terminal back and stops the engine on
+  the way down, instead of leaving a shell with mouse reporting on and the
+  keyboard flags pushed, typing every mouse report and every key back as
+  text ([#78](https://github.com/m96-chan/blinkterm/issues/78)).
+
 ## [0.2.0] - 2026-09-30
 
 ### Added
