@@ -158,7 +158,10 @@ pub struct Options {
 /// What `main` was asked to do, once the command line has been read.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Invocation {
-    Help,
+    /// `--help`, with the keymap whose keys it lists: a `--keymap` on the
+    /// same line, else the platform's. The settings file is not read for
+    /// it, so a `keymap =` line there does not change it.
+    Help(Keymap),
     Version,
     /// `--print-engine`: name the engine the search finds, and stop.
     PrintEngine(Options),
@@ -1114,7 +1117,7 @@ fn home_expanded(mut settings: Settings, home: Option<&Path>) -> Settings {
 pub fn invocation(args: &[String]) -> Result<Invocation, String> {
     let cli = parse_args(args)?;
     match cli.what {
-        Some(What::Help) => return Ok(Invocation::Help),
+        Some(What::Help) => return Ok(Invocation::Help(help_keymap(args))),
         Some(What::Version) => return Ok(Invocation::Version),
         _ => {}
     }
@@ -1143,6 +1146,25 @@ pub fn invocation(args: &[String]) -> Result<Invocation, String> {
         Some(What::Doctor) => Invocation::Doctor(options, provenance),
         _ => Invocation::Run(options),
     })
+}
+
+/// The keymap `--help` lists: the last good `--keymap` before `--`, else the
+/// platform's. Help wins over everything else on the line, a bad word
+/// included, so a keymap it cannot read is passed over rather than refused.
+fn help_keymap(args: &[String]) -> Keymap {
+    let mut chosen = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(text) = value_of(arg, "--keymap", &mut rest) {
+            if let Ok(keymap) = Keymap::parse(text) {
+                chosen = Some(keymap);
+            }
+        }
+    }
+    chosen.unwrap_or_else(Keymap::platform)
 }
 
 #[cfg(test)]
@@ -1234,6 +1256,27 @@ mod tests {
         assert_eq!(s.urls, ["-weird.example", "--help"]);
         assert_eq!(s.what, None, "a --help after -- is a url, not a question");
         assert_eq!(s.force_dark, Some(true));
+    }
+
+    #[test]
+    fn help_lists_the_keymap_the_line_names() {
+        let args = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            invocation(&args(&["--keymap", "linux", "--help"])),
+            Ok(Invocation::Help(Keymap::Linux))
+        );
+        assert_eq!(
+            invocation(&args(&["-h", "--keymap=mac"])),
+            Ok(Invocation::Help(Keymap::Mac))
+        );
+        assert_eq!(
+            invocation(&args(&["--keymap", "qwerty", "--help"])),
+            Ok(Invocation::Help(Keymap::platform()))
+        );
+        assert_eq!(
+            invocation(&args(&["--help", "--", "--keymap", "linux"])),
+            Ok(Invocation::Help(Keymap::platform()))
+        );
     }
 
     #[test]
