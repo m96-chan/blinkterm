@@ -648,6 +648,13 @@ struct Chrome {
     /// What the row last said about the console's errors on the page in
     /// front: the twin of `blocked_words`.
     console_words: Option<String>,
+    /// What [`run`] found wrong before the first page — a `key.` line on a
+    /// chord the terminal keeps, a `--remote` socket not bound — until the
+    /// first page in front has finished loading. The note goes on the tab at
+    /// once, but the first page's landing clears a tab's note, and that
+    /// landing comes after: so it is put back when the load stops, if the
+    /// row has nothing else to say by then.
+    startup: Option<String>,
 }
 
 /// A screencast frame this program has not acknowledged yet: which tab's,
@@ -762,6 +769,7 @@ impl Chrome {
             sites_location: options.sites.clone(),
             console,
             console_words: None,
+            startup: None,
         }
     }
 
@@ -1472,6 +1480,7 @@ pub fn run(options: Options) -> Result<(), String> {
                     open_first(&mut pane, tabs, browser, &mut chrome, &options).and_then(|()| {
                         match summary(&std::mem::take(&mut problems)) {
                             Some(said) => {
+                                chrome.startup = Some(said.clone());
                                 note(tabs, said);
                                 redraw_row(&mut pane, tabs, &chrome)
                             }
@@ -4280,6 +4289,9 @@ fn handle_page_events(
                     // coming, so this and not that is what says it is over.
                     if load::is_main(&params, tab.frame.as_deref()) {
                         tab.stopped_loading();
+                        if index == active && tab.note.is_none() {
+                            tab.note = chrome.startup.take();
+                        }
                         redraw = true;
                     }
                 }
