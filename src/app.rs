@@ -2581,6 +2581,17 @@ fn activate(
                 if tab.loading {
                     tab.stopped_loading();
                 }
+                // And the "loading <url>" a tab opened with a url was given
+                // goes with it: `stopped_loading` clears it only before the
+                // commit, and this page has committed, so the row would say
+                // it was loading a page that is on the screen.
+                if tab
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.starts_with("loading "))
+                {
+                    tab.note = None;
+                }
                 // The visit itself is owed rather than written: this runs
                 // from `handle_input`, and the tab's url is the one that was
                 // asked for until `handle_target_events` reads the engine's

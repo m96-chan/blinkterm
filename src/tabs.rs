@@ -334,19 +334,22 @@ impl<C> Tab<C> {
     /// comes down with the load; the url was never changed for a click. The
     /// title is still asked for on the load event, which is where it is
     /// known; this only clears.
+    ///
+    /// A tab opened with a url — `--remote`, a pick opened in a new tab —
+    /// starts committed, and its landing can come before this program is
+    /// listening (#70); so the note goes whether or not the landing was
+    /// seen.
     pub fn stopped_loading(&mut self) {
         self.loading = false;
         self.since = None;
-        if !self.committed {
-            if self
-                .note
-                .as_deref()
-                .is_some_and(|note| note.starts_with("loading "))
-            {
-                self.note = None;
-            }
-            self.committed = true;
+        if self
+            .note
+            .as_deref()
+            .is_some_and(|note| note.starts_with("loading "))
+        {
+            self.note = None;
         }
+        self.committed = true;
     }
 
     /// How long the load in progress has been going, in whole seconds, once
@@ -1729,6 +1732,19 @@ mod tests {
         assert!(!tab.loading);
         assert_eq!(tab.since, None);
         assert_eq!(tab.loading_for(now + Duration::from_secs(9)), None);
+    }
+
+    #[test]
+    fn a_tab_opened_with_a_url_stops_saying_loading_when_the_load_stops() {
+        // `--remote`: the tab is made with its url and the note, starts
+        // committed, and its landing came before anybody listened.
+        let mut tab = tab("a", "");
+        tab.note = Some("loading https://example.org/".to_string());
+        tab.loading = true;
+        assert!(tab.committed);
+        tab.stopped_loading();
+        assert_eq!(tab.note, None);
+        assert!(!tab.loading);
     }
 
     #[test]
