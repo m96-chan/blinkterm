@@ -105,9 +105,10 @@ pub struct Options {
     pub scheme: appearance::Choice,
     /// `--force-dark`: every page painted dark, dark style or none.
     pub force_dark: bool,
-    /// `--alpha`: the engine paints no default background, and the
-    /// terminal's shows through. See [`crate::appearance`].
-    pub alpha: bool,
+    /// `--alpha`: the engine paints no default background, the page's
+    /// `html` and `body` none either, and the terminal's shows through at an
+    /// amount. See [`crate::appearance`].
+    pub alpha: appearance::Alpha,
     /// How the engine is started; see [`crate::engine::Launch`].
     pub engine: engine::Launch,
     /// `--restore`: reopen the last session's tabs at start. See
@@ -196,7 +197,7 @@ pub struct Settings {
     pub scale: Option<Scale>,
     pub scheme: Option<appearance::Choice>,
     pub force_dark: Option<bool>,
-    pub alpha: Option<bool>,
+    pub alpha: Option<appearance::Alpha>,
     pub engine: Option<PathBuf>,
     /// Appended across sources, never replaced.
     pub engine_args: Vec<String>,
@@ -378,8 +379,11 @@ fn needed<'a>(value: &'a str, needed: &str) -> Result<&'a str, String> {
 /// thing twice was put together by something that meant two different
 /// things. `--profile` and `--temp-profile` together is the same refusal,
 /// since they are one setting with three values. The flags — `--force-dark`,
-/// `--alpha`, `--temp-profile`, `--restore`, `--normal-mode` and the rest — take
+/// `--temp-profile`, `--restore`, `--normal-mode` and the rest — take
 /// nothing after them, and `--force-dark=yes` is an unknown option.
+/// `--alpha` takes an amount if one follows: `--alpha=70`, or `--alpha 70`
+/// when the next word starts with a digit or is `true` or `false`, which a
+/// url never does; anything else after it is left alone, and it is 100.
 ///
 /// Every word that is not an option is a url, one tab each; `--` ends the
 /// options, so a url that starts with `-` can still be given.
@@ -561,6 +565,33 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             config_choice(&mut s, ConfigChoice::At(PathBuf::from(path)))?;
             continue;
         }
+        if let Some(text) = arg.strip_prefix("--alpha=") {
+            once(
+                &mut s.alpha,
+                appearance::Alpha::parse("--alpha", text)?,
+                "--alpha once is enough",
+            )?;
+            continue;
+        }
+        if arg == "--alpha" {
+            // The amount is optional, so the next word is it only if it
+            // could be nothing else: a url does not start with a digit, and
+            // `--alpha 0` is then refused by name rather than opened.
+            let amount = args.as_slice().first().filter(|next| {
+                next.starts_with(|c: char| c.is_ascii_digit())
+                    || next.as_str() == "true"
+                    || next.as_str() == "false"
+            });
+            let alpha = match amount {
+                Some(text) => {
+                    args.next();
+                    appearance::Alpha::parse("--alpha", text)?
+                }
+                None => appearance::Alpha::On(100),
+            };
+            once(&mut s.alpha, alpha, "--alpha once is enough")?;
+            continue;
+        }
         match arg.as_str() {
             "--temp-profile" => once(
                 &mut s.profile,
@@ -568,7 +599,6 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
                 "one profile at a time",
             )?,
             "--force-dark" => once(&mut s.force_dark, true, "--force-dark once is enough")?,
-            "--alpha" => once(&mut s.alpha, true, "--alpha once is enough")?,
             "--restore" => once(&mut s.restore, true, "--restore once is enough")?,
             "--mute" => once(&mut s.mute, true, "--mute once is enough")?,
             "--normal-mode" => once(&mut s.normal_mode, true, "--normal-mode once is enough")?,
@@ -773,7 +803,7 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             "scale" => s.scale = Some(Scale::parse(value).map_err(at)?),
             "color-scheme" => s.scheme = Some(appearance::Choice::parse(value).map_err(at)?),
             "force-dark" => s.force_dark = Some(parse_bool(key, value).map_err(at)?),
-            "alpha" => s.alpha = Some(parse_bool(key, value).map_err(at)?),
+            "alpha" => s.alpha = Some(appearance::Alpha::parse(key, value).map_err(at)?),
             "engine" => s.engine = Some(PathBuf::from(value)),
             "engine-arg" => s
                 .engine_args
@@ -896,7 +926,7 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
         scale: s.scale.unwrap_or(Scale::Auto),
         scheme: s.scheme.unwrap_or_default(),
         force_dark: s.force_dark.unwrap_or(false),
-        alpha: s.alpha.unwrap_or(false),
+        alpha: s.alpha.unwrap_or_default(),
         engine: engine::Launch {
             path: s.engine,
             args: s.engine_args,
@@ -1240,30 +1270,80 @@ mod tests {
     }
 
     #[test]
-    fn alpha_is_a_flag_with_nothing_after_it_and_a_file_boolean() {
+    fn alpha_is_on_off_or_an_amount_from_either_source() {
+        use appearance::Alpha;
         let s = parsed(&["--alpha", "example.com"]).expect("a flag");
-        assert_eq!(s.alpha, Some(true));
+        assert_eq!(s.alpha, Some(Alpha::On(100)), "alone, it is 100");
         assert_eq!(s.urls, ["example.com"], "what follows is the page");
-        let why = parsed(&["--alpha=yes"]).expect_err("refused");
-        assert!(why.contains("--alpha=yes"), "{why}");
+        let s = parsed(&["--alpha", "70", "example.com"]).expect("an amount");
+        assert_eq!(s.alpha, Some(Alpha::On(70)));
+        assert_eq!(s.urls, ["example.com"], "the amount is not a page");
+        assert_eq!(
+            parsed(&["--alpha=70"]).map(|s| s.alpha),
+            Ok(Some(Alpha::On(70)))
+        );
+        assert_eq!(
+            parsed(&["--alpha", "true"]).map(|s| s.alpha),
+            Ok(Some(Alpha::On(100)))
+        );
+        assert_eq!(
+            parsed(&["--alpha=false"]).map(|s| s.alpha),
+            Ok(Some(Alpha::Off))
+        );
+        for bad in [&["--alpha", "0"][..], &["--alpha=101"], &["--alpha=yes"]] {
+            let why = parsed(bad).expect_err("refused");
+            assert!(why.contains("--alpha"), "{bad:?}: {why}");
+        }
+        assert_eq!(
+            parsed(&["--alpha", "200"]),
+            Err("--alpha is true, false or a number from 1 to 100, not \"200\"".to_string()),
+            "refused by name rather than opened as a page"
+        );
         assert_eq!(
             parsed(&["--alpha", "--alpha"]),
             Err("--alpha once is enough".to_string())
         );
-        assert_eq!(file("alpha = true").map(|s| s.alpha), Ok(Some(true)));
+        let s = parsed(&["--alpha", "--", "80"]).expect("-- ends the options");
+        assert_eq!(s.alpha, Some(Alpha::On(100)));
+        assert_eq!(s.urls, ["80"]);
+        assert_eq!(
+            parsed(&["--alpha", "-5"]),
+            Err("unknown option: -5".to_string())
+        );
+
+        assert_eq!(file("alpha = 70").map(|s| s.alpha), Ok(Some(Alpha::On(70))));
+        assert_eq!(
+            file("alpha = true").map(|s| s.alpha),
+            Ok(Some(Alpha::On(100)))
+        );
         assert_eq!(
             file("alpha = loud"),
-            Err("/c:1: alpha is true or false, not \"loud\"".to_string())
+            Err("/c:1: alpha is true, false or a number from 1 to 100, not \"loud\"".to_string())
         );
         let options = resolved(&[]).expect("the defaults");
-        assert!(!options.alpha, "the engine paints its white unless asked");
+        assert_eq!(
+            options.alpha,
+            Alpha::Off,
+            "the engine paints its white unless asked"
+        );
         let options = resolve(
             Settings::default(),
             Settings::default(),
-            file("alpha = true").expect("a file"),
+            file("alpha = 70").expect("a file"),
         )
         .expect("folded");
-        assert!(options.alpha, "the file's word reaches the options");
+        assert_eq!(
+            options.alpha,
+            Alpha::On(70),
+            "the file's word reaches the options"
+        );
+        let options = resolve(
+            parsed(&["--alpha=false"]).expect("cli"),
+            Settings::default(),
+            file("alpha = 70").expect("a file"),
+        )
+        .expect("folded");
+        assert_eq!(options.alpha, Alpha::Off, "the command line turns it off");
     }
 
     #[test]
@@ -2137,7 +2217,7 @@ mod tests {
         assert_eq!(options.scale, Scale::Fixed(2.0));
         assert_eq!(options.scheme, appearance::Choice::Dark);
         assert!(options.force_dark);
-        assert!(options.alpha);
+        assert_eq!(options.alpha, appearance::Alpha::On(100));
         assert_eq!(options.engine.path, Some(PathBuf::from("/ce")));
         assert_eq!(options.engine.user_agent.as_deref(), Some("ca"));
         assert_eq!(options.engine.proxy.as_deref(), Some("c:1"));
@@ -2155,7 +2235,7 @@ mod tests {
         assert_eq!(options.scheme, appearance::Choice::Dark);
         assert_eq!(options.home, "h.example");
         assert!(options.force_dark);
-        assert!(options.alpha);
+        assert_eq!(options.alpha, appearance::Alpha::On(100));
         assert_eq!(options.urls, ["a.example"]);
     }
 

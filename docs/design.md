@@ -77,7 +77,12 @@ ssh), and `--frames raw|png` overrides the choice.
 Under `--alpha` (see [Transparent pages](usage.md#transparent-pages)) the frames stay
 as they are: locally the JPEG frames of a moving page cannot carry the
 transparency and show it black, while the PNG frames over ssh and in tmux do
-carry it.
+carry it. Under an amount (`--alpha 70`) the local frames go as raw RGBA
+instead: the still with its alpha scaled, the JPEG frame decoded with the
+amount as every pixel's alpha, `f=32` where it was `f=24` — 3.9 MB a
+1280x770 frame rather than 2.9, and no slower to decode. The PNG frames over
+ssh and in tmux go as the engine made them, so the amount is not applied
+there.
 
 ## What a page is told
 

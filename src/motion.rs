@@ -47,6 +47,14 @@
 //! is black while it moves, and turns transparent when it rests**, with the
 //! lossless still.
 //!
+//! With the page's own `html` and `body` backgrounds forced transparent as
+//! well, that is most of a real page, not only a bare one: a light page
+//! moving is its dark text on black, and sharp and see-through once it
+//! stops. `--force-dark` makes the moving text light. Under an amount —
+//! `--alpha 70` — the JPEG frame is decoded to RGBA at that alpha and sent
+//! as `f=32` ([`crate::graphics`]), so the black is a 70% tint over the
+//! terminal rather than a solid one, and the text is at 70% too.
+//!
 //! That is chosen, not overlooked. A page that is moving is a page somebody
 //! is driving — a hand on the wheel or a key held — and the frames that pass
 //! while they do are the lossy ones nobody reads, the same argument as the

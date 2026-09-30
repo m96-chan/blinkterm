@@ -23,6 +23,14 @@
 //! it. A JPEG frame has no alpha, so a bare page is black while it moves
 //! (see [`crate::motion`]).
 //!
+//! With an amount — `--alpha 70` — the whole picture is sent at that opacity.
+//! The still's alpha is scaled in place by [`scale_alpha`], after the fit and
+//! with no copy. The JPEG frame is decoded straight to RGBA with the amount
+//! as every pixel's alpha ([`crate::jpeg::decode_rgba`], in the one
+//! allocation the decode makes anyway) and goes as `f=32`, a third more bytes
+//! than `f=24`: 3.9 MB a 1280x770 frame where RGB is 2.9 MB. At 100 nothing
+//! is scaled and the JPEG frame stays `f=24`.
+//!
 //! It costs bytes: 2.9 MB of RGB where the JPEG was 185 kB. Through `t=s`
 //! that is a `write` into tmpfs and a `read` out of it, which is a memcpy at
 //! memory speed and cheaper than the decode it replaces. Through the inline
@@ -249,7 +257,8 @@ const IN_FLIGHT: usize = 16;
 /// `crate::jpeg` produces RGB and a JPEG has no alpha to lose,
 /// `crate::png` produces RGBA and a still is one frame in a hundred and
 /// fifty milliseconds, so neither conversion would buy anything. Under
-/// `--alpha` the still's alpha is the point.
+/// `--alpha` the still's alpha is the point, and under an amount the JPEG
+/// frame is decoded to RGBA in the first place, so it is four here too.
 #[derive(Debug, Clone, Copy)]
 pub struct Raw<'a> {
     pub pixels: &'a [u8],
@@ -287,6 +296,16 @@ impl<'a> Raw<'a> {
         } else {
             32
         }
+    }
+}
+
+/// `--alpha` with an amount: every pixel's alpha times `alpha` out of 255,
+/// rounded, in place. Straight alpha, as the protocol takes it, so the colour
+/// is left as it is — what was clear stays clear, what was opaque becomes
+/// `alpha`, and what the page left half-covered is scaled in proportion.
+pub fn scale_alpha(rgba: &mut [u8], alpha: u8) {
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = ((u32::from(px[3]) * u32::from(alpha) + 127) / 255) as u8;
     }
 }
 
@@ -1124,6 +1143,34 @@ pub(crate) mod tests {
             assert_eq!(cmd.format, format);
             assert_eq!((cmd.width, cmd.height), (2, 2));
         }
+    }
+
+    #[test]
+    fn scaling_alpha_touches_the_fourth_byte_only() {
+        let mut pixels = rgba();
+        pixels[7] = 0;
+        pixels[11] = 128;
+        let before = pixels.clone();
+        scale_alpha(&mut pixels, 179);
+        assert_eq!(
+            pixels.chunks(4).map(|p| p[3]).collect::<Vec<_>>(),
+            [179, 0, 90, 179],
+            "255 is the amount, nothing stays nothing, and the rest in proportion"
+        );
+        for (after, before) in pixels.chunks(4).zip(before.chunks(4)) {
+            assert_eq!(
+                after[..3],
+                before[..3],
+                "straight alpha: the colour as it was"
+            );
+        }
+        let bodies = apc_bodies(&inline_command(&Raw::rgba(&pixels, 2, 2), cells(2, 1)));
+        let cmd = GraphicsCommand::parse(&bodies[0]).expect("parses");
+        assert_eq!(cmd.format, Format::Rgba);
+
+        let mut whole = rgba();
+        scale_alpha(&mut whole, 255);
+        assert_eq!(whole, rgba(), "255 is a scaling that changes nothing");
     }
 
     #[test]

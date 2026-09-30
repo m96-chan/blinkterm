@@ -198,6 +198,38 @@ fn an_image_larger_than_the_budget_is_refused_from_its_header() {
     assert!(jpeg::decode(&data, 48 * 32 * 3).is_ok(), "exactly enough");
 }
 
+/// `--alpha 70`'s moving frame: the same colours as [`jpeg::decode`]'s, to
+/// the byte, with the one alpha as every fourth.
+#[test]
+fn decoding_to_rgba_is_the_rgb_picture_with_the_alpha_interleaved() {
+    for name in ["420.jpg", "gray.jpg"] {
+        let data = fixture(name);
+        let rgb = jpeg::decode(&data, usize::MAX).expect("decodes");
+        let rgba = jpeg::decode_rgba(&data, usize::MAX, 179).expect("decodes");
+        assert_eq!((rgba.width, rgba.height), (rgb.width, rgb.height), "{name}");
+        let expected: Vec<u8> = rgb
+            .rgb
+            .chunks_exact(3)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 179])
+            .collect();
+        assert_eq!(rgba.rgba, expected, "{name}");
+    }
+}
+
+/// The budget counts the four bytes a pixel the RGBA picture will take.
+#[test]
+fn the_rgba_budget_counts_four_bytes_a_pixel() {
+    let data = fixture("restart.jpg");
+    assert_eq!(
+        jpeg::decode_rgba(&data, 48 * 32 * 4 - 1, 255),
+        Err(JpegError::TooLarge)
+    );
+    assert!(
+        jpeg::decode_rgba(&data, 48 * 32 * 4, 255).is_ok(),
+        "exactly enough"
+    );
+}
+
 /// A 16-bit quantisation table means the same thing as the 8-bit one it was
 /// widened from, which is the only way to test a precision no encoder here
 /// emits.

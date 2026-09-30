@@ -49,7 +49,7 @@ use crate::download::{self, Downloads};
 use crate::engine::Engine;
 use crate::find;
 use crate::fullscreen::{self, Heard, Layout};
-use crate::graphics::{Painter, Raw};
+use crate::graphics::{self, Painter, Raw};
 use crate::hints;
 use crate::history::{self, History};
 use crate::historylist::{self, HistoryList};
@@ -2814,6 +2814,10 @@ fn connect_tab(
 /// session that missed this would be the one page in the browser that was
 /// light in a dark terminal.
 ///
+/// Under `--alpha` the script that makes a page's own backgrounds transparent
+/// is registered here too, every time; it is idempotent per document, so a
+/// second registration on a colour re-send adds nothing to the page.
+///
 /// Told rather than asked: a page that has just been made may already be
 /// stopped behind a dialog, and a scheme that did not take is a page that is
 /// light, which is no reason not to open it.
@@ -3833,9 +3837,22 @@ fn handle_page_events(
         // that looks frozen, which is what the engine test comparing the two
         // formats through both decoders exists to catch before a person meets
         // it.
-        if let Ok(image) = crate::jpeg::decode(&jpeg, FRAME_BUDGET) {
-            let raw = Raw::rgb(&image.rgb, image.width, image.height);
-            paint(pane, tabs, chrome, raw)?;
+        //
+        // Under `--alpha` with an amount the frame goes at that opacity: RGBA,
+        // the alpha written by the decoder as it writes the colour.
+        match chrome.appearance.alpha.scaling() {
+            Some(alpha) => {
+                if let Ok(image) = crate::jpeg::decode_rgba(&jpeg, FRAME_BUDGET, alpha) {
+                    let raw = Raw::rgba(&image.rgba, image.width, image.height);
+                    paint(pane, tabs, chrome, raw)?;
+                }
+            }
+            None => {
+                if let Ok(image) = crate::jpeg::decode(&jpeg, FRAME_BUDGET) {
+                    let raw = Raw::rgb(&image.rgb, image.width, image.height);
+                    paint(pane, tabs, chrome, raw)?;
+                }
+            }
         }
     }
     Ok(())
@@ -3896,7 +3913,7 @@ fn put_frame(
     if !placeholders.is_empty() {
         pane.write(&placeholders).map_err(|e| e.to_string())?;
     }
-    let named = chrome.painter.transport() == crate::graphics::Transport::SharedMemory;
+    let named = chrome.painter.transport() == graphics::Transport::SharedMemory;
     let bytes = make(&mut chrome.painter, cells, row);
     if named {
         pane.write(&bytes).map_err(|e| e.to_string())?;
@@ -4065,16 +4082,33 @@ fn collect_still(
         chrome.motion.still_failed();
         return Ok(());
     };
-    // At a fractional level the engine's rounding leaves the still a pixel or
-    // two off the pane, and a picture that is not the pane's size is one the
-    // terminal resamples until the text goes soft. See [`zoom::fit`].
     let pane_pixels = chrome.layout.pixels(chrome.metrics);
-    let fitted = zoom::fit(&image.rgba, image.width, image.height, 4, pane_pixels);
-    let raw = match &fitted {
-        Some(pixels) => Raw::rgba(pixels, pane_pixels.0, pane_pixels.1),
-        None => Raw::rgba(&image.rgba, image.width, image.height),
+    let scaling = chrome.appearance.alpha.scaling();
+    let (pixels, (width, height)) = fitted_still(image, pane_pixels, scaling);
+    paint(pane, tabs, chrome, Raw::rgba(&pixels, width, height))
+}
+
+/// A decoded still made ready to send: fitted to the pane, and its alpha
+/// scaled under `--alpha` with an amount.
+///
+/// At a fractional level the engine's rounding leaves the still a pixel or
+/// two off the pane, and a picture that is not the pane's size is one the
+/// terminal resamples until the text goes soft. See [`zoom::fit`]. The
+/// scaling is done on whichever buffer comes out of that, in place, so an
+/// amount costs one pass over the pixels and no allocation.
+fn fitted_still(
+    image: crate::png::PngImage,
+    pane: (u32, u32),
+    scaling: Option<u8>,
+) -> (Vec<u8>, (u32, u32)) {
+    let (mut pixels, size) = match zoom::fit(&image.rgba, image.width, image.height, 4, pane) {
+        Some(fitted) => (fitted, pane),
+        None => (image.rgba, (image.width, image.height)),
     };
-    paint(pane, tabs, chrome, raw)
+    if let Some(alpha) = scaling {
+        graphics::scale_alpha(&mut pixels, alpha);
+    }
+    (pixels, size)
 }
 
 /// Ask for a still, if the page has earned one.
@@ -8822,7 +8856,11 @@ mod tests {
             &options,
             &profile,
             downloads.clone(),
-            Appearance::new(crate::appearance::Choice::default(), false, true),
+            Appearance::new(
+                crate::appearance::Choice::default(),
+                false,
+                crate::appearance::Alpha::On(100),
+            ),
             Identity::new(None, None, "C"),
             Allowed::in_memory(),
             None,
@@ -8837,6 +8875,49 @@ mod tests {
         });
         assert!(chrome.cast.png, "the PNG route's frames, as without it");
         std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_still_under_an_amount_is_scaled_in_place_and_at_a_hundred_untouched() {
+        // 4x4, every pixel a colour of its own; the first clear, the second
+        // half-covered, the rest opaque.
+        let mut rgba: Vec<u8> = (0..16u8)
+            .flat_map(|i| [i * 10, i * 5, 255 - i * 10, 255])
+            .collect();
+        rgba[3] = 0;
+        rgba[7] = 128;
+        let still = || crate::png::PngImage {
+            width: 4,
+            height: 4,
+            rgba: rgba.clone(),
+        };
+        let alphas = |pixels: &[u8]| pixels.chunks(4).map(|p| p[3]).collect::<Vec<_>>();
+
+        let (pixels, size) = fitted_still(still(), (4, 4), None);
+        assert_eq!(size, (4, 4));
+        assert_eq!(pixels, rgba, "at 100 nothing is touched");
+
+        let (pixels, size) = fitted_still(still(), (4, 4), Some(179));
+        assert_eq!(size, (4, 4));
+        let mut expected = vec![179; 16];
+        expected[0] = 0;
+        expected[1] = 90;
+        assert_eq!(alphas(&pixels), expected);
+        for (after, before) in pixels.chunks(4).zip(rgba.chunks(4)) {
+            assert_eq!(after[..3], before[..3], "the colour as it was");
+        }
+
+        // A pane one pixel wider: zoom::fit's own buffer, scaled the same.
+        let (pixels, size) = fitted_still(still(), (5, 4), Some(179));
+        assert_eq!(size, (5, 4));
+        assert_eq!(pixels.len(), 5 * 4 * 4);
+        let alphas = alphas(&pixels);
+        assert_eq!(alphas[..2], [0, 90], "the first row's own pixels");
+        assert_eq!(alphas[4], 179, "the repeated edge, scaled once");
+        assert!(
+            alphas[5..].iter().all(|&a| a == 179),
+            "every other pixel opaque, at the amount: {alphas:?}"
+        );
     }
 
     #[test]
@@ -8861,7 +8942,11 @@ mod tests {
             &options,
             &profile,
             downloads.clone(),
-            Appearance::new(crate::appearance::Choice::default(), false, false),
+            Appearance::new(
+                crate::appearance::Choice::default(),
+                false,
+                crate::appearance::Alpha::Off,
+            ),
             Identity::new(None, None, "C"),
             Allowed::in_memory(),
             None,

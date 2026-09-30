@@ -211,7 +211,38 @@ pub fn dimensions(data: &[u8]) -> Result<(u32, u32), JpegError> {
 /// `limit` is the largest RGB output accepted, in bytes; an image whose frame
 /// header asks for more is refused before anything is allocated.
 pub fn decode(data: &[u8], limit: usize) -> Result<Image, JpegError> {
-    Reader::new(data).decode(limit)
+    let (frame, rgb) = Reader::new(data).decode(limit, 3, 0)?;
+    Ok(Image {
+        width: frame.width,
+        height: frame.height,
+        rgb,
+    })
+}
+
+/// A decoded image with one alpha for every pixel: RGBA8, four bytes a
+/// pixel, top row first.
+///
+/// For `--alpha` with an amount, where the moving frame goes to the terminal
+/// as `f=32` at that opacity: the fourth byte is written as the colour is, in
+/// the allocation [`decode`] makes anyway, rather than widened afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rgba {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Decode a baseline JPEG into RGBA8, every pixel's alpha `alpha`.
+///
+/// `limit` is the largest RGBA output accepted, in bytes — four a pixel, so
+/// the same limit takes a smaller picture than [`decode`] does.
+pub fn decode_rgba(data: &[u8], limit: usize, alpha: u8) -> Result<Rgba, JpegError> {
+    let (frame, rgba) = Reader::new(data).decode(limit, 4, alpha)?;
+    Ok(Rgba {
+        width: frame.width,
+        height: frame.height,
+        rgba,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -818,13 +849,20 @@ impl<'a> Reader<'a> {
     // The scan
     // -----------------------------------------------------------------------
 
-    fn decode(mut self, limit: usize) -> Result<Image, JpegError> {
+    /// The pixels, `channels` bytes each — three, or four with `alpha` in
+    /// the fourth — and the frame they came from.
+    fn decode(
+        mut self,
+        limit: usize,
+        channels: usize,
+        alpha: u8,
+    ) -> Result<(Frame, Vec<u8>), JpegError> {
         self.read_until_scan(true)?;
         let frame = self.frame.take().ok_or(JpegError::BadScan)?;
 
         let pixels = (frame.width as usize)
             .checked_mul(frame.height as usize)
-            .and_then(|area| area.checked_mul(3))
+            .and_then(|area| area.checked_mul(channels))
             .ok_or(JpegError::BadDimensions)?;
         if pixels > limit {
             return Err(JpegError::TooLarge);
@@ -872,7 +910,8 @@ impl<'a> Reader<'a> {
         }
 
         self.scan(&frame, &order, &mut planes)?;
-        Ok(to_rgb(&frame, &planes))
+        let pixels = to_pixels(&frame, &planes, channels, alpha);
+        Ok((frame, pixels))
     }
 
     /// The entropy-coded segment: MCU after MCU, restart after restart.
@@ -1220,29 +1259,29 @@ fn sample_row(
 }
 
 /// Planes to pixels: upsample the chroma, apply the colour transform, and cut
-/// the MCU padding off the right and bottom edges.
-fn to_rgb(frame: &Frame, planes: &[Vec<u8>]) -> Image {
+/// the MCU padding off the right and bottom edges. `channels` bytes a pixel,
+/// three or four, and with four the fourth is `alpha`.
+fn to_pixels(frame: &Frame, planes: &[Vec<u8>], channels: usize, alpha: u8) -> Vec<u8> {
     let width = frame.width as usize;
     let height = frame.height as usize;
-    let mut rgb = vec![0u8; width * height * 3];
+    let mut out = vec![0u8; width * height * channels];
 
     if frame.components.len() == 1 {
         // Grayscale: the one plane is the picture, padding aside.
         let component = frame.components[0];
         let stride = component.blocks_w * 8;
-        for (y, row) in rgb.chunks_exact_mut(width * 3).enumerate() {
+        for (y, row) in out.chunks_exact_mut(width * channels).enumerate() {
             let source = &planes[0][y * stride..y * stride + width];
-            for (pixel, &grey) in row.chunks_exact_mut(3).zip(source) {
+            for (pixel, &grey) in row.chunks_exact_mut(channels).zip(source) {
                 pixel[0] = grey;
                 pixel[1] = grey;
                 pixel[2] = grey;
+                if channels == 4 {
+                    pixel[3] = alpha;
+                }
             }
         }
-        return Image {
-            width: frame.width,
-            height: frame.height,
-            rgb,
-        };
+        return out;
     }
 
     let colour = Colour::new();
@@ -1251,7 +1290,7 @@ fn to_rgb(frame: &Frame, planes: &[Vec<u8>]) -> Image {
     let mut cr = vec![0u8; width];
     let mut scratch = vec![0i32; width + 2];
 
-    for (y, row) in rgb.chunks_exact_mut(width * 3).enumerate() {
+    for (y, row) in out.chunks_exact_mut(width * channels).enumerate() {
         for (index, target) in [&mut luma, &mut cb, &mut cr].into_iter().enumerate() {
             let component = frame.components[index];
             sample_row(
@@ -1267,7 +1306,7 @@ fn to_rgb(frame: &Frame, planes: &[Vec<u8>]) -> Image {
             );
         }
         for (((pixel, &y), &cb), &cr) in row
-            .chunks_exact_mut(3)
+            .chunks_exact_mut(channels)
             .zip(luma.iter())
             .zip(cb.iter())
             .zip(cr.iter())
@@ -1277,14 +1316,13 @@ fn to_rgb(frame: &Frame, planes: &[Vec<u8>]) -> Image {
             pixel[0] = (y + colour.r_cr[cr as usize]).clamp(0, 255) as u8;
             pixel[1] = green.clamp(0, 255) as u8;
             pixel[2] = (y + colour.b_cb[cb as usize]).clamp(0, 255) as u8;
+            if channels == 4 {
+                pixel[3] = alpha;
+            }
         }
     }
 
-    Image {
-        width: frame.width,
-        height: frame.height,
-        rgb,
-    }
+    out
 }
 
 #[cfg(test)]

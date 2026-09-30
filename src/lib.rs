@@ -78,7 +78,7 @@
 //! two frames arriving out of order is the one to keep. `--alpha`, which lets
 //! the terminal's background show through a page, leaves that as it is: the
 //! still is transparent, and a JPEG frame, which cannot be, shows a bare page
-//! black while it moves.
+//! black while it moves — a tint under `--alpha 70`, whose frames go RGBA.
 //!
 //! The frames are decoded here rather than by the terminal, which is the
 //! other half of the change and the reason the compositor needed none: the
