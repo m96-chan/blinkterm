@@ -10,6 +10,8 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-01
+
 ### Added
 
 - **Clicking the status row.** A click on a tab in the strip switches to
@@ -420,7 +422,8 @@ The first tag.
   sequence is shown as its letters and cannot set the terminal's title or
   clipboard ([#28](https://github.com/m96-chan/blinkterm/issues/28)).
 
-[Unreleased]: https://github.com/m96-chan/blinkterm/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/m96-chan/blinkterm/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/m96-chan/blinkterm/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/m96-chan/blinkterm/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/m96-chan/blinkterm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/m96-chan/blinkterm/commits/v0.1.0
