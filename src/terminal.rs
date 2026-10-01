@@ -8,7 +8,7 @@
 //! there was; the design for issue #83 is several terminals on one profile,
 //! with the windows in one process that owns the engine and each terminal in
 //! a process of its own. So this module is the line between them, drawn
-//! where the backend will draw it, with only one side of it real so far.
+//! where the backend draws it.
 //!
 //! [`Terminal`] is everything a window asks of a terminal, and nothing else:
 //! bytes to write in order, the picture taken off, the screen cleared, a
@@ -17,10 +17,11 @@
 //! terminal is now, and a helper program to run ([`Helper`]) and its answer
 //! ([`HelperOutcome`]). [`LocalTerminal`] is the one that exists: the pane
 //! this process holds, a [`Canvas`] that decodes beside it, the parser that
-//! reads it, and the helpers it runs. The other — the backend's, which will
-//! encode each of these as a message to a terminal in another process — is
-//! what the trait is shaped for: nothing here returns anything a socket
-//! could not carry back later, except the two answers a local terminal has
+//! reads it, and the helpers it runs — the frontend's
+//! ([`crate::frontend`]). The other is the backend's
+//! (`crate::backend::RemoteTerminal`), which encodes each of these as a
+//! message to the frontend that holds the terminal: nothing here returns
+//! anything a socket could not carry back later, except the two answers a local terminal has
 //! at once and a remote one never will (a frame that would not decode, a
 //! helper that could not be started), which are answers a window can do
 //! without.
@@ -30,8 +31,8 @@
 //! its descriptor; one that needs the terminal is run to the end inside
 //! [`Terminal::start_helper`], with the terminal given to it and taken back,
 //! and its answer is there for the next [`Terminal::poll_helper`]. The window
-//! asks straight away for the answer of one it started in the terminal, so
-//! that in this process the answer lands in the same pass it always did.
+//! asks straight away for the answer of one it started in the terminal; from
+//! a terminal in another process it comes on a later pass.
 
 use std::collections::VecDeque;
 use std::os::fd::RawFd;

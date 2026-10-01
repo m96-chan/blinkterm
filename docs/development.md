@@ -62,6 +62,33 @@ in mind while writing one: `Browser.getWindowForTarget` with an id the
 headless shell does not have crashes the whole engine, so ask through
 `app::window_of_target`, never directly.
 
+`tests/windows.rs` is #83 itself: several terminals on one profile. Each
+test starts the real backend the way a frontend does — `frontend::attach`
+with the `Spawn` launcher, this build's binary as `--serve-fd`, a scratch
+profile — and drives it with fake frontends: a connection each, made-up
+terminal sizes, frames acknowledged as a terminal would, and the row's bytes
+read for what they say. Two windows on one engine and one lock holder, each
+at its own size and with its own input; one closed and the other painting;
+the last one closed stopping the engine, the lock released and a cookie
+kept for the next start; `--remote` reaching the window used last; a second
+profile with an engine and a cookie jar of its own; a frontend that vanishes
+and whose tabs are offered to the next window after the grace; and a link
+middle-clicked in two windows at once landing in each window it was clicked
+in. Engine-gated like `tests/engine.rs`, one at a time:
+
+```sh
+BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
+  cargo test --release --test windows -- --test-threads=1
+```
+
+The grace a vanished frontend gets is fifteen seconds (`backend::GRACE`);
+the tests pass the hidden `--grace-ms <n>`, which only a run with
+`--serve-fd` accepts, to make it shorter. When a test leaves something
+running, or a real run misbehaves, the backend's standard error is
+`<profile>/backend.log`, rewritten by each backend a frontend starts: the
+engine's warnings, a window that lost its terminal, a page that was closed
+because no window could be shown to have asked for it.
+
 ### Several terminals on one profile: the failure modes
 
 `tests/hardening.rs` holds the backend (#83) to what it promises when
@@ -98,9 +125,8 @@ inline (the tests set `SSH_CONNECTION`), because the terminal's reader looks
 for shared memory under `/dev/shm`. CI's macOS job runs both files beside the
 engine suite.
 
-When one of them fails, or a real start does, the backend's side of it is in
-`<profile>/backend.log`: its standard error, truncated by each candidate
-backend that starts, so it is the log of the latest run. Each line starts
+Reading `backend.log` after a failure: it is truncated by each candidate
+backend a frontend starts, so it is the log of the latest run. Each line starts
 `blinkterm:` and says which window (`window 2 lost its terminal: …`, `window
 2 was not taken back; its tabs are saved`), what was closed and why
 (`closed a page the engine opened (<target>): no window asked for it`), and

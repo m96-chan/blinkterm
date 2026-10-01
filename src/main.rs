@@ -173,10 +173,14 @@ chrome-headless-shell, chromium, chromium-browser, google-chrome or
 chromium-shell. blinkterm does not ship one; blinkterm --install-engine
 fetches the tested one, or install the one you want.
 
-A profile is made readable by you alone (0700), and one blinkterm uses it at a
-time: a second one started on the same profile is refused, and told which pid
-has it. A running blinkterm takes urls from \"blinkterm --remote <url>\" over
-blinkterm.sock in its profile, so it can be $BROWSER. The open tabs are saved
+A profile is made readable by you alone (0700), and one engine runs on it: a
+second blinkterm started on the same profile opens a window of its own in it,
+with its own tabs and the same cookies, and ctrl+q closes only that window.
+The first one starts a background process for the profile, which stops when
+the last window on it closes; its log is backend.log in the profile. A
+running blinkterm takes urls from \"blinkterm --remote <url>\" over
+blinkterm.sock in its profile, into the window used last, so it can be
+$BROWSER. The open tabs are saved
 in the profile; --restore reopens them, and after a crash the next start
 offers to. Bookmarks are kept in the profile too,
 in a file called bookmarks, one url<TAB>title per line.
@@ -187,7 +191,7 @@ chosen opens the default one, and asks which when there is no default.
 A file a page offers — a link to a PDF, a Content-Disposition: attachment —
 is saved in the download directory under its own name, \"report (1).pdf\" if
 that name is taken, and the status row says so; the page stays where it was.
-Quitting cancels a download that is still coming.
+Closing the last window on a profile cancels a download that is still coming.
 
 The terminal has to speak the Kitty graphics protocol, the Kitty keyboard
 protocol and SGR mouse reporting: a tOS pane, Kitty, WezTerm or Ghostty. It
@@ -254,7 +258,7 @@ keys (keymap linux; --keymap mac or keymap = mac for the other):
                  again to put the page back
   alt+shift+r    read the site styles and scripts again
   esc            leave a page's fullscreen; stop a page that is loading
-  ctrl+q         quit
+  ctrl+q         close this window; the others on the profile stay
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no
 ";
 
@@ -313,7 +317,7 @@ keys (keymap mac; --keymap linux or keymap = linux for the other):
   cmd+alt+shift+r
                  read the site styles and scripts again
   esc            leave a page's fullscreen; stop a page that is loading
-  ctrl+q         quit
+  ctrl+q         close this window; the others on the profile stay
   a dialog       takes the top row: any key, y/n, or type and enter; esc is no
 ";
 

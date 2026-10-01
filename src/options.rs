@@ -86,7 +86,7 @@ pub const NORMAL_NOT_REMAPPABLE_YET: &str =
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
     /// The pages to open, one tab each, the first in front. Empty means
-    /// `home`. Not yet normalised: `app::drive` does that, as it did.
+    /// `home`. Not yet normalised: the window's backend does that.
     pub urls: Vec<String>,
     /// `home`: the page a run with no url opens. `about:blank` unless said.
     pub home: String,

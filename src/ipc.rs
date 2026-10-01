@@ -9,8 +9,7 @@
 //! pickers, password commands, the external browser). This module is the
 //! wire between the two, and nothing else: the messages, their framing, the
 //! socket a backend listens on, and a writer that never blocks the loop that
-//! feeds it. Nothing in the binary uses it yet; the backend and the frontend
-//! that will are the next step.
+//! feeds it. [`crate::backend`] and [`crate::frontend`] are the two ends.
 //!
 //! # Framing
 //!

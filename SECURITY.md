@@ -63,20 +63,39 @@ machine. It prints a warning when it does. Do not browse as root.
   crash is trusted, and a temporary profile never has one
   ([#60](https://github.com/m96-chan/blinkterm/issues/60)).
 
-- **The backend socket (coming).** For several terminals on one profile
-  ([#83](https://github.com/m96-chan/blinkterm/issues/83)), the code for a
-  second socket, `<profile>/backend.sock`, is in `src/ipc.rs`; nothing listens
-  on it yet. It is bound the way the `--remote` socket is — only under the
-  profile lock, over whatever a crash left, 0600 inside the 0700 profile or
-  behind a symlink to a fresh 0700 directory of its own — and on top of the
-  directory's permissions every connection is checked with the kernel
+- **The backend socket.** Every terminal started on a profile reaches the
+  profile's backend — the background process that holds the profile, runs
+  its one engine and keeps every window
+  ([#83](https://github.com/m96-chan/blinkterm/issues/83)) — through
+  `<profile>/backend.sock`. It is bound the way the `--remote` socket is:
+  only under the profile lock, over whatever a crash left, 0600 inside the
+  0700 profile or, where the path is too long or the filesystem cannot hold
+  a socket, behind a symlink to a fresh 0700 directory of its own. On top of
+  the directory's permissions every connection is checked with the kernel
   (`SO_PEERCRED` on Linux, `getpeereid` on a Mac) and hung up on unless it
   comes from the same user; where the peer cannot be asked, it is refused.
-  What it will accept is typed messages that drive one window, the way its
-  keyboard does: no CDP, no script, no command. Lengths are checked before
-  anything is held for a message, and a peer that stops reading is dropped
-  rather than buffered without end. This entry grows with the change that
-  starts using it.
+  What a connected process can do is open a window and drive it the way its
+  keyboard and mouse do — keys, clicks, pastes, a resize — through typed
+  messages: no CDP, no script, no command, nothing a terminal could not
+  already do. It is told what that window's terminal is told: the row's
+  bytes and the page's frames. A password command's output crosses it once,
+  from the terminal that ran the command to the backend that fills the form,
+  and is overwritten with zeros at both ends once used. Lengths are checked
+  before anything is held for a message, and a peer that stops reading is
+  dropped rather than buffered without end. The frontend trusts what its
+  backend sends it to write to its terminal — the backend is the same
+  program, run by the same user, and what it sends is what one process used
+  to write itself — so the row's sanitising is the backend's, as it always
+  was. A temporary profile's backend has no socket at all: it is reached
+  only through the socket pair its own terminal started it with. Still no
+  TCP listener anywhere.
+
+- **The backend's log.** The backend has no terminal; its standard error
+  goes to `<profile>/backend.log` (0600, rewritten by each backend a
+  terminal starts). That is mostly the engine's own stderr, which can quote
+  a url you visited, and the lines the backend writes about windows and the
+  pages it closed, which can too. It is in the profile, beside the history,
+  and as private as it is.
 
 - **What gets written to your terminal.** A terminal executes the bytes it is
   sent, so anything page-derived that reaches the status row is a place where a
@@ -270,8 +289,13 @@ machine. It prints a warning when it does. Do not browse as root.
   a page is told light or dark, as any browser tells it, and nothing more
   ([#16](https://github.com/m96-chan/blinkterm/issues/16)).
 
-- **The engine's lifetime.** `blinkterm` starts Chromium in a process group of
-  its own and kills the group on exit, on a signal, and from a panic hook.
+- **The engine's lifetime.** The profile's backend starts Chromium in a
+  process group of its own and kills the group when the last window closes,
+  on a signal, and from a panic hook; a terminal's own process never touches
+  it. A backend killed outright cannot, so it writes the group's number to
+  `<profile>/engine.pgid`, and the next backend on the profile kills what is
+  left of that group — after checking it is an engine on that profile — before
+  starting one of its own.
   A Chromium left running after `blinkterm` has gone — holding your profile,
   and with `chromium-shell` an open debugging port — would be a security
   problem, so failures of that machinery count here.

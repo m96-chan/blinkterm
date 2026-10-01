@@ -581,11 +581,27 @@ pub fn reap_orphan(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a process's command line, as `/proc/<pid>/cmdline` has it, says
+/// `--user-data-dir=<dir>`: as one of its words, or inside the one string
+/// a browser that has rewritten its own title makes of them (Chromium does,
+/// with spaces), followed by the end of a word.
+pub fn names_profile(cmdline: &[u8], dir: &Path) -> bool {
+    let wanted = format!("--user-data-dir={}", dir.display());
+    let wanted = wanted.as_bytes();
+    if cmdline.len() < wanted.len() {
+        return false;
+    }
+    (0..=cmdline.len() - wanted.len()).any(|at| {
+        let starts = at == 0 || matches!(cmdline[at - 1], 0 | b' ');
+        let ends = matches!(cmdline.get(at + wanted.len()), None | Some(0 | b' '));
+        starts && ends && &cmdline[at..at + wanted.len()] == wanted
+    })
+}
+
 /// Whether process group `group` is an engine started on `dir`: some living
-/// member's command line has `--user-data-dir=<dir>` in it.
+/// member's command line names it ([`names_profile`]).
 #[cfg(target_os = "linux")]
 fn is_engine_group(group: i32, dir: &Path, _exe: &Path) -> bool {
-    let wanted = format!("--user-data-dir={}", dir.display());
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return false;
     };
@@ -595,11 +611,8 @@ fn is_engine_group(group: i32, dir: &Path, _exe: &Path) -> bool {
             .and_then(|stat| state_and_group(&stat))
             .is_some_and(|(state, pgrp)| pgrp == group && state != 'Z');
         in_group
-            && std::fs::read(entry.path().join("cmdline")).is_ok_and(|cmdline| {
-                cmdline
-                    .split(|&b| b == 0)
-                    .any(|arg| arg == wanted.as_bytes())
-            })
+            && std::fs::read(entry.path().join("cmdline"))
+                .is_ok_and(|cmdline| names_profile(&cmdline, dir))
     })
 }
 
@@ -1242,6 +1255,26 @@ pub fn first_page(reply: &Json) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_command_line_names_its_profile_as_a_word_or_inside_a_title() {
+        let dir = Path::new("/p/x");
+        assert!(names_profile(
+            b"chrome\0--user-data-dir=/p/x\0--headless\0",
+            dir
+        ));
+        assert!(names_profile(
+            b"chrome --headless --user-data-dir=/p/x --mute",
+            dir
+        ));
+        assert!(names_profile(b"chrome --user-data-dir=/p/x", dir));
+        assert!(
+            !names_profile(b"chrome --user-data-dir=/p/xy", dir),
+            "another profile"
+        );
+        assert!(!names_profile(b"chrome x--user-data-dir=/p/x", dir));
+        assert!(!names_profile(b"", dir));
+    }
 
     #[test]
     fn a_pgid_marker_names_a_group_and_an_executable() {
