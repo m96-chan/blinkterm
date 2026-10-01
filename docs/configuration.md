@@ -321,13 +321,12 @@ The lists themselves are yours and are only read (see
 ### Bookmarks
 
 `ctrl+d` bookmarks the page in front, and `ctrl+d` again removes the
-bookmark; the row says which. They are kept in one file for every profile,
-`$XDG_DATA_HOME/blinkterm/bookmarks` (or `~/.local/share/blinkterm/bookmarks`),
-beside the default profile rather than in any of them — the same file under
-`--profile` and under `--temp-profile`, because a profile is the engine's data
-and a bookmark is yours: pressing `ctrl+d` in a throwaway profile is asking
-for that one page to outlive it. The file is readable by you alone (0600), one
-bookmark a line:
+bookmark; the row says which. They are kept in the profile, in a file called
+`bookmarks` beside the history, so each profile has its own: the bookmarks
+you make under `--profile-name Work` are not offered under your personal
+profile. `--temp-profile` keeps them for the run only — `ctrl+d` works, the
+row says the bookmark is for this run, and nothing is written. The file is
+readable by you alone (0600), one bookmark a line:
 
 ```text
 https://example.com/<TAB>Example Domain
@@ -342,10 +341,25 @@ it with anything; `grep` it to see what is kept. A url is matched exactly, so
 `https://example.com/` and `https://example.com` are two bookmarks. The url
 bar offers bookmarks before the pages you visited: the dim suggestion is a
 bookmark's when one starts with what you typed, and `↑` walks the bookmarks
-that match before the history. Two `blinkterm`s can share the file: every
-change takes a lock on `bookmarks.lock` and reads the file again first, so
-neither loses the other's bookmark; what one adds shows up in the other after
-its next `ctrl+d` or its next start.
+that match before the history. Every change takes a lock on
+`bookmarks.lock` beside the file and reads the file again first, so a change
+made by hand or by a script while `blinkterm` runs is not lost; it shows up
+in the url bar after the next `ctrl+d` or the next start.
+
+Before profiles had their own, every profile shared one file,
+`$XDG_DATA_HOME/blinkterm/bookmarks` (or `~/.local/share/blinkterm/bookmarks`).
+The first start on the `Default` profile — the one an upgrade registers,
+`$XDG_DATA_HOME/blinkterm/profile` — copies that file into it, once, says so
+on the row, and leaves `bookmarks.migrated` beside the old file so that it is
+never copied again, even if you empty the profile's. The old file is kept as
+it was, for an older `blinkterm`; what either adds afterwards is its own. No
+other profile gets a copy: to give one the old bookmarks, copy the file into
+its directory yourself (`blinkterm profiles` lists where each one is), while
+that profile is not running:
+
+```sh
+cp ~/.local/share/blinkterm/bookmarks <profile dir>/bookmarks
+```
 
 ### The session
 
@@ -368,3 +382,11 @@ wants the row. How a run that did not quit is known is the file's first line,
 `# blinkterm session: open` until the run quits and writes `closed`.
 `--temp-profile` keeps the session in memory, for `ctrl+shift+t`, and writes
 nothing.
+
+The tabs in the file are grouped under a line for the window they were in —
+`# window 1 live`, `closed` or `lost` — after a `# format: 2` line. A run has
+one window, so today the file has one group; the groups are there for the
+profile that serves several terminals at once. A file written by an older
+`blinkterm` reads as one group, and an older `blinkterm` reads this one as
+one window with every group's tabs, since every line this version adds
+starts with `#`.
