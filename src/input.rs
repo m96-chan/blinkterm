@@ -301,6 +301,11 @@ pub enum Input {
     PasteRefused {
         bytes: usize,
     },
+    /// A paste whose end marker never came, given up on
+    /// ([`Parser::abandon_paste`]): never produced by the parser itself, but
+    /// by the loop that saw the terminal go quiet, so that the row can say
+    /// so wherever the row is drawn.
+    PasteCut,
     /// An `OSC slot ; rgb:… ST` colour report: `slot` 11 is the background,
     /// which is the one this program asks about. See [`colour_report`].
     Colour {

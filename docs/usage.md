@@ -465,3 +465,47 @@ to start one in, so with none running a link says so in the journal and
 opens nothing. On macOS `gh` and `git` honour `$BROWSER`, but `open` and the
 rest of the system do not: they go to the default browser, which a program
 with no window cannot be.
+
+## When a start on a profile in use says no
+
+A second `blinkterm` on a profile opens a window of the one already serving
+it, and most of what can go wrong there ends with one of these sentences.
+What they mean, and what to do:
+
+- `the profile at <dir> is in use by pid <pid>, which is not taking windows`
+  — the lock is held by a process that never started listening for windows
+  in thirty seconds: an older blinkterm (from before windows were shared), a
+  backend stuck on its way out, or something else holding
+  `<dir>/blinkterm.lock`. Quit that blinkterm; `ps -p <pid>` says what the
+  pid is. Meanwhile `blinkterm --remote <url>` reaches an older blinkterm,
+  and `--temp-profile` or `--profile <other dir>` starts one beside it.
+- `the blinkterm serving <dir> (pid <pid>) is version <a> and this is <b>`
+  — an upgrade while windows were open. Quit that version's windows (each
+  `ctrl+q`); the next start runs the new one.
+- `the blinkterm serving <dir> (pid <pid>) runs the engine with <key> =
+  <value>, and this start asked for <other>` — `engine`, `engine-arg`,
+  `user-agent`, `proxy`, `mute`, `download-dir`, `block-list`, `block`,
+  `sites-dir`, `sites` and `console` are the engine's, so every window on a
+  profile has the same ones, whether they came from the command line or the
+  settings file. The key named is the first that differs. Start with the
+  same settings, quit the other windows first, or give this one a profile
+  of its own.
+- `the blinkterm serving <dir> stopped unexpectedly; what it said is in
+  <dir>/backend.log` — the process holding the profile and the engine went
+  without a word: killed, or crashed. Each window on the profile ends with
+  this; `backend.log` has its last words. The next start cleans up after it
+  — the old engine is stopped first if any of it is still running — and
+  offers the tabs back.
+- `the blinkterm serving <dir> stopped: <why>` — it stopped on purpose,
+  usually because the engine died twice in a minute; the sentence says how
+  many tabs were saved, and `blinkterm --restore` reopens them.
+- `an engine from a previous blinkterm (process group <n>) is still running
+  on <dir> and would not stop` — a crashed blinkterm's engine is still on
+  the profile and did not stop when killed. `kill -9 -<n>` (the minus sends
+  it to the group; `pgrep -g <n>` lists what is in it), then start again.
+
+A start that comes while the last window's blinkterm is writing the profile
+out — the two seconds after the last `ctrl+q` that keep the cookies — waits
+for it and then starts a fresh one; it says nothing unless that takes longer
+than thirty seconds, when it prints `the blinkterm serving <dir> has been
+shutting down for <n> s; try again in a moment`.

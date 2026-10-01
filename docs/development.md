@@ -89,6 +89,53 @@ running, or a real run misbehaves, the backend's standard error is
 engine's warnings, a window that lost its terminal, a page that was closed
 because no window could be shown to have asked for it.
 
+### Several terminals on one profile: the failure modes
+
+`tests/hardening.rs` holds the backend (#83) to what it promises when
+something goes wrong: two terminals starting at once on a free profile, the
+frontend that started the backend leaving first, a frontend, the backend or
+the engine killed outright, a start during the last window's shutdown, a
+browser-wide setting that differs (a proxy), the socket and `engine.pgid` a
+crash leaves, a terminal that stops reading beside one that keeps up, and
+the cookie jar across a stop at the end of a grace. Like the window tests it
+starts the real backend through `frontend::attach` and drives it with fake
+frontends, with the hidden `--grace-ms` passed through to make the reconnect
+grace short. Some of it is done by force to make it certain: the engine is
+stopped (`SIGSTOP`) so that a shutdown takes its whole close timeout and an
+attach is sure to land inside it, and a stand-in process group with
+`--user-data-dir=<profile>` on its command line plays the orphaned engine
+that `engine::reap_orphan` must kill (a real one cannot be kept: a stopped
+engine whose backend is killed is an orphaned process group with a stopped
+member, which the kernel ends with `SIGHUP`). One test there needs no
+engine and runs everywhere: a profile path longer than a socket address
+gets a private fallback for both sockets.
+
+`tests/terminal.rs` runs the real binary in a pseudoterminal
+(`tests/support/pty.rs`: `openpty`, the child in a session of its own with
+the pty as its controlling terminal, `TIOCSWINSZ` with pixels so that
+`--no-probe` has a cell size) with `--no-probe --frames raw --tmux off`, and
+reads it through `tos_term` as `tests/engine.rs` does: the status row comes
+up, `ctrl+q` exits 0 and the lock is let go once the backend has stopped, a
+second pane on the same named profile gets its own row with the profile's
+name, closing one pane leaves the other drawing, and a pane whose terminal
+closes (the master end dropped, a hang-up) or whose frontend is killed costs
+only its own window — the last one after the full fifteen-second grace,
+which makes that test take about twenty seconds. On a Mac the frames go
+inline (the tests set `SSH_CONNECTION`), because the terminal's reader looks
+for shared memory under `/dev/shm`. CI's macOS job runs both files beside the
+engine suite.
+
+Reading `backend.log` after a failure: it is truncated by each candidate
+backend a frontend starts, so it is the log of the latest run. Each line starts
+`blinkterm:` and says which window (`window 2 lost its terminal: …`, `window
+2 was not taken back; its tabs are saved`), what was closed and why
+(`closed a page the engine opened (<target>): no window asked for it`), and
+an engine death (`… ; starting it again`); the engine's own complaints are
+there between them. The tests' scratch profiles are under the temporary
+directory as `blinkterm-it-hardening-*` and `blinkterm-it-terminal-*` and
+are removed when a test ends, so to read the log of a failing one, run it
+alone with a `sleep` added before its end, or copy the file in the test.
+
 ## Checks
 
 What CI runs, and what to run before pushing:
@@ -106,7 +153,9 @@ nothing else. The one worth knowing about is
 `clippy::undocumented_unsafe_blocks`: there are ninety-eight `unsafe` blocks
 in `src/` (`grep -o 'unsafe {' src/*.rs | wc -l`, the unit tests' among
 them), nearly all of them one-line `libc` calls, and each says what makes it
-sound.
+sound. The integration tests' — the pty and the process groups in
+`tests/hardening.rs`, `tests/terminal.rs` and `tests/support/pty.rs` among
+them — are held to the same lint, tOS's copied file reader excepted.
 
 CI also runs clippy, the unit tests and the real-engine suite on macOS. That
 job exercises the `shm_open` frame path, app-bundle search and macOS scroll

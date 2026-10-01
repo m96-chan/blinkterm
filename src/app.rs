@@ -1766,7 +1766,7 @@ pub(crate) fn open_first(
 ) -> Result<(), String> {
     // What the last run left, decided before anything is opened: its tabs,
     // with `--restore`; a question on the row, after a run that did not quit.
-    let plan = session::plan_for_window(shared.session.next_group(), restore);
+    let plan = session::plan_for_window(shared.session.next_group_for(restore), restore);
     let mut restored = false;
     if let Some(snapshot) = plan.restore {
         shared.session.take_group(chrome.id);
@@ -5552,6 +5552,10 @@ fn handle_input(
                     crate::input::PASTE_LIMIT / 1024
                 ),
             );
+            redraw_row(term, tabs, chrome, shared)?;
+        }
+        Input::PasteCut => {
+            note(tabs, "paste cut short; try again");
             redraw_row(term, tabs, chrome, shared)?;
         }
         Input::Paste(text) => {

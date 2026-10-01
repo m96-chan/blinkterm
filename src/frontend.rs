@@ -244,12 +244,22 @@ fn handshake(stream: UnixStream, dir: Option<&Path>) -> Result<Reached<Link>, St
         dir: dir.map(Path::to_path_buf).unwrap_or_default(),
         label: String::new(),
     };
-    link.send(&ToBackend::Hello {
-        protocol: ipc::PROTOCOL,
-        version: ipc::VERSION.to_string(),
-        dir: dir.map(Path::to_path_buf),
-    })?;
-    match link.recv(HANDSHAKE_TIMEOUT)? {
+    let answer = link
+        .send(&ToBackend::Hello {
+            protocol: ipc::PROTOCOL,
+            version: ipc::VERSION.to_string(),
+            dir: dir.map(Path::to_path_buf),
+        })
+        .and_then(|()| link.recv(HANDSHAKE_TIMEOUT));
+    // A backend that hangs up before it answers is one on its way out: the
+    // connection waited in its socket's queue while it stopped its engine,
+    // and went when the socket did. That is tried again, as a backend that
+    // says it is shutting down is, within the attach's deadline.
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(why) => return Ok(Reached::Refused { why, retry: true }),
+    };
+    match answer {
         Some(ToFrontend::Welcome {
             pid,
             generation,
@@ -787,7 +797,11 @@ fn drive(
             // A paste that was opened and has gone quiet: the end marker is
             // not coming, and what arrived is half of something.
             paste_heard = None;
-            term.abandon_paste();
+            if term.abandon_paste() {
+                // The row is the backend's, so it is told to say so.
+                let pixel_mouse = term.pixel_coordinates();
+                take_input(term, link, Input::PasteCut, pixel_mouse, metrics)?;
+            }
         } else if let Some(input) = term.flush() {
             // Nothing arrived, so a held escape was the Escape key after all.
             let pixel_mouse = term.pixel_coordinates();
@@ -1253,6 +1267,21 @@ mod tests {
         ));
         assert!(fake.slept >= ATTACH_TIMEOUT);
         assert!(fake.spawned > 1, "tried again every two seconds");
+    }
+
+    /// A backend that hangs up on a hello without a word — one whose socket
+    /// went while the connection waited in its queue — is tried again, not
+    /// the end of the attach.
+    #[test]
+    fn a_backend_that_hangs_up_on_hello_is_tried_again() {
+        let (ours, theirs) = UnixStream::pair().expect("a pair");
+        drop(theirs);
+        match handshake(ours, Some(Path::new("/p"))) {
+            Ok(Reached::Refused { retry: true, .. }) => {}
+            Ok(Reached::Refused { why, retry: false }) => panic!("final: {why}"),
+            Ok(_) => panic!("not refused"),
+            Err(why) => panic!("the attach would end: {why}"),
+        }
     }
 
     #[test]
