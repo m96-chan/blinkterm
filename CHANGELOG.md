@@ -88,6 +88,11 @@ flag, a different default, a raised Rust floor all do.
   and `alt+o` by its own `$DISPLAY`, not the first terminal's, and `alt+s`
   prints on its own locale's paper
   ([#104](https://github.com/m96-chan/blinkterm/issues/104)).
+- A `file-picker-terminal` picker or a `password-command-terminal` command no
+  longer leaves its window blank for five seconds afterwards: the backend
+  holds that window's screencast while the helper has the terminal and paints
+  a fresh frame as soon as it exits; other windows on the profile are
+  unaffected ([#105](https://github.com/m96-chan/blinkterm/issues/105)).
 - Closing the terminal under a window — its tab or window closed, an ssh
   session dropped — no longer counts as `ctrl+q`: its tabs are offered at
   the next start, as a crash's are. Only `ctrl+q`, or `ctrl+w` on the last
