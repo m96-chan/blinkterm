@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use blinkterm::engine;
 use blinkterm::fit::Metrics;
 use blinkterm::frontend::{self, Link, Spawn};
-use blinkterm::input::{Input, Key, KeyAction, KeyInput, Mods};
+use blinkterm::input::{Input, Key, KeyAction, KeyInput, Mods, MouseInput, MouseKind};
 use blinkterm::ipc::{
     self, BrowserSettings, CloseWhy, FrameKind, Open, RouteFlags, ToBackend, ToFrontend,
     WindowSettings,
@@ -36,6 +36,12 @@ function f(){n=n>300?0:n+3;b.style.left=n+'px';requestAnimationFrame(f)}f();\
 
 /// Sets a cookie that lasts, and says so in its title.
 const SET_COOKIE: &str = "<!doctype html><title>cookie set</title><body>set</body>";
+
+/// One link over the whole page, to `/opened-<from>`, where `<from>` is
+/// the page's own query: a middle click anywhere opens it behind.
+const LINKS: &str = "<!doctype html><title>links</title>\
+<body style='margin:0'><a id=l style='display:block;height:100vh' href='#'>go</a>\
+<script>document.getElementById('l').href='/opened-'+location.search.slice(1)</script>";
 
 /// Says in its title which cookie it was sent.
 const SHOW_COOKIE: &str = "<!doctype html><title>x</title>\
@@ -92,6 +98,21 @@ fn serve() -> String {
                 )
             } else if request.starts_with("GET /show") {
                 (SHOW_COOKIE, "")
+            } else if request.starts_with("GET /links") {
+                (LINKS, "")
+            } else if let Some(rest) = request.strip_prefix("GET /opened-") {
+                let from: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                let page = format!("<!doctype html><title>opened by {from}</title>");
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                    page.len()
+                );
+                let _ = stream.write_all(answer.as_bytes());
+                continue;
             } else {
                 (PAGE, "")
             };
@@ -266,6 +287,25 @@ impl Front {
                 pixel_mouse: false,
             })
             .expect("sent");
+    }
+
+    /// A middle click at a cell of the page, pressed and let go.
+    fn middle_click(&mut self, x: u32, y: u32) {
+        for kind in [MouseKind::Press, MouseKind::Release] {
+            self.link
+                .send(&ToBackend::Input {
+                    input: Input::Mouse(MouseInput {
+                        kind,
+                        button: Some(1),
+                        mods: Mods::default(),
+                        x,
+                        y,
+                        wheel: (0, 0),
+                    }),
+                    pixel_mouse: false,
+                })
+                .expect("sent");
+        }
     }
 
     /// Close the window as `ctrl+q` does, and wait for the backend to say
@@ -677,6 +717,60 @@ fn a_link_that_vanishes_is_offered_its_tabs_to_the_next_window_after_grace() {
     );
     a.quit();
     c.quit();
+    assert!(gone_within(backend, Duration::from_secs(10)));
+    stop_backend(backend);
+}
+
+/// The hard case for routing: a link opened with a modifier names no
+/// opener, and two windows open one in the same moment. Each page lands
+/// in the window it was clicked in — attributed by the disposition the
+/// clicking page's own session announced — and in no other.
+#[test]
+fn a_link_opened_behind_lands_in_the_window_it_was_clicked_in() {
+    if !engine_named() {
+        return;
+    }
+    let scratch = Scratch::new("route");
+    let page = serve();
+    let mut spawn = launcher(Duration::from_secs(15));
+    let mut a = Front::open(
+        &mut spawn,
+        &scratch.0,
+        (80, 24),
+        &[format!("{page}links?a")],
+    );
+    let mut b = Front::open(
+        &mut spawn,
+        &scratch.0,
+        (80, 24),
+        &[format!("{page}links?b")],
+    );
+    let backend = a.link.backend_pid;
+    for front in [&mut a, &mut b] {
+        assert!(
+            front.pump(PATIENCE, |f| f.says("links")),
+            "{}",
+            front.said()
+        );
+        front.pump(Duration::from_millis(500), |_| false);
+    }
+    a.middle_click(10, 6);
+    b.middle_click(10, 6);
+    // A tab behind shows its url on the strip until it is looked at.
+    assert!(a.pump(PATIENCE, |f| f.says("2 http")), "{}", a.said());
+    assert!(b.pump(PATIENCE, |f| f.says("2 http")), "{}", b.said());
+    a.pump(Duration::from_secs(1), |_| false);
+    b.pump(Duration::from_secs(1), |_| false);
+    assert!(a.says("2 http://") && a.says("/opened-a"), "{}", a.said());
+    assert!(b.says("/opened-b"), "{}", b.said());
+    assert!(!a.says("/opened-b"), "a's window got b's page");
+    assert!(!b.says("/opened-a"), "b's window got a's page");
+    assert!(
+        !a.says("3 http") && !b.says("3 http"),
+        "a page landed twice"
+    );
+    a.quit();
+    b.quit();
     assert!(gone_within(backend, Duration::from_secs(10)));
     stop_backend(backend);
 }
