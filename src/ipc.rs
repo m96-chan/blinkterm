@@ -164,7 +164,10 @@ pub enum ToBackend {
         waited_ms: Option<u64>,
         viewport_gen: u32,
     },
-    /// A helper the backend asked for has finished.
+    /// A helper the backend asked for has finished. For one that had the
+    /// terminal, the terminal is back: the window's cast, held since the
+    /// [`ToFrontend::Helper`], starts again, at the size of a
+    /// [`ToBackend::Resize`] the frontend sends just before this.
     HelperDone { id: u64, outcome: Outcome },
     /// This window is done.
     Close { why: CloseWhy },
@@ -221,7 +224,11 @@ pub enum ToFrontend {
     ClearScreen,
     /// A picture to paint.
     Frame(Frame),
-    /// Run a helper program on the terminal's side.
+    /// Run a helper program on the terminal's side. One that runs in the
+    /// terminal ([`Job::Picker`] or [`Job::Login`] with `terminal`) holds
+    /// the window's cast from this message until the answering
+    /// [`ToBackend::HelperDone`]: the frontend paints nothing meanwhile,
+    /// and is not counted as stalled for it.
     Helper { id: u64, job: Job },
     /// The window is gone; the frontend exits with `exit`.
     Closed { why: String, exit: u8 },

@@ -76,6 +76,14 @@ flag, a different default, a raised Rust floor all do.
 - A site file that is refused is said on the first window's row and in
   `backend.log`, rather than in the shell before the page.
 
+### Fixed
+
+- A `file-picker-terminal` picker or a `password-command-terminal` command no
+  longer leaves its window blank for five seconds afterwards: the backend
+  holds that window's screencast while the helper has the terminal and paints
+  a fresh frame as soon as it exits; other windows on the profile are
+  unaffected ([#105](https://github.com/m96-chan/blinkterm/issues/105)).
+
 ## [0.4.0] - 2026-10-01
 
 ### Added

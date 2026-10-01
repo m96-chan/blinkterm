@@ -3,7 +3,8 @@
 //! the engine killed outright, an attach while the backend is on its way
 //! out, a setting that cannot be shared, what a crash leaves in the profile,
 //! a path too long for a socket, a terminal that stops reading beside one
-//! that keeps up, and the cookie jar at the end of it all.
+//! that keeps up, a terminal handed to a file picker beside one that keeps
+//! painting, and the cookie jar at the end of it all.
 //!
 //! As in `tests/windows.rs`, the backend is the real one, started by
 //! [`blinkterm::frontend::attach`] the way the program starts it, and the
@@ -41,6 +42,20 @@ const PAGE: &str = "<!doctype html><title>ready</title>\
 addEventListener('keydown',function(e){location.href='/key-'+e.key});\
 var b=document.getElementById('b'),n=0;\
 function f(){n=n>300?0:n+3;b.style.left=n+'px';requestAnimationFrame(f)}f();\
+</script></body>";
+
+/// A page that moves, and whose file input is clicked on a key — the key is
+/// the activation a chooser needs — and which goes to `/pick-cancelled` when
+/// the input hears `cancel`, so that the row's url says it did.
+const PICK: &str = "<!doctype html><title>pick ready</title>\
+<body style='margin:0;height:100vh;background:#fff'>\
+<input id=f type=file style='position:absolute;left:0;top:40px'>\
+<div id=b style='position:absolute;width:60px;height:30px;background:#33c'></div>\
+<script>\
+addEventListener('keydown',function(){f.click()});\
+f.addEventListener('cancel',function(){location.href='/pick-cancelled'});\
+var b=document.getElementById('b'),n=0;\
+function g(){n=n>300?0:n+3;b.style.left=n+'px';requestAnimationFrame(g)}g();\
 </script></body>";
 
 /// Sets a cookie that lasts, and says so in its title.
@@ -85,7 +100,7 @@ impl Drop for Scratch {
 }
 
 /// A local server for the pages: `/set` sets a cookie, `/show` shows it,
-/// anything else is [`PAGE`].
+/// `/pick` is [`PICK`], anything else is [`PAGE`].
 fn serve() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to serve on");
     let address = listener.local_addr().expect("an address");
@@ -101,6 +116,8 @@ fn serve() -> String {
                 )
             } else if request.starts_with("GET /show") {
                 (SHOW_COOKIE, "")
+            } else if request.starts_with("GET /pick") {
+                (PICK, "")
             } else {
                 (PAGE, "")
             };
@@ -182,6 +199,11 @@ struct Front {
     unacked: Vec<u64>,
     acking: bool,
     closed: Option<(String, u8)>,
+    /// The file pickers it was asked to run: id, tab, input, and whether in
+    /// the terminal.
+    pickers: Vec<(u64, String, i64, bool)>,
+    /// How many times it was told to clear the screen.
+    cleared: usize,
 }
 
 impl Front {
@@ -201,6 +223,8 @@ impl Front {
             unacked: Vec::new(),
             acking: true,
             closed: None,
+            pickers: Vec::new(),
+            cleared: 0,
         })
     }
 
@@ -242,6 +266,17 @@ impl Front {
                 }
             }
             ToFrontend::Closed { why, exit } => self.closed = Some((why, exit)),
+            ToFrontend::Helper {
+                id,
+                job:
+                    ipc::Job::Picker {
+                        tab,
+                        node,
+                        terminal,
+                        ..
+                    },
+            } => self.pickers.push((id, tab, node, terminal)),
+            ToFrontend::ClearScreen => self.cleared += 1,
             _ => {}
         }
     }
@@ -1215,6 +1250,115 @@ fn a_slow_frontend_bounds_its_own_frames_and_the_fast_one_keeps_its_rate() {
     assert!(rate >= 20.0 || (!timed && rate > 0.0), "{rate:.1} fps");
     fast.quit();
     slow.quit();
+    assert!(gone_within(backend, Duration::from_secs(10)));
+    stop_backend(backend);
+}
+
+/// Issue #105: a picker that takes the terminal holds its window's cast
+/// rather than stalling it — no frame for the window while the terminal is
+/// the picker's, however long that is, and the other window on the profile
+/// painting throughout — and its answer lays the window out again and
+/// paints it at once.
+#[test]
+fn a_terminal_picker_holds_its_window_and_the_answer_paints_it_again() {
+    if !engine_named() {
+        return;
+    }
+    let scratch = Scratch::new("picker");
+    let page = serve();
+    let mut spawn = launcher(Duration::from_secs(15));
+    let mut other = Front::open(
+        &mut spawn,
+        &scratch.0,
+        (80, 24),
+        std::slice::from_ref(&page),
+    );
+    let mut open = an_open((80, 24), &[format!("{page}pick")], &options(&[]), true);
+    open.window = WindowSettings::from(&options(&["--file-picker-terminal", "pick"]));
+    let mut picking = Front::try_open(&mut spawn, &scratch.0, open).expect("a window");
+    let backend = other.link.backend_pid;
+    assert!(
+        picking.pump(PATIENCE, |f| f.says("pick ready") && f.frames >= 3),
+        "{}",
+        picking.said()
+    );
+    assert!(other.pump(PATIENCE, |f| f.frames >= 3));
+
+    // The key clicks the input; the picker is the terminal's.
+    picking.key('p');
+    assert!(
+        picking.pump(PATIENCE, |f| !f.pickers.is_empty()),
+        "no picker was asked for: {}",
+        picking.said()
+    );
+    let (id, tab, node, terminal) = picking.pickers[0].clone();
+    assert!(terminal, "not the terminal's picker");
+
+    // The terminal is the picker's, and paints nothing, for longer than a
+    // stall: the window is sent nothing, and the other one keeps its rate.
+    let before = picking.frames;
+    let during = other.rate(backend::STALL + Duration::from_secs(1));
+    eprintln!("the other window beside a picker: {during:.1} fps");
+    picking.pump(Duration::from_millis(200), |_| false);
+    assert_eq!(
+        picking.frames, before,
+        "frames were sent to a terminal a picker had"
+    );
+    let timed = timing_asserted("the other window's rate");
+    assert!(
+        during >= 20.0 || (!timed && during > 0.0),
+        "the other window slowed to {during:.1} fps"
+    );
+
+    // The picker exits: the terminal's size, then the answer. The window is
+    // laid out again and painted at once, without the frontend having
+    // painted anything in between.
+    let cleared = picking.cleared;
+    let send = |front: &mut Front, message: ToBackend| front.link.send(&message).expect("sent");
+    send(
+        &mut picking,
+        ToBackend::Resize {
+            metrics: metrics(80, 24),
+            viewport_gen: 1,
+        },
+    );
+    send(
+        &mut picking,
+        ToBackend::HelperDone {
+            id,
+            outcome: ipc::Outcome::Picker {
+                tab,
+                node,
+                result: ipc::Picked::Cancel,
+            },
+        },
+    );
+    let back = Instant::now();
+    assert!(
+        picking.pump(PATIENCE, |f| f.cleared > cleared && f.frames > before),
+        "the window was not painted again: cleared {} times, {} frames",
+        picking.cleared - cleared,
+        picking.frames - before
+    );
+    let took = back.elapsed();
+    eprintln!("the first frame after the picker: {took:?}");
+    assert!(
+        took < Duration::from_secs(1) || !timed,
+        "the window took {took:?} to paint again"
+    );
+    assert!(
+        picking.pump(PATIENCE, |f| f.says("/pick-cancelled")),
+        "the page was not told: {}",
+        picking.said()
+    );
+    picking.frames = 0;
+    assert!(
+        picking.pump(PATIENCE, |f| f.frames >= 10),
+        "the window did not keep casting: {} frames",
+        picking.frames
+    );
+    other.quit();
+    picking.quit();
     assert!(gone_within(backend, Duration::from_secs(10)));
     stop_backend(backend);
 }

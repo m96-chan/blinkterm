@@ -2136,6 +2136,11 @@ pub(crate) fn window_id(win: &Window) -> WindowId {
     win.chrome.id
 }
 
+/// The size the window is laid out for: what its terminal said last.
+pub(crate) fn window_metrics(win: &Window) -> Metrics {
+    win.chrome.metrics
+}
+
 /// A sentence on the window's row, drawn now: what its terminal said about
 /// something it was asked to do and could not, like start a desktop
 /// browser.
@@ -2381,8 +2386,9 @@ pub(crate) fn pass_window(
     handle_target_events(term, tabs, browser, chrome, shared, events, downloads_moved)?;
     handle_page_events(term, tabs, chrome, shared)?;
     // A click on a file input that a picker is to answer, read just now:
-    // started in the same pass, which for one that runs in the terminal
-    // means the loop stops here until it has exited.
+    // started in the same pass, which for one that runs in a terminal in
+    // this process means the loop stops here until it has exited, and for
+    // one in a frontend's that the backend holds the window's cast.
     start_picker(term, tabs, chrome, shared)?;
     // The answer to a navigation, which may have been held for as long as
     // a page's "leave this page?" was on the row. After the page's events,
@@ -6540,9 +6546,12 @@ fn start_picker(
                         tab: target,
                         node: chooser.backend_node_id,
                     });
-                    // One that had the terminal has exited by now, and the
-                    // terminal has its arrow back: its answer is taken in
-                    // the same pass, as it always was.
+                    // On a terminal in this process, one that had the
+                    // terminal has exited by now, and the terminal has its
+                    // arrow back: its answer is taken in the same pass, as
+                    // it always was. In another process it is still
+                    // running, and its answer comes as any other's does
+                    // ([`crate::backend`] holds the cast until then).
                     if kind == picker::Kind::Terminal {
                         chrome.shape = Shape::Default;
                         if let Some(HelperOutcome::Picker(outcome)) = term.poll_helper(id, &[]) {
@@ -6877,8 +6886,11 @@ fn start_login(
                 url: url.clone(),
                 site: site.clone(),
             });
-            // One that had the terminal has exited by now, and the terminal
-            // has its arrow back: its answer is taken here, as it always was.
+            // On a terminal in this process, one that had the terminal has
+            // exited by now, and the terminal has its arrow back: its answer
+            // is taken here, as it always was. In another process it is
+            // still running, and its answer comes as any other's does
+            // ([`crate::backend`] holds the cast until then).
             if kind == picker::Kind::Terminal {
                 chrome.shape = Shape::Default;
                 if let Some(HelperOutcome::Login(outcome)) = term.poll_helper(id, &[]) {

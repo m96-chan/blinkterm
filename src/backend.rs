@@ -58,6 +58,19 @@
 //! did in one process. A window whose oldest frame has been out for
 //! [`STALL`] stops casting until its terminal catches up.
 //!
+//! A terminal that has handed itself to a helper — a `file-picker-terminal`
+//! picker, a password command run in the terminal — is not painting on
+//! purpose, and is not a stalled one (issue #105). The helper runs inside
+//! the frontend's loop, so nothing is acknowledged until it exits, and five
+//! seconds of a picker is nothing unusual. So the backend holds that
+//! window's cast itself from the moment it sends the job until the
+//! frontend's answer: the frames out are given up and none is sent, and the
+//! answer lays the window out again — at the size the frontend says just
+//! before it, since the terminal may have been resized meanwhile — and
+//! starts the cast with a fresh frame. The frontend's half is in
+//! [`crate::frontend`]; no message was added for it, since the job and its
+//! answer already say when the terminal went and when it came back.
+//!
 //! # Lifecycle
 //!
 //! A frontend whose connection ends without a word suspends its window: the
@@ -146,7 +159,9 @@ const READ_CHUNK: usize = 256 * 1024;
 
 /// One window's frames on their way to its terminal: numbered, at most
 /// [`IN_FLIGHT`] out, the newest waiting one replacing an older one, and the
-/// window stalled when its terminal has stopped saying it painted.
+/// window stalled when its terminal has stopped saying it painted — or
+/// paused, when the terminal is with a helper and is not painting on
+/// purpose (see the module's section on frames).
 #[derive(Debug, Default)]
 pub(crate) struct FrameQueue {
     next_seq: u64,
@@ -156,13 +171,24 @@ pub(crate) struct FrameQueue {
     /// How long the last frame the terminal painted waited to be written,
     /// for the window's throttle; taken once.
     waited: Option<Duration>,
+    /// The terminal is with a helper: every frame is dropped, nothing is
+    /// out, and nothing is late.
+    paused: bool,
+    /// The last frame numbered before the pause. The terminal still says
+    /// it painted those, after the helper; how long they waited is the
+    /// helper's time, not the link's, and is no news for the throttle.
+    paused_through: u64,
 }
 
 impl FrameQueue {
     /// A frame the window wants painted: numbered and returned to send now,
     /// or held — replacing a frame already held — while [`IN_FLIGHT`] are
     /// out.
+    /// Paused, it is dropped: not numbered, not held, not sent.
     pub(crate) fn offer(&mut self, mut frame: ipc::Frame, now: Instant) -> Option<ipc::Frame> {
+        if self.paused {
+            return None;
+        }
         self.next_seq += 1;
         frame.seq = self.next_seq;
         if self.in_flight.len() < IN_FLIGHT {
@@ -183,7 +209,7 @@ impl FrameQueue {
         now: Instant,
     ) -> Option<ipc::Frame> {
         self.in_flight.retain(|(out, _)| *out > seq);
-        if waited.is_some() {
+        if waited.is_some() && seq > self.paused_through {
             self.waited = waited;
         }
         if self.in_flight.len() < IN_FLIGHT {
@@ -204,7 +230,13 @@ impl FrameQueue {
     /// longer than [`STALL`] and the window should stop casting,
     /// `Some(false)` when a stalled terminal has caught up and it should
     /// start again, `None` for no change.
+    ///
+    /// Paused, never: the cast is held for another reason, and by
+    /// [`RemoteTerminal::hold`].
     pub(crate) fn stall(&mut self, now: Instant) -> Option<bool> {
+        if self.paused {
+            return None;
+        }
         let late = self
             .in_flight
             .front()
@@ -227,6 +259,27 @@ impl FrameQueue {
         self.pending = None;
         self.stalled = false;
         self.waited = None;
+        self.paused = false;
+    }
+
+    /// The terminal has gone to a helper. What is out is given up — the
+    /// terminal paints nothing until the helper exits, and the window is
+    /// laid out again after — so that [`FrameQueue::all_painted`] holds
+    /// and the engine's frame owed an acknowledgement is acknowledged; and
+    /// every frame from here is dropped, until [`FrameQueue::resume`].
+    pub(crate) fn pause(&mut self) {
+        self.paused_through = self.next_seq;
+        self.in_flight.clear();
+        self.pending = None;
+        self.stalled = false;
+        self.waited = None;
+        self.paused = true;
+    }
+
+    /// The terminal is back from its helper: frames are sent again,
+    /// numbered on from where they were.
+    pub(crate) fn resume(&mut self) {
+        self.paused = false;
     }
 }
 
@@ -346,6 +399,15 @@ pub(crate) struct RemoteTerminal {
     waiting: Vec<u64>,
     /// The answers that have come and not been asked for.
     answers: HashMap<u64, HelperOutcome>,
+    /// The helpers given the terminal itself and not yet said done by the
+    /// frontend: while there is one, the window is not painting on purpose,
+    /// and its cast is held rather than stalled. Not the same list as
+    /// `waiting`, which forgets a helper the window has stopped wanting
+    /// while the frontend still has it running.
+    in_terminal: Vec<u64>,
+    /// Whether the window's cast is held for them: what
+    /// [`RemoteTerminal::hold`] said last.
+    held: bool,
 }
 
 impl RemoteTerminal {
@@ -357,6 +419,8 @@ impl RemoteTerminal {
             resized: None,
             waiting: Vec::new(),
             answers: HashMap::new(),
+            in_terminal: Vec::new(),
+            held: false,
         }
     }
 
@@ -382,11 +446,41 @@ impl RemoteTerminal {
         }
     }
 
-    /// The frontend is gone: nothing out with it any more.
+    /// The frontend said helper `id` is done, whatever its answer and
+    /// whether or not anybody still wants it: if it had the terminal, the
+    /// terminal is back, and with the last of them the frames go again.
+    pub(crate) fn terminal_back(&mut self, id: u64) {
+        let had = !self.in_terminal.is_empty();
+        self.in_terminal.retain(|running| *running != id);
+        if had && self.in_terminal.is_empty() {
+            self.frames.resume();
+        }
+    }
+
+    /// Once a pass, after the window's own half: `Some(true)` when a helper
+    /// has just taken the terminal and the window's cast is to be held,
+    /// `Some(false)` when the terminal has just come back from the last one
+    /// and the window is to be laid out and cast again, `None` for no
+    /// change — and then the [`FrameQueue`]'s own stall decides.
+    pub(crate) fn hold(&mut self) -> Option<bool> {
+        let wanted = !self.in_terminal.is_empty();
+        if wanted == self.held {
+            return None;
+        }
+        self.held = wanted;
+        Some(wanted)
+    }
+
+    /// The frontend is gone: nothing out with it any more, and no helper
+    /// holding the cast — a window without a terminal holds its own
+    /// ([`app::suspend_window`]), and one taken back is cast again
+    /// ([`app::resume_window`]).
     fn detach(&mut self) -> Option<Conn> {
         self.frames.clear();
         self.waiting.clear();
         self.answers.clear();
+        self.in_terminal.clear();
+        self.held = false;
         self.resized = None;
         self.conn.take()
     }
@@ -394,6 +488,8 @@ impl RemoteTerminal {
     /// A frontend took the window back.
     fn attach(&mut self, conn: Conn, route: RouteFlags) {
         self.frames.clear();
+        self.in_terminal.clear();
+        self.held = false;
         self.route = route;
         self.conn = Some(conn);
     }
@@ -471,11 +567,18 @@ impl Terminal for RemoteTerminal {
         if self.conn.is_none() {
             return Ok(Started::Failed("the terminal is not attached".to_string()));
         }
+        let in_terminal = job.in_terminal();
         self.waiting.push(id);
         self.send(&ToFrontend::Helper {
             id,
             job: job_for(job),
         });
+        // From here the frontend is running it and painting nothing, until
+        // it says the helper is done.
+        if in_terminal {
+            self.in_terminal.push(id);
+            self.frames.pause();
+        }
         Ok(Started::Running)
     }
 
@@ -489,6 +592,11 @@ impl Terminal for RemoteTerminal {
         Some(outcome)
     }
 
+    /// The window has stopped wanting it, which does not give the terminal
+    /// back: a helper that has the terminal runs to its end in the
+    /// frontend whatever the window wants, and frames sent before then
+    /// would only be late again. Its id stays in `in_terminal` until the
+    /// frontend's [`ToBackend::HelperDone`].
     fn end_helper(&mut self, id: u64) {
         self.waiting.retain(|waiting| *waiting != id);
         self.answers.remove(&id);
@@ -1240,14 +1348,21 @@ impl Backend {
                         slot.term
                             .painted_up_to(seq, waited_ms.map(Duration::from_millis));
                     }
-                    ToBackend::HelperDone { id, outcome } => match outcome_for(outcome) {
-                        Ok(Some(outcome)) => slot.term.answer(id, outcome),
-                        Ok(None) => {}
-                        Err(why) => {
-                            let _ =
-                                app::window_note(&mut slot.term, &mut slot.win, &self.shared, why);
+                    ToBackend::HelperDone { id, outcome } => {
+                        slot.term.terminal_back(id);
+                        match outcome_for(outcome) {
+                            Ok(Some(outcome)) => slot.term.answer(id, outcome),
+                            Ok(None) => {}
+                            Err(why) => {
+                                let _ = app::window_note(
+                                    &mut slot.term,
+                                    &mut slot.win,
+                                    &self.shared,
+                                    why,
+                                );
+                            }
                         }
-                    },
+                    }
                     ToBackend::Close { why } => {
                         let _ = why == CloseWhy::Quit;
                         going.push((index, Going::Quit));
@@ -1323,9 +1438,44 @@ impl Backend {
                     Err(why) => going.push((index, Going::Failed(why))),
                 },
             }
-            match slot.term.frames.stall(now) {
-                Some(held) if slot.term.linked() => app::hold_cast(&mut slot.win, held),
-                _ => {}
+            if !slot.term.linked() {
+                continue;
+            }
+            // After the window's half, which is where a picker is started
+            // (and a password command, from the input read before it): a
+            // helper given the terminal holds the cast from the pass it
+            // starts, and the pass its answer comes lays the window out
+            // again — at the size the frontend said just before it, taken
+            // here so that the next pass does not lay it out a second time.
+            match slot.term.hold() {
+                Some(true) => app::hold_cast(&mut slot.win, true),
+                Some(false) => {
+                    let metrics = slot
+                        .term
+                        .resized
+                        .take()
+                        .unwrap_or_else(|| app::window_metrics(&slot.win));
+                    let resumed = app::resume_window(
+                        &mut slot.term,
+                        &mut slot.win,
+                        &mut self.shared,
+                        metrics,
+                    );
+                    if let Err(why) = resumed {
+                        match app::ended_by_engine(why, &mut live.engine, &live.browser) {
+                            Ok(dead) => {
+                                death = Some(dead);
+                                break;
+                            }
+                            Err(why) => going.push((index, Going::Failed(why))),
+                        }
+                    }
+                }
+                None => {
+                    if let Some(held) = slot.term.frames.stall(now) {
+                        app::hold_cast(&mut slot.win, held);
+                    }
+                }
             }
         }
         if death.is_some() {
@@ -1949,6 +2099,145 @@ mod tests {
             Some(HelperOutcome::Picker(picker::Outcome::Cancel))
         ));
         assert!(term.poll_helper(5, &[]).is_none(), "once");
+    }
+
+    #[test]
+    fn a_held_queue_drops_frames_and_never_stalls() {
+        let now = Instant::now();
+        let mut queue = FrameQueue::default();
+        assert_eq!(queue.offer(frame(), now).map(|f| f.seq), Some(1));
+        queue.pause();
+        // What was out is given up, so the engine's frame is acknowledged.
+        assert!(queue.all_painted());
+        assert!(queue.offer(frame(), now).is_none());
+        assert!(queue.offer(frame(), now).is_none());
+        assert!(queue.all_painted(), "nothing held while paused");
+        assert_eq!(queue.stall(now + STALL * 10), None, "never late");
+        // The frame out before the pause is said painted after the helper:
+        // no news, and its wait is the helper's.
+        assert!(queue
+            .painted(1, Some(Duration::from_millis(7)), now)
+            .is_none());
+        assert_eq!(queue.waited.take(), None);
+        queue.resume();
+        assert_eq!(
+            queue.offer(frame(), now).map(|f| f.seq),
+            Some(2),
+            "numbered on, the dropped ones never numbered"
+        );
+        assert_eq!(queue.stall(now), None);
+    }
+
+    #[test]
+    fn a_terminal_helper_holds_the_cast_until_the_frontend_says_it_is_back() {
+        let (ours, theirs) = UnixStream::pair().expect("a pair");
+        let route = RouteFlags {
+            paced: true,
+            png: false,
+            keyed: true,
+            alpha: None,
+            every_nth: 1,
+        };
+        let mut term = RemoteTerminal::new(Conn::new(ours), route);
+        let offer = |term: &mut RemoteTerminal| {
+            term.frame(FrameOut {
+                payload: Encoded::Jpeg(&[9, 9]),
+                cells: Cells { cols: 2, rows: 1 },
+                row: 2,
+                pixels: (16, 16),
+                viewport_gen: 1,
+            })
+            .unwrap();
+        };
+        let picker = |kind| Helper::Picker {
+            tab: "t".to_string(),
+            chooser: crate::upload::Chooser {
+                backend_node_id: 4,
+                multiple: false,
+                frame_id: String::new(),
+                session: None,
+            },
+            command: picker::Command {
+                words: vec!["pick".to_string()],
+            },
+            kind,
+            dir: PathBuf::from("/"),
+        };
+        let login = |kind| Helper::Login {
+            tab: "t".to_string(),
+            url: "https://a.example/".to_string(),
+            site: login::site("https://a.example/").expect("a site"),
+            command: picker::Command {
+                words: vec!["pass".to_string()],
+            },
+            kind,
+            dir: PathBuf::from("/"),
+        };
+        assert_eq!(term.hold(), None, "nothing to hold for");
+        offer(&mut term);
+        assert!(!term.painted().all, "a frame is out");
+
+        // A picker that takes the terminal: held at once, the frame out
+        // given up, and nothing sent until the frontend says it is back.
+        let started = term.start_helper(1, picker(picker::Kind::Terminal));
+        assert_eq!(started.unwrap(), Started::Running);
+        assert_eq!(term.hold(), Some(true));
+        assert_eq!(term.hold(), None, "said once");
+        assert!(term.painted().all);
+        offer(&mut term);
+        offer(&mut term);
+        assert!(term.painted().all, "dropped, not out");
+        assert_eq!(term.frames.stall(Instant::now() + STALL * 10), None);
+        // The window losing interest is not the terminal coming back.
+        term.end_helper(1);
+        assert_eq!(term.hold(), None);
+        // A helper that never had the terminal changes nothing.
+        term.terminal_back(7);
+        assert_eq!(term.hold(), None);
+        term.terminal_back(1);
+        assert_eq!(term.hold(), Some(false));
+        offer(&mut term);
+        assert!(!term.painted().all, "frames go again");
+
+        // Two at once (a picker, then a password command): held until the
+        // last is back.
+        term.painted_up_to(u64::MAX, None);
+        term.start_helper(2, picker(picker::Kind::Terminal))
+            .unwrap();
+        term.start_helper(3, login(picker::Kind::Terminal)).unwrap();
+        assert_eq!(term.hold(), Some(true));
+        term.terminal_back(2);
+        assert_eq!(term.hold(), None);
+        offer(&mut term);
+        assert!(term.painted().all, "still held");
+        term.terminal_back(3);
+        assert_eq!(term.hold(), Some(false));
+
+        // Ones that leave the terminal alone never hold it.
+        term.start_helper(4, picker(picker::Kind::Gui)).unwrap();
+        term.start_helper(5, login(picker::Kind::Gui)).unwrap();
+        let external = Helper::External {
+            argv: vec!["x".to_string()],
+            browser: None,
+            home: None,
+            url: "https://a.example/".to_string(),
+            configured: None,
+        };
+        term.start_helper(6, external).unwrap();
+        assert_eq!(term.hold(), None);
+
+        // The frontend going takes the hold with it: the window's own
+        // suspension holds its cast, and its resumption starts it.
+        term.start_helper(8, picker(picker::Kind::Terminal))
+            .unwrap();
+        assert_eq!(term.hold(), Some(true));
+        let conn = term.detach().expect("attached");
+        assert_eq!(term.hold(), None);
+        term.attach(conn, route);
+        assert_eq!(term.hold(), None);
+        offer(&mut term);
+        assert!(!term.painted().all, "frames go to the frontend back");
+        drop(theirs);
     }
 
     #[test]
