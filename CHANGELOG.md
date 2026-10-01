@@ -10,6 +10,31 @@ flag, a different default, a raised Rust floor all do.
 
 ## [Unreleased]
 
+### Added
+
+- **Named profiles.** Profiles have names now, as in Chrome: `blinkterm
+  profiles create Work` makes a new identity — its own cookies, logins,
+  history and saved tabs — and `blinkterm --profile-name Work` opens it.
+  `blinkterm profiles` lists them, and `create`, `rename`, `default` and
+  `remove` manage them; `create <name> --dir <dir>` registers a directory you
+  already have. The list is `$XDG_DATA_HOME/blinkterm/profiles.json`. The
+  first start after upgrading registers the existing profile as `Default`
+  without moving anything. A start with no profile chosen opens the default;
+  with no default, or with `--choose-profile`, it asks on the terminal
+  first, and a start with no terminal to ask in says so instead of waiting.
+  `profile-name =` and `choose-profile = true` work in the settings file.
+  Once there are two profiles or more, the status row shows the name of the
+  one in use. `remove` refuses a profile that is in use, moves one blinkterm
+  made to `$XDG_DATA_HOME/blinkterm/trash/` rather than deleting it, and
+  only forgets a `--dir` one. `blinkterm --remote --profile-name Work <url>`
+  reaches the blinkterm on that profile, and `--remote` never asks
+  ([#83](https://github.com/m96-chan/blinkterm/issues/83)).
+
+### Changed
+
+- `blinkterm profiles` is now the profiles command rather than a url to a
+  host called `profiles`; `blinkterm -- profiles` still opens that host.
+
 ## [0.4.0] - 2026-10-01
 
 ### Added

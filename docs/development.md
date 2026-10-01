@@ -18,7 +18,10 @@ BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
 
 `tests/remote.rs` runs the binary itself as `blinkterm --remote`, as `gh` or
 `xdg-open` would, against a socket the test listens on; it needs no engine
-and runs with the rest of `cargo test`.
+and runs with the rest of `cargo test`. `tests/profiles.rs` does the same for
+`blinkterm profiles` and the profile selectors, in a scratch
+`$XDG_DATA_HOME` with stdin from nowhere, so nothing in it can wait on the
+picker; the picker itself is tested in `src/chooser.rs` over a fake stdin.
 
 `tests/install.rs` runs `blinkterm --install-engine` for real: it downloads
 the pinned `chrome-headless-shell` (about 100 MB) into a scratch

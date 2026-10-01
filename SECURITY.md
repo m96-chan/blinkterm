@@ -226,6 +226,20 @@ machine. It prints a warning when it does. Do not browse as root.
   through the same plain-text filter as the row on the way in and on the way
   out ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
 
+- **Profiles and the registry.** `$XDG_DATA_HOME/blinkterm/profiles.json`,
+  0600 in the 0700 data directory, lists the names of your profiles and their
+  directories, and nothing secret. A name is display text: it goes through
+  the same plain-text filter as a title on its way to the status row and the
+  picker, and it never becomes part of a path — a profile blinkterm makes is
+  `profiles/<id>/`, the id random hex, and the ids and relative directories
+  in the file are checked whenever it is read so that a hand edit cannot
+  point one outside the data directory. A removed profile blinkterm made is
+  *moved* to `$XDG_DATA_HOME/blinkterm/trash/`, keeping its 0700, and still
+  holds its cookies and logins until you delete it; `blinkterm profiles
+  remove` of a directory registered with `--dir` deletes nothing. Removal is
+  refused while a blinkterm holds the profile's lock
+  ([#83](https://github.com/m96-chan/blinkterm/issues/83)).
+
 - **What the terminal answers.** `blinkterm` asks the terminal one question
   whose answer is not a key: its background colour (`OSC 11 ; ?`), for
   whether pages are told dark is preferred. The answer arrives on the same

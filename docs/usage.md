@@ -311,7 +311,11 @@ or `unblocked` on a site you turned blocking off for, and `reader` while
 the page is in [reader mode](features.md#reader-mode). After that,
 `2 errors`: the errors the page logged, threw or failed to fetch since you
 last opened its [console](features.md#the-console) (`ctrl+shift+j`) on
-this tab.
+this tab. Once you have more than one
+[named profile](configuration.md#named-profiles), the profile's name is the
+first word at the right, so a work window and a personal one cannot be
+mistaken for each other; with one profile, `--profile <dir>` or
+`--temp-profile` it is not shown.
 
 The url bar, the find prompt, the tab list, the history list or the console, the allow
 line (`alt+p`), a page's dialog and a file input's path take the whole row while they are
@@ -367,8 +371,12 @@ long as there is a terminal to start one in; with no terminal (a desktop's
 
 The profile decides which `blinkterm` is reached, exactly as it decides which
 profile a start takes: `blinkterm --remote --profile ~/work-profile <url>`
-reaches the one on `~/work-profile`. A `--temp-profile` run is its own and
-never listens, and `--remote --temp-profile` is refused as a contradiction.
+reaches the one on `~/work-profile`, and `blinkterm --remote --profile-name
+Work <url>` the one on the profile named `Work`. Without either it is the
+default profile; `--remote` never opens the profile picker, so with no
+default it says so and exits 1, and `--remote --choose-profile` is refused.
+A `--temp-profile` run is its own and never listens, and `--remote
+--temp-profile` is refused as a contradiction.
 
 Each url is read as the url bar reads what is typed — `example.com` is
 `https://example.com`, `localhost:3000` is `http://`, a path is `file://` —
