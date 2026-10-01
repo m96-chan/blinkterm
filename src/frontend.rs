@@ -44,6 +44,46 @@
 //! on the profile as they are. A frontend never touches the engine — not
 //! from a signal, not from its panic hook — because it is not this
 //! process's.
+//!
+//! # A dropped link
+//!
+//! The connection can go without the backend's `closed`: the backend killed
+//! or crashed, or a connection it gave up on — one that stopped taking what
+//! it was sent ([`ipc`]'s outbox). The backend that is still there keeps
+//! the window, suspended, for [`crate::backend::GRACE`], and gives it back
+//! to an `open` with the same nonce (`opened`, `resumed`), clearing the
+//! screen and laying it out again. So a drop — a read that finds the
+//! connection's end, or a write that fails, [`Link::dropped`] — is not the
+//! end at once. The frontend closes its side, so that the backend has seen
+//! it go, and tries the socket again for [`RESUME_WITHIN`], the same
+//! fifteen seconds, with [`reattach`]; once welcomed, it sends `open` again
+//! with its first nonce and settings and the pane's size now. Its frames
+//! owed and resize pending are forgotten; the backend's relayout is what
+//! comes next.
+//!
+//! [`reattach`] never starts a backend: a fresh one would be a fresh window,
+//! and the window is what is being taken back. Nobody listening while
+//! nobody holds the profile's lock is a backend gone for good, and the end
+//! at once; nobody listening while the lock is held, or a backend that does
+//! not answer, is tried until the fifteen seconds are out. Either way the
+//! run ends with the sentence it always ended with, `stopped unexpectedly`
+//! and where the log is. A temporary profile's backend listens on no socket,
+//! so a drop there is the end as before.
+//!
+//! What the terminal sends in the gap is read, so that the terminal is not
+//! held up, and dropped: a person typing at a frozen screen cannot see
+//! where it is going, and the backend never saw it to say what it did, so
+//! it is not sent to the window that comes back. A cell size is kept, being
+//! this side's. What was sent before the drop is not sent again either:
+//! whether the backend acted on it is not known. A `closed` the backend
+//! said before it hung up is read before anything is tried, so that a
+//! window the person closed is not taken back.
+//!
+//! A window the backend no longer has — another frontend started a fresh
+//! backend after this one's died, or its grace was shorter than this side's
+//! patience — is opened new, `resumed` false, on the home page and with no
+//! urls, where it offers the lost tabs back as any start after a crash
+//! does.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -133,6 +173,19 @@ pub struct Link {
     pub generation: u64,
     pub dir: PathBuf,
     pub label: String,
+    /// Whether the connection itself has gone: the backend hung up, or
+    /// would not take what was written. See [`Link::dropped`].
+    broken: bool,
+}
+
+/// What a backend answered `open` with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Opened {
+    /// The window's number.
+    pub window: u64,
+    /// Whether it is a window this frontend had before, taken back by its
+    /// nonce, rather than a new one.
+    pub resumed: bool,
 }
 
 impl Link {
@@ -144,11 +197,22 @@ impl Link {
     /// Say `message`, waiting for the backend to take it.
     pub fn send(&mut self, message: &ToBackend) -> Result<(), String> {
         self.stream.write_all(&ipc::encode(message)).map_err(|e| {
+            // A write that failed, or timed out halfway, leaves nothing on
+            // this connection worth saying more on.
+            self.broken = true;
             format!(
                 "cannot reach the blinkterm serving {}: {e}",
                 self.dir.display()
             )
         })
+    }
+
+    /// Whether the connection itself has gone — the backend hung up, or
+    /// stopped taking what was written — rather than said something this
+    /// side cannot read. A dropped link is one the window's loop tries to
+    /// take the window back from; see the module's section on it.
+    pub fn dropped(&self) -> bool {
+        self.broken
     }
 
     /// The next message, waiting up to `within`; `None` when none came.
@@ -196,7 +260,10 @@ impl Link {
         let mut buf = vec![0u8; 256 * 1024];
         loop {
             match self.stream.read(&mut buf) {
-                Ok(0) => return Err(self.gone()),
+                Ok(0) => {
+                    self.broken = true;
+                    return Err(self.gone());
+                }
                 Ok(n) => {
                     let messages = self.decoder.feed::<ToFrontend>(&buf[..n])?;
                     self.queued.extend(messages);
@@ -204,7 +271,10 @@ impl Link {
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
-                Err(_) => return Err(self.gone()),
+                Err(_) => {
+                    self.broken = true;
+                    return Err(self.gone());
+                }
             }
         }
     }
@@ -217,15 +287,17 @@ impl Link {
         )
     }
 
-    /// Open a window: `open` sent, and the backend's answer — the window's
-    /// number, or the refusal's sentence.
-    pub fn open(&mut self, open: Open) -> Result<u64, String> {
+    /// Open a window: `open` sent, and the backend's answer — the window,
+    /// or the refusal's sentence.
+    pub fn open(&mut self, open: Open) -> Result<Opened, String> {
         self.send(&ToBackend::Open(Box::new(open)))?;
         let deadline = Instant::now() + HANDSHAKE_TIMEOUT * 3;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.recv(left)? {
-                Some(ToFrontend::Opened { window, .. }) => return Ok(window),
+                Some(ToFrontend::Opened { window, resumed }) => {
+                    return Ok(Opened { window, resumed })
+                }
                 Some(ToFrontend::Refused { why, .. }) => return Err(why),
                 Some(ToFrontend::Closed { why, .. }) => return Err(why),
                 Some(_) => {}
@@ -252,6 +324,7 @@ fn handshake(stream: UnixStream, dir: Option<&Path>) -> Result<Reached<Link>, St
         generation: 0,
         dir: dir.map(Path::to_path_buf).unwrap_or_default(),
         label: String::new(),
+        broken: false,
     };
     let answer = link
         .send(&ToBackend::Hello {
@@ -333,6 +406,17 @@ pub trait Launcher {
     fn sleep(&mut self, how_long: Duration) {
         std::thread::sleep(how_long);
     }
+    /// Whether nobody holds the lock on the profile at `dir`: its backend is
+    /// gone, not just not listening. Asking takes the lock for the moment
+    /// it takes to ask; a candidate backend that tries for it in that
+    /// moment says `busy`, and its frontend tries the socket again, which
+    /// is what it does for any other holder.
+    fn lock_free(&self, dir: &Path) -> bool {
+        matches!(
+            crate::profile::try_lock(dir),
+            Ok(crate::profile::Tried::Taken(_))
+        )
+    }
 }
 
 /// The sentence for a profile somebody holds who never starts taking
@@ -383,6 +467,56 @@ pub fn attach<L: Launcher>(launcher: &mut L, dir: Option<&Path>) -> Result<L::Li
         }
         if launcher.now() >= deadline {
             return Err(last_refusal.unwrap_or_else(|| not_taking_windows(dir, holder)));
+        }
+        launcher.sleep(backoff);
+        backoff = (backoff * 2).min(BACKOFF_MOST);
+    }
+}
+
+/// How long a frontend whose link dropped tries to take its window back:
+/// as long as the backend keeps a window whose terminal went.
+pub const RESUME_WITHIN: Duration = crate::backend::GRACE;
+
+/// Why [`reattach`] did not reach the backend.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotTaken {
+    /// It is gone — the profile's lock is free — or did not come back in
+    /// time, or the caller stopped asking.
+    Gone,
+    /// It answered, and will not take this frontend: the sentence.
+    Refused(String),
+}
+
+/// Reach the backend of the profile at `dir` again, after a link to it
+/// dropped, until `deadline`: see the module's section on a dropped link.
+/// Unlike [`attach`] this never starts a backend — a fresh one would be a
+/// fresh window, and the window is what is being taken back — and nobody
+/// listening while nobody holds the profile is the end at once.
+/// `keep_going` is asked between tries, and `false` ends it as
+/// [`NotTaken::Gone`].
+pub fn reattach<L: Launcher>(
+    launcher: &mut L,
+    dir: &Path,
+    deadline: Instant,
+    mut keep_going: impl FnMut() -> bool,
+) -> Result<L::Link, NotTaken> {
+    let mut backoff = BACKOFF_FIRST;
+    loop {
+        match launcher.connect(dir) {
+            Ok(Reached::Link(link)) => return Ok(link),
+            Ok(Reached::Refused { why, retry: false }) => return Err(NotTaken::Refused(why)),
+            // On its way out, or too busy to answer: it may yet come back,
+            // and the deadline is what says it did not.
+            Ok(Reached::Refused { retry: true, .. }) => {}
+            Ok(Reached::NobodyThere) => {
+                if launcher.lock_free(dir) {
+                    return Err(NotTaken::Gone);
+                }
+            }
+            Err(why) => return Err(NotTaken::Refused(why)),
+        }
+        if launcher.now() >= deadline || !keep_going() {
+            return Err(NotTaken::Gone);
         }
         launcher.sleep(backoff);
         backoff = (backoff * 2).min(BACKOFF_MOST);
@@ -621,6 +755,7 @@ pub fn spawn_candidate(
         generation: 0,
         dir: dir.map(Path::to_path_buf).unwrap_or_default(),
         label: String::new(),
+        broken: false,
     };
     let first = pair.recv(CANDIDATE_TIMEOUT).map_err(|_| {
         format!(
@@ -743,8 +878,15 @@ pub fn run(options: Options, selected: registry::Selected) -> Result<(), String>
             // backend's own environment is whichever terminal started it.
             display: picker::has_display(|name| std::env::var(name).ok()),
         };
-        link.open(open)?;
-        drive(&mut term, &mut link, metrics, &mut launcher)
+        link.open(open.clone())?;
+        drive(
+            &mut term,
+            link,
+            metrics,
+            &mut launcher,
+            selected.dir.as_deref(),
+            &open,
+        )
     });
     term.leave();
     outcome
@@ -756,166 +898,358 @@ enum Running {
     Login { tab: String, url: String },
 }
 
-/// The window, until the backend says it is closed.
-fn drive(
-    term: &mut LocalTerminal,
-    link: &mut Link,
-    mut metrics: Metrics,
-    launcher: &mut Spawn,
-) -> Result<(), String> {
-    let mut buf = [0u8; 8192];
+/// What the window's loop keeps from one pass to the next, and across a
+/// link taken back.
+struct Driving {
+    buf: [u8; 8192],
+    metrics: Metrics,
     // When the terminal last sent a byte of a paste that is still open.
-    let mut paste_heard: Option<Instant> = None;
+    paste_heard: Option<Instant>,
     // The newest frame painted or dropped and not yet acknowledged.
-    let mut owed: Option<u64> = None;
-    let mut waited: Option<Duration> = None;
+    owed: Option<u64>,
+    waited: Option<Duration>,
     // A resize has been sent and the backend has not laid the window out
     // again yet: a frame meanwhile is of the old size, and dropped.
-    let mut relayout_due = false;
-    let mut viewport_gen: u32 = 0;
-    let mut helpers: Vec<(u64, Running)> = Vec::new();
+    relayout_due: bool,
+    viewport_gen: u32,
+    helpers: Vec<(u64, Running)>,
+}
+
+/// Whether the window goes on after a pass.
+enum Flow {
+    Going,
+    /// The window is over, and how the run ends.
+    Ended(Result<(), String>),
+}
+
+/// The window, until the backend says it is closed. A link that drops
+/// under it is taken back if it can be — see the module's section on a
+/// dropped link — on the profile at `dir` (`None`, a temporary profile,
+/// cannot be), with `open` sent again.
+fn drive(
+    term: &mut LocalTerminal,
+    mut link: Link,
+    metrics: Metrics,
+    launcher: &mut Spawn,
+    dir: Option<&Path>,
+    open: &Open,
+) -> Result<(), String> {
+    let mut st = Driving {
+        buf: [0u8; 8192],
+        metrics,
+        paste_heard: None,
+        owed: None,
+        waited: None,
+        relayout_due: false,
+        viewport_gen: 0,
+        helpers: Vec::new(),
+    };
     loop {
-        if app::quit_requested() {
-            return close(link, CloseWhy::Hangup);
-        }
-        report_size(
-            term,
-            link,
-            &mut metrics,
-            &mut viewport_gen,
-            &mut relayout_due,
-        )?;
-        let mut watching = vec![term.input_fd(), link.fd()];
-        watching.extend(term.helper_fds());
-        let wait = if owed.is_some() {
-            FRAME_POLL_MS
-        } else {
-            POLL_MS
-        };
-        let ready = tty::poll_readable(&watching, wait)
-            .map_err(|e| format!("cannot wait for input: {e}"))?;
-
-        if ready.contains(&term.input_fd()) {
-            match tty::read_available(term.input_fd(), &mut buf) {
-                Ok(ReadOutcome::Data(n)) => {
-                    let inputs = term.parse(&buf[..n]);
-                    paste_heard = term.pasting().then(Instant::now);
-                    let pixel_mouse = term.pixel_coordinates();
-                    for input in inputs {
-                        take_input(term, link, input, pixel_mouse, metrics)?;
-                    }
-                }
-                Ok(ReadOutcome::Eof) => return close(link, CloseWhy::Terminal),
-                Ok(ReadOutcome::WouldBlock) => {}
-                Err(err) => return Err(format!("cannot read the terminal: {err}")),
-            }
-        } else if paste_heard.is_some_and(|at| at.elapsed() > PASTE_IDLE) {
-            // A paste that was opened and has gone quiet: the end marker is
-            // not coming, and what arrived is half of something.
-            paste_heard = None;
-            if term.abandon_paste() {
-                // The row is the backend's, so it is told to say so.
-                let pixel_mouse = term.pixel_coordinates();
-                take_input(term, link, Input::PasteCut, pixel_mouse, metrics)?;
-            }
-        } else if let Some(input) = term.flush() {
-            // Nothing arrived, so a held escape was the Escape key after all.
-            let pixel_mouse = term.pixel_coordinates();
-            take_input(term, link, input, pixel_mouse, metrics)?;
-        }
-        term.reap();
-        launcher.reap();
-
-        if ready.contains(&link.fd()) {
-            for message in link.read_available()? {
-                match message {
-                    ToFrontend::Text(bytes) => term.write(&bytes)?,
-                    ToFrontend::ClearPicture => term.clear_picture()?,
-                    ToFrontend::ClearScreen => {
-                        term.clear_screen()?;
-                        relayout_due = false;
-                    }
-                    ToFrontend::Frame(frame) => {
-                        owed = Some(owed.map_or(frame.seq, |seq| seq.max(frame.seq)));
-                        if !relayout_due {
-                            let pixels = (
-                                frame.cells.cols.saturating_mul(metrics.cell.0).max(1),
-                                frame.cells.rows.saturating_mul(metrics.cell.1).max(1),
-                            );
-                            let payload = match frame.kind {
-                                FrameKind::Jpeg => Encoded::Jpeg(&frame.image),
-                                FrameKind::Png => Encoded::Png(&frame.image),
-                            };
-                            term.frame(FrameOut {
-                                payload,
-                                cells: frame.cells,
-                                row: frame.row,
-                                pixels,
-                                viewport_gen: frame.viewport_gen,
-                            })?;
-                        }
-                    }
-                    ToFrontend::Helper { id, job } => {
-                        let in_terminal = matches!(
-                            &job,
-                            Job::Picker { terminal: true, .. } | Job::Login { terminal: true, .. }
-                        );
-                        let answer = start_job(term, &mut helpers, id, job)?;
-                        // One that had the terminal has exited by now. The
-                        // backend holds the window's cast until its answer,
-                        // and lays the window out again when it comes: at
-                        // the size the terminal is now, said first, and
-                        // here rather than at the top of the next pass,
-                        // which is after the answer (issue #105).
-                        if in_terminal {
-                            report_size(
-                                term,
-                                link,
-                                &mut metrics,
-                                &mut viewport_gen,
-                                &mut relayout_due,
-                            )?;
-                        }
-                        if let Some(answer) = answer {
-                            link.send(&answer)?;
-                        }
-                    }
-                    ToFrontend::Closed { why, exit } => {
-                        return if exit == 0 { Ok(()) } else { Err(why) };
-                    }
-                    ToFrontend::Refused { why, .. } => return Err(why),
-                    _ => {}
-                }
-            }
-        }
-        // The helpers' answers, each once.
-        let mut answered = Vec::new();
-        for (index, (id, _)) in helpers.iter().enumerate() {
-            if let Some(outcome) = term.poll_helper(*id, &ready) {
-                answered.push((index, outcome));
-            }
-        }
-        for (index, outcome) in answered.into_iter().rev() {
-            let (id, running) = helpers.remove(index);
-            link.send(&ToBackend::HelperDone {
-                id,
-                outcome: outcome_of(running, outcome),
-            })?;
-        }
-        // The frames painted, acknowledged once they have all gone out.
-        let painted = term.painted();
-        if painted.waited.is_some() {
-            waited = painted.waited;
-        }
-        if let (true, Some(seq)) = (painted.all, owed) {
-            owed = None;
-            link.send(&ToBackend::Painted {
-                seq,
-                waited_ms: waited.take().map(|d| d.as_millis() as u64),
-                viewport_gen,
-            })?;
+        match pass(term, &mut link, &mut st, launcher) {
+            Ok(Flow::Going) => {}
+            Ok(Flow::Ended(outcome)) => return outcome,
+            Err(_) if link.dropped() => match resume(term, launcher, dir, open, &mut st, link)? {
+                Some(again) => link = again,
+                None => return Ok(()),
+            },
+            Err(why) => return Err(why),
         }
     }
+}
+
+/// One pass of the window's loop. `Err` with [`Link::dropped`] is the link
+/// gone under it; any other `Err` is the end.
+fn pass(
+    term: &mut LocalTerminal,
+    link: &mut Link,
+    st: &mut Driving,
+    launcher: &mut Spawn,
+) -> Result<Flow, String> {
+    let Driving {
+        buf,
+        metrics,
+        paste_heard,
+        owed,
+        waited,
+        relayout_due,
+        viewport_gen,
+        helpers,
+    } = st;
+    if app::quit_requested() {
+        close(link, CloseWhy::Hangup)?;
+        return Ok(Flow::Ended(Ok(())));
+    }
+    report_size(term, link, metrics, viewport_gen, relayout_due)?;
+    let mut watching = vec![term.input_fd(), link.fd()];
+    watching.extend(term.helper_fds());
+    let wait = if owed.is_some() {
+        FRAME_POLL_MS
+    } else {
+        POLL_MS
+    };
+    let ready =
+        tty::poll_readable(&watching, wait).map_err(|e| format!("cannot wait for input: {e}"))?;
+
+    if ready.contains(&term.input_fd()) {
+        match tty::read_available(term.input_fd(), buf) {
+            Ok(ReadOutcome::Data(n)) => {
+                let inputs = term.parse(&buf[..n]);
+                *paste_heard = term.pasting().then(Instant::now);
+                let pixel_mouse = term.pixel_coordinates();
+                for input in inputs {
+                    take_input(term, link, input, pixel_mouse, *metrics)?;
+                }
+            }
+            Ok(ReadOutcome::Eof) => {
+                close(link, CloseWhy::Terminal)?;
+                return Ok(Flow::Ended(Ok(())));
+            }
+            Ok(ReadOutcome::WouldBlock) => {}
+            Err(err) => return Err(format!("cannot read the terminal: {err}")),
+        }
+    } else if paste_heard.is_some_and(|at| at.elapsed() > PASTE_IDLE) {
+        // A paste that was opened and has gone quiet: the end marker is
+        // not coming, and what arrived is half of something.
+        *paste_heard = None;
+        if term.abandon_paste() {
+            // The row is the backend's, so it is told to say so.
+            let pixel_mouse = term.pixel_coordinates();
+            take_input(term, link, Input::PasteCut, pixel_mouse, *metrics)?;
+        }
+    } else if let Some(input) = term.flush() {
+        // Nothing arrived, so a held escape was the Escape key after all.
+        let pixel_mouse = term.pixel_coordinates();
+        take_input(term, link, input, pixel_mouse, *metrics)?;
+    }
+    term.reap();
+    launcher.reap();
+
+    if ready.contains(&link.fd()) {
+        for message in link.read_available()? {
+            match message {
+                ToFrontend::Text(bytes) => term.write(&bytes)?,
+                ToFrontend::ClearPicture => term.clear_picture()?,
+                ToFrontend::ClearScreen => {
+                    term.clear_screen()?;
+                    *relayout_due = false;
+                }
+                ToFrontend::Frame(frame) => {
+                    *owed = Some(owed.map_or(frame.seq, |seq| seq.max(frame.seq)));
+                    if !*relayout_due {
+                        let pixels = (
+                            frame.cells.cols.saturating_mul(metrics.cell.0).max(1),
+                            frame.cells.rows.saturating_mul(metrics.cell.1).max(1),
+                        );
+                        let payload = match frame.kind {
+                            FrameKind::Jpeg => Encoded::Jpeg(&frame.image),
+                            FrameKind::Png => Encoded::Png(&frame.image),
+                        };
+                        term.frame(FrameOut {
+                            payload,
+                            cells: frame.cells,
+                            row: frame.row,
+                            pixels,
+                            viewport_gen: frame.viewport_gen,
+                        })?;
+                    }
+                }
+                ToFrontend::Helper { id, job } => {
+                    let in_terminal = matches!(
+                        &job,
+                        Job::Picker { terminal: true, .. } | Job::Login { terminal: true, .. }
+                    );
+                    let answer = start_job(term, helpers, id, job)?;
+                    // One that had the terminal has exited by now. The
+                    // backend holds the window's cast until its answer,
+                    // and lays the window out again when it comes: at
+                    // the size the terminal is now, said first, and
+                    // here rather than at the top of the next pass,
+                    // which is after the answer (issue #105).
+                    if in_terminal {
+                        report_size(term, link, metrics, viewport_gen, relayout_due)?;
+                    }
+                    if let Some(answer) = answer {
+                        link.send(&answer)?;
+                    }
+                }
+                ToFrontend::Closed { why, exit } => {
+                    return Ok(Flow::Ended(if exit == 0 { Ok(()) } else { Err(why) }));
+                }
+                ToFrontend::Refused { why, .. } => return Ok(Flow::Ended(Err(why))),
+                _ => {}
+            }
+        }
+    }
+    // The helpers' answers, each once.
+    let mut answered = Vec::new();
+    for (index, (id, _)) in helpers.iter().enumerate() {
+        if let Some(outcome) = term.poll_helper(*id, &ready) {
+            answered.push((index, outcome));
+        }
+    }
+    for (index, outcome) in answered.into_iter().rev() {
+        let (id, running) = helpers.remove(index);
+        link.send(&ToBackend::HelperDone {
+            id,
+            outcome: outcome_of(running, outcome),
+        })?;
+    }
+    // The frames painted, acknowledged once they have all gone out.
+    let painted = term.painted();
+    if painted.waited.is_some() {
+        *waited = painted.waited;
+    }
+    if let (true, Some(seq)) = (painted.all, *owed) {
+        *owed = None;
+        link.send(&ToBackend::Painted {
+            seq,
+            waited_ms: waited.take().map(|d| d.as_millis() as u64),
+            viewport_gen: *viewport_gen,
+        })?;
+    }
+    Ok(Flow::Going)
+}
+
+/// Take the window back after `lost` dropped: see the module's section on
+/// a dropped link. `Some` is a link with the window open on it again;
+/// `None` is the run over as it would have been with the link up — the
+/// terminal gone, a signal to stop, or a `closed` the backend said before
+/// it hung up; `Err` is the sentence to end with.
+fn resume(
+    term: &mut LocalTerminal,
+    launcher: &mut Spawn,
+    dir: Option<&Path>,
+    open: &Open,
+    st: &mut Driving,
+    mut lost: Link,
+) -> Result<Option<Link>, String> {
+    // What the backend said before it hung up comes first: a window it
+    // closed is closed, and a write that failed because it had already
+    // said so and gone is not a drop. Taking it back would open a window
+    // the person had just closed.
+    for message in lost.read_available().unwrap_or_default() {
+        match message {
+            ToFrontend::Closed { why, exit } => {
+                return if exit == 0 { Ok(None) } else { Err(why) };
+            }
+            ToFrontend::Refused { why, .. } => return Err(why),
+            _ => {}
+        }
+    }
+    let sentence = lost.gone();
+    // Closed before anything is tried, so that the backend has seen this
+    // connection go — and suspended the window — by the time another one
+    // asks for it.
+    drop(lost);
+    // A temporary profile's backend listens on no socket: the pair it was
+    // started with was the only way to it.
+    let Some(dir) = dir else {
+        return Err(sentence);
+    };
+    let deadline = Instant::now() + RESUME_WITHIN;
+    let mut ended: Option<Result<(), String>> = None;
+    let mut link = loop {
+        let cell = st.metrics.cell;
+        let reached = reattach(launcher, dir, deadline, || {
+            gap(term, &mut st.buf, cell, &mut ended)
+        });
+        if let Some(outcome) = ended.take() {
+            return outcome.map(|()| None);
+        }
+        let mut link = match reached {
+            Ok(link) => link,
+            Err(NotTaken::Gone) => return Err(sentence),
+            Err(NotTaken::Refused(why)) => return Err(why),
+        };
+        // The window as it is now, since the pane may have changed size in
+        // the gap; the same nonce, so that the backend takes the window
+        // back rather than opening another. No urls: a window the backend
+        // no longer has — its grace ran out first — opens on the home page
+        // and offers its tabs back, rather than opening the urls this run
+        // started with a second time.
+        term.resized()?;
+        st.metrics = term.metrics()?;
+        let mut again = open.clone();
+        again.metrics = st.metrics;
+        again.pixel_mouse = term.pixel_coordinates();
+        again.urls.clear();
+        again.restore = false;
+        again.problems.clear();
+        match link.open(again) {
+            Ok(_) => break link,
+            Err(_) if link.dropped() && Instant::now() < deadline => {}
+            Err(why) => return Err(why),
+        }
+    };
+    // Up to the moment the window is back, what was typed was typed at a
+    // window that was not there.
+    if !gap(term, &mut st.buf, st.metrics.cell, &mut ended) {
+        let why = if app::quit_requested() {
+            CloseWhy::Hangup
+        } else {
+            CloseWhy::Terminal
+        };
+        let _ = close(&mut link, why);
+        return ended.unwrap_or(Ok(())).map(|()| None);
+    }
+    // The backend clears the screen and lays the window out again; nothing
+    // this side was waiting for on the old link is coming. A paste still
+    // arriving is the person's one paste, and goes when it ends, or is cut
+    // as any other.
+    st.paste_heard = term.pasting().then(Instant::now);
+    st.owed = None;
+    st.waited = None;
+    st.relayout_due = false;
+    Ok(Some(link))
+}
+
+/// The terminal's bytes while there is no window to send them to: read and
+/// dropped, but for a cell size, which is this side's (`cell` is the one
+/// the window was laid out for). What was typed at a frozen screen is not
+/// sent to the window that comes back: the person typing could not see
+/// where it was going, and the backend never saw it to say what it did. An
+/// escape held for its next byte is let go of with the rest. `false`, with
+/// `ended` set, is the terminal gone or a signal to stop.
+fn gap(
+    term: &mut LocalTerminal,
+    buf: &mut [u8],
+    cell: (u32, u32),
+    ended: &mut Option<Result<(), String>>,
+) -> bool {
+    if app::quit_requested() {
+        *ended = Some(Ok(()));
+        return false;
+    }
+    loop {
+        match tty::poll_readable(&[term.input_fd()], 0) {
+            Ok(ready) if ready.is_empty() => break,
+            Ok(_) => {}
+            Err(e) => {
+                *ended = Some(Err(format!("cannot wait for input: {e}")));
+                return false;
+            }
+        }
+        match tty::read_available(term.input_fd(), buf) {
+            Ok(ReadOutcome::Data(n)) => {
+                for input in term.parse(&buf[..n]) {
+                    if let Input::CellSize { width, height } = input {
+                        term.cell_size(width, height, cell);
+                    }
+                }
+            }
+            Ok(ReadOutcome::WouldBlock) => break,
+            Ok(ReadOutcome::Eof) => {
+                *ended = Some(Ok(()));
+                return false;
+            }
+            Err(err) => {
+                *ended = Some(Err(format!("cannot read the terminal: {err}")));
+                return false;
+            }
+        }
+    }
+    let _ = term.flush();
+    true
 }
 
 /// The terminal's size, to the backend, if it is a different one or wants
@@ -1223,6 +1557,9 @@ mod tests {
         clock: Instant,
         spawned: usize,
         slept: Duration,
+        /// What the profile's lock is asked to say: held, unless a test
+        /// says otherwise.
+        lock_free: bool,
     }
 
     impl Fake {
@@ -1233,6 +1570,7 @@ mod tests {
                 clock: Instant::now(),
                 spawned: 0,
                 slept: Duration::ZERO,
+                lock_free: false,
             }
         }
     }
@@ -1259,6 +1597,9 @@ mod tests {
         }
         fn sleep(&mut self, how_long: Duration) {
             self.slept += how_long;
+        }
+        fn lock_free(&self, _dir: &Path) -> bool {
+            self.lock_free
         }
     }
 
@@ -1340,6 +1681,144 @@ mod tests {
             Ok(_) => panic!("not refused"),
             Err(why) => panic!("the attach would end: {why}"),
         }
+    }
+
+    /// A backend that is still there — the lock held — and not listening
+    /// for a moment is waited for, and nothing is started meanwhile.
+    #[test]
+    fn a_dropped_link_is_taken_back_without_starting_a_backend() {
+        let dir = Path::new("/p");
+        let mut fake = Fake::new(
+            vec![Reached::NobodyThere, Reached::NobodyThere, Reached::Link(5)],
+            vec![Spawned::Ready(9)],
+        );
+        let deadline = fake.now() + RESUME_WITHIN;
+        assert_eq!(reattach(&mut fake, dir, deadline, || true), Ok(5));
+        assert_eq!(fake.spawned, 0, "a backend was started");
+    }
+
+    /// Nobody listening and nobody holding the profile: the backend is
+    /// gone, and there is nothing to wait for.
+    #[test]
+    fn a_backend_gone_for_good_is_given_up_on_at_once() {
+        let mut fake = Fake::new(vec![], vec![Spawned::Ready(9)]);
+        fake.lock_free = true;
+        let deadline = fake.now() + RESUME_WITHIN;
+        assert_eq!(
+            reattach(&mut fake, Path::new("/p"), deadline, || true),
+            Err(NotTaken::Gone)
+        );
+        assert!(fake.slept < BACKOFF_MOST, "waited {:?}", fake.slept);
+        assert_eq!(fake.spawned, 0);
+    }
+
+    /// Somebody holding the profile who never listens again is waited for
+    /// as long as the backend would keep the window, and no longer; and a
+    /// caller that stops asking ends it at once.
+    #[test]
+    fn a_backend_that_holds_the_lock_but_never_listens_is_given_up_on_at_the_deadline() {
+        let mut fake = Fake::new(vec![], vec![]);
+        let deadline = fake.now() + RESUME_WITHIN;
+        assert_eq!(
+            reattach(&mut fake, Path::new("/p"), deadline, || true),
+            Err(NotTaken::Gone)
+        );
+        assert!(
+            fake.slept >= RESUME_WITHIN,
+            "gave up after {:?}",
+            fake.slept
+        );
+        assert!(fake.slept < RESUME_WITHIN + BACKOFF_MOST * 2);
+        assert_eq!(fake.spawned, 0);
+
+        let mut fake = Fake::new(vec![], vec![]);
+        let deadline = fake.now() + RESUME_WITHIN;
+        let mut asked = 0;
+        let stopped = reattach(&mut fake, Path::new("/p"), deadline, || {
+            asked += 1;
+            false
+        });
+        assert_eq!(stopped, Err(NotTaken::Gone));
+        assert_eq!((asked, fake.slept), (1, Duration::ZERO), "one try");
+    }
+
+    #[test]
+    fn a_final_refusal_ends_the_resume_with_its_sentence() {
+        let dir = Path::new("/p");
+        let mut fake = Fake::new(
+            vec![Reached::Refused {
+                why: "versions".to_string(),
+                retry: false,
+            }],
+            vec![],
+        );
+        let deadline = fake.now() + RESUME_WITHIN;
+        assert_eq!(
+            reattach(&mut fake, dir, deadline, || true),
+            Err(NotTaken::Refused("versions".to_string()))
+        );
+        let mut fake = Fake::new(
+            vec![
+                Reached::Refused {
+                    why: "did not answer".to_string(),
+                    retry: true,
+                },
+                Reached::Link(3),
+            ],
+            vec![],
+        );
+        let deadline = fake.now() + RESUME_WITHIN;
+        assert_eq!(reattach(&mut fake, dir, deadline, || true), Ok(3));
+    }
+
+    /// A link over one end of a pair, as [`handshake`] makes one.
+    fn a_link(stream: UnixStream) -> Link {
+        Link {
+            stream,
+            decoder: ipc::Decoder::new(),
+            queued: Default::default(),
+            backend_pid: 0,
+            generation: 0,
+            dir: PathBuf::from("/p"),
+            label: String::new(),
+            broken: false,
+        }
+    }
+
+    /// The connection's end, read or written, is a drop; and what the
+    /// backend said before it hung up is handed over first, so that a
+    /// `closed` is never taken for one.
+    #[test]
+    fn a_link_whose_peer_went_says_so() {
+        let (ours, theirs) = UnixStream::pair().expect("a pair");
+        let mut link = a_link(ours);
+        assert!(!link.dropped());
+        drop(theirs);
+        let why = link.read_available().expect_err("the end");
+        assert!(why.contains("stopped unexpectedly"), "{why}");
+        assert!(link.dropped());
+
+        let (ours, theirs) = UnixStream::pair().expect("a pair");
+        let mut link = a_link(ours);
+        drop(theirs);
+        assert!(link.send(&ToBackend::Ping).is_err());
+        assert!(link.dropped());
+
+        let (ours, mut theirs) = UnixStream::pair().expect("a pair");
+        let mut link = a_link(ours);
+        theirs
+            .write_all(&ipc::encode(&ToFrontend::Closed {
+                why: String::new(),
+                exit: 0,
+            }))
+            .expect("written");
+        drop(theirs);
+        let said = link.read_available().expect("what was said");
+        assert!(
+            matches!(said.as_slice(), [ToFrontend::Closed { exit: 0, .. }]),
+            "{said:?}"
+        );
+        assert!(link.read_available().is_err(), "then the end");
     }
 
     #[test]

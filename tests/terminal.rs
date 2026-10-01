@@ -707,3 +707,76 @@ fn a_terminal_hung_up_is_offered_back_and_one_quit_with_ctrl_q_waits_for_restore
     );
     quit(&mut restored, backend, "restored");
 }
+
+/// A backend killed outright under a pane (#103). The frontend sees its
+/// link drop and would take its window back from a backend still there,
+/// but nobody listens and nobody holds the profile: the backend is gone for
+/// good, and the pane ends at once — not after the fifteen seconds it would
+/// wait for one that is coming back — with the sentence saying where its
+/// log is, and a status that is not success.
+///
+/// The other half, a link dropped under a backend that is still there and
+/// the window taken back, is `tests/windows.rs`'s: a real frontend's link
+/// cannot be cut from outside without killing one end or the other.
+#[test]
+fn a_backend_that_dies_under_a_pane_ends_it_with_the_sentence_within_bounds() {
+    if !engine_named() {
+        return;
+    }
+    let scratch = Scratch::new("died");
+    let profile = scratch.0.join("profile");
+    let page = serve();
+    let args = [
+        "--no-config",
+        "--no-probe",
+        "--frames",
+        "raw",
+        "--tmux",
+        "off",
+        "--profile",
+        profile.to_str().unwrap(),
+        page.as_str(),
+    ];
+    let mut pane = Pane::start(scratch.command(&args, "died"));
+    let up = pane.pump(PATIENCE, |p| p.pictures >= 3);
+    let backend = lock_holder(&profile);
+    if !up {
+        stop(backend);
+    }
+    assert!(up, "row {:?}: {}", pane.row(), scratch.stderr("died"));
+    let backend = backend.expect("a backend holds the profile");
+    let group = std::fs::read_to_string(profile.join(engine::PGID_FILE))
+        .ok()
+        .and_then(|text| engine::parse_pgid_marker(&text))
+        .map(|(group, _)| group);
+
+    // SAFETY: two integers, no memory; the pid the profile's lock named.
+    unsafe {
+        libc::kill(backend as i32, libc::SIGKILL);
+    }
+    let killed = Instant::now();
+    pane.pump(Duration::from_secs(10), |p| p.pty.ended);
+    let status = pane.pty.exit_within(Duration::from_secs(5));
+    let took = killed.elapsed();
+    if let Some(group) = group {
+        // What the kill left of the engine, not left for the next test.
+        // SAFETY: two integers, no memory; the group the backend wrote.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    }
+    let said = scratch.stderr("died");
+    assert!(
+        status.is_some_and(|s| s.code().is_some_and(|code| code != 0)),
+        "{status:?}: {said}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "took {took:?}, as if it waited for a backend that is not coming"
+    );
+    assert!(
+        said.contains("stopped unexpectedly") && said.contains("backend.log"),
+        "{said}"
+    );
+    assert!(lock_free_within(&profile, Duration::from_secs(5)));
+}

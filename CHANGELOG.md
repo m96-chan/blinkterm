@@ -75,6 +75,12 @@ flag, a different default, a raised Rust floor all do.
   cookie jar: the backend does that after the terminal is given back.
 - A site file that is refused is said on the first window's row and in
   `backend.log`, rather than in the shell before the page.
+- A terminal whose connection to the profile's backend drops while the
+  backend is still running takes its window back — the same tabs, the
+  screen drawn again — within fifteen seconds instead of exiting; what was
+  typed while it was gone is dropped, not sent late. A backend that has
+  really gone still ends the window at once, saying it `stopped
+  unexpectedly` ([#103](https://github.com/m96-chan/blinkterm/issues/103)).
 
 ### Fixed
 

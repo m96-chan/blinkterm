@@ -160,9 +160,12 @@ fn metrics(cols: u32, rows: u32) -> Metrics {
     }
 }
 
-/// One fake frontend: its link, and what the backend has said to it.
+/// One fake frontend: its link, what it opened its window with and what
+/// it was answered, and what the backend has said to it.
 struct Front {
     link: Link,
+    open: Open,
+    opened: frontend::Opened,
     metrics: Metrics,
     text: Vec<u8>,
     frames: Vec<(u32, u32)>,
@@ -192,7 +195,7 @@ impl Front {
         let mut link = frontend::attach(spawn, Some(dir)).expect("attached");
         let options = options();
         let metrics = metrics(size.0, size.1);
-        link.open(Open {
+        let open = Open {
             nonce: ipc::new_nonce(),
             window: WindowSettings::from(&options),
             browser: BrowserSettings::from(&options),
@@ -211,10 +214,12 @@ impl Front {
             cwd: std::env::temp_dir(),
             home_dir: None,
             display,
-        })
-        .expect("a window");
+        };
+        let opened = link.open(open.clone()).expect("a window");
         Front {
             link,
+            open,
+            opened,
             metrics,
             text: Vec::new(),
             frames: Vec::new(),
@@ -861,6 +866,91 @@ fn two_windows_decide_the_desktop_by_their_own_terminal() {
 
     desk.quit();
     ssh.quit();
+    assert!(gone_within(backend, Duration::from_secs(10)));
+    stop_backend(backend);
+}
+
+/// A link that drops under a frontend whose backend is still there (#103):
+/// the frontend reaches the backend again without starting another, sends
+/// `open` again with its nonce, and has its own window back — resumed, its
+/// tabs, its page taking keys — and the profile has one window, not two,
+/// and nothing lost.
+#[test]
+fn a_link_that_drops_takes_its_window_back_with_its_tabs_and_no_second_window() {
+    if !engine_named() {
+        return;
+    }
+    let scratch = Scratch::new("resume");
+    let page = serve();
+    let mut spawn = launcher(Duration::from_secs(15));
+    let mut a = Front::open(
+        &mut spawn,
+        &scratch.0,
+        (80, 24),
+        &[format!("{page}first"), format!("{page}second")],
+    );
+    assert!(!a.opened.resumed, "a new window at first");
+    let backend = a.link.backend_pid;
+    assert!(
+        a.pump(PATIENCE, |f| f.frames.len() >= 3 && f.says("/first")),
+        "{}",
+        a.said()
+    );
+    // Long enough for the session to have recorded both tabs.
+    a.pump(Duration::from_secs(1), |_| false);
+
+    // The connection goes, as a frontend's does when it notices a drop:
+    // closed on this side, then the socket tried again.
+    let Front {
+        link, open, opened, ..
+    } = a;
+    drop(link);
+    let started = spawn.children.len();
+    let link = frontend::reattach(
+        &mut spawn,
+        &scratch.0,
+        Instant::now() + frontend::RESUME_WITHIN,
+        || true,
+    )
+    .expect("reached again");
+    assert_eq!(link.backend_pid, backend, "the same backend");
+    assert_eq!(spawn.children.len(), started, "nothing was started");
+    let mut b = Front {
+        link,
+        open: open.clone(),
+        opened,
+        metrics: metrics(80, 24),
+        text: Vec::new(),
+        frames: Vec::new(),
+        helpers: Vec::new(),
+        closed: None,
+    };
+    let mut again = open.clone();
+    again.urls.clear();
+    let back = b.link.open(again).expect("the window back");
+    assert!(back.resumed, "a new window, not the old one");
+    assert_eq!(back.window, opened.window, "another window");
+
+    // Laid out again and painting: the row names the page in front.
+    let want = b.frame_size();
+    assert!(
+        b.pump(PATIENCE, |f| f.says("/first")
+            && f.frames.iter().filter(|s| **s == want).count() >= 3),
+        "{}",
+        b.said()
+    );
+    b.key('x');
+    assert!(b.pump(PATIENCE, |f| f.says("key-x")), "{}", b.said());
+    b.pump(Duration::from_secs(1), |_| false);
+    let session = std::fs::read_to_string(scratch.0.join("session")).expect("a session");
+    assert!(!session.contains(" lost\n"), "{session}");
+    assert_eq!(session.matches("# window ").count(), 1, "{session}");
+    assert!(
+        session.contains("/second\t") && session.contains("/key-x\t"),
+        "{session}"
+    );
+
+    b.quit();
     assert!(gone_within(backend, Duration::from_secs(10)));
     stop_backend(backend);
 }
