@@ -71,6 +71,64 @@
 //! disposition on the opener's session says the same thing in words, but it
 //! arrives on another connection a moment before the target, and the loop
 //! reads the browser's mailbox first; the opener's absence is enough.
+//!
+//! # Two windows in one engine
+//!
+//! A second terminal on the same profile is going to be a second *window* in
+//! the engine the first one started (#83), not a second engine: one profile
+//! directory takes one engine. Before anything is built on that, this is
+//! what an engine does with two windows, measured by the engine tests named
+//! in the last column — `chrome-headless-shell` 153.0.8010.52, the engine CI
+//! runs and this program pins, and Chrome 154.0.8037.92 started as this
+//! program starts any Chromium, by hand. The first window is the engine's
+//! own first page; the second is [`crate::app::create_window_target`]
+//! (`Target.createTarget {newWindow: true}`).
+//!
+//! | question | headless shell 153 | Chrome 154 | test |
+//! | --- | --- | --- | --- |
+//! | two screencasts at once, 640x360 and 320x240 | both at 60 frames a second, every frame at its own window's size | the same | `two_windows_cast_at_once_each_at_its_own_size` |
+//! | `Target.activateTarget` on either page, both casting | neither window's rate moves (60 → 60/61) | the same | `activating_one_windows_target_does_not_stop_the_others_screencast` |
+//! | a key on one page's session | that page alone sees it, both ways round | the same | `input_to_one_window_reaches_only_its_page` |
+//! | `Browser.getWindowForTarget` | answers: the first page is window 1, the second 2 | answers, with large ids | every one |
+//! | … for a target the engine does not have | **SEGV in the browser process**; the engine is gone | `No target with given id` | `closing_every_target_of_one_window_leaves_the_other_painting` (guarded) |
+//! | `Target.createTarget` *without* `newWindow` | a window of its own (3, 4: `background` or not) | the window created last, not the first | measured once, held by no test |
+//! | `target=_blank` click in the second window | `openerId` = its page; in a window of its own | `openerId` = its page; in the opener's window | `a_popup_belongs_to_its_openers_window` |
+//! | middle click in both windows, 2 ms apart | no `openerId`, no `openerFrameId`; each in a window of its own | no opener; each in the clicking window | `an_openerless_target_belongs_to_the_window_it_was_clicked_in` |
+//! | … the opener's `frameRequestedNavigation` | `newTab` with the url, on the pipe *before* the target is announced; the url follows in `targetInfoChanged` | the same, and the url is already in `targetCreated` | the same |
+//! | closing every page of the second window | the first goes on at 60 | the same | `closing_every_target_of_one_window_leaves_the_other_painting` |
+//!
+//! Three things follow, and they are not what the design for #83 assumed.
+//!
+//! `newWindow` is a no-op in the headless shell: every target is its own
+//! window there, so independent visibility is not something the flag buys
+//! but something the engine already does, and nothing needs overriding —
+//! `Page.setWebLifecycleState` and `Emulation.setFocusEmulationEnabled`, the
+//! fallbacks kept ready for an activation that stalled the other window, were
+//! not needed. The flag is still passed, because in Chrome it is what makes
+//! the page a window rather than a tab in the newest one.
+//!
+//! The engine's window number does not attribute an openerless page in the
+//! engine this program pins: a middle-clicked link lands in a window that is
+//! neither of the two. It does in Chrome, and never points at the *wrong*
+//! window in either (the tests assert that much), but routing cannot rest on
+//! an answer one engine gives. What attributes it in both is the disposition:
+//! the opener's own session says `newTab` and the url, before the browser's
+//! connection has announced the target, so a router that keeps those as
+//! pending entries per window and matches the new page's first url against
+//! them finds exactly one window — `route_by_disposition` in the engine tests
+//! is that rule, run over the pipe's own order. Two windows opening the same
+//! url within the same moment remain ambiguous, and are closed rather than
+//! guessed. The opener, where there is one, attributes a popup in both.
+//!
+//! And `Browser.getWindowForTarget` must never be asked about a target that
+//! may have gone, because in the headless shell the answer is a crash of
+//! every window at once. [`crate::app::window_of_target`] asks
+//! `Target.getTargetInfo` first, which narrows that to a target closing
+//! between two calls on one thread (twenty close-then-ask races in a row did
+//! not crash it, which is evidence and not proof). Asking on the target's
+//! *own* session with no `targetId` is safe outright: on a live session it
+//! answers, and on one whose page has closed the engine says it detached and
+//! nothing else happens. That is the form to use once a target is attached.
 
 use std::borrow::Cow;
 use std::path::Path;
