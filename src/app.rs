@@ -3111,6 +3111,82 @@ fn create_tab(
     })
 }
 
+/// Open `url` in a new *engine window* and say which target it is.
+///
+/// `Target.createTarget` with `newWindow: true`: not a tab beside the ones
+/// the program has, but a page in a window of its own, which is what a second
+/// terminal attached to the same profile is going to drive (#83). Nothing is
+/// attached and nothing is set up — the caller does that, as it would for any
+/// target — because what is new here is only where the page lives.
+///
+/// What a window buys was measured against `chrome-headless-shell` 153 in the
+/// engine tests, and the table is in [`crate::tabs`]: a page in each of two
+/// windows casts at once, each at its own size, takes its own input, and
+/// goes on casting while the other is activated. In the headless shell the
+/// flag changes nothing observable — every target there is a window of its
+/// own, with it or without it — and it is passed because in Chrome it is the
+/// difference between a window and a tab in whichever window was opened last,
+/// which is where Chrome puts a `Target.createTarget` without it.
+pub fn create_window_target(browser: &mut Client, url: &str) -> Result<String, String> {
+    let created = browser.call(
+        "Target.createTarget",
+        Json::object(vec![
+            ("url", Json::string(url)),
+            ("newWindow", Json::Bool(true)),
+        ]),
+    )?;
+    created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .filter(|target| !target.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "the engine opened a window and did not say which page".to_string())
+}
+
+/// The engine window `target` lives in, as the engine numbers windows.
+///
+/// `Browser.getWindowForTarget`, asked on the browser's own connection —
+/// after `Target.getTargetInfo` has said the target exists, and that order is
+/// not caution for its own sake. Measured against `chrome-headless-shell`
+/// 153: `Browser.getWindowForTarget` with a `targetId` the engine does not
+/// have — a page that closed a moment ago, a made-up id, an empty string —
+/// is a SEGV in the browser process, and the whole engine is gone with every
+/// window in it. `Target.getTargetInfo` with the same id answers "No target
+/// with given id found" and nothing else happens. So an id that has gone is
+/// an `Err` here rather than a crash. What is left is a target that closes
+/// between the two calls, which the engine handles one after the other on
+/// one thread; narrow, not impossible. Chrome answers an unknown id with an
+/// error of its own and needs none of this.
+///
+/// What the number is worth differs by engine, and the table is in
+/// [`crate::tabs`]. In Chrome a page opened from a page — a popup, a
+/// middle-clicked link — is in its opener's window, so the number attributes
+/// it. In the headless shell *every* target is a window of its own, opened by
+/// a click or by `Target.createTarget` with or without `newWindow`, so the
+/// number tells two targets apart and says nothing about where one came from.
+/// It is the engine this program pins, which is why the routing of an
+/// openerless page does not rest on this.
+pub fn window_of_target(browser: &mut Client, target: &str) -> Result<i64, String> {
+    // An empty id is the one `Target.getTargetInfo` would not refuse: on the
+    // browser's connection it means "this session's target", which is the
+    // browser, and the crash would be the next call.
+    if target.is_empty() {
+        return Err("no target to ask about".to_string());
+    }
+    browser.call(
+        "Target.getTargetInfo",
+        Json::object(vec![("targetId", Json::string(target))]),
+    )?;
+    let answer = browser.call(
+        "Browser.getWindowForTarget",
+        Json::object(vec![("targetId", Json::string(target))]),
+    )?;
+    answer
+        .get("windowId")
+        .and_then(Json::as_i64)
+        .ok_or_else(|| format!("the engine did not say which window {target} is in"))
+}
+
 /// Ask the engine to attach to this session's out-of-process iframes and say
 /// so, so that a file input inside one can be answered (issue #57).
 ///

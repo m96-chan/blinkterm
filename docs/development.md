@@ -40,6 +40,28 @@ builds the bookworm image with the engine and the fonts in it if you would
 rather not install a Chromium; `tools/` also holds the Python tools the design
 was measured with, and has its own README.
 
+The six two-window tests at the end of `tests/engine.rs` (#83) measure what
+an engine does with two windows: simultaneous screencasts, activation, input,
+and which window a popup or a middle-clicked link belongs to. CI runs them
+against the pinned headless shell only, and the two engines answer some of
+those questions differently — the headless shell gives every target a window
+of its own, Chrome puts a page opened from a page in its opener's window — so
+when anything about windows or target routing changes, also run them by hand
+against a full Chrome or Chromium and compare with the table in `src/tabs.rs`:
+
+```sh
+BLINKTERM_ENGINE=/usr/bin/google-chrome-stable cargo test --release --test engine -- \
+  --test-threads=1 --nocapture two_windows activating_one input_to_one_window \
+  a_popup_belongs an_openerless closing_every_target
+```
+
+`--nocapture` because the lines they print — frame rates, window ids, the
+pipe order of the disposition and the target — are the measurement; the
+assertions only hold what both engines agree on. One fact from there to keep
+in mind while writing one: `Browser.getWindowForTarget` with an id the
+headless shell does not have crashes the whole engine, so ask through
+`app::window_of_target`, never directly.
+
 ## Checks
 
 What CI runs, and what to run before pushing:
