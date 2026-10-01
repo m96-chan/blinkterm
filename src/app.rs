@@ -73,6 +73,7 @@ use crate::permissions::{self, Allowed, Permission};
 use crate::picker::{self, Pickers};
 use crate::profile::Profile;
 use crate::reader::{self, Answered};
+use crate::registry;
 use crate::remote::{self, Delivered, Listener};
 use crate::route::{self, Payload, Route, Wrap};
 use crate::save;
@@ -598,6 +599,10 @@ struct Chrome {
     /// The person's bookmarks, one file for every profile; see
     /// [`crate::bookmarks`].
     bookmarks: Bookmarks,
+    /// The profile's name, first of the words at the right of the row, so
+    /// that a work window and a personal one cannot be confused: only once
+    /// the registry holds two profiles or more ([`Profile::label`]).
+    profile_label: Option<String>,
     /// The tabs as last written, the closed ones, and what the last run
     /// left; see [`crate::session`].
     session: Session,
@@ -758,6 +763,7 @@ impl Chrome {
                 Ok(dir) => Bookmarks::load(&dir),
                 Err(_) => Bookmarks::in_memory(),
             },
+            profile_label: profile.label().map(str::to_string),
             session: if profile.is_temporary() {
                 Session::in_memory()
             } else {
@@ -1291,12 +1297,23 @@ enum Driven {
 /// a minute, or an engine that will not start again, ends the
 /// program — with the sentence that says the tabs are saved.
 pub fn run(options: Options) -> Result<(), String> {
-    // `--remote` first, before the terminal is looked at: a sender is often
+    // Which profile, first of all: before `--remote` looks for a socket, and
+    // before the terminal is probed. The picker, when it runs, runs on the
+    // ordinary screen in cooked mode, with no signal handlers, no panic hook
+    // and no engine to clean up after; `--remote` resolves the same choice
+    // and never asks. See [`registry::select`] and [`crate::chooser`].
+    let ask = if options.remote {
+        registry::Ask::Never("--remote never asks")
+    } else {
+        registry::Ask::IfTerminal
+    };
+    let selected = registry::select(&options.profile, ask)?;
+    // `--remote` next, before the terminal is looked at: a sender is often
     // run by another program with no terminal at all, and a blinkterm that is
     // running needs none from it. Only with nobody there does it go on to
     // start, as a run without the flag would. See [`crate::remote`].
     let remote_dir = if options.remote {
-        Profile::locate(&options.profile)?
+        selected.dir.clone()
     } else {
         None
     };
@@ -1379,7 +1396,7 @@ pub fn run(options: Options) -> Result<(), String> {
 
     // Taken before the engine is started, so that a profile another blinkterm
     // is using is refused before anything has written to it.
-    let profile = Profile::take(options.profile.clone())?;
+    let profile = Profile::take_selected(selected)?;
     // The `--remote` socket, bound now that the lock is held — which is what
     // makes whatever a crash left at its path safe to remove — and before the
     // engine is started, so that a sender that comes while it starts waits
@@ -3499,22 +3516,9 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
     if chrome.layout.whole {
         return Ok(());
     }
-    let cols = chrome.metrics.cols;
     let Some(active) = tabs.active() else {
         return Ok(());
     };
-    let now = Instant::now();
-    let downloading = chrome.downloads.line(now);
-    let hovered = &chrome.hover.shown().href;
-    let pointing = (!hovered.is_empty()).then(|| hover::words(hovered));
-    let loading = active
-        .loading
-        .then(|| load::loading_hint(active.loading_for(now)));
-    let marker = active.zoom.marker();
-    let blocked = blocked_words(tabs, chrome);
-    let reader = active.reader.then_some("reader");
-    let errors = console_words(tabs, chrome);
-    let mode = mode_words(&chrome.mode, chrome.hinting.as_ref());
     let owner = row_owner(
         tabs,
         chrome.bar.as_ref(),
@@ -3533,8 +3537,34 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
     let bytes = if let Some(owner) = owner {
         // Whatever owns the row, the strip is not on it to be clicked.
         chrome.row_spans.borrow_mut().clear();
-        owned_row(cols, tabs, owner)
-    } else if tabs.len() < 2 {
+        owned_row(chrome.metrics.cols, tabs, owner)
+    } else {
+        plain_row(tabs, active, chrome)
+    };
+    pane.write(&bytes).map_err(|e| e.to_string())
+}
+
+/// The row when nothing owns it: the url, or the strip, with the words at
+/// the right — the profile's name first, when there is one to show — and
+/// the spans a click is read against, as a side effect. The half of
+/// [`redraw_row`] that has no terminal, so that a test can read what it
+/// draws.
+fn plain_row(tabs: &Tabs<Client>, active: &Tab<Client>, chrome: &Chrome) -> Vec<u8> {
+    let cols = chrome.metrics.cols;
+    let label = chrome.profile_label.as_deref();
+    let now = Instant::now();
+    let downloading = chrome.downloads.line(now);
+    let hovered = &chrome.hover.shown().href;
+    let pointing = (!hovered.is_empty()).then(|| hover::words(hovered));
+    let loading = active
+        .loading
+        .then(|| load::loading_hint(active.loading_for(now)));
+    let marker = active.zoom.marker();
+    let blocked = blocked_words(tabs, chrome);
+    let reader = active.reader.then_some("reader");
+    let errors = console_words(tabs, chrome);
+    let mode = mode_words(&chrome.mode, chrome.hinting.as_ref());
+    if tabs.len() < 2 {
         // One tab: the row is the url, all of it, as far as a press goes.
         *chrome.row_spans.borrow_mut() = vec![strip::Span {
             part: strip::Part::Url,
@@ -3542,8 +3572,10 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
             to: cols as usize,
         }];
         let left = pointing.unwrap_or_else(|| active.line());
-        // The download's words or the loading hint, then the level.
+        // The profile, the download's words or the loading hint, then the
+        // level.
         match words(&[
+            label,
             downloading.or(loading).as_deref(),
             marker.as_deref(),
             blocked.as_deref(),
@@ -3577,6 +3609,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         let showing_url = news.is_none();
         let right = match news {
             Some(news) => words(&[
+                label,
                 Some(&news),
                 marker.as_deref(),
                 blocked.as_deref(),
@@ -3585,6 +3618,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
                 mode.as_deref(),
             ]),
             None => words(&[
+                label,
                 mode.as_deref(),
                 marker.as_deref(),
                 blocked.as_deref(),
@@ -3611,8 +3645,7 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         }
         *chrome.row_spans.borrow_mut() = spans;
         drawn.bytes
-    };
-    pane.write(&bytes).map_err(|e| e.to_string())
+    }
 }
 
 /// What the row says about blocking on the page in front: `12 blocked`,
@@ -10203,6 +10236,49 @@ mod tests {
         assert_eq!(console_words(&tabs, &chrome).as_deref(), Some("2 errors"));
         recorder.opened("S1");
         assert_eq!(console_words(&tabs, &chrome), None);
+        drop(tabs);
+        drop(commands);
+        drop(replies);
+        exchange.shutdown();
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn the_profile_s_name_is_the_first_word_at_the_right_and_without_one_the_row_is_as_it_was() {
+        use std::os::unix::io::IntoRawFd;
+        let (commands, ours_write) = std::io::pipe().expect("a pipe");
+        let (ours_read, replies) = std::io::pipe().expect("a pipe");
+        let exchange =
+            crate::cdp::Exchange::over(ours_read.into_raw_fd(), ours_write.into_raw_fd());
+        let client = |session: &str| {
+            Client::on(&exchange, Some(session.to_string())).expect("a page client")
+        };
+        let mut tabs = Tabs::new(Tab::new("a", client("S1"), "https://a.example/"));
+        let (mut chrome, downloads) = drawing_chrome("profile-label", Arc::new(Recorder::new()));
+        chrome.mode = normal::Mode::starting(true);
+        let row = |tabs: &Tabs<Client>, chrome: &Chrome| {
+            let active = tabs.active().expect("a tab");
+            String::from_utf8(plain_row(tabs, active, chrome)).expect("text")
+        };
+
+        let one_without = row(&tabs, &chrome);
+        chrome.profile_label = Some("Work".to_string());
+        let one_with = row(&tabs, &chrome);
+        assert!(one_with.contains("Work  normal"), "{one_with:?}");
+        chrome.profile_label = None;
+        assert_eq!(row(&tabs, &chrome), one_without, "no name, no change");
+
+        tabs.open(Tab::new("b", client("S2"), "https://b.example/"));
+        let two_without = row(&tabs, &chrome);
+        chrome.profile_label = Some("Work".to_string());
+        let two_with = row(&tabs, &chrome);
+        assert!(
+            two_with.contains("Work  normal  https://b.example/"),
+            "{two_with:?}"
+        );
+        chrome.profile_label = None;
+        assert_eq!(row(&tabs, &chrome), two_without, "no name, no change");
+
         drop(tabs);
         drop(commands);
         drop(replies);

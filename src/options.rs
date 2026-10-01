@@ -59,6 +59,7 @@ use crate::engine;
 use crate::login;
 use crate::picker;
 use crate::profile;
+use crate::registry;
 use crate::route;
 use crate::save;
 use crate::sites;
@@ -170,6 +171,9 @@ pub enum Invocation {
     /// `--install-engine`: fetch the pinned engine, verified, start it once,
     /// and stop. Command line only. See [`crate::install`].
     InstallEngine(Options),
+    /// `blinkterm profiles …`, with the words after `profiles`: list and
+    /// change the named profiles, and stop. See [`crate::chooser`].
+    Profiles(Vec<String>),
     Run(Options),
 }
 
@@ -217,7 +221,8 @@ pub struct Settings {
     /// Command line only: a page is what a run is for.
     pub urls: Vec<String>,
     pub home: Option<String>,
-    /// `profile = <dir>` is `At`, `temp-profile = true` is `Temporary`.
+    /// `profile = <dir>` is `At`, `temp-profile = true` is `Temporary`,
+    /// `profile-name = <name>` is `Named`, `choose-profile = true` is `Pick`.
     pub profile: Option<profile::Choice>,
     pub download_dir: Option<PathBuf>,
     pub pdf_paper: Option<save::Paper>,
@@ -418,8 +423,9 @@ fn needed<'a>(value: &'a str, needed: &str) -> Result<&'a str, String> {
 /// Every value option is taken as `--name value` and `--name=value`, because
 /// both are what people type, and refused twice: a command line that says a
 /// thing twice was put together by something that meant two different
-/// things. `--profile` and `--temp-profile` together is the same refusal,
-/// since they are one setting with three values. The flags — `--force-dark`,
+/// things. `--profile`, `--profile-name`, `--temp-profile` and
+/// `--choose-profile`, any two together, is the same refusal, since they are
+/// one setting with five values. The flags — `--force-dark`,
 /// `--temp-profile`, `--restore`, `--normal-mode` and the rest — take
 /// nothing after them, and `--force-dark=yes` is an unknown option.
 /// `--alpha` takes an amount if one follows: `--alpha=70`, or `--alpha 70`
@@ -533,6 +539,16 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             once(
                 &mut s.profile,
                 profile::Choice::At(PathBuf::from(dir)),
+                "one profile at a time",
+            )?;
+            continue;
+        }
+        if let Some(name) = value_of(arg, "--profile-name", &mut args) {
+            let name = needed(name, "--profile-name needs a name: --profile-name <name>")?;
+            registry::validate_name(name).map_err(|why| format!("--profile-name: {why}"))?;
+            once(
+                &mut s.profile,
+                profile::Choice::Named(name.to_string()),
                 "one profile at a time",
             )?;
             continue;
@@ -658,6 +674,11 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
                 profile::Choice::Temporary,
                 "one profile at a time",
             )?,
+            "--choose-profile" => once(
+                &mut s.profile,
+                profile::Choice::Pick,
+                "one profile at a time",
+            )?,
             "--force-dark" => once(&mut s.force_dark, true, "--force-dark once is enough")?,
             "--restore" => once(&mut s.restore, true, "--restore once is enough")?,
             "--mute" => once(&mut s.mute, true, "--mute once is enough")?,
@@ -689,6 +710,13 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
                  a temporary profile is its run's alone, so there is no blinkterm \
                  to reach on it"
                 .to_string());
+        }
+        if s.profile == Some(profile::Choice::Pick) {
+            return Err(
+                "--remote and --choose-profile together is a contradiction: \
+                 a sender never asks which profile; say --profile-name <name>"
+                    .to_string(),
+            );
         }
     }
     Ok(s)
@@ -753,10 +781,12 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 34] = [
+const KEYS: [&str; 36] = [
     "home",
     "profile",
+    "profile-name",
     "temp-profile",
+    "choose-profile",
     "download-dir",
     "pdf-paper",
     "search-url",
@@ -858,24 +888,32 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
         };
         match key {
             "home" => s.home = Some(value.to_string()),
-            "profile" => {
-                if s.profile == Some(profile::Choice::Temporary) {
-                    let other = line_of("temp-profile").unwrap_or_default();
-                    return Err(at(format!(
-                        "profile is set, but temp-profile = true is on line {other}"
-                    )));
-                }
-                s.profile = Some(profile::Choice::At(PathBuf::from(value)));
+            "profile" => profile_setting(
+                &mut s,
+                key,
+                profile::Choice::At(PathBuf::from(value)),
+                line_of,
+            )
+            .map_err(at)?,
+            "profile-name" => {
+                registry::validate_name(value).map_err(|why| at(format!("profile-name: {why}")))?;
+                profile_setting(
+                    &mut s,
+                    key,
+                    profile::Choice::Named(value.to_string()),
+                    line_of,
+                )
+                .map_err(at)?
             }
             "temp-profile" => {
                 if parse_bool(key, value).map_err(at)? {
-                    if s.profile.is_some() {
-                        let other = line_of("profile").unwrap_or_default();
-                        return Err(at(format!(
-                            "temp-profile = true, but profile is set on line {other}"
-                        )));
-                    }
-                    s.profile = Some(profile::Choice::Temporary);
+                    profile_setting(&mut s, key, profile::Choice::Temporary, line_of)
+                        .map_err(at)?;
+                }
+            }
+            "choose-profile" => {
+                if parse_bool(key, value).map_err(at)? {
+                    profile_setting(&mut s, key, profile::Choice::Pick, line_of).map_err(at)?;
                 }
             }
             "download-dir" => s.download_dir = Some(PathBuf::from(value)),
@@ -928,6 +966,42 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
         }
     }
     Ok(s)
+}
+
+/// One of the four profile keys in a file, which are one setting: `profile`,
+/// `profile-name`, `temp-profile = true` and `choose-profile = true`. A
+/// second of them, whichever, is refused with the line the first was on.
+/// (`temp-profile = false` and `choose-profile = false` say nothing, and so
+/// never conflict.)
+fn profile_setting(
+    s: &mut Settings,
+    key: &str,
+    choice: profile::Choice,
+    line_of: impl Fn(&str) -> Option<usize>,
+) -> Result<(), String> {
+    // How each key reads in a sentence: as the subject, and as the one
+    // already there.
+    let said = |key: &str| match key {
+        "temp-profile" | "choose-profile" => (format!("{key} = true"), format!("{key} = true is")),
+        _ => (format!("{key} is set"), format!("{key} is set")),
+    };
+    if let Some(first) = &s.profile {
+        let other = match first {
+            profile::Choice::At(_) => "profile",
+            profile::Choice::Named(_) => "profile-name",
+            profile::Choice::Temporary => "temp-profile",
+            profile::Choice::Pick => "choose-profile",
+            profile::Choice::Default => unreachable!("a file never says Default"),
+        };
+        let line = line_of(other).unwrap_or_default();
+        return Err(format!(
+            "{}, but {} on line {line}",
+            said(key).0,
+            said(other).1
+        ));
+    }
+    s.profile = Some(choice);
+    Ok(())
 }
 
 /// A line's key and value, trimmed, split at the first `=` — except in a
@@ -1133,7 +1207,14 @@ fn home_expanded(mut settings: Settings, home: Option<&Path>) -> Settings {
 /// resolve. `--help` and `--version` are answered without reading anything
 /// else, so a broken settings file never stands between a person and the
 /// help.
+///
+/// `profiles` as the first word is the `blinkterm profiles` command, and
+/// nothing else on the line is read here: its words are its own, and the
+/// settings file has nothing to say to it.
 pub fn invocation(args: &[String]) -> Result<Invocation, String> {
+    if args.first().is_some_and(|first| first == "profiles") {
+        return Ok(Invocation::Profiles(args[1..].to_vec()));
+    }
     let cli = parse_args(args)?;
     match cli.what {
         Some(What::Help) => return Ok(Invocation::Help(help_keymap(args))),
@@ -1539,6 +1620,90 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_name_is_named_either_way_round_and_choose_profile_is_a_flag() {
+        for args in [
+            &["--profile-name", "Work", "example.com"][..],
+            &["--profile-name=Work", "example.com"][..],
+        ] {
+            assert_eq!(
+                parsed(args).map(|s| s.profile),
+                Ok(Some(Choice::Named("Work".to_string()))),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            parsed(&["--choose-profile"]).map(|s| s.profile),
+            Ok(Some(Choice::Pick))
+        );
+        for args in [&["--profile-name"][..], &["--profile-name="][..]] {
+            assert_eq!(
+                parsed(args),
+                Err("--profile-name needs a name: --profile-name <name>".to_string()),
+                "{args:?}"
+            );
+        }
+        let why = parsed(&["--profile-name", "a/b"]).unwrap_err();
+        assert!(
+            why.starts_with("--profile-name: a profile name cannot contain / or \\"),
+            "{why}"
+        );
+        assert_eq!(
+            parsed(&["--choose-profile=x"]),
+            Err("unknown option: --choose-profile=x".to_string())
+        );
+        let selectors: [&[&str]; 4] = [
+            &["--profile", "/p"],
+            &["--profile-name", "Work"],
+            &["--temp-profile"],
+            &["--choose-profile"],
+        ];
+        for first in selectors {
+            for second in selectors {
+                let args: Vec<&str> = first.iter().chain(second.iter()).copied().collect();
+                assert_eq!(
+                    parsed(&args),
+                    Err("one profile at a time".to_string()),
+                    "{args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_with_choose_profile_is_a_contradiction_and_with_a_name_is_not() {
+        let why = parsed(&["--remote", "--choose-profile", "a.example"]).unwrap_err();
+        assert!(
+            why.starts_with("--remote and --choose-profile together is a contradiction"),
+            "{why}"
+        );
+        assert!(why.contains("--profile-name <name>"), "{why}");
+        let options = resolved(&["--remote", "--profile-name", "Work", "a.example"]).expect("ok");
+        assert_eq!(options.profile, Choice::Named("Work".to_string()));
+        assert!(options.remote);
+    }
+
+    #[test]
+    fn profiles_first_is_the_command_and_anywhere_else_is_a_url() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            invocation(&args(&["profiles", "list"])),
+            Ok(Invocation::Profiles(args(&["list"])))
+        );
+        assert_eq!(
+            invocation(&args(&["profiles", "--help"])),
+            Ok(Invocation::Profiles(args(&["--help"])))
+        );
+        assert_eq!(
+            parsed(&["--profile", "x", "profiles"]).map(|s| s.urls),
+            Ok(vec!["profiles".to_string()])
+        );
+        assert_eq!(
+            parsed(&["--", "profiles"]).map(|s| s.urls),
+            Ok(vec!["profiles".to_string()])
+        );
+    }
+
+    #[test]
     fn a_download_directory_is_named_either_way_round_and_only_once() {
         for args in [
             &["--download-dir", "x", "example.com"][..],
@@ -1935,6 +2100,71 @@ mod tests {
             file("temp-profile = true").map(|s| s.profile),
             Ok(Some(Choice::Temporary))
         );
+    }
+
+    #[test]
+    fn profile_name_and_choose_profile_are_read_from_the_file_and_one_profile_key_at_a_time() {
+        assert_eq!(
+            file("profile-name = Work").map(|s| s.profile),
+            Ok(Some(Choice::Named("Work".to_string())))
+        );
+        assert_eq!(
+            file("choose-profile = true").map(|s| s.profile),
+            Ok(Some(Choice::Pick))
+        );
+        assert_eq!(file("choose-profile = false"), Ok(Settings::default()));
+        let why = file("\nprofile-name = a/b").unwrap_err();
+        assert!(
+            why.starts_with("/c:2: profile-name: a profile name cannot contain"),
+            "{why}"
+        );
+        let cases = [
+            (
+                "profile = /p\nprofile-name = Work",
+                "/c:2: profile-name is set, but profile is set on line 1",
+            ),
+            (
+                "profile-name = Work\ntemp-profile = true",
+                "/c:2: temp-profile = true, but profile-name is set on line 1",
+            ),
+            (
+                "choose-profile = true\n\nprofile-name = Work",
+                "/c:3: profile-name is set, but choose-profile = true is on line 1",
+            ),
+            (
+                "temp-profile = true\nchoose-profile = true",
+                "/c:2: choose-profile = true, but temp-profile = true is on line 1",
+            ),
+            (
+                "choose-profile = true\nprofile = /p",
+                "/c:2: profile is set, but choose-profile = true is on line 1",
+            ),
+        ];
+        for (text, why) in cases {
+            assert_eq!(file(text), Err(why.to_string()), "{text:?}");
+        }
+        assert_eq!(
+            file("choose-profile = false\nprofile-name = Work").map(|s| s.profile),
+            Ok(Some(Choice::Named("Work".to_string())))
+        );
+    }
+
+    #[test]
+    fn the_command_line_s_temp_profile_beats_a_profile_name_in_the_file() {
+        let options = resolve(
+            parsed(&["--temp-profile"]).expect("parsed"),
+            Settings::default(),
+            file("profile-name = Work").expect("a file"),
+        )
+        .expect("resolved");
+        assert_eq!(options.profile, Choice::Temporary);
+        let options = resolve(
+            parsed(&["--profile-name", "Home"]).expect("parsed"),
+            Settings::default(),
+            file("choose-profile = true").expect("a file"),
+        )
+        .expect("resolved");
+        assert_eq!(options.profile, Choice::Named("Home".to_string()));
     }
 
     #[test]

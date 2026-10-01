@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use blinkterm::app;
 use blinkterm::bindings::{self, Keymap};
+use blinkterm::chooser;
 use blinkterm::doctor;
 use blinkterm::engine;
 use blinkterm::install;
@@ -17,13 +18,23 @@ const USAGE_HEAD: &str = "\
 blinkterm, a real browser in a terminal pane
 
 usage: blinkterm [options] [url ...]
+       blinkterm profiles [list|create|rename|default|remove]
+
+commands:
+  profiles         list, make, rename, remove the named profiles and choose
+                   the default; blinkterm profiles --help says how
 
 options:
   -h, --help       show this message
   -V, --version    show the version
-  --profile <dir>  keep cookies, logins and storage in <dir>
-                   (default: $XDG_DATA_HOME/blinkterm/profile, or
+  --profile <dir>  keep cookies, logins and storage in the directory <dir>
+                   (default: the default named profile, which at first is
+                   $XDG_DATA_HOME/blinkterm/profile, or
                    ~/.local/share/blinkterm/profile)
+  --profile-name <name>
+                   use the profile called <name>, one of blinkterm profiles
+                   list; a name it does not have is an error
+  --choose-profile ask which profile, even when one is the default
   --temp-profile   a profile that is thrown away when this program exits
   --remote         open the urls as new tabs in the blinkterm already running
                    on this profile, and exit; with none running, start as
@@ -169,6 +180,9 @@ blinkterm.sock in its profile, so it can be $BROWSER. The open tabs are saved
 in the profile; --restore reopens them, and after a crash the next start
 offers to. Bookmarks are one file for every
 profile, $XDG_DATA_HOME/blinkterm/bookmarks, one url<TAB>title per line.
+Named profiles are listed in $XDG_DATA_HOME/blinkterm/profiles.json, and
+blinkterm profiles makes, renames and removes them. A start with no profile
+chosen opens the default one, and asks which when there is no default.
 
 A file a page offers — a link to a PDF, a Content-Disposition: attachment —
 is saved in the download directory under its own name, \"report (1).pdf\" if
@@ -350,6 +364,7 @@ fn main() -> ExitCode {
             return exit(doctor::report(&options, &provenance));
         }
         Invocation::InstallEngine(options) => return exit(install::run(&options)),
+        Invocation::Profiles(args) => return chooser::command(&args),
         Invocation::Run(options) => options,
     };
 
@@ -427,6 +442,15 @@ mod tests {
     fn the_options_list_names_keymap() {
         assert!(USAGE_HEAD.contains("  --keymap <mac|linux>\n"));
         assert!(USAGE_TAIL.starts_with("Everything else goes to the page."));
+    }
+
+    #[test]
+    fn the_options_list_names_the_profile_selectors() {
+        assert!(USAGE_HEAD.contains("  --profile-name <name>\n"));
+        assert!(USAGE_HEAD.contains("  --choose-profile "));
+        assert!(USAGE_HEAD.contains("  --temp-profile "));
+        assert!(USAGE_HEAD.contains("\ncommands:\n  profiles "));
+        assert!(USAGE_HEAD.contains("blinkterm profiles [list|create|rename|default|remove]"));
     }
 
     #[test]

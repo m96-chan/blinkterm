@@ -80,6 +80,16 @@
 //! quietly would be friendlier for a second and then cost somebody a login
 //! they thought was being kept: a note on the status row is exactly the kind
 //! of thing nobody reads.
+//!
+//! # Names are the registry's
+//!
+//! A [`Choice`] can also name a profile — `--profile-name Work`, or nothing
+//! at all and the registry's default — and those are resolved by
+//! [`crate::registry::select`], which turns every choice into a directory and,
+//! for a named one, the name the row shows. This module only ever sees the
+//! directory: [`Profile::take_selected`] makes it and locks it exactly as a
+//! `--profile <dir>` is made and locked, so a named profile is held by the
+//! same `flock` and refused by the same sentence.
 
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -90,6 +100,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::registry;
 
 /// The file inside a profile that the lock is taken on.
 pub const LOCK_FILE: &str = "blinkterm.lock";
@@ -118,12 +130,19 @@ static TEMP_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Which profile the person asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
-    /// `$XDG_DATA_HOME/blinkterm/profile`, or `~/.local/share/...` without it.
+    /// Nothing said: the registry's default profile, which for somebody who
+    /// has never made another is `$XDG_DATA_HOME/blinkterm/profile` (or
+    /// `~/.local/share/...` without it), and with no default the picker. See
+    /// [`crate::registry::select`].
     Default,
-    /// `--profile <dir>`.
+    /// `--profile <dir>`: a directory, and the registry is not asked.
     At(PathBuf),
     /// `--temp-profile`: nothing kept, nothing left behind.
     Temporary,
+    /// `--profile-name <name>`: a profile the registry has by that name.
+    Named(String),
+    /// `--choose-profile`: ask, even when there is a default.
+    Pick,
 }
 
 /// A profile directory this program has the use of until the value is dropped.
@@ -139,41 +158,59 @@ pub struct Profile {
     #[allow(dead_code)]
     lock: Option<File>,
     temporary: bool,
+    /// The name the status row shows, when there is one worth showing: see
+    /// [`crate::registry::Selected::label`].
+    label: Option<String>,
 }
 
 impl Profile {
     /// Resolve `choice` to a directory, make it if it is not there, and take
     /// it for this process.
+    ///
+    /// For a caller that cannot ask — the engine tests, a library user — so
+    /// a [`Choice::Pick`], or a [`Choice::Default`] with no default profile,
+    /// is the sentence that says so rather than a question on a terminal.
+    /// [`crate::app::run`] asks first ([`crate::registry::select`]) and then
+    /// calls [`Profile::take_selected`].
     pub fn take(choice: Choice) -> Result<Profile, String> {
-        let Some(dir) = Profile::locate(&choice)? else {
-            return Profile::temporary();
-        };
+        Profile::take_selected(registry::select(
+            &choice,
+            registry::Ask::Never("this call cannot ask"),
+        )?)
+    }
+
+    /// What [`crate::registry::select`] chose, made and taken: a temporary
+    /// profile for no directory, else [`Profile::take_at`].
+    pub fn take_selected(selected: registry::Selected) -> Result<Profile, String> {
+        match selected.dir {
+            None => Profile::temporary(),
+            Some(dir) => Profile::take_at(dir, selected.label),
+        }
+    }
+
+    /// The profile at `dir`, made 0700 if it is not there and locked for this
+    /// process, with `label` for the row.
+    pub fn take_at(dir: PathBuf, label: Option<String>) -> Result<Profile, String> {
         make_private_dir(&dir)?;
         let lock = lock(&dir)?;
         Ok(Profile {
             dir,
             lock: Some(lock),
             temporary: false,
+            label,
         })
     }
 
     /// Where `choice` points, without making it or taking it; `None` for a
     /// temporary profile, which has no place until it is made.
     ///
-    /// Factored out of [`Profile::take`] so that `blinkterm --remote` finds
-    /// the running blinkterm's socket in exactly the directory a start with
-    /// the same command line would have locked (see `crate::remote`). A
-    /// relative `--profile` is made absolute against the working directory
-    /// here, once, for both.
+    /// The directory [`crate::registry::select`] resolves without asking, so
+    /// that `blinkterm --remote` finds the running blinkterm's socket in
+    /// exactly the directory a start with the same command line would have
+    /// locked (see `crate::remote`). A relative `--profile` is made absolute
+    /// against the working directory there, once, for both.
     pub fn locate(choice: &Choice) -> Result<Option<PathBuf>, String> {
-        match choice {
-            Choice::Temporary => Ok(None),
-            Choice::Default => Profile::default_dir().map(Some),
-            Choice::At(dir) if dir.is_absolute() => Ok(Some(dir.clone())),
-            Choice::At(dir) => std::env::current_dir()
-                .map(|cwd| Some(cwd.join(dir)))
-                .map_err(|e| format!("cannot tell where {} is: {e}", dir.display())),
-        }
+        registry::select(choice, registry::Ask::Never("this call cannot ask")).map(|s| s.dir)
     }
 
     /// Where the profile goes when nobody says, from this process's
@@ -222,12 +259,20 @@ impl Profile {
             dir,
             lock: None,
             temporary: true,
+            label: None,
         })
     }
 
     /// The directory, for `--user-data-dir`.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The profile's name, for the status row: `Some` only for a named
+    /// profile while the registry holds more than one, since a name nobody
+    /// has to tell from another is a word on the row for nothing.
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
     }
 
     /// Whether this is thrown away at the end: there is nothing in it worth
@@ -409,7 +454,7 @@ pub(crate) fn remove_tree(dir: &Path) {
 /// the person may have chosen it — and one that exists and is not a directory
 /// is an error that names it, rather than whatever the engine would make of a
 /// `--user-data-dir` that is a file.
-fn make_private_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn make_private_dir(dir: &Path) -> Result<(), String> {
     match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => return Ok(()),
         Ok(_) => {
@@ -433,6 +478,51 @@ fn make_private_dir(dir: &Path) -> Result<(), String> {
 /// The file is opened without truncating: until the lock is taken, what is in
 /// it is the holder's pid, and that is what the refusal quotes.
 fn lock(dir: &Path) -> Result<File, String> {
+    let mut file = match try_lock(dir)? {
+        Tried::Taken(file) => file,
+        Tried::Held(holder) => {
+            let holder = match holder {
+                Some(pid) => format!(" (pid {pid})"),
+                None => String::new(),
+            };
+            return Err(format!(
+                "the profile at {} is in use by another blinkterm{holder}; quit it, \
+                 open the url there with blinkterm --remote <url>, \
+                 or run this one with --temp-profile or --profile <dir>",
+                dir.display()
+            ));
+        }
+    };
+    // The pid is a courtesy for the message above, not part of the lock, so a
+    // failure to write it is not a failure to take the profile.
+    let _ = file
+        .set_len(0)
+        .and_then(|()| file.seek(SeekFrom::Start(0)))
+        .and_then(|_| writeln!(file, "{}", std::process::id()))
+        .and_then(|()| file.flush());
+    Ok(file)
+}
+
+/// What one non-blocking try for a profile's lock found.
+#[derive(Debug)]
+pub(crate) enum Tried {
+    /// The lock, for as long as the file is held.
+    Taken(File),
+    /// Somebody else has it, and this is the pid they wrote into it, when it
+    /// could be read.
+    Held(Option<u32>),
+}
+
+/// Try for the lock on the profile at `dir` without waiting: the half of
+/// [`lock`] that [`crate::registry::remove`] shares, since a profile is
+/// removed only while nobody is using it, and that
+/// [`crate::registry::in_use`] asks for the picker and `blinkterm profiles
+/// list`.
+///
+/// The file is opened without truncating: until the lock is taken, what is in
+/// it is the holder's pid, and that is what [`Tried::Held`] carries. Nothing
+/// is written into it here; [`lock`] writes this process's pid once it has it.
+pub(crate) fn try_lock(dir: &Path) -> Result<Tried, String> {
     let path = dir.join(LOCK_FILE);
     let mut file = OpenOptions::new()
         .read(true)
@@ -448,25 +538,9 @@ fn lock(dir: &Path) -> Result<File, String> {
         }
         let mut holder = String::new();
         let _ = file.read_to_string(&mut holder);
-        let holder = match holder.trim().parse::<u32>() {
-            Ok(pid) => format!(" (pid {pid})"),
-            Err(_) => String::new(),
-        };
-        return Err(format!(
-            "the profile at {} is in use by another blinkterm{holder}; quit it, \
-             open the url there with blinkterm --remote <url>, \
-             or run this one with --temp-profile or --profile <dir>",
-            dir.display()
-        ));
+        return Ok(Tried::Held(holder.trim().parse::<u32>().ok()));
     }
-    // The pid is a courtesy for the message above, not part of the lock, so a
-    // failure to write it is not a failure to take the profile.
-    let _ = file
-        .set_len(0)
-        .and_then(|()| file.seek(SeekFrom::Start(0)))
-        .and_then(|_| writeln!(file, "{}", std::process::id()))
-        .and_then(|()| file.flush());
-    Ok(file)
+    Ok(Tried::Taken(file))
 }
 
 /// Take `path` for as long as the returned file is held: a blocking
