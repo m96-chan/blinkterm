@@ -208,12 +208,7 @@ fn parse_reply(line: &str) -> Checked {
 /// when this is dropped.
 #[derive(Debug)]
 pub struct Listener {
-    socket: UnixListener,
-    /// Where a sender looks: the socket itself, or the symlink to it.
-    link: PathBuf,
-    /// The fresh directory the socket is in when the profile could not hold
-    /// it, removed with it.
-    fallback: Option<PathBuf>,
+    bound: Bound,
 }
 
 impl Listener {
@@ -221,65 +216,19 @@ impl Listener {
     /// on. Whatever is at the socket's path is removed first: under the lock,
     /// it can only be what a crash left.
     pub fn bind(profile: &Path) -> Result<Listener, String> {
-        let link = socket_path(profile);
-        clear(&link);
-        let (socket, fallback) = match UnixListener::bind(&link) {
-            Ok(socket) => (socket, None),
-            Err(first) => {
-                let dir = crate::profile::make_temp_dir(FALLBACK_PREFIX).map_err(|second| {
-                    format!(
-                        "cannot make a socket in {} ({first}) nor a directory for one in {second}",
-                        profile.display()
-                    )
-                })?;
-                let target = dir.join("sock");
-                let bound = UnixListener::bind(&target)
-                    .and_then(|socket| std::os::unix::fs::symlink(&target, &link).map(|()| socket));
-                match bound {
-                    Ok(socket) => (socket, Some(dir)),
-                    Err(second) => {
-                        let _ = std::fs::remove_dir_all(&dir);
-                        return Err(format!(
-                            "cannot make a socket in {} ({first}) nor a link there to one \
-                             in {} ({second})",
-                            profile.display(),
-                            dir.display()
-                        ));
-                    }
-                }
-            }
-        };
-        let listener = Listener {
-            socket,
-            link,
-            fallback,
-        };
-        // Between the bind and this the socket has the umask's mode, which is
-        // why it is only ever made inside a 0700 directory: the profile, or
-        // the fallback `mkdtemp` made. On a Mac the socket's own mode is not
-        // consulted by `connect` at all, and the directory is the whole of
-        // the access control there — which it is here too, in the end.
-        let bound = listener
-            .fallback
-            .as_ref()
-            .map_or(listener.link.clone(), |dir| dir.join("sock"));
-        std::fs::set_permissions(&bound, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("cannot make {} private: {e}", bound.display()))?;
-        listener
-            .socket
-            .set_nonblocking(true)
-            .map_err(|e| format!("cannot listen on {}: {e}", listener.link.display()))?;
-        Ok(listener)
+        Ok(Listener {
+            bound: bind_private(profile, SOCKET_FILE, FALLBACK_PREFIX)?,
+        })
     }
 
     /// The descriptor to wait on: readable when a sender has connected.
     pub fn fd(&self) -> RawFd {
-        self.socket.as_raw_fd()
+        self.bound.socket.as_raw_fd()
     }
 
     /// Where a sender looks for this socket.
     pub fn path(&self) -> &Path {
-        &self.link
+        self.bound.path()
     }
 
     /// Every sender that has connected, each read to the end of what it said.
@@ -290,7 +239,7 @@ impl Listener {
     pub fn accept_ready(&mut self) -> Result<Vec<Delivery>, String> {
         let mut deliveries = Vec::new();
         loop {
-            match self.socket.accept() {
+            match self.bound.socket.accept() {
                 Ok((stream, _)) => deliveries.push(Delivery::read(stream)),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(deliveries),
                 Err(e)
@@ -299,7 +248,7 @@ impl Listener {
                         ErrorKind::Interrupted | ErrorKind::ConnectionAborted
                     ) => {}
                 Err(e) if deliveries.is_empty() => {
-                    return Err(format!("{}: {e}", self.link.display()))
+                    return Err(format!("{}: {e}", self.path().display()))
                 }
                 // Answer the ones already taken; the error comes back on the
                 // next turn if it is still there.
@@ -309,7 +258,31 @@ impl Listener {
     }
 }
 
-impl Drop for Listener {
+/// A listening socket that only its owner can reach, at `<dir>/<name>` or
+/// behind a symlink there, removed again when this is dropped.
+///
+/// What [`Listener`] is made of, and [`crate::ipc::Endpoint`] too: the two
+/// sockets a profile can have are bound the same way, under its lock, for
+/// the reasons the module's section on the socket gives.
+#[derive(Debug)]
+pub(crate) struct Bound {
+    /// The listening socket, non-blocking.
+    pub(crate) socket: UnixListener,
+    /// Where a peer looks: the socket itself, or the symlink to it.
+    link: PathBuf,
+    /// The fresh directory the socket is in when the profile could not hold
+    /// it, removed with it.
+    fallback: Option<PathBuf>,
+}
+
+impl Bound {
+    /// Where a peer looks for this socket.
+    pub(crate) fn path(&self) -> &Path {
+        &self.link
+    }
+}
+
+impl Drop for Bound {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.link);
         if let Some(dir) = &self.fallback {
@@ -318,14 +291,78 @@ impl Drop for Listener {
     }
 }
 
+/// Listen at `<dir>/<name>`, made 0600 inside `dir`, which is 0700 and whose
+/// lock the caller holds; or, when that path cannot hold a socket — too long
+/// for `sun_path`, a filesystem without sockets — in a fresh 0700 directory
+/// `mkdtemp(3)` makes under the temporary directory with a name starting
+/// with `prefix`, behind a symlink at `<dir>/<name>`.
+///
+/// Whatever is at the path is removed first, with the fallback directory a
+/// link there points into when its name starts with `prefix`: under the lock,
+/// it can only be what a crash left. Each socket a profile has gets a
+/// `prefix` of its own, so that clearing one never removes the other's
+/// directory.
+pub(crate) fn bind_private(dir: &Path, name: &str, prefix: &str) -> Result<Bound, String> {
+    let link = dir.join(name);
+    clear(&link, prefix);
+    let (socket, fallback) = match UnixListener::bind(&link) {
+        Ok(socket) => (socket, None),
+        Err(first) => {
+            let made = crate::profile::make_temp_dir(prefix).map_err(|second| {
+                format!(
+                    "cannot make a socket in {} ({first}) nor a directory for one in {second}",
+                    dir.display()
+                )
+            })?;
+            let target = made.join("sock");
+            let bound = UnixListener::bind(&target)
+                .and_then(|socket| std::os::unix::fs::symlink(&target, &link).map(|()| socket));
+            match bound {
+                Ok(socket) => (socket, Some(made)),
+                Err(second) => {
+                    let _ = std::fs::remove_dir_all(&made);
+                    return Err(format!(
+                        "cannot make a socket in {} ({first}) nor a link there to one \
+                         in {} ({second})",
+                        dir.display(),
+                        made.display()
+                    ));
+                }
+            }
+        }
+    };
+    let bound = Bound {
+        socket,
+        link,
+        fallback,
+    };
+    // Between the bind and this the socket has the umask's mode, which is
+    // why it is only ever made inside a 0700 directory: the profile, or
+    // the fallback `mkdtemp` made. On a Mac the socket's own mode is not
+    // consulted by `connect` at all, and the directory is the whole of
+    // the access control there — which it is here too, in the end.
+    let socket_file = bound
+        .fallback
+        .as_ref()
+        .map_or(bound.link.clone(), |made| made.join("sock"));
+    std::fs::set_permissions(&socket_file, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("cannot make {} private: {e}", socket_file.display()))?;
+    bound
+        .socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("cannot listen on {}: {e}", bound.link.display()))?;
+    Ok(bound)
+}
+
 /// Remove what is at the socket's path, and the fallback directory a link
-/// there points into if it is one this program made: what a crash left.
-fn clear(link: &Path) {
+/// there points into if it is one this program made with `prefix`: what a
+/// crash left.
+fn clear(link: &Path, prefix: &str) {
     if let Ok(target) = std::fs::read_link(link) {
         if let Some(dir) = target.parent() {
             let ours = dir
                 .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(FALLBACK_PREFIX));
+                .is_some_and(|name| name.to_string_lossy().starts_with(prefix));
             if ours && dir.starts_with(std::env::temp_dir()) {
                 let _ = std::fs::remove_dir_all(dir);
             }

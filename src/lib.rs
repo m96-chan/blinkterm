@@ -151,6 +151,7 @@ pub mod identity;
 pub mod inflate;
 pub mod input;
 pub mod install;
+pub mod ipc;
 pub mod jpeg;
 pub mod json;
 pub mod keys;
