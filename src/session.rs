@@ -75,12 +75,16 @@
 //! # Knowing that the last run did not quit
 //!
 //! The first line is the marker: `# blinkterm session: open` while a run has
-//! the profile, `# blinkterm session: closed` once it has quit. A run that
-//! ends by a quit — `ctrl+q`, the last tab closing, a `SIGTERM` or a `SIGHUP`
-//! — writes `closed` ([`Session::finish`]), and marks its window's group
-//! closed with it; every other ending leaves `open` and the group `live`: a
-//! panic (nothing runs under `panic = "abort"`, and nothing needs to — the
-//! file is already right), a `SIGKILL`, the engine dying. So the next start
+//! the profile, `# blinkterm session: closed` once it has quit. A window
+//! that ends by a quit — `ctrl+q`, its last tab closing — marks its group
+//! closed ([`Session::window_closed`]), and so does a backend stopped by a
+//! `SIGTERM` or a `SIGHUP` for the windows it still has ([`Session::finish`]).
+//! A window whose own terminal goes — a `SIGHUP` to its frontend, its input
+//! ending, its frontend vanishing — has not quit, and its group is marked
+//! lost ([`Session::window_lost`]). Every other ending leaves `open` and the
+//! group `live`: a panic (nothing runs under `panic = "abort"`, and nothing
+//! needs to — the file is already right), a `SIGKILL`, the engine dying.
+//! So the next start
 //! reads a lost group and offers the tabs back ([`plan_for_window`],
 //! [`Offer`]). The header stays `open` while any group in the file would be
 //! offered, so that an older blinkterm reading it offers it too. There is no
