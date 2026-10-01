@@ -121,6 +121,15 @@ use crate::profile::Profile;
 /// it does not exit on `Browser.close`, so a kept profile is never flushed.
 /// Measured against a `content_shell` build and against Debian's 153 in CI.
 /// It still renders a page, so it stays on the list, behind anything better.
+///
+/// Before any of them, but after every engine somebody named, comes the one
+/// `blinkterm --install-engine` unpacked, [`crate::install::installed_engine`]:
+/// the pinned `chrome-headless-shell`, and only that version. Before `PATH`
+/// because installing it was an explicit act, and a `chromium-shell` some
+/// package pulled in must not beat the engine the person just asked for;
+/// only the pinned version because what is installed is what was tested, so
+/// a blinkterm upgraded past it stops finding it and says how to fetch the
+/// new one.
 pub const CANDIDATES: [&str; 5] = [
     "chrome-headless-shell",
     "chromium",
@@ -133,11 +142,13 @@ pub const CANDIDATES: [&str; 5] = [
 /// where a browser is: an app bundle's executable, looked at after
 /// [`CANDIDATES`] and in this order. `~` is `$HOME`.
 ///
-/// Chrome for Testing's `chrome-headless-shell` is not here because it has
-/// no fixed home — it is a zip the person unpacks where they like — and a
-/// guess at a Puppeteer or Playwright cache would be a guess at a version
-/// number. It is found on `PATH` or named with `$BLINKTERM_ENGINE`, as on
-/// Linux.
+/// Chrome for Testing's `chrome-headless-shell` is not here. Unpacked by
+/// hand it has no fixed home — it is a zip the person unpacks where they
+/// like — and a guess at a Puppeteer or Playwright cache would be a guess at
+/// a version number. Unpacked by `--install-engine` it has one,
+/// [`crate::install::executable_in`], which is looked at before `PATH`, not
+/// here after it. Otherwise it is found on `PATH` or named with
+/// `$BLINKTERM_ENGINE`, as on Linux.
 #[cfg(target_os = "macos")]
 pub const BUNDLES: [&str; 4] = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -516,17 +527,30 @@ fn named_engine(path: &Path, source: &str) -> Result<PathBuf, String> {
     ))
 }
 
-/// The `PATH` search over [`CANDIDATES`], and on a Mac then the app
-/// bundles in [`BUNDLES`].
+/// The engine `--install-engine` put in place, then the `PATH` search over
+/// [`CANDIDATES`], and on a Mac then the app bundles in [`BUNDLES`].
 fn search_candidates() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    search_candidates_in(std::env::var_os("PATH").as_deref(), home.as_deref())
+    let installed = crate::install::installed_engine();
+    search_candidates_in(
+        std::env::var_os("PATH").as_deref(),
+        home.as_deref(),
+        installed.as_deref(),
+    )
 }
 
-/// [`search_candidates`] with `PATH` and `HOME` given rather than read, so
-/// that a test can point them at a scratch directory without changing the
-/// environment every other test in the process is spawning shells with.
-fn search_candidates_in(path: Option<&OsStr>, home: Option<&Path>) -> Result<PathBuf, String> {
+/// [`search_candidates`] with `PATH`, `HOME` and the installed engine given
+/// rather than read, so that a test can point them at a scratch directory
+/// without changing the environment every other test in the process is
+/// spawning shells with.
+fn search_candidates_in(
+    path: Option<&OsStr>,
+    home: Option<&Path>,
+    installed: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(engine) = installed.filter(|engine| is_executable(engine)) {
+        return Ok(engine.to_path_buf());
+    }
     for candidate in CANDIDATES {
         if let Some(found) = search_path_in(candidate, path) {
             return Ok(found);
@@ -543,7 +567,8 @@ fn search_candidates_in(path: Option<&OsStr>, home: Option<&Path>) -> Result<Pat
         Err(format!(
             "no browser engine on PATH: looked for {}; nor an app under \
              /Applications or ~/Applications (Google Chrome, Chromium); \
-             set {ENGINE_ENV} to one",
+             set {ENGINE_ENV} to one; or run blinkterm --install-engine to \
+             fetch the tested chrome-headless-shell",
             CANDIDATES.join(", ")
         ))
     }
@@ -552,13 +577,15 @@ fn search_candidates_in(path: Option<&OsStr>, home: Option<&Path>) -> Result<Pat
         // Only a Mac keeps browsers in the home directory's `Applications`.
         let _ = home;
         Err(format!(
-            "no browser engine on PATH: looked for {}; set {ENGINE_ENV} to one",
+            "no browser engine on PATH: looked for {}; set {ENGINE_ENV} to one; \
+             or run blinkterm --install-engine to fetch the tested \
+             chrome-headless-shell",
             CANDIDATES.join(", ")
         ))
     }
 }
 
-fn search_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn search_path(name: &str) -> Option<PathBuf> {
     search_path_in(name, std::env::var_os("PATH").as_deref())
 }
 
@@ -572,7 +599,7 @@ fn search_path_in(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
@@ -1400,7 +1427,7 @@ mod tests {
         let empty = OsStr::new("");
         // Unless this Mac has a Chrome in /Applications, which is looked at
         // first and is as good an answer, the one in the home directory is it.
-        let found = search_candidates_in(Some(empty), Some(&home)).expect("a bundle");
+        let found = search_candidates_in(Some(empty), Some(&home), None).expect("a bundle");
         assert!(
             found == bundle || found.starts_with("/Applications/"),
             "{}",
@@ -1409,7 +1436,7 @@ mod tests {
 
         let bin = scratch.join("bin");
         executable(&bin.join("chromium"));
-        let found = search_candidates_in(Some(bin.as_os_str()), Some(&home)).expect("found");
+        let found = search_candidates_in(Some(bin.as_os_str()), Some(&home), None).expect("found");
         assert_eq!(found, bin.join("chromium"), "PATH comes before any bundle");
         std::fs::remove_dir_all(&scratch).ok();
     }
@@ -1419,10 +1446,44 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn with_nothing_on_path_the_search_says_what_it_looked_for() {
-        let failed = search_candidates_in(Some(OsStr::new("")), Some(Path::new("/nonexistent")))
-            .expect_err("nothing to find");
+        let failed = search_candidates_in(
+            Some(OsStr::new("")),
+            Some(Path::new("/nonexistent")),
+            Some(Path::new("/nonexistent/chrome-headless-shell")),
+        )
+        .expect_err("nothing to find");
         assert!(failed.contains("chrome-headless-shell"), "{failed}");
         assert!(failed.contains(ENGINE_ENV), "{failed}");
+        assert!(failed.contains("--install-engine"), "{failed}");
+    }
+
+    #[test]
+    fn an_installed_engine_is_taken_before_path_and_a_missing_one_is_passed_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch =
+            std::env::temp_dir().join(format!("blinkterm-installed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let executable = |path: &Path| {
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+            std::fs::write(path, "#!/bin/sh\n").expect("a script");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        };
+        let bin = scratch.join("bin");
+        executable(&bin.join("chromium"));
+        let installed = scratch.join("engine/1/chrome-headless-shell-x/chrome-headless-shell");
+        executable(&installed);
+        let home = scratch.join("home");
+
+        let found = search_candidates_in(Some(bin.as_os_str()), Some(&home), Some(&installed))
+            .expect("found");
+        assert_eq!(found, installed, "the installed engine comes before PATH");
+
+        let gone = scratch.join("engine/2/chrome-headless-shell-x/chrome-headless-shell");
+        let found =
+            search_candidates_in(Some(bin.as_os_str()), Some(&home), Some(&gone)).expect("found");
+        assert_eq!(found, bin.join("chromium"), "a missing one is passed over");
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     /// Set the variable, run, put it back. The tests that use it are in one

@@ -167,6 +167,9 @@ pub enum Invocation {
     PrintEngine(Options),
     /// `--doctor`: start the engine and ask the terminal, and stop.
     Doctor(Options, Provenance),
+    /// `--install-engine`: fetch the pinned engine, verified, start it once,
+    /// and stop. Command line only. See [`crate::install`].
+    InstallEngine(Options),
     Run(Options),
 }
 
@@ -188,14 +191,16 @@ pub struct Provenance {
     pub keymap_from: Option<&'static str>,
 }
 
-/// `--help`, `--version`, `--print-engine` or `--doctor`: the command-line
-/// switches that are not settings but say what this run is for.
+/// `--help`, `--version`, `--print-engine`, `--doctor` or
+/// `--install-engine`: the command-line switches that are not settings but
+/// say what this run is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum What {
     Help,
     Version,
     PrintEngine,
     Doctor,
+    InstallEngine,
 }
 
 /// `--config <path>` or `--no-config`.
@@ -664,6 +669,7 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             "--no-config" => config_choice(&mut s, ConfigChoice::None)?,
             "--print-engine" => what(&mut s, What::PrintEngine)?,
             "--doctor" => what(&mut s, What::Doctor)?,
+            "--install-engine" => what(&mut s, What::InstallEngine)?,
             "--remote" => once(&mut s.remote, true, "--remote once is enough")?,
             _ if arg.starts_with('-') && arg.len() > 1 => {
                 return Err(format!("unknown option: {arg}"));
@@ -705,22 +711,28 @@ fn config_choice(s: &mut Settings, choice: ConfigChoice) -> Result<(), String> {
     }
 }
 
-/// `--print-engine` or `--doctor`, one of them once.
+/// `--print-engine`, `--doctor` or `--install-engine`, one of them once.
 fn what(s: &mut Settings, what: What) -> Result<(), String> {
     match s.what {
         None => {
             s.what = Some(what);
             Ok(())
         }
-        Some(already) if already == what => Err(format!(
-            "{} once is enough",
-            if what == What::Doctor {
-                "--doctor"
-            } else {
-                "--print-engine"
-            }
-        )),
-        Some(_) => Err("--print-engine or --doctor, not both".to_string()),
+        Some(already) if already == what => Err(format!("{} once is enough", name(what))),
+        Some(_) => {
+            Err("one of --print-engine, --doctor and --install-engine at a time".to_string())
+        }
+    }
+}
+
+/// The switch that says `what`, for a sentence.
+fn name(what: What) -> &'static str {
+    match what {
+        What::Help => "--help",
+        What::Version => "--version",
+        What::PrintEngine => "--print-engine",
+        What::Doctor => "--doctor",
+        What::InstallEngine => "--install-engine",
     }
 }
 
@@ -820,6 +832,13 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
                 "unknown setting \"url\"; the page to open goes on the command line, or in home"
                     .to_string(),
             ));
+        }
+        if matches!(key, "print-engine" | "doctor" | "install-engine") {
+            // A file that fetched an engine, or stopped every run to report
+            // on one, is not a setting anybody meant to keep.
+            return Err(at(format!(
+                "unknown setting {key:?}; --{key} is asked on the command line, once"
+            )));
         }
         let Some(&key) = KEYS.iter().find(|known| **known == key) else {
             return Err(at(format!(
@@ -1144,6 +1163,7 @@ pub fn invocation(args: &[String]) -> Result<Invocation, String> {
     Ok(match what {
         Some(What::PrintEngine) => Invocation::PrintEngine(options),
         Some(What::Doctor) => Invocation::Doctor(options, provenance),
+        Some(What::InstallEngine) => Invocation::InstallEngine(options),
         _ => Invocation::Run(options),
     })
 }
@@ -1749,7 +1769,37 @@ mod tests {
         );
         assert_eq!(
             parsed(&["--doctor", "--print-engine"]),
-            Err("--print-engine or --doctor, not both".to_string())
+            Err("one of --print-engine, --doctor and --install-engine at a time".to_string())
+        );
+        assert_eq!(
+            parsed(&["--doctor", "--doctor"]),
+            Err("--doctor once is enough".to_string())
+        );
+    }
+
+    #[test]
+    fn install_engine_is_a_command_line_question_and_never_a_setting() {
+        assert_eq!(
+            parsed(&["--install-engine"]).map(|s| s.what),
+            Ok(Some(What::InstallEngine))
+        );
+        assert_eq!(
+            parsed(&["--install-engine", "--doctor"]),
+            Err("one of --print-engine, --doctor and --install-engine at a time".to_string())
+        );
+        assert_eq!(
+            parsed(&["--install-engine", "--install-engine"]),
+            Err("--install-engine once is enough".to_string())
+        );
+        assert_eq!(
+            parsed(&["--install-engine=yes"]),
+            Err("unknown option: --install-engine=yes".to_string())
+        );
+        assert_eq!(
+            file("install-engine = true"),
+            Err("/c:1: unknown setting \"install-engine\"; \
+                 --install-engine is asked on the command line, once"
+                .to_string())
         );
     }
 
