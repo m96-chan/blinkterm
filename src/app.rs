@@ -4200,12 +4200,17 @@ fn handle_page_events(
                         // Every frame is told to the policy, even though only
                         // the last will be painted. Frames are coalesced here
                         // because a pane cannot draw sixty a second; the count
-                        // in a still's window is not, because one frame there
-                        // is the still photographing itself and two are the
-                        // page moving — see [`motion::SHUTTER_FRAMES`] — and a
+                        // in a still's window is not, because a new picture
+                        // there may be newer than the still and more than
+                        // [`motion::SHUTTER_FRAMES`] are the page moving, and a
                         // pass that happened to collect two must not look like
-                        // a pass that collected one.
-                        if !chrome.motion.motion_frame(stamp, Instant::now()) {
+                        // a pass that collected one. What the frame shows is
+                        // told too, as it came: a frame that repeats the one
+                        // before it is the still photographing itself, not
+                        // the page (see "The picture, not the clock" in
+                        // [`motion`]).
+                        let picture = motion::Picture::of(data.as_bytes());
+                        if !chrome.motion.motion_frame(stamp, picture, Instant::now()) {
                             continue;
                         }
                         match crate::base64::decode(data.as_bytes()) {
@@ -4679,10 +4684,11 @@ fn rest_shot(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> R
 /// Take the reply to the still, if it has come back.
 ///
 /// Called after the page's events have been drained, so that a frame which
-/// arrived on the same pass as the reply has already been counted against it —
-/// which matters, because the count is the rule: one frame in the window is
-/// the still photographing itself and more than one is the page moving. See
-/// [`motion::SHUTTER_FRAMES`].
+/// arrived on the same pass as the reply has already been counted against it:
+/// more than [`motion::SHUTTER_FRAMES`] new pictures while it was out are the
+/// page moving, and the still is not worth decoding. A frame read after the
+/// reply is not lost either way — see "The picture, not the clock" in
+/// [`motion`].
 fn collect_still(
     pane: &mut Pane,
     tabs: &mut Tabs<Client>,
@@ -4817,13 +4823,17 @@ fn request_still(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
     let Some(tab) = tabs.active_mut() else {
         return;
     };
+    // Read before the request goes out, not after: this is the earliest
+    // moment the still can depict, and a frame stamped between the two would
+    // otherwise be taken for older than a still that may not show it.
+    let asked = motion::now_seconds();
     let sent = tab.connection.send(
         "Page.captureScreenshot",
         Json::object(vec![("format", Json::string("png"))]),
     );
     match sent {
         Ok(pending) => {
-            chrome.motion.still_requested(motion::now_seconds());
+            chrome.motion.still_requested(asked);
             chrome.still = Some(Still {
                 target,
                 pending,

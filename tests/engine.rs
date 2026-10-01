@@ -176,46 +176,60 @@ fn prepare(client: &mut Client) {
             ]),
         )
         .expect("the viewport");
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(PAGE))]),
-        )
-        .expect("the page loads");
+    navigate(client, PAGE).expect("the page loads");
     wait_for_title(client, "ready", Duration::from_secs(10));
 }
 
-fn title(client: &mut Client) -> String {
-    client
-        .call_within(
-            "Runtime.evaluate",
-            Json::object(vec![
-                ("expression", Json::string("document.title")),
-                ("returnByValue", Json::Bool(true)),
-            ]),
-            Duration::from_secs(5),
-        )
-        .ok()
-        .and_then(|value| {
-            value
-                .path(&["result", "value"])
-                .and_then(Json::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
-}
-
+/// Wait for the page to call itself `wanted` — and to have finished
+/// loading, in a document that is not one [`navigate`] has left.
+///
+/// A title alone says less than it seems to. A `<title>` is parsed before the
+/// body it heads, so a page of three hundred paragraphs is called by its name
+/// while most of them are still arriving, and a test that went on to count
+/// them counted 31 of 300 on the shared macOS VM. And the document being left
+/// keeps its title until the next one replaces it, so a second navigation to
+/// a page of the same name found its title at once, in the old document, and
+/// set the test's timer going there. `readyState` settles the first, and the
+/// mark [`navigate`] leaves on the old document the second.
+///
+/// What comes back is the title, or — when it never came — the last title
+/// seen and why that was not enough, which is what an assertion on it then
+/// prints.
 fn wait_for_title(client: &mut Client, wanted: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     let mut last = String::new();
     while Instant::now() < deadline {
-        last = title(client);
-        if last.starts_with(wanted) {
-            return last;
+        let state = evaluate(
+            client,
+            "[!!window.__blinktermLeft, document.readyState, document.title]",
+        );
+        let field = |at: usize| state.as_array().and_then(|all| all.get(at).cloned());
+        let left = field(0).and_then(|it| it.as_bool()).unwrap_or(true);
+        let ready = field(1).and_then(|it| it.as_str().map(str::to_string));
+        let seen = field(2)
+            .and_then(|it| it.as_str().map(str::to_string))
+            .unwrap_or_default();
+        match (left, ready.as_deref()) {
+            (false, Some("complete")) if seen.starts_with(wanted) => return seen,
+            (true, _) => last = format!("{seen} (in the document being left)"),
+            (false, Some(ready)) if seen.starts_with(wanted) => {
+                last = format!("{seen} (but the document is still {ready})")
+            }
+            _ => last = seen,
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     last
+}
+
+/// Go to `url`, marking the document being left first so that
+/// [`wait_for_title`] cannot mistake it for the one arriving.
+fn navigate(client: &mut Client, url: &str) -> Result<Json, String> {
+    evaluate(client, "window.__blinktermLeft = true");
+    client.call(
+        "Page.navigate",
+        Json::object(vec![("url", Json::string(url))]),
+    )
 }
 
 fn a_terminal(dir: &std::path::Path) -> tos_term::Terminal {
@@ -649,12 +663,7 @@ fn form(client: &mut Client) {
     client
         .call("Page.enable", Json::empty())
         .expect("Page.enable");
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(FORM))]),
-        )
-        .expect("the page loads");
+    navigate(client, FORM).expect("the page loads");
     assert_eq!(
         wait_for_title(client, "ready", Duration::from_secs(10)),
         "ready"
@@ -954,13 +963,7 @@ fn two_tabs() -> Option<(Engine, Client, Tabs<Client>)> {
             .call("Page.enable", Json::empty())
             .expect("Page.enable");
         viewport(&mut first.connection);
-        first
-            .connection
-            .call(
-                "Page.navigate",
-                Json::object(vec![("url", Json::string(&base))]),
-            )
-            .expect("the page loads");
+        navigate(&mut first.connection, &base).expect("the page loads");
         assert_eq!(
             wait_for_title(&mut first.connection, "first", Duration::from_secs(10)),
             "first"
@@ -1169,13 +1172,7 @@ fn a_middle_click_and_a_ctrl_click_on_a_link_open_a_tab_behind_the_one_in_front(
             .call("Page.enable", Json::empty())
             .expect("Page.enable");
         viewport(&mut first.connection);
-        first
-            .connection
-            .call(
-                "Page.navigate",
-                Json::object(vec![("url", Json::string(format!("{base}opens")))]),
-            )
-            .expect("the page loads");
+        navigate(&mut first.connection, &format!("{base}opens")).expect("the page loads");
         assert_eq!(
             wait_for_title(&mut first.connection, "opens", Duration::from_secs(10)),
             "opens"
@@ -1480,12 +1477,7 @@ fn a_tab_this_program_opens_is_reachable_and_counted_once() {
     tab.connection
         .call("Page.enable", Json::empty())
         .expect("Page.enable");
-    tab.connection
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(&base))]),
-        )
-        .expect("it navigates");
+    navigate(&mut tab.connection, &base).expect("it navigates");
     assert_eq!(
         wait_for_title(&mut tab.connection, "first", Duration::from_secs(10)),
         "first"
@@ -2094,12 +2086,7 @@ fn article(client: &mut Client, width: u32, height: u32) {
             ]),
         )
         .expect("a pane-sized viewport");
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(ARTICLE))]),
-        )
-        .expect("the article loads");
+    navigate(client, ARTICLE).expect("the article loads");
     assert_eq!(
         wait_for_title(client, "article", Duration::from_secs(15)),
         "article"
@@ -2399,13 +2386,19 @@ fn raw_pixels_cost_the_terminal_a_fraction_of_what_a_png_frame_did() {
     // browser, whichever format the engine is fast enough to manage.
     //
     // 20 on macOS: the hosted arm64 runner measured 24.1 once (#46), and a
-    // browser at 20 frames a second is still one.
+    // browser at 20 frames a second is still one. A frame rate is the
+    // machine's as much as the program's, though, and with other work on the
+    // same cores it came to 13 here — so on the shared macOS VM it is printed
+    // and not asserted. The terminal's share above is a ratio of two costs on
+    // the same machine, and stays.
     let floor = if cfg!(target_os = "macos") {
         20.0
     } else {
         25.0
     };
-    assert!(after_fps > floor, "only {after_fps:.1} fps end to end");
+    if !skip_timing_on_shared_runner("the end-to-end frame rate") {
+        assert!(after_fps > floor, "only {after_fps:.1} fps end to end");
+    }
 
     painter.clean_up();
     std::fs::remove_dir_all(&before_dir).ok();
@@ -2441,7 +2434,7 @@ fn scroll_y(client: &mut Client) -> f64 {
 /// `Page.screencastFrame` carries `metadata.scrollOffsetY`, which is the
 /// number the whole of this section is about: it is what the person sees move.
 /// Acknowledges everything it takes, as the program does.
-fn take_offsets(client: &mut Client) -> Vec<(f64, Option<f64>)> {
+fn take_offsets(client: &mut Client) -> Vec<(f64, Option<f64>, motion::Picture)> {
     let mut frames = Vec::new();
     for event in client.events() {
         if event.method != "Page.screencastFrame" {
@@ -2464,7 +2457,17 @@ fn take_offsets(client: &mut Client) -> Vec<(f64, Option<f64>)> {
             .params
             .path(&["metadata", "timestamp"])
             .and_then(Json::as_f64);
-        frames.push((offset, stamp));
+        // What the frame shows, from its bytes as they came, which is what
+        // the program tells the policy.
+        let picture = motion::Picture::of(
+            event
+                .params
+                .get("data")
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        frames.push((offset, stamp, picture));
     }
     frames
 }
@@ -2701,9 +2704,9 @@ fn roll(client: &mut Client, notches: u32, apart: Duration) -> Roll {
         if let Some(when) = wheel.activity() {
             rest.input(when);
         }
-        for (offset, stamp) in take_offsets(client) {
+        for (offset, stamp, picture) in take_offsets(client) {
             let seen = Instant::now();
-            rest.motion_frame(stamp, seen);
+            rest.motion_frame(stamp, picture, seen);
             roll.frames.push((offset - was, seen));
             was = offset;
         }
@@ -2770,10 +2773,15 @@ const EVERY: Duration = Duration::from_millis(50);
 const STEADY: u32 = 6;
 const STEADILY: Duration = Duration::from_millis(100);
 
+/// One still of [`shutter_rounds`]: when it was asked for, when its reply
+/// was taken, and every frame it provoked — its stamp, and whether it showed
+/// the same picture as the frame before it.
+type ShutterRound = (f64, f64, Vec<(f64, bool)>);
+
 /// Stills of a page nobody is touching, at a device scale of `scale`: for
 /// each, when it was asked for, when its reply was taken, and the stamps of
 /// every screencast frame it provoked, in wall-clock seconds.
-fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<(f64, f64, Vec<f64>)> {
+fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<ShutterRound> {
     prepare(client);
     article(client, WIDE, TALL);
     client
@@ -2797,8 +2805,11 @@ fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<(f64, f64, Vec<f64>)> 
     // Let the load's own frames go by, and check that a page nobody is
     // touching then produces none of its own.
     let settle = Instant::now() + Duration::from_secs(2);
+    let mut last = None;
     while Instant::now() < settle {
-        take_frames(client);
+        if let Some((bytes, _)) = take_frames(client).pop() {
+            last = Some(motion::Picture::of(&bytes));
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut idle = 0usize;
@@ -2828,11 +2839,19 @@ fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<(f64, f64, Vec<f64>)> 
             "a still with no picture in it"
         );
         // Everything the screenshot provoked, including anything that was
-        // already queued when the reply was taken.
+        // already queued when the reply was taken, and whether each showed
+        // the same picture as the frame before it — see "The picture, not
+        // the clock" in `motion`.
         let mut stamps = Vec::new();
         let until = Instant::now() + Duration::from_millis(600);
         while Instant::now() < until {
-            stamps.extend(take_frames(client).into_iter().filter_map(|(_, at)| at));
+            for (bytes, at) in take_frames(client) {
+                let picture = motion::Picture::of(&bytes);
+                let repeat = last.replace(picture) == Some(picture);
+                if let Some(at) = at {
+                    stamps.push((at, repeat));
+                }
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
         eprintln!(
@@ -2841,7 +2860,11 @@ fn shutter_rounds(client: &mut Client, scale: f64) -> Vec<(f64, f64, Vec<f64>)> 
             stamps.len(),
             stamps
                 .iter()
-                .map(|at| format!("{:+.0}", (at - requested) * 1000.0))
+                .map(|(at, repeat)| format!(
+                    "{:+.0}{}",
+                    (at - requested) * 1000.0,
+                    if *repeat { "" } else { " new" }
+                ))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
@@ -2873,11 +2896,14 @@ fn a_still_photographs_itself_into_the_screencast_exactly_once() {
     let timed = !skip_timing_on_shared_runner("the shutter frame's stamp");
     for (requested, replied, stamps) in shutter_rounds(&mut client, 1.0) {
         assert_eq!(stamps.len(), 1, "a still provoked {} frames", stamps.len());
-        // And it is stamped inside the still's own window, which is what
-        // makes crediting the still with its reply enough to keep it off the
-        // screen.
+        let (stamp, repeat) = stamps[0];
+        // It shows, byte for byte, the frame before it, which is what the
+        // policy tells it from the page by: were it not so, every rest at
+        // scale 1 would cost two stills rather than one.
+        assert!(repeat, "the shutter frame is a new picture");
+        // And it is stamped inside the still's own window.
         assert!(
-            !timed || (stamps[0] >= requested && stamps[0] <= replied),
+            !timed || (stamp >= requested && stamp <= replied),
             "the shutter frame is stamped outside the still it belongs to"
         );
     }
@@ -2904,7 +2930,7 @@ fn at_scale_two_a_still_photographs_itself_at_most_twice_and_within_its_window()
             stamps.len()
         );
         let took = (replied - requested).max(motion::SHUTTER_GRACE.as_secs_f64());
-        for stamp in stamps {
+        for (stamp, _) in stamps {
             assert!(
                 !timed || (stamp >= requested && stamp <= replied + took),
                 "a shutter frame at {:+.0} ms, past the window",
@@ -2922,27 +2948,53 @@ const LATE_BOX: &str = "setTimeout(function(){var d=document.createElement('div'
 d.style.cssText='position:absolute;z-index:9;left:200px;top:100px;width:80px;height:50px;background:#000';\
 document.body.appendChild(d)},700)";
 
+/// The same box, 100 ms after it is asked for rather than 700.
+const SOON_BOX: &str = "setTimeout(function(){var d=document.createElement('div');\
+d.style.cssText='position:absolute;z-index:9;left:200px;top:100px;width:80px;height:50px;background:#000';\
+document.body.appendChild(d)},100)";
+
+/// How [`run_the_rest_policy`] treats its first still.
+#[derive(Clone, Copy)]
+enum FirstStill {
+    /// As the program does: its reply is read as soon as it is there.
+    Prompt,
+    /// [`SOON_BOX`] is set off as it goes out, and then nothing at all is
+    /// read for as long as given — the shared macOS VM descheduling the
+    /// loop, or a still at scale 2 taking that long — after which the reply
+    /// is read before the frames that came meanwhile. The page changes while
+    /// the still is out, after it was taken.
+    Slow(Duration),
+}
+
 /// The program's loop, cut down to what paints: frames told to the policy
 /// and painted when it says so, stills asked for when it says so and
-/// painted when it says so. What it returns is what the pane ends on — the
-/// last still, if the last thing painted was a still — and how many stills
-/// were asked for in the last `tail` of the run.
+/// painted when it says so. A reply is read before the frames of the same
+/// pass, the order that makes the policy's job the hardest.
+///
+/// It runs for at least `run`, and then until the policy has been at rest
+/// for `tail`, so that a slow machine is given the time it needs rather than
+/// the time a fast one would; a policy that never comes to rest runs until a
+/// deadline. What it returns is what the pane ends on — the last still, if
+/// the last thing painted was a still — and how many stills were asked for
+/// in the last `tail` of the run.
 fn run_the_rest_policy(
     client: &mut Client,
     run: Duration,
     tail: Duration,
+    first: FirstStill,
 ) -> (Option<Vec<u8>>, usize) {
     let started = Instant::now();
+    let give_up = started + run + Duration::from_secs(20);
     let mut rest = Motion::new(started);
     let mut in_flight: Option<Pending> = None;
     let mut on_screen: Option<Vec<u8>> = None;
     let mut asked = Vec::new();
-    while started.elapsed() < run {
+    let mut at_rest_since: Option<Instant> = None;
+    loop {
         let now = Instant::now();
-        for (_, stamp) in take_frames(client) {
-            if rest.motion_frame(stamp, Instant::now()) {
-                on_screen = None;
-            }
+        let settled = at_rest_since.is_some_and(|since| now.duration_since(since) >= tail);
+        if (started.elapsed() >= run && settled) || now >= give_up {
+            break;
         }
         if let Some(pending) = &in_flight {
             if let Some(reply) = client.take_reply(pending) {
@@ -2955,24 +3007,43 @@ fn run_the_rest_policy(
                 }
             }
         }
-        if in_flight.is_none() && rest.wants_still(now) {
+        for (bytes, stamp) in take_frames(client) {
+            let picture = motion::Picture::of(&bytes);
+            let painted = rest.motion_frame(stamp, picture, Instant::now());
+            if painted {
+                on_screen = None;
+            }
+        }
+        if in_flight.is_none() && rest.wants_still(Instant::now()) {
+            // The clock is read before the request, as the program reads it.
+            let at = motion::now_seconds();
             in_flight = Some(ask_for_a_still(client));
-            rest.still_requested(motion::now_seconds());
+            rest.still_requested(at);
             asked.push(started.elapsed());
+            if let (FirstStill::Slow(hold), 1) = (first, asked.len()) {
+                evaluate(client, SOON_BOX);
+                std::thread::sleep(hold);
+                continue;
+            }
+        }
+        if rest.at_rest() {
+            at_rest_since.get_or_insert(Instant::now());
+        } else {
+            at_rest_since = None;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let late = asked.iter().filter(|at| **at + tail >= run).count();
-    eprintln!("stills asked for at {asked:?}");
+    let ran = started.elapsed();
+    let late = asked.iter().filter(|at| **at + tail >= ran).count();
+    eprintln!("stills asked for at {asked:?}, in a run of {ran:?}");
     (on_screen, late)
 }
 
-/// After a load that paints late, at scale 1 and at 2, under forced
-/// transparency: the pane ends on a still, the still shows the late change,
-/// its forced-transparent parts are clear, and once the page is quiet no
-/// more stills are asked for.
-#[test]
-fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
+/// A page that changes once, late, at scale 1 and at 2, under forced
+/// transparency, the policy run over it as the program runs it: the pane
+/// ends on a still, the still shows the late change, its forced-transparent
+/// parts are clear, and once the page is quiet no more stills are asked for.
+fn a_late_change_at_either_scale(first: FirstStill) {
     let Some((mut engine, mut client)) = connect() else {
         return;
     };
@@ -2999,19 +3070,20 @@ fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
             .expect("the scale");
         transparent(&mut client, false);
         cast(&mut client, "jpeg", Some(motion::QUALITY), css.0, css.1);
-        client
-            .call(
-                "Page.navigate",
-                Json::object(vec![("url", Json::string(ARTICLE))]),
-            )
-            .expect("the article loads");
+        navigate(&mut client, ARTICLE).expect("the article loads");
         assert_eq!(
             wait_for_title(&mut client, "article", Duration::from_secs(15)),
             "article"
         );
-        evaluate(&mut client, LATE_BOX);
-        let (still, late) =
-            run_the_rest_policy(&mut client, Duration::from_secs(5), Duration::from_secs(2));
+        if let FirstStill::Prompt = first {
+            evaluate(&mut client, LATE_BOX);
+        }
+        let (still, late) = run_the_rest_policy(
+            &mut client,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            first,
+        );
         let _ = client.call("Page.stopScreencast", Json::empty());
         let png = still.expect("the pane ends on a still, not a moving frame");
         let image = blinkterm::png::decode(&png, 64 << 20).expect("a still decodes");
@@ -3036,6 +3108,23 @@ fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
     }
     client.close();
     engine.kill();
+}
+
+/// After a load that paints late: see [`a_late_change_at_either_scale`].
+#[test]
+fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
+    a_late_change_at_either_scale(FirstStill::Prompt);
+}
+
+/// The same, with the change made while a slow still is out, after it was
+/// taken, and the frame that shows it read only after the still's reply —
+/// which is how the shared macOS VM ended a pane at scale 2 on a still from
+/// before the change, deterministically. The still is newer by the clock of
+/// its reply and older by what it shows; see "The picture, not the clock"
+/// in [`motion`].
+#[test]
+fn a_change_while_a_slow_still_is_out_ends_on_a_still_that_shows_it() {
+    a_late_change_at_either_scale(FirstStill::Slow(Duration::from_millis(700)));
 }
 
 /// One notch is an animation that arrives and stops.
@@ -3403,11 +3492,21 @@ fn nothing_is_kept_for_the_acknowledgements_and_the_wheel() {
     let mut frames = 0usize;
     let mut events = 0usize;
 
-    let until = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < until {
+    // What this needs is a page that was casting — acknowledgements being
+    // sent and answered — not a frame rate, so it runs until enough frames
+    // have come rather than for a fixed three seconds: on the shared macOS
+    // VM three seconds of scrolling once came to 18 frames (#46). The wheel
+    // keeps turning until they have, a flick down and a flick back up, so
+    // that the page has somewhere to go; the deadline is only for an engine
+    // that is not casting at all.
+    const CASTING: usize = 20;
+    let give_up = Instant::now() + Duration::from_secs(30);
+    while (notches < NOTCHES || frames <= CASTING) && Instant::now() < give_up {
         let now = Instant::now();
-        if notches < NOTCHES && now >= next_notch {
-            animator.notch(at, (0.0, blinkterm::app::WHEEL_PIXELS), now);
+        if now >= next_notch {
+            let down = (notches / NOTCHES).is_multiple_of(2);
+            let pixels = blinkterm::app::WHEEL_PIXELS;
+            animator.notch(at, (0.0, if down { pixels } else { -pixels }), now);
             notches += 1;
             next_notch = now + EVERY;
         }
@@ -3422,15 +3521,11 @@ fn nothing_is_kept_for_the_acknowledgements_and_the_wheel() {
     std::thread::sleep(Duration::from_millis(500));
     frames += take_offsets(&mut client).len();
 
-    assert_eq!(notches, NOTCHES, "the notches never all went out");
-    // What this needs is a page that was casting, not a frame rate: on the
-    // shared macOS VM three seconds of scrolling came to 18 frames (#46),
-    // which is casting all the same.
-    let casting = if shared_macos_runner() { 10 } else { 20 };
+    assert!(notches >= NOTCHES, "the notches never all went out");
     assert!(
-        frames > casting,
-        "only {frames} frames in three seconds; the page was not casting, so \
-         this proves nothing about the acknowledgements"
+        frames > CASTING,
+        "only {frames} frames in thirty seconds of scrolling; the page was not \
+         casting, so this proves nothing about the acknowledgements"
     );
     eprintln!(
         "{frames} frames acknowledged and {events} wheel events sent; the \
@@ -4526,12 +4621,7 @@ fn a_page_that_asks(client: &mut Client, url: &str, title: &str) {
     client
         .call("Page.enable", Json::empty())
         .expect("Page.enable");
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(url))]),
-        )
-        .expect("the page loads");
+    navigate(client, url).expect("the page loads");
     assert_eq!(
         wait_for_title(client, title, Duration::from_secs(10)),
         title
@@ -6004,12 +6094,7 @@ fn tall_page(client: &mut Client, height: u32) {
         "data:text/html,<title>tall</title><body style='margin:0'>\
          <div style='height:{height}px;background:linear-gradient(%23c33,%2333c)'></div>"
     );
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(url))]),
-        )
-        .expect("the page loads");
+    navigate(client, &url).expect("the page loads");
     assert_eq!(
         wait_for_title(client, "tall", Duration::from_secs(15)),
         "tall"
@@ -6242,12 +6327,7 @@ fn enter_submits_a_form_and_breaks_a_line_in_a_textarea() {
     client
         .call("Page.enable", Json::empty())
         .expect("Page.enable");
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(page))]),
-        )
-        .expect("the page loads");
+    navigate(&mut client, page).expect("the page loads");
     wait_for_title(&mut client, "ready", Duration::from_secs(10));
 
     let press = |action| KeyInput {
@@ -6385,12 +6465,7 @@ fn finding(url: &str, title: &str) -> Option<(Engine, Client, i64)> {
 
 /// Go to `url` and wait for it to call itself `title`.
 fn open(client: &mut Client, url: &str, title: &str) {
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(url))]),
-        )
-        .expect("the page loads");
+    navigate(client, url).expect("the page loads");
     assert_eq!(
         wait_for_title(client, title, Duration::from_secs(15)),
         title,
@@ -6889,12 +6964,7 @@ fn prepare_at(client: &mut Client, factor: f64) -> blinkterm::zoom::Viewport {
 /// else first, so that the page being left is not taken for it.
 fn go_to(client: &mut Client, url: &str) {
     evaluate(client, "document.title='leaving'");
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(url))]),
-        )
-        .expect("the page loads");
+    navigate(client, url).expect("the page loads");
     assert_eq!(
         wait_for_title(client, "ready", Duration::from_secs(10)),
         "ready"
@@ -9496,12 +9566,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
     // first in front, two opened behind it.
     {
         let tab = tabs.active_mut().expect("the first tab");
-        tab.connection
-            .call(
-                "Page.navigate",
-                Json::object(vec![("url", Json::string(&base))]),
-            )
-            .expect("the first page");
+        navigate(&mut tab.connection, &base).expect("the first page");
         assert_eq!(
             wait_for_title(&mut tab.connection, "first", Duration::from_secs(10)),
             "first"
@@ -9621,12 +9686,7 @@ fn an_engine_killed_under_a_session_is_started_again_on_its_profile_with_the_tab
     viewport(&mut tab.connection);
     tab.dormant = false;
     let url = tab.url.clone();
-    tab.connection
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(&url))]),
-        )
-        .expect("the page again");
+    navigate(&mut tab.connection, &url).expect("the page again");
     assert_eq!(
         wait_for_title(&mut tab.connection, "first", Duration::from_secs(10)),
         "first"
@@ -9811,12 +9871,7 @@ fn permission_states(client: &mut Client, names: &[&str]) -> String {
 
 /// Navigate a page's session and wait for the title it should land with.
 fn land_on(client: &mut Client, url: &str, title: &str) {
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(url))]),
-        )
-        .expect("the page loads");
+    navigate(client, url).expect("the page loads");
     assert_eq!(wait_for_title(client, title, CRASH_NOTICE), title, "{url}");
 }
 
@@ -10511,12 +10566,7 @@ fn a_page_is_told_chromium_and_this_program_and_nothing_headless() {
     client
         .call("Page.enable", Json::empty())
         .expect("Page.enable");
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(format!("{base}plain")))]),
-        )
-        .expect("the page loads");
+    navigate(&mut client, &format!("{base}plain")).expect("the page loads");
     wait_for_title(&mut client, "plain", Duration::from_secs(10));
     let agent = evaluate(&mut client, "navigator.userAgent");
     let agent = agent.as_str().expect("a user agent");
@@ -10759,12 +10809,7 @@ fn booted_with(blocker: Option<&Arc<Blocker>>, console: Option<&Arc<Recorder>>) 
 
 /// Navigate and wait for the page's title to start with `wanted`.
 fn load_titled(client: &mut Client, url: &str, wanted: &str) -> String {
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(url))]),
-        )
-        .expect("the navigation is answered");
+    navigate(client, url).expect("the navigation is answered");
     wait_for_title(client, wanted, Duration::from_secs(20))
 }
 
@@ -11552,12 +11597,7 @@ fn a_site_script_runs_at_document_start_in_a_world_the_page_cannot_see_unless_it
     let base = serve_site_pages();
 
     evaluate(&mut client, "document.title='leaving'");
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(format!("{base}/sites")))]),
-        )
-        .expect("the page loads");
+    navigate(&mut client, &format!("{base}/sites")).expect("the page loads");
     assert_eq!(
         wait_for_title(&mut client, "ready ", Duration::from_secs(10)),
         "ready yesundefined2 abc",
@@ -12330,12 +12370,7 @@ fn a_page_that_logs_throws_and_404s_an_image_fills_the_console_with_one_entry_ea
     let broken = format!("{base}/404");
     let refused = format!("http://127.0.0.1:{closed}/x.png");
     let page = format!("{base}/console");
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(&page))]),
-        )
-        .expect("the page loads");
+    navigate(&mut client, &page).expect("the page loads");
     assert_eq!(
         wait_for_title(&mut client, "done", Duration::from_secs(10)),
         "done"
@@ -12500,12 +12535,7 @@ var t0=performance.now();for(var j=0;j<200;j++){console.log(big)}\
 var took=Math.round(performance.now()-t0);\
 setTimeout(function(){document.title='seen ['+seen+'] '+took+' ms'},200)</script>";
     let look = |client: &mut Client| {
-        client
-            .call(
-                "Page.navigate",
-                Json::object(vec![("url", Json::string(page))]),
-            )
-            .expect("the page loads");
+        navigate(client, page).expect("the page loads");
         wait_for_title(client, "seen", Duration::from_secs(10))
     };
     let off = look(&mut client);
@@ -12546,12 +12576,7 @@ fn a_console_message_with_an_escape_sequence_cannot_reach_the_terminal() {
     let page = "data:text/html,<title>start</title><script>\
 console.log(String.fromCharCode(27)+']0;pwned'+String.fromCharCode(7)\
 +String.fromCharCode(0x202e)+'moc');document.title='done'</script>";
-    client
-        .call(
-            "Page.navigate",
-            Json::object(vec![("url", Json::string(page))]),
-        )
-        .expect("the page loads");
+    navigate(&mut client, page).expect("the page loads");
     wait_for_title(&mut client, "done", Duration::from_secs(10));
     let entries = entries_when(&recorder, &session, 1, Duration::from_secs(3));
     assert_eq!(entries.len(), 1, "{entries:?}");
