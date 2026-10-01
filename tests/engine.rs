@@ -44,7 +44,7 @@ use blinkterm::profile::{Choice, Profile};
 use blinkterm::route::{Payload, Placement, Route, Wrap};
 use blinkterm::scroll::{self, Animator, Dispatch, Step, Wheel};
 use blinkterm::sites::{self, Sites};
-use blinkterm::tabs::{Outcome, Tab, Tabs};
+use blinkterm::tabs::{Change, Outcome, Tab, Tabs};
 
 // tOS's `t=s` reader, the one a real tOS pane installs, copied from
 // `tos-compositor` at `c7677bde` and kept as it is there so that the two can
@@ -8972,7 +8972,7 @@ fn hints_on_about_blank_and_the_error_page_are_none_and_no_exception() {
 // ---------------------------------------------------------------------------
 
 use blinkterm::fit::Metrics;
-use blinkterm::session::{self, Session, Snapshot, State};
+use blinkterm::session::{self, GroupState, Session, Snapshot, State, WindowId};
 
 /// A page that paints every frame, so that a screencast of it is a count.
 /// No `%` and no `#` in it: this is a url, and `#` would start its fragment.
@@ -9341,7 +9341,7 @@ fn an_engine_that_dies_ends_every_session_at_once_and_leaves_the_session_file_op
         active: 1,
     };
     let now = Instant::now();
-    kept.record(two.clone(), now);
+    kept.record_window(WindowId(1), two.clone(), now);
     kept.flush(now).expect("written");
 
     let group = engine.group().expect("a group of its own");
@@ -9365,18 +9365,26 @@ fn an_engine_that_dies_ends_every_session_at_once_and_leaves_the_session_file_op
     let why = engine.check().unwrap_err();
     eprintln!("{why}");
 
-    let saved = Session::load(&dir).saved().cloned().expect("a session");
+    let read = || {
+        Session::parse(&std::fs::read_to_string(dir.join(session::FILE)).expect("the file"))
+            .expect("a session")
+    };
+    let saved = read();
     assert_eq!(saved.state, State::Open, "the run did not quit");
-    assert_eq!(saved.snapshot, two);
+    assert_eq!(saved.groups.len(), 1, "one window");
+    assert_eq!(saved.groups[0].state, GroupState::Lost);
+    assert_eq!(saved.groups[0].snapshot, two);
     kept.finish(false);
+    let saved = read();
     assert_eq!(
-        Session::load(&dir).saved().map(|saved| saved.state),
-        Some(State::Open)
+        (saved.state, saved.groups[0].state),
+        (State::Open, GroupState::Lost)
     );
     kept.finish(true);
+    let saved = read();
     assert_eq!(
-        Session::load(&dir).saved().map(|saved| saved.state),
-        Some(State::Closed)
+        (saved.state, saved.groups[0].state),
+        (State::Closed, GroupState::Closed)
     );
 
     drop(page);
@@ -12737,5 +12745,690 @@ fn the_console_booted_beside_the_blocker_starts_empty_and_hears_what_was_blocked
     assert!(heard.is_empty(), "the mailbox heard {heard:?}");
     drop(tabs);
     drop(browser);
+    engine.kill();
+}
+
+// ---------------------------------------------------------------------------
+// Two engine windows, one engine (#83, step 3)
+
+/// One engine window as these tests drive it: the page target in it, a
+/// session on that page, and the engine's number for the window.
+struct Window {
+    target: String,
+    page: Client,
+    id: i64,
+}
+
+/// An engine with two windows in it, and the browser's connection with target
+/// discovery on: the first window is the one the engine started with, adopted
+/// as `app::run` adopts it, and the second is [`app::create_window_target`]'s.
+///
+/// [`app::create_window_target`]: blinkterm::app::create_window_target
+fn two_windows() -> Option<(Engine, Client, Window, Window)> {
+    let (engine, page, target) = connect_with_target()?;
+    let mut browser = engine.browser().expect("the browser's client");
+    browser
+        .call(
+            "Target.setDiscoverTargets",
+            Json::object(vec![("discover", Json::Bool(true))]),
+        )
+        .expect("discovery");
+    let id = blinkterm::app::window_of_target(&mut browser, &target)
+        .expect("the engine's first page is in a window");
+    let first = Window { target, page, id };
+
+    let target =
+        blinkterm::app::create_window_target(&mut browser, "about:blank").expect("a second window");
+    let page = browser
+        .attach(&target, Duration::from_secs(10))
+        .expect("a session on the second window's page");
+    let id = blinkterm::app::window_of_target(&mut browser, &target)
+        .expect("the second page is in a window");
+    let second = Window { target, page, id };
+    assert_ne!(
+        first.id, second.id,
+        "newWindow put the page in the window that was already there"
+    );
+    eprintln!("windows: {} and {}", first.id, second.id);
+    Some((engine, browser, first, second))
+}
+
+/// Size a window's page, load `url` in it, and wait for `title`.
+fn dress(window: &mut Window, url: &str, title: &str, (width, height): (u32, u32)) {
+    let page = &mut window.page;
+    page.call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    page.call(
+        "Emulation.setDeviceMetricsOverride",
+        Json::object(vec![
+            ("width", Json::number(width)),
+            ("height", Json::number(height)),
+            ("deviceScaleFactor", Json::number(1)),
+            ("mobile", Json::Bool(false)),
+        ]),
+    )
+    .expect("the viewport");
+    navigate(page, url).expect("the page loads");
+    assert_eq!(
+        wait_for_title(page, title, Duration::from_secs(10)),
+        title,
+        "window {} never loaded {url}",
+        window.id
+    );
+}
+
+/// Frames from both windows' screencasts for `within`, each acknowledged as
+/// it is taken, decoded, and checked against the size its window was given.
+fn cast_from_both(
+    first: &mut Window,
+    second: &mut Window,
+    sizes: [(u32, u32); 2],
+    within: Duration,
+) -> [usize; 2] {
+    let mut counts = [0usize; 2];
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        for (at, window) in [&mut *first, &mut *second].into_iter().enumerate() {
+            for (jpeg, _) in take_frames(&mut window.page) {
+                let image =
+                    blinkterm::jpeg::decode(&jpeg, 64 * 1024 * 1024).expect("a frame decodes");
+                assert_eq!(
+                    (image.width, image.height),
+                    sizes[at],
+                    "a frame from window {} at the wrong size",
+                    window.id
+                );
+                counts[at] += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    counts
+}
+
+/// The thing a second terminal needs from the engine before anything else:
+/// two windows' pages cast at the same time, each at the size it was given,
+/// neither starving the other.
+#[test]
+fn two_windows_cast_at_once_each_at_its_own_size() {
+    let Some((mut engine, mut browser, mut first, mut second)) = two_windows() else {
+        return;
+    };
+    let sizes = [(640, 360), (320, 240)];
+    dress(&mut first, PAGE, "ready", sizes[0]);
+    dress(&mut second, PAGE, "ready", sizes[1]);
+    cast(&mut first.page, "jpeg", Some(motion::QUALITY), 640, 360);
+    cast(&mut second.page, "jpeg", Some(motion::QUALITY), 320, 240);
+    // The first frame of each is the one the start paints; past it, both pages
+    // are animating and both should be sending.
+    let _ = cast_from_both(&mut first, &mut second, sizes, Duration::from_millis(300));
+    let [a, b] = cast_from_both(&mut first, &mut second, sizes, Duration::from_secs(1));
+    eprintln!("two windows: {a} and {b} frames in one second");
+    assert!(a >= 10, "the first window cast {a} frames in a second");
+    assert!(b >= 10, "the second window cast {b} frames in a second");
+
+    browser.close();
+    first.page.close();
+    second.page.close();
+    engine.kill();
+}
+
+/// `Target.activateTarget` is what the program says when a tab comes to the
+/// front, and in a desktop browser that is a window coming to the front. Here
+/// it must not be one window taking the frames from the other.
+#[test]
+fn activating_one_windows_target_does_not_stop_the_others_screencast() {
+    let Some((mut engine, mut browser, mut first, mut second)) = two_windows() else {
+        return;
+    };
+    let sizes = [(WIDTH, HEIGHT), (WIDTH, HEIGHT)];
+    dress(&mut first, PAGE, "ready", sizes[0]);
+    dress(&mut second, PAGE, "ready", sizes[1]);
+    cast(
+        &mut first.page,
+        "jpeg",
+        Some(motion::QUALITY),
+        WIDTH,
+        HEIGHT,
+    );
+    cast(
+        &mut second.page,
+        "jpeg",
+        Some(motion::QUALITY),
+        WIDTH,
+        HEIGHT,
+    );
+    let _ = cast_from_both(&mut first, &mut second, sizes, Duration::from_millis(300));
+    let [before, other_before] =
+        cast_from_both(&mut first, &mut second, sizes, Duration::from_secs(1));
+
+    let order = [
+        ("second", second.target.clone()),
+        ("first", first.target.clone()),
+    ];
+    for (name, target) in &order {
+        browser
+            .call(
+                "Target.activateTarget",
+                Json::object(vec![("targetId", Json::string(target))]),
+            )
+            .unwrap_or_else(|why| panic!("activating the {name} window's page: {why}"));
+        let [after, other_after] =
+            cast_from_both(&mut first, &mut second, sizes, Duration::from_secs(1));
+        eprintln!(
+            "activating the {name}: first {before} -> {after}, second {other_before} -> {other_after}"
+        );
+        assert!(
+            after * 2 >= before,
+            "activating the {name} window's page took the first window from {before} to {after} frames a second"
+        );
+        assert!(
+            other_after * 2 >= other_before,
+            "activating the {name} window's page took the second window from {other_before} to {other_after} frames a second"
+        );
+    }
+
+    browser.close();
+    first.page.close();
+    second.page.close();
+    engine.kill();
+}
+
+/// A key sent on one window's session is that window's page's, and the
+/// other page hears nothing — both ways round.
+#[test]
+fn input_to_one_window_reaches_only_its_page() {
+    let Some((mut engine, mut browser, mut first, mut second)) = two_windows() else {
+        return;
+    };
+    dress(&mut first, PAGE, "ready", (WIDTH, HEIGHT));
+    dress(&mut second, PAGE, "ready", (320, 240));
+    let press = |key: char| KeyInput {
+        key: Key::Char(key),
+        mods: Mods::default(),
+        action: KeyAction::Press,
+        text: Some(key),
+    };
+    let title = |window: &mut Window| evaluate(&mut window.page, "document.title");
+
+    first
+        .page
+        .call(
+            "Input.dispatchKeyEvent",
+            keys::dispatch(&press('a')).expect("a key"),
+        )
+        .expect("the key is dispatched");
+    assert_eq!(
+        wait_for_title(&mut first.page, "key ", Duration::from_secs(5)),
+        "key a KeyA 65"
+    );
+    assert_eq!(
+        title(&mut second),
+        Json::string("ready"),
+        "the key went to both"
+    );
+
+    second
+        .page
+        .call(
+            "Input.dispatchKeyEvent",
+            keys::dispatch(&press('b')).expect("a key"),
+        )
+        .expect("the key is dispatched");
+    assert_eq!(
+        wait_for_title(&mut second.page, "key ", Duration::from_secs(5)),
+        "key b KeyB 66"
+    );
+    assert_eq!(
+        title(&mut first),
+        Json::string("key a KeyA 65"),
+        "the second key reached the first window"
+    );
+
+    browser.close();
+    first.page.close();
+    second.page.close();
+    engine.kill();
+}
+
+/// What the browser connection says about pages for `within`, or until what
+/// it has said so far is `enough`.
+fn announced(
+    browser: &mut Client,
+    within: Duration,
+    enough: impl Fn(&[Change]) -> bool,
+) -> Vec<Change> {
+    let deadline = Instant::now() + within;
+    let mut changes = Vec::new();
+    while Instant::now() < deadline {
+        changes.extend(browser.events().iter().filter_map(blinkterm::tabs::change));
+        if enough(&changes) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    changes
+}
+
+/// Click the `target=_blank` link on [`OPENS_PAGE`] in `window`, and say which
+/// target the page it asked for is.
+fn open_a_popup(browser: &mut Client, window: &mut Window) -> String {
+    click_with(&mut window.page, (40, 130), "left", 1, 0);
+    let opener = window.target.clone();
+    let popup_of = |change: &Change| match change {
+        Change::Opened {
+            target,
+            opener: Some(by),
+            ..
+        } if *by == opener => Some(target.clone()),
+        _ => None,
+    };
+    let changes = announced(browser, Duration::from_secs(15), |changes| {
+        changes.iter().any(|change| popup_of(change).is_some())
+    });
+    changes
+        .iter()
+        .find_map(popup_of)
+        .unwrap_or_else(|| panic!("no page named {opener} as its opener: {changes:?}"))
+}
+
+/// Whether `window` is `own`, or a window of its own that neither of the two
+/// is — the two answers the engines give for a page opened from `own`'s page
+/// (see the table in `src/tabs.rs`) — and which, in words.
+fn landed(window: i64, own: i64, other: i64) -> &'static str {
+    assert_ne!(
+        window, other,
+        "a page opened from window {own} landed in window {other}"
+    );
+    if window == own {
+        "its opener's window"
+    } else {
+        "a window of its own"
+    }
+}
+
+/// A page that asks for a window — a `target=_blank` link — names its opener,
+/// and the opener is the window it has to be routed to. Where the engine puts
+/// it differs: Chrome puts it in the opener's window, the headless shell in a
+/// window of its own. Neither puts it in the *other* window, which is the one
+/// thing that would make the engine's word misleading.
+#[test]
+fn a_popup_belongs_to_its_openers_window() {
+    let Some((mut engine, mut browser, mut first, mut second)) = two_windows() else {
+        return;
+    };
+    let base = serve();
+    let opens = format!("{base}opens");
+    dress(&mut first, &opens, "opens", (WIDTH, HEIGHT));
+    dress(&mut second, &opens, "opens", (WIDTH, HEIGHT));
+    let _ = browser.events();
+
+    // `open_a_popup` finds it by its opener, which is the assertion that
+    // matters: `openerId` is the second window's page.
+    let popup = open_a_popup(&mut browser, &mut second);
+    let window =
+        blinkterm::app::window_of_target(&mut browser, &popup).expect("the popup is in a window");
+    eprintln!(
+        "popup: opened from window {}, landed in window {window}: {}",
+        second.id,
+        landed(window, second.id, first.id)
+    );
+
+    browser.close();
+    first.page.close();
+    second.page.close();
+    engine.kill();
+}
+
+/// One message of the few [`PipeOrder`] keeps, in the order the pipe carried
+/// it.
+#[derive(Debug, Clone)]
+struct OnPipe {
+    method: String,
+    session: Option<String>,
+    target: Option<String>,
+    opener: Option<String>,
+    url: Option<String>,
+    disposition: Option<String>,
+}
+
+/// A hook in front of the router ([`blinkterm::cdp::Intercept`]) that writes
+/// down, in pipe order, every page target's announcement and every
+/// `Page.frameRequestedNavigation`, and consumes nothing.
+///
+/// The mailboxes cannot say this: the browser's and each page's are separate
+/// queues, and which of two events in two of them came first is gone by the
+/// time the loop reads either. Which came first is the whole question for the
+/// disposition fallback, because it can only attribute a target whose
+/// disposition is already in hand.
+#[derive(Default)]
+struct PipeOrder(std::sync::Mutex<Vec<OnPipe>>);
+
+impl blinkterm::cdp::Intercept for PipeOrder {
+    fn intercept(&self, message: &Json, _wire: &blinkterm::cdp::Notifier) -> bool {
+        let method = message.get("method").and_then(Json::as_str).unwrap_or("");
+        let field = |path: &[&str]| {
+            message
+                .path(path)
+                .and_then(Json::as_str)
+                .filter(|it| !it.is_empty())
+                .map(str::to_string)
+        };
+        let heard = match method {
+            "Target.targetCreated" | "Target.targetInfoChanged"
+                if field(&["params", "targetInfo", "type"]).as_deref() == Some("page") =>
+            {
+                OnPipe {
+                    method: method.to_string(),
+                    session: None,
+                    target: field(&["params", "targetInfo", "targetId"]),
+                    opener: field(&["params", "targetInfo", "openerId"]),
+                    url: field(&["params", "targetInfo", "url"]),
+                    disposition: None,
+                }
+            }
+            "Page.frameRequestedNavigation" => OnPipe {
+                method: method.to_string(),
+                session: field(&["sessionId"]),
+                target: None,
+                opener: None,
+                url: field(&["params", "url"]),
+                disposition: field(&["params", "disposition"]),
+            },
+            _ => return false,
+        };
+        if let Ok(mut log) = self.0.lock() {
+            log.push(heard);
+        }
+        false
+    }
+}
+
+/// The disposition fallback of the design for #83 (§4.5), run over what the
+/// pipe carried: a `newTab` or `newWindow` disposition on a window's page
+/// session is a pending entry for that window and that url, and an openerless
+/// page target belongs to the one window with a pending entry for the url it
+/// first says it has. A target whose url arrives before any entry for it, or
+/// that two windows are waiting on, is attributed to nobody — which is what
+/// the design closes rather than guesses.
+fn route_by_disposition(
+    log: &[OnPipe],
+    sessions: [&str; 2],
+) -> std::collections::HashMap<String, usize> {
+    let mut pending: Vec<(usize, String)> = Vec::new();
+    let mut openerless = std::collections::HashSet::new();
+    let mut routed = std::collections::HashMap::new();
+    for heard in log {
+        if heard.method == "Page.frameRequestedNavigation" {
+            let window = sessions
+                .iter()
+                .position(|session| heard.session.as_deref() == Some(*session));
+            let opens = matches!(heard.disposition.as_deref(), Some("newTab" | "newWindow"));
+            if let (Some(window), true, Some(url)) = (window, opens, &heard.url) {
+                pending.push((window, url.clone()));
+            }
+            continue;
+        }
+        let Some(target) = &heard.target else {
+            continue;
+        };
+        if heard.method == "Target.targetCreated" && heard.opener.is_none() {
+            openerless.insert(target.clone());
+        }
+        if !openerless.contains(target) || routed.contains_key(target) {
+            continue;
+        }
+        let Some(url) = &heard.url else {
+            continue;
+        };
+        let waiting: Vec<usize> = pending
+            .iter()
+            .filter(|(_, wanted)| wanted == url)
+            .map(|(window, _)| *window)
+            .collect();
+        if let [window] = waiting[..] {
+            routed.insert(target.clone(), window);
+            pending.retain(|(_, wanted)| wanted != url);
+        }
+    }
+    routed
+}
+
+/// The hard case: a link the person middle-clicked names no opener (see
+/// `src/tabs.rs`), so when two windows each have one clicked at once the
+/// opener cannot say which window a new page is for.
+///
+/// `Browser.getWindowForTarget` cannot either, in the engine this program
+/// ships with: the headless shell gives *every* target a window of its own, so
+/// the new page's window is neither of the two (Chrome puts it in the clicking
+/// window). What does attribute it, in both, is the disposition: the opener's
+/// own session says `newTab` with the url, and says it on the pipe before the
+/// browser's connection gives the new target that url. That is asserted here
+/// by running the routing over the pipe's own order.
+#[test]
+fn an_openerless_target_belongs_to_the_window_it_was_clicked_in() {
+    let Some((mut engine, mut browser, mut first, mut second)) = two_windows() else {
+        return;
+    };
+    let order = Arc::new(PipeOrder::default());
+    engine.intercept(Some(order.clone()));
+    let base = serve();
+    let opens = format!("{base}opens");
+    dress(&mut first, &opens, "opens", (WIDTH, HEIGHT));
+    dress(&mut second, &opens, "opens", (WIDTH, HEIGHT));
+    // The same link in both, pointing at two addresses, so that each new page
+    // says by its url which click it was.
+    for (window, name) in [(&mut first, "a"), (&mut second, "b")] {
+        evaluate(
+            &mut window.page,
+            &format!("document.querySelector('a').href='/plain?from={name}'"),
+        );
+    }
+    let _ = browser.events();
+
+    let started = Instant::now();
+    click_with(&mut first.page, (40, 30), "middle", 4, 0);
+    click_with(&mut second.page, (40, 30), "middle", 4, 0);
+    // Within one moment, so that "the window clicked last" could not tell
+    // them apart. Not held on the shared macOS VM, which can stop the whole
+    // guest for longer than this (see `shared_macos_runner`); what the test
+    // is about holds however far apart they were.
+    let apart = started.elapsed();
+    eprintln!("openerless: the two clicks took {apart:?}");
+    assert!(
+        apart < Duration::from_millis(100) || shared_macos_runner(),
+        "the clicks took {apart:?}"
+    );
+
+    // Both new pages, told apart by address.
+    let mut found: [Option<(String, Option<String>)>; 2] = [None, None];
+    let mut openers = std::collections::HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while found.iter().any(Option::is_none) && Instant::now() < deadline {
+        for change in announced(&mut browser, Duration::from_millis(200), |_| false) {
+            match change {
+                Change::Opened { target, opener, .. } => {
+                    openers.insert(target, opener);
+                }
+                Change::Renamed { target, url } => {
+                    for (at, name) in ["a", "b"].into_iter().enumerate() {
+                        if url.ends_with(&format!("/plain?from={name}")) {
+                            let opener = openers.get(&target).cloned().flatten();
+                            found[at] = Some((target.clone(), opener));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let [Some((from_first, first_opener)), Some((from_second, second_opener))] = found else {
+        panic!("not both middle clicks opened a page: {found:?}");
+    };
+    assert_eq!(first_opener, None, "a middle click named an opener");
+    assert_eq!(second_opener, None, "a middle click named an opener");
+
+    let in_first = blinkterm::app::window_of_target(&mut browser, &from_first)
+        .expect("the first click's page is in a window");
+    let in_second = blinkterm::app::window_of_target(&mut browser, &from_second)
+        .expect("the second click's page is in a window");
+    eprintln!(
+        "openerless: clicked in {} landed in {in_first}: {}; clicked in {} landed in {in_second}: {}",
+        first.id,
+        landed(in_first, first.id, second.id),
+        second.id,
+        landed(in_second, second.id, first.id),
+    );
+    assert_ne!(in_first, in_second, "two clicks, one window");
+
+    // The fallback, over the pipe's order.
+    let log = order.0.lock().expect("the log").clone();
+    let sessions = [
+        first.page.session().expect("a page session"),
+        second.page.session().expect("a page session"),
+    ];
+    let routed = route_by_disposition(&log, sessions);
+    assert_eq!(
+        (routed.get(&from_first), routed.get(&from_second)),
+        (Some(&0), Some(&1)),
+        "the dispositions did not attribute both pages; the pipe said {log:#?}"
+    );
+    let at = |wanted: &dyn Fn(&OnPipe) -> bool| log.iter().position(wanted);
+    for (target, session) in [(&from_first, sessions[0]), (&from_second, sessions[1])] {
+        let said = at(&|heard| heard.session.as_deref() == Some(session));
+        let created = at(&|heard| heard.target.as_ref() == Some(target));
+        let addressed = at(&|heard| heard.target.as_ref() == Some(target) && heard.url.is_some());
+        eprintln!(
+            "openerless: pipe order for {target}: disposition at {said:?}, \
+             announced at {created:?}, url at {addressed:?}"
+        );
+    }
+
+    // And each opener's own mailbox heard newTab once, which is where the
+    // program will read it.
+    for window in [&mut first, &mut second] {
+        let (_, events) = watch_page(&mut window.page, Duration::from_millis(100));
+        let dispositions: Vec<String> = events
+            .iter()
+            .filter(|event| event.method == "Page.frameRequestedNavigation")
+            .filter_map(|event| event.params.get("disposition").and_then(Json::as_str))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            dispositions,
+            ["newTab"],
+            "window {}'s session did not say newTab once",
+            window.id
+        );
+    }
+
+    browser.close();
+    first.page.close();
+    second.page.close();
+    engine.kill();
+}
+
+/// A window whose pages are all closed is gone, and the other window goes on
+/// painting — which is what closing one terminal must look like to another.
+///
+/// "Its pages" are the ones the program routed to it: here the window's own
+/// page and a popup it opened, which in the headless shell is in an engine
+/// window of its own (see [`a_popup_belongs_to_its_openers_window`]) and is
+/// this window's by its opener.
+#[test]
+fn closing_every_target_of_one_window_leaves_the_other_painting() {
+    let Some((mut engine, mut browser, mut first, mut second)) = two_windows() else {
+        return;
+    };
+    let base = serve();
+    dress(&mut first, PAGE, "ready", (WIDTH, HEIGHT));
+    dress(
+        &mut second,
+        &format!("{base}opens"),
+        "opens",
+        (WIDTH, HEIGHT),
+    );
+    let _ = browser.events();
+
+    // A second page for the second window, the way pages get there.
+    let popup = open_a_popup(&mut browser, &mut second);
+    let window =
+        blinkterm::app::window_of_target(&mut browser, &popup).expect("the popup is in a window");
+    landed(window, second.id, first.id);
+
+    cast(
+        &mut first.page,
+        "jpeg",
+        Some(motion::QUALITY),
+        WIDTH,
+        HEIGHT,
+    );
+    let (before, _) = watch_page(&mut first.page, Duration::from_secs(1));
+
+    let closing = [popup, second.target.clone()];
+    for target in &closing {
+        browser
+            .call(
+                "Target.closeTarget",
+                Json::object(vec![("targetId", Json::string(target))]),
+            )
+            .expect("the page closes");
+    }
+    let changes = announced(&mut browser, Duration::from_secs(10), |changes| {
+        closing.iter().all(|target| {
+            changes.contains(&Change::Closed {
+                target: target.clone(),
+            })
+        })
+    });
+    for target in &closing {
+        assert!(
+            changes.contains(&Change::Closed {
+                target: target.clone()
+            }),
+            "{target} was not said to be gone: {changes:?}"
+        );
+    }
+
+    let (after, _) = watch_page(&mut first.page, Duration::from_secs(1));
+    eprintln!("closing a window: the other went {before} -> {after} frames a second");
+    assert!(
+        after >= 10,
+        "the first window cast {after} frames a second after the second closed"
+    );
+    assert_eq!(
+        blinkterm::app::window_of_target(&mut browser, &first.target),
+        Ok(first.id),
+        "the first window changed under its page"
+    );
+    // Asking after a page that has gone is an answer, not the end of the
+    // engine: unguarded, this question is a SEGV in the headless shell (see
+    // `app::window_of_target`), and the first window would stop here.
+    let gone = blinkterm::app::window_of_target(&mut browser, &second.target);
+    eprintln!("closing a window: asked for the closed page's window, {gone:?}");
+    assert!(gone.is_err(), "a closed page still has a window");
+    assert_eq!(
+        browser.ended(),
+        None,
+        "asking about a closed page ended the engine"
+    );
+    let (still, _) = watch_page(&mut first.page, Duration::from_millis(500));
+    assert!(
+        still >= 5,
+        "the first window cast {still} frames in half a second after the question"
+    );
+    assert_eq!(
+        blinkterm::app::window_of_target(&mut browser, ""),
+        Err("no target to ask about".to_string())
+    );
+    assert_eq!(
+        browser.ended(),
+        None,
+        "asking about no page ended the engine"
+    );
+
+    browser.close();
+    first.page.close();
+    second.page.close();
     engine.kill();
 }

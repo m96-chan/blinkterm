@@ -309,9 +309,11 @@ impl Drop for Profile {
 }
 
 /// The directory the default profile is in: `$XDG_DATA_HOME/blinkterm`, or
-/// `~/.local/share/blinkterm` without it. It is also where a file that is the
-/// person's rather than a profile's goes — the bookmarks, which every profile
-/// shares (see [`crate::bookmarks`]).
+/// `~/.local/share/blinkterm` without it. It is also where the files that
+/// are about every profile go — the registry ([`crate::registry`]) — and
+/// where the bookmarks every profile shared before each had its own are
+/// still found, to be copied into the `Default` profile once (see
+/// [`crate::bookmarks`]).
 ///
 /// The XDG base directory specification says a relative `$XDG_DATA_HOME` is
 /// invalid and is to be ignored, and an empty one is the same as none; both

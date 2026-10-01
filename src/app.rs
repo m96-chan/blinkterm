@@ -79,7 +79,7 @@ use crate::route::{self, Payload, Route, Wrap};
 use crate::save;
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
-use crate::session::{self, Offer, Reply, Session, Snapshot};
+use crate::session::{self, Offer, Reply, Session, Snapshot, WindowId};
 use crate::sites::{self, Sites};
 use crate::strip;
 use crate::tablist::{self, TabList};
@@ -330,6 +330,11 @@ impl Relaunches {
         self.last = Some(now);
     }
 }
+
+/// The one window a run has, as the session file records it: its tabs are
+/// one group there ([`crate::session`]), restored, offered and closed as a
+/// window's.
+const WINDOW: WindowId = WindowId(1);
 
 /// How recently the tab list must have shrunk for the tabs it had before to
 /// be the ones a relaunch brings back: see [`Shrunk`].
@@ -596,7 +601,7 @@ struct Chrome {
     focus: Option<Focus>,
     /// The reader's question out with the page in front.
     reader: Option<Reading>,
-    /// The person's bookmarks, one file for every profile; see
+    /// The profile's bookmarks, or this run's for a temporary profile; see
     /// [`crate::bookmarks`].
     bookmarks: Bookmarks,
     /// The profile's name, first of the words at the right of the row, so
@@ -757,12 +762,7 @@ impl Chrome {
             hinting: None,
             focus: None,
             reader: None,
-            // The same file under every profile, a temporary one
-            // included: a bookmark is the person's, not the engine's.
-            bookmarks: match Profile::data_dir() {
-                Ok(dir) => Bookmarks::load(&dir),
-                Err(_) => Bookmarks::in_memory(),
-            },
+            bookmarks: Bookmarks::for_profile(profile),
             profile_label: profile.label().map(str::to_string),
             session: if profile.is_temporary() {
                 Session::in_memory()
@@ -1397,6 +1397,16 @@ pub fn run(options: Options) -> Result<(), String> {
     // Taken before the engine is started, so that a profile another blinkterm
     // is using is refused before anything has written to it.
     let profile = Profile::take_selected(selected)?;
+    // The bookmarks every profile shared before each had its own, copied
+    // into the `Default` profile the first time it is started — under the
+    // profile's lock, so no other blinkterm on it is reading its bookmarks
+    // yet. What was copied is said on the row with the start's problems.
+    let mut copied = match Profile::data_dir() {
+        Ok(data) if !profile.is_temporary() => {
+            crate::bookmarks::migrate_legacy(&data, profile.dir())
+        }
+        _ => None,
+    };
     // The `--remote` socket, bound now that the lock is held — which is what
     // makes whatever a crash left at its path safe to remove — and before the
     // engine is started, so that a sender that comes while it starts waits
@@ -1513,7 +1523,11 @@ pub fn run(options: Options) -> Result<(), String> {
                 // the tabs that were there when it died.
                 let opened = if std::mem::take(&mut opening) {
                     open_first(&mut pane, tabs, browser, &mut chrome, &options).and_then(|()| {
-                        match summary(&std::mem::take(&mut problems)) {
+                        let said = match (summary(&std::mem::take(&mut problems)), copied.take()) {
+                            (Some(problems), Some(copied)) => Some(format!("{problems}; {copied}")),
+                            (problems, copied) => problems.or(copied),
+                        };
+                        match said {
                             Some(said) => {
                                 chrome.startup = Some(said.clone());
                                 note(tabs, said);
@@ -1636,10 +1650,10 @@ fn open_first(
 ) -> Result<(), String> {
     // What the last run left, decided before anything is opened: its tabs,
     // with `--restore`; a question on the row, after a run that did not quit.
-    let plan = session::plan(chrome.session.saved(), options.restore);
+    let plan = session::plan_for_window(chrome.session.next_group(), options.restore);
     let mut restored = false;
     if let Some(snapshot) = plan.restore {
-        chrome.session.take_saved();
+        chrome.session.take_group(WINDOW);
         restore_tabs(
             tabs,
             browser,
@@ -1652,7 +1666,7 @@ fn open_first(
     }
     if let Some(offer) = plan.offer {
         chrome.offer = Some(offer);
-        chrome.session.hold(true);
+        chrome.session.offer_group(WINDOW);
     }
     // The first url on the command line, or the home page when there is none.
     let url = normalise(options.urls.first().unwrap_or(&options.home));
@@ -2129,7 +2143,9 @@ fn drive(
         // which there are many and a missed one is a session that lies. A
         // few string clones; a write only when it differs from the last, at
         // most once every [`session::WRITE_EVERY`].
-        chrome.session.record(Snapshot::of(tabs), Instant::now());
+        chrome
+            .session
+            .record_window(WINDOW, Snapshot::of(tabs), Instant::now());
         shrunk.pass(tabs, Instant::now());
         if let Err(why) = chrome.session.flush(Instant::now()) {
             note(tabs, why);
@@ -2195,7 +2211,7 @@ fn relayout(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> Re
 /// `--restore` reopens. Just `why` when nothing was saved, or the session is
 /// kept nowhere — a temporary profile's.
 fn died(why: String, session: &Session) -> String {
-    match session.saved_tabs() {
+    match session.saved_tabs(WINDOW) {
         Some(1) => format!("{why}; the tab you had is saved: blinkterm --restore reopens it"),
         Some(tabs) => {
             format!("{why}; the {tabs} tabs you had are saved: blinkterm --restore reopens them")
@@ -2754,9 +2770,11 @@ fn decline_or_restore(
     yes: bool,
 ) -> Result<(), String> {
     chrome.offer = None;
-    chrome.session.hold(false);
+    // Answered either way, the group is this window's now: a no is not
+    // asked again, and the window's own tabs replace it once it has any.
+    let offered = chrome.session.take_offered(WINDOW);
     if yes {
-        if let Some(saved) = chrome.session.take_saved() {
+        if let Some(saved) = offered {
             let was = tabs.active_target().map(str::to_string);
             restore_tabs(
                 tabs,
@@ -3091,6 +3109,82 @@ fn create_tab(
     } else {
         tabs.open(tab)
     })
+}
+
+/// Open `url` in a new *engine window* and say which target it is.
+///
+/// `Target.createTarget` with `newWindow: true`: not a tab beside the ones
+/// the program has, but a page in a window of its own, which is what a second
+/// terminal attached to the same profile is going to drive (#83). Nothing is
+/// attached and nothing is set up — the caller does that, as it would for any
+/// target — because what is new here is only where the page lives.
+///
+/// What a window buys was measured against `chrome-headless-shell` 153 in the
+/// engine tests, and the table is in [`crate::tabs`]: a page in each of two
+/// windows casts at once, each at its own size, takes its own input, and
+/// goes on casting while the other is activated. In the headless shell the
+/// flag changes nothing observable — every target there is a window of its
+/// own, with it or without it — and it is passed because in Chrome it is the
+/// difference between a window and a tab in whichever window was opened last,
+/// which is where Chrome puts a `Target.createTarget` without it.
+pub fn create_window_target(browser: &mut Client, url: &str) -> Result<String, String> {
+    let created = browser.call(
+        "Target.createTarget",
+        Json::object(vec![
+            ("url", Json::string(url)),
+            ("newWindow", Json::Bool(true)),
+        ]),
+    )?;
+    created
+        .get("targetId")
+        .and_then(Json::as_str)
+        .filter(|target| !target.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "the engine opened a window and did not say which page".to_string())
+}
+
+/// The engine window `target` lives in, as the engine numbers windows.
+///
+/// `Browser.getWindowForTarget`, asked on the browser's own connection —
+/// after `Target.getTargetInfo` has said the target exists, and that order is
+/// not caution for its own sake. Measured against `chrome-headless-shell`
+/// 153: `Browser.getWindowForTarget` with a `targetId` the engine does not
+/// have — a page that closed a moment ago, a made-up id, an empty string —
+/// is a SEGV in the browser process, and the whole engine is gone with every
+/// window in it. `Target.getTargetInfo` with the same id answers "No target
+/// with given id found" and nothing else happens. So an id that has gone is
+/// an `Err` here rather than a crash. What is left is a target that closes
+/// between the two calls, which the engine handles one after the other on
+/// one thread; narrow, not impossible. Chrome answers an unknown id with an
+/// error of its own and needs none of this.
+///
+/// What the number is worth differs by engine, and the table is in
+/// [`crate::tabs`]. In Chrome a page opened from a page — a popup, a
+/// middle-clicked link — is in its opener's window, so the number attributes
+/// it. In the headless shell *every* target is a window of its own, opened by
+/// a click or by `Target.createTarget` with or without `newWindow`, so the
+/// number tells two targets apart and says nothing about where one came from.
+/// It is the engine this program pins, which is why the routing of an
+/// openerless page does not rest on this.
+pub fn window_of_target(browser: &mut Client, target: &str) -> Result<i64, String> {
+    // An empty id is the one `Target.getTargetInfo` would not refuse: on the
+    // browser's connection it means "this session's target", which is the
+    // browser, and the crash would be the next call.
+    if target.is_empty() {
+        return Err("no target to ask about".to_string());
+    }
+    browser.call(
+        "Target.getTargetInfo",
+        Json::object(vec![("targetId", Json::string(target))]),
+    )?;
+    let answer = browser.call(
+        "Browser.getWindowForTarget",
+        Json::object(vec![("targetId", Json::string(target))]),
+    )?;
+    answer
+        .get("windowId")
+        .and_then(Json::as_i64)
+        .ok_or_else(|| format!("the engine did not say which window {target} is in"))
 }
 
 /// Ask the engine to attach to this session's out-of-process iframes and say
@@ -9917,7 +10011,7 @@ mod tests {
             active: 0,
         };
         let now = Instant::now();
-        kept.record(tabs(3), now);
+        kept.record_window(WINDOW, tabs(3), now);
         assert_eq!(
             died(why(), &kept),
             format!(
@@ -9925,7 +10019,7 @@ mod tests {
                 why()
             )
         );
-        kept.record(tabs(1), now + Duration::from_secs(1));
+        kept.record_window(WINDOW, tabs(1), now + Duration::from_secs(1));
         assert_eq!(
             died(why(), &kept),
             format!(
@@ -9934,7 +10028,7 @@ mod tests {
             )
         );
         let mut memory = Session::in_memory();
-        memory.record(tabs(3), now);
+        memory.record_window(WINDOW, tabs(3), now);
         assert_eq!(
             died(why(), &memory),
             why(),
@@ -9967,7 +10061,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let mut kept = Session::load(&dir);
-        kept.record(
+        kept.record_window(
+            WINDOW,
             Snapshot {
                 tabs: (0..3)
                     .map(|i| session::Entry {
