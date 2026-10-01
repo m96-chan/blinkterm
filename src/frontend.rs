@@ -797,7 +797,11 @@ fn drive(
             // A paste that was opened and has gone quiet: the end marker is
             // not coming, and what arrived is half of something.
             paste_heard = None;
-            term.abandon_paste();
+            if term.abandon_paste() {
+                // The row is the backend's, so it is told to say so.
+                let pixel_mouse = term.pixel_coordinates();
+                take_input(term, link, Input::PasteCut, pixel_mouse, metrics)?;
+            }
         } else if let Some(input) = term.flush() {
             // Nothing arrived, so a held escape was the Escape key after all.
             let pixel_mouse = term.pixel_coordinates();

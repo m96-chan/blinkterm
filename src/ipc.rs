@@ -921,6 +921,7 @@ pub fn input_to_json(input: &Input) -> Json {
             "paste_refused",
             vec![("bytes", Json::Number(*bytes as f64))],
         ),
+        Input::PasteCut => ("paste_cut", Vec::new()),
         Input::Colour { slot, rgb } => (
             "colour",
             vec![
@@ -962,6 +963,7 @@ pub fn input_from_json(json: &Json) -> Result<Input, String> {
             bytes: usize::try_from(whole(field(json, "bytes")?, "bytes")?)
                 .map_err(|_| bad("bytes"))?,
         },
+        "paste_cut" => Input::PasteCut,
         "colour" => Input::Colour {
             slot: u32_field(json, "slot")?,
             rgb: match array(json, "rgb")? {
@@ -2245,6 +2247,7 @@ mod tests {
             },
             Input::Paste("line one\n\x1b[201~\"quoted\" \u{202e}".to_string()),
             Input::PasteRefused { bytes: 1 << 20 },
+            Input::PasteCut,
             Input::Colour {
                 slot: 11,
                 rgb: (0x12, 0xab, 0xff),

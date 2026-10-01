@@ -5554,6 +5554,10 @@ fn handle_input(
             );
             redraw_row(term, tabs, chrome, shared)?;
         }
+        Input::PasteCut => {
+            note(tabs, "paste cut short; try again");
+            redraw_row(term, tabs, chrome, shared)?;
+        }
         Input::Paste(text) => {
             // A paste is a person working on this page, as a key is.
             chrome.motion.input(Instant::now());

@@ -296,6 +296,17 @@ fn a_status_row_appears_and_ctrl_q_exits_0_and_releases_the_lock() {
         );
     }
 
+    // A paste whose end never comes is given up on by the frontend after two
+    // quiet seconds, and the row — the backend's — says so.
+    pane.pty.write(b"\x1b[200~half a paste");
+    assert!(
+        pane.pump(Duration::from_secs(6), |p| p
+            .row()
+            .contains("paste cut short")),
+        "row {:?}",
+        pane.row()
+    );
+
     pane.pty.write(CTRL_Q);
     pane.pump(Duration::from_secs(5), |p| p.pty.ended);
     let status = pane.pty.exit_within(Duration::from_secs(5));
