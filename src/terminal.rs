@@ -109,11 +109,16 @@ pub enum Helper {
         dir: PathBuf,
     },
     /// A desktop browser: `argv`, with `BROWSER` as `browser` says and
-    /// started in `home`. Left to run, never answered.
+    /// started in `home`. Left to run, never answered. `url` and
+    /// `configured` (`external-browser`) are what `argv` was made from, for
+    /// a terminal in another process, which makes its own from them with its
+    /// own environment ([`crate::ipc::Job::External`]).
     External {
         argv: Vec<String>,
         browser: Option<String>,
         home: Option<PathBuf>,
+        url: String,
+        configured: Option<picker::Command>,
     },
 }
 
@@ -460,6 +465,7 @@ impl Terminal for LocalTerminal {
                 argv,
                 browser,
                 home,
+                ..
             } => {
                 let mut process = external::process(&argv, browser.as_deref(), home.as_deref());
                 match external::launch(&mut process, &argv[0]) {

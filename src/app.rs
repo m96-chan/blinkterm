@@ -49,7 +49,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::fit::Metrics;
-use crate::tty::{self, ReadOutcome};
 
 use crate::appearance::Appearance;
 use crate::bindings::{Action, Bindings, Lookup};
@@ -65,7 +64,6 @@ use crate::engine::Engine;
 use crate::external;
 use crate::find;
 use crate::fullscreen::{self, Heard, Layout};
-use crate::graphics::{Canvas, Painter};
 use crate::hints;
 use crate::history::{self, History};
 use crate::historylist::{self, HistoryList};
@@ -86,16 +84,17 @@ use crate::profile::Profile;
 use crate::reader::{self, Answered};
 use crate::registry;
 use crate::remote::{self, Delivered, Listener};
-use crate::route::{self, Payload, Route, Wrap};
+#[cfg(test)]
+use crate::route::Route;
 use crate::save;
-use crate::screen::{self, Pane};
+use crate::screen;
 use crate::scroll::{self, Step};
 use crate::session::{self, Offer, Reply, Session, Snapshot, WindowId};
 use crate::sites::{self, Sites};
 use crate::strip;
 use crate::tablist::{self, TabList};
 use crate::tabs::{Counted, Outcome, Tab, Tabs};
-use crate::terminal::{Encoded, FrameOut, Helper, HelperOutcome, LocalTerminal, Started, Terminal};
+use crate::terminal::{Encoded, FrameOut, Helper, HelperOutcome, Started, Terminal};
 use crate::upload::{self, Upload};
 use crate::zoom::{self, Scale, Viewport, Zoom, Zooms};
 
@@ -113,7 +112,7 @@ const TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 /// Chromium — and that is the time it spends writing the profile, which is
 /// the point. So five: room for a heavier page than `about:blank`, and short
 /// enough that a quit which is not going to be clean still ends.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// CSS pixels per wheel notch.
 ///
@@ -153,17 +152,6 @@ const POLL_MS: i32 = 50;
 /// The poll while a frame is owed an acknowledgement, on a route paced by
 /// the link: see [`tick_frames`].
 const FRAME_POLL_MS: i32 = 4;
-
-/// How long a paste that has been opened and not closed may go without a byte
-/// before it is given up on.
-///
-/// A terminal that sent `CSI 200 ~` and then nothing is a terminal that will
-/// never send the end marker, and until it is given up on every key typed is
-/// more paste. Forty times [`POLL_MS`], which is longer than any stall of an
-/// ssh connection a person would sit through with a paste half-arrived; and it
-/// is a silence, not a total, so a 64 KiB paste that trickles in over a slow
-/// line for longer than this is not cut while it is still coming.
-const PASTE_IDLE: Duration = Duration::from_secs(2);
 
 /// How long the page gets to say what is selected.
 ///
@@ -239,30 +227,34 @@ const FOCUS_TIMEOUT: Duration = hover::ASK_TIMEOUT;
 
 /// Set by the signal handlers. A handler may do nothing else.
 static QUIT: AtomicBool = AtomicBool::new(false);
-static RESIZED: AtomicBool = AtomicBool::new(false);
+pub(crate) static RESIZED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a `SIGTERM` (or, in a frontend, a `SIGINT` or `SIGHUP`) has
+/// asked this process to stop.
+pub(crate) fn quit_requested() -> bool {
+    QUIT.load(Ordering::SeqCst)
+}
 
 extern "C" fn on_quit(_signal: libc::c_int) {
     QUIT.store(true, Ordering::SeqCst);
 }
 
-/// A death this program cannot do anything about, on the way down: the
-/// terminal put back, and the engine stopped.
+/// A death a frontend cannot do anything about, on the way down: the
+/// terminal put back.
 ///
 /// `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE` and `SIGABRT` are the ways out the
 /// panic hook never sees. A release build aborts on panic, so the hook covers
-/// every panic, but nothing in Rust covers a fault in the engine's client
-/// library, in a `mmap`ped frame store, or a `CHECK` that came from outside —
-/// and what the person is left with then is what issue #78 reported: a shell
-/// with mouse reporting still on and the keyboard flags still pushed, typing
-/// every report and every key back as text, and a Chromium still running.
+/// every panic, but nothing in Rust covers a fault in a `mmap`ped frame
+/// store, or a `CHECK` that came from outside — and what the person is left
+/// with then is what issue #78 reported: a shell with mouse reporting still
+/// on and the keyboard flags still pushed, typing every report and every key
+/// back as text.
 ///
-/// What a handler may do bounds this exactly. [`screen::emergency_from_signal`]
-/// is one `write(2)` of bytes that were already there and one `tcsetattr(3)`;
-/// [`crate::engine::kill_engine`] is one atomic swap and one `kill(2)`. The
-/// temporary profile is *not* removed here — that is `opendir` and `unlink`
-/// over a tree, none of which a handler may do — so a crash leaves one
-/// behind, in `$TMPDIR`, where the next clean run's own removal does not
-/// reach it. A directory left in `/tmp` is the lesser of the two.
+/// What a handler may do bounds this exactly: [`screen::emergency_from_signal`]
+/// is one `write(2)` of bytes that were already there and one
+/// `tcsetattr(3)`. The engine is not this process's — it is the backend's,
+/// which other terminals may be using — so nothing here goes near it
+/// (#83); the backend's own handler is [`on_fatal_backend`].
 ///
 /// The handler was installed with `SA_RESETHAND`, so the signal's disposition
 /// is already the default by the time this runs: `raise` is the program dying
@@ -270,10 +262,22 @@ extern "C" fn on_quit(_signal: libc::c_int) {
 /// (128 + n) and whatever crash report the system was going to write.
 extern "C" fn on_fatal(signal: libc::c_int) {
     screen::emergency_from_signal();
-    crate::engine::kill_engine();
     // SAFETY: `raise(3)` takes an integer and reads no memory, and is
     // async-signal-safe. The disposition is the default already
     // (`SA_RESETHAND`), so this does not come back here.
+    unsafe {
+        libc::raise(signal);
+    }
+}
+
+/// [`on_fatal`] for a backend, which has no terminal and owns the engine:
+/// the engine's group killed — one atomic swap and one `kill(2)`
+/// ([`crate::engine::kill_engine`]) — so that no Chromium outlives it. A
+/// temporary profile is left for the next start's sweep, since removing a
+/// tree is nothing a handler may do.
+extern "C" fn on_fatal_backend(signal: libc::c_int) {
+    crate::engine::kill_engine();
+    // SAFETY: as in `on_fatal`.
     unsafe {
         libc::raise(signal);
     }
@@ -318,20 +322,20 @@ const RELAUNCH_COOLDOWN: Duration = Duration::from_secs(60);
 /// one a minute is the rule a person can predict, and a page that kills the
 /// engine is found out on the second death either way.
 #[derive(Debug, Default)]
-struct Relaunches {
+pub(crate) struct Relaunches {
     last: Option<Instant>,
 }
 
 impl Relaunches {
     /// Whether a death now is one to start the engine again for: yes unless
     /// it was started again less than [`RELAUNCH_COOLDOWN`] ago.
-    fn allows(&self, now: Instant) -> bool {
+    pub(crate) fn allows(&self, now: Instant) -> bool {
         self.last
             .is_none_or(|last| now.saturating_duration_since(last) >= RELAUNCH_COOLDOWN)
     }
 
     /// The engine was started again now.
-    fn relaunched(&mut self, now: Instant) {
+    pub(crate) fn relaunched(&mut self, now: Instant) {
         self.last = Some(now);
     }
 }
@@ -339,6 +343,7 @@ impl Relaunches {
 /// The one window a run has, as the session file records it: its tabs are
 /// one group there ([`crate::session`]), restored, offered and closed as a
 /// window's.
+#[cfg(test)]
 const WINDOW: WindowId = WindowId(1);
 
 /// How recently the tab list must have shrunk for the tabs it had before to
@@ -361,7 +366,7 @@ const SHRUNK_WITHIN: Duration = Duration::from_secs(3);
 /// tabs. A tab the person closed in the seconds before the engine died comes
 /// back with the rest, which is the cheaper mistake.
 #[derive(Debug, Default)]
-struct Shrunk {
+pub(crate) struct Shrunk {
     /// What the list was on the last pass, and how many tabs it had: the
     /// count and not the snapshot's length, because a tab going to
     /// `about:blank` leaves the snapshot and is not a tab lost.
@@ -402,14 +407,31 @@ impl Shrunk {
     }
 }
 
-/// Ask to be told about the three signals that matter, without `SA_RESTART`:
-/// a `poll` that is interrupted is a `poll` that comes back and looks at the
+/// Which process [`install_signals`] is setting up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    /// A terminal's: `SIGTERM`, `SIGINT` and `SIGHUP` close its window,
+    /// `SIGWINCH` is a resize, and a fatal signal puts the terminal back.
+    Frontend,
+    /// A profile's: only `SIGTERM` stops it — it has no terminal to hang
+    /// up and no keyboard to interrupt it, and the `setsid` it was started
+    /// under keeps the first terminal's signals away — and a fatal signal
+    /// takes the engine with it.
+    Backend,
+}
+
+/// Ask to be told about the signals that matter, without `SA_RESTART`: a
+/// `poll` that is interrupted is a `poll` that comes back and looks at the
 /// flags, which is the whole point of setting them.
 ///
 /// And about the five that mean the program is over whatever it does next,
-/// so that it can still put the terminal back on the way down: see
-/// [`on_fatal`].
-fn install_signals() {
+/// so that it can still put the terminal back, or stop the engine, on the
+/// way down: see [`on_fatal`] and [`on_fatal_backend`].
+pub(crate) fn install_signals(role: Role) {
+    let fatal = match role {
+        Role::Frontend => on_fatal as *const () as usize,
+        Role::Backend => on_fatal_backend as *const () as usize,
+    };
     // SAFETY: every pointer handed over below points at a live local that
     // outlives its call -- `sigaction(2)` and `sigemptyset(3)` copy what they
     // are given rather than keeping it. The handlers being installed do one
@@ -417,20 +439,27 @@ fn install_signals() {
     // to do; `on_quit` and `on_winch` are `extern "C"`, so the kernel's idea
     // of how to call them matches theirs.
     unsafe {
-        for (signal, handler) in [
-            (libc::SIGTERM, on_quit as *const () as usize),
-            (libc::SIGINT, on_quit as *const () as usize),
-            (libc::SIGHUP, on_quit as *const () as usize),
-            (libc::SIGWINCH, on_winch as *const () as usize),
-        ] {
+        let quit = on_quit as *const () as usize;
+        let mut handled = vec![(libc::SIGTERM, quit)];
+        match role {
+            Role::Frontend => handled.extend([
+                (libc::SIGINT, quit),
+                (libc::SIGHUP, quit),
+                (libc::SIGWINCH, on_winch as *const () as usize),
+            ]),
+            Role::Backend => {
+                handled.extend([(libc::SIGINT, libc::SIG_IGN), (libc::SIGHUP, libc::SIG_IGN)])
+            }
+        }
+        for (signal, handler) in handled {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = handler;
             libc::sigemptyset(&mut action.sa_mask);
             libc::sigaction(signal, &action, std::ptr::null_mut());
         }
-        // An engine that closes its end of the pipe must not kill this
-        // program before it has put the terminal back: with this, a write to
-        // it is `EPIPE`, which `cdp` turns into a sentence.
+        // An engine, or a backend, that closes its end must not kill this
+        // program before it has put things back: with this, a write to it
+        // is `EPIPE`, which turns into a sentence.
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         // And the ways out that are not this program's decision.
         //
@@ -455,7 +484,7 @@ fn install_signals() {
             libc::SIGABRT,
         ] {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = on_fatal as *const () as usize;
+            action.sa_sigaction = fatal;
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER | libc::SA_ONSTACK;
             libc::sigaction(signal, &action, std::ptr::null_mut());
@@ -473,7 +502,7 @@ fn install_signals() {
 /// backend serving several windows keeps once, and the terminal's half to
 /// [`LocalTerminal`]. What is left is what a second window on the same
 /// profile has a second one of. [`Window`] is this beside the tabs.
-struct Chrome {
+pub(crate) struct Chrome {
     /// Which window this is in the session file ([`crate::session`]).
     id: WindowId,
     /// Whether the terminal's mouse reports are in pixels rather than
@@ -640,7 +669,27 @@ struct Chrome {
     /// landing comes after: so it is put back when the load stops, if the
     /// row has nothing else to say by then.
     startup: Option<String>,
+    /// The working directory of the terminal this window is drawn on, which
+    /// a file input's prompt starts in before anything has been uploaded
+    /// ([`upload::start_dir`]): the frontend's, not the backend's.
+    cwd: Option<PathBuf>,
+    /// That terminal's `$HOME`: `~` in a path typed on the row, and where a
+    /// password command and a desktop browser are started.
+    home_dir: Option<PathBuf>,
+    /// The links this window's pages asked to open in a new tab or window
+    /// (`Page.frameRequestedNavigation` with a `newTab` or `newWindow`
+    /// disposition), with when: what attributes a page target that names no
+    /// opener to the window it was clicked in. Read and emptied by the
+    /// backend's routing ([`take_dispositions`]); kept for
+    /// [`DISPOSITION_WITHIN`] at most.
+    dispositions: Vec<(String, Instant)>,
 }
+
+/// How long a `newTab` disposition is kept for the target it announces: see
+/// [`Chrome::dispositions`]. The target follows it on the pipe within a few
+/// milliseconds (measured in the engine tests); two seconds is room for a
+/// loaded machine.
+pub(crate) const DISPOSITION_WITHIN: Duration = Duration::from_secs(2);
 
 /// What every window on a profile shares: what is kept in the profile —
 /// the history, the bookmarks, the zooms, the allowances, the sites
@@ -653,7 +702,7 @@ struct Chrome {
 /// and the backend #83 is building toward keeps one for all of them. The
 /// engine and the browser's client are not here yet; they stay beside it in
 /// [`run`] until there is a backend process to own them.
-struct Shared {
+pub(crate) struct Shared {
     /// The pages visited, which the url bar offers back; kept in the profile,
     /// or only in memory for a temporary one. See [`crate::history`].
     history: History,
@@ -661,7 +710,7 @@ struct Shared {
     /// about them. The program's rather than a tab's: a download outlives
     /// the tab it started in, and its events come on the browser's
     /// connection. See [`crate::download`].
-    downloads: Downloads,
+    pub(crate) downloads: Downloads,
     /// The socket `blinkterm --remote` hands urls over, bound under the
     /// profile lock; none on a temporary profile, or when it could not be
     /// made. Here, on the [`Shared`], so that an engine that dies and is
@@ -670,7 +719,7 @@ struct Shared {
     /// sender in the second or two `Browser.close` takes then finds nobody
     /// and is refused by the lock, which says what to do. See
     /// [`pump_remote`].
-    remote: Option<Listener>,
+    pub(crate) remote: Option<Listener>,
     /// The zoom levels remembered per host; kept in the profile, or only in
     /// memory for a temporary one. See [`crate::zoom`].
     zooms: Zooms,
@@ -686,7 +735,7 @@ struct Shared {
     profile_label: Option<String>,
     /// The tabs as last written, the closed ones, and what the last run
     /// left; see [`crate::session`].
-    session: Session,
+    pub(crate) session: Session,
     /// The origins the person allowed something, kept in the profile, or
     /// only in memory for a temporary one. See [`crate::permissions`].
     allowed: Allowed,
@@ -717,7 +766,7 @@ struct Shared {
     /// proxy — the first and each one after a death.
     launch: crate::engine::Launch,
     /// When the engine was last started again: see [`Relaunches`].
-    relaunches: Relaunches,
+    pub(crate) relaunches: Relaunches,
 }
 
 /// A screencast frame this program has not acknowledged yet: which tab's,
@@ -733,7 +782,30 @@ impl Chrome {
     /// out with the engine, and the settings that are a window's — the
     /// scale, the search url, the paper, the pickers and password commands,
     /// the external browser, the mode, the keys — from `options`.
+    #[cfg(test)]
     fn new(id: WindowId, metrics: Metrics, options: &Options, appearance: Appearance) -> Chrome {
+        Chrome::from_settings(
+            id,
+            metrics,
+            &crate::ipc::WindowSettings::from(options),
+            appearance,
+            std::env::current_dir().ok(),
+            upload::home(),
+        )
+    }
+
+    /// [`Chrome::new`] from the settings a frontend sent
+    /// ([`crate::ipc::WindowSettings`]), and its working directory and
+    /// `$HOME`.
+    pub(crate) fn from_settings(
+        id: WindowId,
+        metrics: Metrics,
+        settings: &crate::ipc::WindowSettings,
+        appearance: Appearance,
+        cwd: Option<PathBuf>,
+        home_dir: Option<PathBuf>,
+    ) -> Chrome {
+        let options = settings;
         Chrome {
             id,
             pixel_mouse: false,
@@ -789,12 +861,16 @@ impl Chrome {
             blocked_words: None,
             console_words: None,
             startup: None,
+            cwd,
+            home_dir,
+            dispositions: Vec::new(),
         }
     }
 
     /// The route [`run`] chose for this run's frames: the cast that asks for
     /// them. Once, before the first frame. The painter that sends them is
     /// the terminal's ([`LocalTerminal`]).
+    #[cfg(test)]
     fn take_route(&mut self, route: Route) {
         self.cast = motion::Cast::for_route(&route);
         self.throttle = motion::Throttle::default();
@@ -876,8 +952,8 @@ impl Chrome {
     fn upload_base(&self) -> PathBuf {
         upload::start_dir(
             self.upload_dir.as_deref(),
-            std::env::current_dir().ok(),
-            upload::home().as_deref(),
+            self.cwd.clone(),
+            self.home_dir.as_deref(),
         )
     }
 }
@@ -943,7 +1019,7 @@ impl Shared {
 /// A run has one. The backend #83 is building toward has one per terminal
 /// attached to it, each driven by the same two halves of a pass
 /// ([`prepare_window`], [`pass_window`]) that drive this one.
-struct Window {
+pub(crate) struct Window {
     tabs: Tabs<Client>,
     chrome: Chrome,
     shrunk: Shrunk,
@@ -951,9 +1027,9 @@ struct Window {
 
 /// The engine and the browser's client while they are alive: what
 /// [`boot`] starts, less the first tab, which goes to the [`Window`].
-struct Live {
-    engine: Engine,
-    browser: Client,
+pub(crate) struct Live {
+    pub(crate) engine: Engine,
+    pub(crate) browser: Client,
 }
 
 /// The url bar while it is open.
@@ -1365,19 +1441,12 @@ pub fn boot(
     })
 }
 
-/// How [`drive`] ended, when it did not fail.
-enum Driven {
-    /// The person quit, the last tab closed, or the terminal went.
-    Quit,
-    /// The engine is gone, with the reason [`Engine::check`] or the browser's
-    /// connection gave. What to do about it is [`run`]'s.
-    EngineDied(String),
-}
-
 /// How one half of a window's pass ended ([`prepare_window`],
-/// [`pass_window`]): on to the rest of it, or the end of [`drive`] for one of
-/// the reasons [`Driven`] has.
-enum Pass {
+/// [`pass_window`]): on to the rest of it, the window is over — the person
+/// quit it, its last tab closed, its terminal went — or the engine is gone,
+/// with the reason [`Engine::check`] or the browser's connection gave, which
+/// is the backend's to act on for every window at once.
+pub(crate) enum Pass {
     Continue,
     Quit,
     EngineDied(String),
@@ -1385,13 +1454,19 @@ enum Pass {
 
 /// Run until the person quits or something goes wrong.
 ///
-/// The engine is started, the terminal taken, and then `drive` runs until
-/// it ends. When it ends because the engine died, the engine is started
-/// again in place on the same profile and the tabs come back (`relaunch`),
-/// and `drive` carries on with the new one; only a second death within
-/// a minute, or an engine that will not start again, ends the
-/// program — with the sentence that says the tabs are saved.
+/// Every start is two processes since #83: this one, the *frontend*, which
+/// holds the terminal, and the profile's *backend*, which holds the profile,
+/// the engine and every window's logic, and which serves every terminal
+/// started on the profile — one window each ([`crate::frontend`],
+/// [`crate::backend`]). A backend is this same program run with the hidden
+/// `--serve-fd`, which is the first thing looked at. Otherwise the profile
+/// is chosen, `--remote` tried, and the terminal checked, as they always
+/// were, before the frontend attaches to the profile's backend or starts
+/// one.
 pub fn run(options: Options) -> Result<(), String> {
+    if let Some(fd) = options.serve {
+        return crate::backend::serve(options, fd);
+    }
     // Which profile, first of all: before `--remote` looks for a socket, and
     // before the terminal is probed. The picker, when it runs, runs on the
     // ordinary screen in cooked mode, with no signal handlers, no panic hook
@@ -1450,53 +1525,37 @@ pub fn run(options: Options) -> Result<(), String> {
         }
         return Err("stdout is not a terminal, so there is nowhere to put a page".to_string());
     }
-    // The terminal is asked what it is before anything is started: a
-    // terminal that cannot draw costs a sentence in the shell rather than a
-    // Chromium start and a blank pane. See [`doctor::probe`] and
-    // [`route::choose`].
-    let env = route::Env::current();
-    let (verdict, heard) = if options.route.probe {
-        crate::doctor::probe(0, env.tmux || env.screen, crate::doctor::TERMINAL_TIMEOUT)
-            .map_err(|e| format!("cannot take the terminal: {e}"))?
-    } else {
-        (
-            crate::doctor::Verdict::Skipped,
-            crate::doctor::TerminalAnswer::default(),
-        )
-    };
-    if let Some(why) = crate::doctor::refusal(verdict, &env) {
-        return Err(why);
-    }
-    let route = route::choose(&env, options.route, verdict, Painter::shm_usable());
-    // What the row says once the first page is up: a `key.` line on a chord
-    // Kitty keeps, which would otherwise do nothing and say nothing, and a
-    // `--remote` socket that could not be bound, below. See
-    // [`crate::taken`].
-    let mut problems: Vec<String> = Vec::new();
-    if env.kitty {
-        problems.extend(crate::taken::conflicts(
-            &options.bindings,
-            cfg!(target_os = "macos"),
-        ));
-    }
-    install_signals();
-    std::panic::set_hook(Box::new(|info| {
-        // A release build aborts here, so this is the only chance to put the
-        // terminal back and stop the engine.
-        screen::emergency();
-        crate::engine::kill_engine();
-        crate::profile::remove_temp_profile();
-        eprintln!("blinkterm: {info}");
-    }));
+    crate::frontend::run(options, selected)
+}
 
-    // Taken before the engine is started, so that a profile another blinkterm
-    // is using is refused before anything has written to it.
-    let profile = Profile::take_selected(selected)?;
+/// What a backend has once its profile is up: the profile's half, the
+/// engine and its browser client, the engine's first tab — which the first
+/// window adopts — and what the first window's row says about the start:
+/// `problems` (the `--remote` socket not bound, a site file refused) and
+/// `copied` (the bookmarks imported into `Default`).
+pub(crate) struct ProfileUp {
+    pub(crate) shared: Shared,
+    pub(crate) live: Live,
+    pub(crate) first: Tabs<Client>,
+    pub(crate) problems: Vec<String>,
+    pub(crate) copied: Option<String>,
+}
+
+/// Everything [`run`] did between taking the profile and the first page,
+/// for a backend: the bookmarks every profile shared before each had its
+/// own copied into `Default` once, the `--remote` socket bound, the
+/// download directory made, what the person allowed and unblocked read, the
+/// host lists and the site files read, and the engine started ([`boot`]).
+///
+/// `profile` is held — its lock taken — by the caller, which is what makes
+/// whatever a crash left at the socket's path safe to remove.
+pub(crate) fn start_profile(options: &Options, profile: Profile) -> Result<ProfileUp, String> {
+    let mut problems: Vec<String> = Vec::new();
     // The bookmarks every profile shared before each had its own, copied
     // into the `Default` profile the first time it is started — under the
     // profile's lock, so no other blinkterm on it is reading its bookmarks
     // yet. What was copied is said on the row with the start's problems.
-    let mut copied = match Profile::data_dir() {
+    let copied = match Profile::data_dir() {
         Ok(data) if !profile.is_temporary() => {
             crate::bookmarks::migrate_legacy(&data, profile.dir())
         }
@@ -1509,55 +1568,53 @@ pub fn run(options: Options) -> Result<(), String> {
     // the lock. Not being able to listen is not a reason not to browse: it is
     // a note on the row. A temporary profile is this run's alone and never
     // listens.
-    let mut listener = if profile.is_temporary() {
+    let listener = if profile.is_temporary() {
         None
     } else {
         match Listener::bind(profile.dir()) {
             Ok(listener) => Some(listener),
             Err(why) => {
-                // First, so that the "more" after it are the key lines,
-                // which are what `--doctor` lists.
-                problems.insert(0, format!("not listening for --remote: {why}"));
+                problems.push(format!("not listening for --remote: {why}"));
                 None
             }
         }
     };
-    // What pages are told about light and dark, before there is a page to
-    // tell: the flags now, the terminal's answer when it comes.
-    let mut appearance = Appearance::new(options.scheme, options.force_dark, options.alpha);
-    // Under `--alpha`, a page painted on the key where this program decodes
-    // the frames and so can take it back out; on nothing where the engine's
-    // PNG goes to the terminal as it came. See [`crate::chroma`].
-    appearance.keyed = route.payload == Payload::Raw;
-    // Once for the run, and before the pane is taken, so that a directory
-    // which is a file is a sentence in the shell. Every engine is told it.
+    // What the engine's first page is told about light and dark: the
+    // settings' answer, until a window says its own.
+    let appearance = Appearance::new(options.scheme, options.force_dark, options.alpha);
+    // Once for the backend, so that a directory which is a file is a
+    // sentence the frontend prints. Every engine is told it.
     let downloads_dir = download::prepare(options.download.clone())?;
     // What the person allowed, read from the profile before the engine is
-    // started, because the engine is told it as it starts; then kept on the
-    // `Chrome`, which tells every engine after it.
+    // started, because the engine is told it as it starts.
     let allowed = if profile.is_temporary() {
         Allowed::in_memory()
     } else {
         Allowed::load(profile.dir())
     };
-    // The host lists, read once and before the pane is taken, so that a list
-    // that cannot be read is a sentence in the shell; with the sites the
-    // person unblocked, which the blocker is made knowing.
+    // The host lists, read once, with the sites the person unblocked, which
+    // the blocker is made knowing.
     let unblocked = if profile.is_temporary() {
         Unblocked::in_memory()
     } else {
         Unblocked::load(profile.dir())
     };
     let blocker = block::load(&options.block, &unblocked)?;
-    // The site files, likewise before the pane: a named directory that is
-    // not there ends the run with a sentence, and a file refused is said in
-    // the shell, where it stays to be read.
+    // The site files: a named directory that is not there ends the start
+    // with a sentence; a file refused is said in the backend's log and on
+    // the first window's row.
     let sites = sites::load(&options.sites)?;
     for why in &sites.skipped {
         eprintln!("blinkterm: site file {why}");
+        problems.push(format!("site file {why}"));
     }
     let console = options.console.then(|| Arc::new(Recorder::new()));
-    let first = boot(
+    let Booted {
+        engine,
+        browser,
+        tabs,
+        identity,
+    } = boot(
         profile,
         &options.engine,
         &downloads_dir,
@@ -1567,201 +1624,149 @@ pub fn run(options: Options) -> Result<(), String> {
         &sites,
         console.as_ref(),
     )?;
-
-    let pane = Pane::enter(0, 1, route.wrap == Wrap::None, route.wrap)
-        .map_err(|e| format!("cannot take the terminal: {e}"))?;
-    // The painter for the route chosen, beside what it takes out of a frame
-    // under `--alpha`; and the cell size the probe heard, which over ssh is
-    // what the page is sized for from the first frame rather than from the
-    // second.
-    let canvas = Canvas::new(
-        Painter::with_route(route),
-        appearance.keys(),
-        appearance.alpha.scaling(),
+    let mut shared = Shared::new(
+        options,
+        engine.profile(),
+        downloads_dir,
+        identity,
+        allowed,
+        blocker,
+        unblocked,
+        sites,
+        console,
     );
-    let mut term = LocalTerminal::new(pane, canvas, heard.cell, &RESIZED);
-    // `None` once a relaunch has failed: the old engine was stopped and the
-    // profile went with the new one that did not start, so there is nothing
-    // left at the end to ask to close.
-    let mut live: Option<Live>;
-    // The window's tabs, once its pass is over: closed below, before the
-    // engine is asked to close, as they always were.
-    let tabs: Option<Tabs<Client>>;
-    // The profile's half — `Shared` — is built here rather than in `drive`,
-    // so that what it knows about the downloads is still here when `drive`
-    // is over and the engine is being stopped, and so that it outlives an
-    // engine that dies; the window beside it likewise. The rest of both
-    // goes at the end of this block, before the pane is given back, as it
-    // always did.
-    let (outcome, downloads) = match term.metrics() {
-        Ok(metrics) => {
-            let Booted {
-                engine,
-                browser,
-                tabs: first_tabs,
-                identity,
-            } = first;
-            let mut shared = Shared::new(
-                &options,
-                engine.profile(),
-                downloads_dir,
-                identity,
-                allowed,
-                blocker,
-                unblocked,
-                sites,
-                console,
-            );
-            shared.remote = listener.take();
-            let mut win = Window {
-                tabs: first_tabs,
-                chrome: Chrome::new(WINDOW, metrics, &options, appearance),
-                shrunk: Shrunk::default(),
-            };
-            win.chrome.take_route(route);
-            live = Some(Live { engine, browser });
-            let mut opening = true;
-            let outcome = loop {
-                let Some(Live { engine, browser }) = live.as_mut() else {
-                    break Ok(());
-                };
-                // What the last run left and what the command line asked
-                // for are opened once, on the first engine; a relaunch opens
-                // the tabs that were there when it died.
-                let opened = if std::mem::take(&mut opening) {
-                    let Window { tabs, chrome, .. } = &mut win;
-                    open_first(&mut term, tabs, browser, chrome, &mut shared, &options).and_then(
-                        |()| {
-                            let said =
-                                match (summary(&std::mem::take(&mut problems)), copied.take()) {
-                                    (Some(problems), Some(copied)) => {
-                                        Some(format!("{problems}; {copied}"))
-                                    }
-                                    (problems, copied) => problems.or(copied),
-                                };
-                            match said {
-                                Some(said) => {
-                                    chrome.startup = Some(said.clone());
-                                    note(tabs, said);
-                                    redraw_row(&mut term, tabs, chrome, &shared)
-                                }
-                                None => Ok(()),
-                            }
-                        },
-                    )
-                } else {
-                    Ok(())
-                };
-                let driven = opened
-                    .and_then(|()| drive(&mut term, &mut win, &mut shared, browser, engine))
-                    .or_else(|why| ended_by_engine(why, engine, browser));
-                match driven {
-                    Ok(Driven::Quit) => break Ok(()),
-                    Err(why) => break Err(why),
-                    Ok(Driven::EngineDied(why)) => {
-                        // Two deaths in a minute end the program: see
-                        // [`Relaunches`].
-                        if !shared.relaunches.allows(Instant::now()) {
-                            break Err(died(gave_up(why), &shared.session, win.chrome.id));
-                        }
-                        let Some(dead) = live.take() else {
-                            break Err(why);
-                        };
-                        let snapshot = win
-                            .shrunk
-                            .for_relaunch(Snapshot::of(&win.tabs), Instant::now());
-                        match relaunch(&mut term, &mut win, &mut shared, dead, why, snapshot) {
-                            Ok(again) => {
-                                live = Some(again);
-                                shared.relaunches.relaunched(Instant::now());
-                                win.shrunk = Shrunk::default();
-                            }
-                            Err(sentence) => break Err(sentence),
-                        }
-                    }
-                }
-            };
-            // A quit says the session is closed; anything else leaves it
-            // open, with what was still waiting to be written, so that the
-            // next start offers it back. See [`crate::session`].
-            shared.session.finish(outcome.is_ok());
-            tabs = Some(win.tabs);
-            (outcome, Some(shared.downloads))
-        }
-        Err(e) => {
-            let Booted {
-                engine,
-                browser,
-                tabs: first_tabs,
-                identity: _,
-            } = first;
-            live = Some(Live { engine, browser });
-            tabs = Some(first_tabs);
-            (Err(e), None)
-        }
+    shared.remote = listener;
+    if let Some(label) = &options.profile_label {
+        shared.profile_label = Some(label.clone());
+    }
+    Ok(ProfileUp {
+        shared,
+        live: Live { engine, browser },
+        first: tabs,
+        problems,
+        copied,
+    })
+}
+
+/// A window as a frontend's `open` makes it: `first` its tabs — the
+/// engine's first, adopted, or a new engine window's ([`window_target`]) —
+/// laid out at `metrics`, with the settings, the route's cast and the
+/// working directory and `$HOME` of the terminal it is drawn on.
+pub(crate) fn new_window(
+    id: WindowId,
+    mut first: Tabs<Client>,
+    metrics: Metrics,
+    open: &crate::ipc::Open,
+    shared: &Shared,
+) -> Window {
+    let settings = &open.window;
+    let mut appearance = Appearance::new(settings.scheme, settings.force_dark, settings.alpha);
+    // Under `--alpha`, a page painted on the key where the frontend decodes
+    // the frames and so can take it back out. See [`crate::chroma`].
+    appearance.keyed = open.route.keyed;
+    // The tab was made knowing the backend's own settings; told this
+    // window's, which are the ones its terminal asked for.
+    if let Some(tab) = first.active_mut() {
+        prepare_session(&mut tab.connection, &appearance, &shared.identity);
+    }
+    let mut chrome = Chrome::from_settings(
+        id,
+        metrics,
+        settings,
+        appearance,
+        Some(open.cwd.clone()),
+        open.home_dir.clone(),
+    );
+    chrome.cast = motion::Cast {
+        png: open.route.png,
+        every_nth: open.route.every_nth.max(1),
+        step: 1,
     };
-    // A socket that never reached the `Shared` — the pane could not be
-    // measured — goes now, while the lock that makes it ours is still held.
-    drop(listener.take());
-    term.leave();
-    let mut downloads = downloads;
-    if let Some(Live {
-        mut engine,
-        mut browser,
-    }) = live
-    {
-        // Dropping the tabs closes every page's session, which is all a tab
-        // is once the engine is about to be killed anyway.
-        drop(tabs);
-        if let Some(downloads) = downloads.as_mut() {
-            // Whatever is still coming is cancelled, whichever way the engine
-            // is about to stop: `Browser.close` would cancel it too, but the
-            // temporary profile's way out is a kill, and a kill leaves the
-            // engine's partial file behind. Cancelled, the engine removes it.
-            downloads.cancel_all(&mut browser);
-        }
-        if !engine.profile().is_temporary() {
-            // `Browser.close` is the only stop that writes the cookie jar — a
-            // `SIGTERM` loses it; `crate::profile` has the measurements — and
-            // the writing happens after the reply, in the two seconds before
-            // the process ends, so the engine is waited for rather than just
-            // asked. Every way out comes through here: ctrl+q, the last tab
-            // closed, the terminal gone, a SIGTERM, SIGINT or SIGHUP by way
-            // of QUIT, and an error out of `drive`, where a connection that
-            // has already ended makes this fail at once. A temporary profile
-            // has nothing worth writing and skips it, which keeps its quit as
-            // fast as it was.
-            let _ = browser.call_within("Browser.close", Json::empty(), CLOSE_TIMEOUT);
-            engine.wait_for_exit(CLOSE_TIMEOUT);
-        }
-        browser.close();
-        engine.kill();
+    chrome.throttle = motion::Throttle::default();
+    Window {
+        tabs: first,
+        chrome,
+        shrunk: Shrunk::default(),
     }
-    // And the partial files of every download this run saw begin and not
-    // save, now that nothing can be writing them: the engine removes the
-    // ones it cancelled, but after it has said so, and a kill can come in
-    // between. Those files and nothing else — the directory is the person's.
-    for partial in downloads.iter().flat_map(Downloads::partials) {
-        let _ = std::fs::remove_file(partial);
+}
+
+/// The first tab of a window that does not adopt the engine's own: a page
+/// in a new engine window ([`create_window_target`]), set up as every tab
+/// is.
+pub(crate) fn window_target(
+    browser: &mut Client,
+    shared: &Shared,
+    appearance: &Appearance,
+) -> Result<Tabs<Client>, String> {
+    let target = create_window_target(browser, "about:blank")?;
+    let (connection, frame, scripts) = connect_tab(
+        browser,
+        &target,
+        appearance,
+        &shared.identity,
+        &shared.sites,
+    )?;
+    let mut tab = Tab::new(target, connection, "about:blank");
+    tab.counted = Counted::Yes;
+    tab.frame = frame;
+    tab.site_scripts = scripts;
+    Ok(Tabs::new(tab))
+}
+
+/// What a new window opens ([`open_first`]: the session's plan, the urls or
+/// the home page), and then what its row says about the start: the
+/// frontend's `problems` and the backend's, and the bookmarks `copied`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_window(
+    term: &mut dyn Terminal,
+    win: &mut Window,
+    browser: &mut Client,
+    shared: &mut Shared,
+    open: &crate::ipc::Open,
+    problems: &[String],
+    copied: Option<String>,
+) -> Result<(), String> {
+    let Window { tabs, chrome, .. } = win;
+    open_first(
+        term,
+        tabs,
+        browser,
+        chrome,
+        shared,
+        &open.urls,
+        open.restore,
+        &open.window.home,
+    )?;
+    let said = match (summary(problems), copied) {
+        (Some(problems), Some(copied)) => Some(format!("{problems}; {copied}")),
+        (problems, copied) => problems.or(copied),
+    };
+    if let Some(said) = said {
+        chrome.startup = Some(said.clone());
+        note(tabs, said);
+        redraw_row(term, tabs, chrome, shared)?;
     }
-    outcome
+    Ok(())
 }
 
 /// What the last run left and what the command line asked for, opened on
 /// the first engine before the loop starts: the saved tabs with `--restore`,
 /// the offer after an unclean exit, the first url in front and the rest
 /// behind it. Once per run — a relaunch reopens the tabs it had instead.
-fn open_first(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_first(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
     shared: &mut Shared,
-    options: &Options,
+    urls: &[String],
+    restore: bool,
+    home: &str,
 ) -> Result<(), String> {
     // What the last run left, decided before anything is opened: its tabs,
     // with `--restore`; a question on the row, after a run that did not quit.
-    let plan = session::plan_for_window(shared.session.next_group(), options.restore);
+    let plan = session::plan_for_window(shared.session.next_group(), restore);
     let mut restored = false;
     if let Some(snapshot) = plan.restore {
         shared.session.take_group(chrome.id);
@@ -1780,11 +1785,11 @@ fn open_first(
         shared.session.offer_group(chrome.id);
     }
     // The first url on the command line, or the home page when there is none.
-    let url = normalise(options.urls.first().unwrap_or(&options.home));
+    let url = normalise(urls.first().map(String::as_str).unwrap_or(home));
     // A url asked for on top of a restore is one more tab, in front — the
     // rest of them go behind it, below; with nothing asked for, the restored
     // tab in front is the page, and the home page is not opened.
-    if restored && !options.urls.is_empty() {
+    if restored && !urls.is_empty() {
         let appearance = chrome.appearance;
         let identity = shared.identity.clone();
         match open_tab(tabs, browser, &appearance, &identity, &shared.sites, &url) {
@@ -1816,29 +1821,31 @@ fn open_first(
     // Whether or not it was an error on the wire: a reply that says the page
     // did not come has replaced the loading note with why.
     redraw_row(term, tabs, chrome, shared)?;
-    open_the_rest(tabs, browser, chrome, shared, &options.urls);
+    open_the_rest(tabs, browser, chrome, shared, urls);
     redraw_row(term, tabs, chrome, shared)
 }
 
-/// An error out of [`drive`] or [`open_first`], read again in the light of
-/// the engine: if it has gone, the error was only the first sign of it —
-/// "cannot send …: the engine closed its end of the pipe" from a resize, a
-/// switch, a new tab — and it is a death, for [`relaunch`]; if not, it is an
-/// error of its own and ends the program as it always did.
+/// An error out of a window's pass or [`open_first`], read again in the
+/// light of the engine: if it has gone, the error was only the first sign
+/// of it — "cannot send …: the engine closed its end of the pipe" from a
+/// resize, a switch, a new tab — and `Ok` is the death, for
+/// [`relaunch_all`]; if not, `Err` is the error, which is that window's own.
 ///
 /// The two signs of a death can come a little after the error that the
 /// death caused, so they are looked for over [`DEATH_GRACE`] before the
 /// error is believed.
-fn ended_by_engine(why: String, engine: &mut Engine, browser: &Client) -> Result<Driven, String> {
+pub(crate) fn ended_by_engine(
+    why: String,
+    engine: &mut Engine,
+    browser: &Client,
+) -> Result<String, String> {
     let deadline = Instant::now() + DEATH_GRACE;
     loop {
         if let Err(death) = engine.check() {
-            return Ok(Driven::EngineDied(death));
+            return Ok(death);
         }
         if let Some(ended) = browser.ended() {
-            return Ok(Driven::EngineDied(format!(
-                "the engine stopped talking: {ended}"
-            )));
+            return Ok(format!("the engine stopped talking: {ended}"));
         }
         if Instant::now() >= deadline {
             return Err(why);
@@ -1847,56 +1854,69 @@ fn ended_by_engine(why: String, engine: &mut Engine, browser: &Client) -> Result
     }
 }
 
-/// Start the engine again after it died under a running session, and bring
-/// the tabs back on it.
+/// Start the engine again after it died under a running backend, and bring
+/// every window's tabs back on it.
 ///
-/// `snapshot` is the tabs to bring back, taken from the live list rather
-/// than from the session — what the session last recorded is up to half a
-/// second old, and nothing at all while the offer after an unclean exit is
-/// on the row — or from just before it shrank ([`Shrunk`]). They come back as a
-/// `--restore` brings them, dormant, the one in front woken, so that a
-/// hundred tabs are a hundred blank pages and one real one rather than a
-/// hundred fetched at once on a machine whose browser just died. Nothing is
-/// sent to the dead engine: its clients are dropped before the new ones
-/// exist. While this runs the loop reads no input; the terminal's bytes wait
-/// in the pty — about a tenth of a second, and a fortieth more per tab
+/// Each window's tabs are taken from its live list rather than from the
+/// session — what the session last recorded is up to half a second old, and
+/// nothing at all while the offer after an unclean exit is on the row — or
+/// from just before it shrank ([`Shrunk`]). They come back as a `--restore`
+/// brings them, dormant, the one in front woken, so that a hundred tabs are
+/// a hundred blank pages and one real one rather than a hundred fetched at
+/// once on a machine whose browser just died. Nothing is sent to the dead
+/// engine: its clients are dropped before the new ones exist. While this
+/// runs the backend reads no input; each terminal's bytes wait in its
+/// socket — about a tenth of a second, and a fortieth more per tab
 /// (measured against chrome-headless-shell 153).
+///
+/// The first window adopts the new engine's first page; every other window
+/// gets a new engine window ([`window_target`]), as when it was opened. A
+/// window whose page cannot be made is left with no tabs, which its next
+/// pass reads as the window over. With no window at all the first page is
+/// handed back, for the next window to adopt.
 ///
 /// The old engine's profile is moved into the new one without ever being let
 /// go ([`Engine::retire`]): a kept profile's lock released for a moment is a
-/// moment for another `blinkterm` to take it.
+/// moment for another `blinkterm` to take it. `appearance` is what the first
+/// page is told when there is no window to ask.
 ///
-/// An `Err` is the sentence the program ends with — an engine that would
-/// not start again, with what [`died`] adds about the saved tabs — or a
-/// terminal that could not be written to. Whether to start it again at all
-/// ([`Relaunches`]) is decided before this is called.
-fn relaunch(
-    term: &mut dyn Terminal,
-    win: &mut Window,
+/// An `Err` is the reason the backend stops with — an engine that would not
+/// start again ([`could_not_restart`]) — or a terminal that could not be
+/// written to. Whether to start it again at all ([`Relaunches`]) is decided
+/// before this is called.
+pub(crate) fn relaunch_all(
+    windows: &mut [(&mut dyn Terminal, &mut Window)],
     shared: &mut Shared,
     dead: Live,
     why: String,
-    snapshot: Snapshot,
-) -> Result<Live, String> {
-    let Window { tabs, chrome, .. } = win;
+    appearance: &Appearance,
+) -> Result<(Live, Option<Tabs<Client>>), String> {
     let now = Instant::now();
     // The picture goes, as it does for a renderer that died in front: a dead
     // page that looks alive is a click that does nothing. The row is written
     // directly, because `redraw_row` draws from the tabs and these are going.
-    term.clear_picture()?;
-    term.write(b"\x1b[2;1H\x1b[J")?;
-    term.write(&screen::status_line(
-        chrome.metrics.cols,
-        "the engine died; starting it again…",
-    ))?;
-    end_helpers(term, chrome);
+    for (term, win) in windows.iter_mut() {
+        term.clear_picture()?;
+        term.write(b"\x1b[2;1H\x1b[J")?;
+        term.write(&screen::status_line(
+            win.chrome.metrics.cols,
+            "the engine died; starting it again…",
+        ))?;
+        end_helpers(*term, &win.chrome);
+    }
     shared.downloads.engine_died(now);
-    chrome.engine_gone(&mut shared.downloads, now);
-    sync_shape(term, chrome)?;
+    let mut snapshots = Vec::with_capacity(windows.len());
+    for (term, win) in windows.iter_mut() {
+        win.chrome.engine_gone(&mut shared.downloads, now);
+        sync_shape(*term, &mut win.chrome)?;
+        snapshots.push(win.shrunk.for_relaunch(Snapshot::of(&win.tabs), now));
+    }
 
     // Every tab's `Client::close` sees the pipe ended and sends no detach.
     let Live { engine, browser } = dead;
-    drop(tabs.take_all());
+    for (_, win) in windows.iter_mut() {
+        drop(win.tabs.take_all());
+    }
     drop(browser);
     let profile = engine.retire();
     // Nothing can be writing the downloads that were coming now; the exit
@@ -1905,57 +1925,65 @@ fn relaunch(
         let _ = std::fs::remove_file(partial);
     }
 
+    let first_appearance = windows
+        .first()
+        .map(|(_, win)| win.chrome.appearance)
+        .unwrap_or(*appearance);
     let Booted {
         engine,
         mut browser,
         tabs: fresh,
         identity,
-    } = match boot(
+    } = boot(
         profile,
         &shared.launch,
         &shared.downloads_dir,
-        &chrome.appearance,
+        &first_appearance,
         &shared.allowed,
         shared.blocker.as_ref(),
         &shared.sites,
         shared.console.as_ref(),
-    ) {
-        Ok(booted) => booted,
-        Err(failure) => {
-            return Err(died(
-                could_not_restart(why, failure),
-                &shared.session,
-                chrome.id,
-            ))
-        }
-    };
-    *tabs = fresh;
-    let saved = snapshot.tabs.len().min(session::RESTORE_CAP);
-    // The new engine's one blank tab is untouched, so the first saved tab
-    // adopts it; with nothing saved — every tab was blank — it stays in
-    // front as it is.
+    )
+    .map_err(|failure| could_not_restart(why.clone(), failure))?;
     shared.identity = identity.clone();
-    restore_tabs(
-        tabs,
-        &mut browser,
-        &chrome.appearance,
-        &identity,
-        &shared.sites,
-        snapshot,
-    );
-    // A failure here is put on the tab rather than returned: whether the
-    // engine is gone again is for the next pass's checks to say.
-    let trouble = activate(tabs, &mut browser, chrome, shared).err();
-    let mut sentence = relaunched_words(saved, tabs.len());
-    if let Some(trouble) = trouble {
-        sentence = format!("{sentence}; {trouble}");
+    let mut spare = Some(fresh);
+    for ((term, win), snapshot) in windows.iter_mut().zip(snapshots) {
+        let tabs = match spare.take() {
+            Some(tabs) => tabs,
+            None => match window_target(&mut browser, shared, &win.chrome.appearance) {
+                Ok(tabs) => tabs,
+                Err(_) => continue,
+            },
+        };
+        win.tabs = tabs;
+        win.shrunk = Shrunk::default();
+        let Window { tabs, chrome, .. } = &mut **win;
+        let saved = snapshot.tabs.len().min(session::RESTORE_CAP);
+        // The new window's one blank tab is untouched, so the first saved tab
+        // adopts it; with nothing saved — every tab was blank — it stays in
+        // front as it is.
+        restore_tabs(
+            tabs,
+            &mut browser,
+            &chrome.appearance,
+            &identity,
+            &shared.sites,
+            snapshot,
+        );
+        // A failure here is put on the tab rather than returned: whether the
+        // engine is gone again is for the next pass's checks to say.
+        let trouble = activate(tabs, &mut browser, chrome, shared).err();
+        let mut sentence = relaunched_words(saved, tabs.len());
+        if let Some(trouble) = trouble {
+            sentence = format!("{sentence}; {trouble}");
+        }
+        // After `activate`, so that it stands in front of the woken tab's
+        // "loading …" until the page lands and replaces it; the seconds still
+        // count on the right.
+        note(tabs, sentence);
+        redraw_row(*term, tabs, chrome, shared)?;
     }
-    // After `activate`, so that it stands in front of the woken tab's
-    // "loading …" until the page lands and replaces it; the seconds still
-    // count on the right.
-    note(tabs, sentence);
-    redraw_row(term, tabs, chrome, shared)?;
-    Ok(Live { engine, browser })
+    Ok((Live { engine, browser }, spare))
 }
 
 /// What the row says once the engine has been started again: how many of
@@ -1973,7 +2001,7 @@ fn relaunched_words(saved: usize, open: usize) -> String {
 
 /// The reason for a death that is not started again: the second within a
 /// minute of the first. See [`Relaunches`].
-fn gave_up(why: String) -> String {
+pub(crate) fn gave_up(why: String) -> String {
     format!(
         "{why}; it died a second time within a minute of being started again, \
          so it is not started a third time"
@@ -1981,99 +2009,171 @@ fn gave_up(why: String) -> String {
 }
 
 /// The reason for a death after which the engine would not start again.
-fn could_not_restart(why: String, failure: String) -> String {
+pub(crate) fn could_not_restart(why: String, failure: String) -> String {
     format!("{why}; starting it again failed: {failure}")
 }
 
-/// Everything between taking the terminal and giving it back, on one engine.
-///
-/// It no longer decides what to open — [`open_first`] does, once — and it
-/// no longer ends the program when the engine dies: it says so,
-/// [`Driven::EngineDied`], and [`run`] decides.
-fn drive(
-    term: &mut LocalTerminal,
-    win: &mut Window,
-    shared: &mut Shared,
-    browser: &mut Client,
-    engine: &mut Engine,
-) -> Result<Driven, String> {
-    let mut last_check = Instant::now();
-    let mut buf = [0u8; 8192];
-    // When the terminal last sent a byte of a paste that is still open; see
-    // [`PASTE_IDLE`].
-    let mut paste_heard: Option<Instant> = None;
-
-    while !QUIT.load(Ordering::SeqCst) {
-        match prepare_window(term, win, shared, browser, engine, &mut last_check)? {
-            Pass::Continue => {}
-            Pass::Quit => return Ok(Driven::Quit),
-            Pass::EngineDied(why) => return Ok(Driven::EngineDied(why)),
-        }
-
-        let mut watching = vec![term.input_fd(), browser.wake_fd()];
-        watching.extend(window_fds(win, term));
-        // A `blinkterm --remote` knocking; see [`pump_remote`].
-        watching.extend(shared.remote.as_ref().map(Listener::fd));
-        let ready = tty::poll_readable(&watching, poll_wait(win))
-            .map_err(|e| format!("cannot wait for input: {e}"))?;
-
-        if ready.contains(&term.input_fd()) {
-            match tty::read_available(term.input_fd(), &mut buf) {
-                Ok(ReadOutcome::Data(n)) => {
-                    let inputs = term.parse(&buf[..n]);
-                    paste_heard = term.pasting().then(Instant::now);
-                    win.chrome.pixel_mouse = term.pixel_coordinates();
-                    for input in inputs {
-                        if !take_input(term, win, shared, browser, input)? {
-                            return Ok(Driven::Quit);
-                        }
-                    }
-                }
-                Ok(ReadOutcome::Eof) => return Ok(Driven::Quit),
-                Ok(ReadOutcome::WouldBlock) => {}
-                Err(err) => return Err(format!("cannot read the terminal: {err}")),
-            }
-        } else if paste_heard.is_some_and(|at| at.elapsed() > PASTE_IDLE) {
-            // A paste that was opened and has gone quiet: the end marker is
-            // not coming, and what arrived is half of something.
-            paste_heard = None;
-            if term.abandon_paste() {
-                note(&mut win.tabs, "paste cut short; try again");
-                redraw_row(term, &win.tabs, &win.chrome, shared)?;
-            }
-        } else if let Some(input) = term.flush() {
-            // Nothing arrived, so a held escape was the Escape key after all.
-            if !take_input(term, win, shared, browser, input)? {
-                return Ok(Driven::Quit);
-            }
-        }
-        // A desktop browser started by alt+o that has exited, forgotten.
-        term.reap();
-        match pass_window(term, win, shared, browser, &ready)? {
-            Pass::Continue => {}
-            Pass::Quit => return Ok(Driven::Quit),
-            Pass::EngineDied(why) => return Ok(Driven::EngineDied(why)),
-        }
-    }
-    Ok(Driven::Quit)
-}
-
-/// One thing the terminal said, for the window: the cell size the
-/// terminal's own ([`LocalTerminal::cell_size`]), and the rest
-/// [`handle_input`]'s. `false` means quit.
-fn take_input(
-    term: &mut LocalTerminal,
+/// One thing a window's terminal said, for the window: [`handle_input`]'s,
+/// with `pixel_mouse` — whether the terminal's mouse reports are in pixels,
+/// which its parser knows — told first. A cell size is the terminal's own
+/// business and never reaches here ([`LocalTerminal::cell_size`]). `false`
+/// means the window is over: the person quit it.
+pub(crate) fn window_input(
+    term: &mut dyn Terminal,
     win: &mut Window,
     shared: &mut Shared,
     browser: &mut Client,
     input: Input,
+    pixel_mouse: bool,
 ) -> Result<bool, String> {
     let Window { tabs, chrome, .. } = win;
-    if let Input::CellSize { width, height } = input {
-        term.cell_size(width, height, chrome.metrics.cell);
+    chrome.pixel_mouse = pixel_mouse;
+    if let Input::CellSize { .. } = input {
         return Ok(true);
     }
     handle_input(term, tabs, browser, chrome, shared, input)
+}
+
+/// The terminal a window is drawn on has gone — its frontend's connection
+/// ended without a word — and the window waits for it to come back
+/// ([`crate::backend::GRACE`]).
+///
+/// What was out with the terminal is given up: the frame owed an
+/// acknowledgement is acknowledged, so the engine is not left waiting on a
+/// terminal that is not there; a file picker or a password command the
+/// terminal was running is forgotten, and the page whose file input it was
+/// is told `cancel`; the wheel lets go. And the page in front stops casting,
+/// since there is nobody to paint it for. Its tabs stay as they are, and go
+/// on being heard every pass.
+pub(crate) fn suspend_window(term: &mut dyn Terminal, win: &mut Window) {
+    let Window { tabs, chrome, .. } = win;
+    end_helpers(term, chrome);
+    if let Some(wait) = chrome.picker.take() {
+        if let Some(tab) = tabs.index_of(&wait.tab).and_then(|i| tabs.get_mut(i)) {
+            if let Some(picking) = tab.picking.take() {
+                cancel_chooser(
+                    &mut tab.connection,
+                    picking.chooser.session.as_deref(),
+                    picking.chooser.backend_node_id,
+                );
+            }
+        }
+    }
+    if matches!(chrome.login, Some(LoginState::Fetching { .. })) {
+        chrome.login = None;
+    }
+    chrome.wheel.forget();
+    if let Some(Unacked { target, session }) = chrome.unacked.take() {
+        if let Some(tab) = tabs.index_of(&target).and_then(|i| tabs.get_mut(i)) {
+            acknowledge(&mut tab.connection, session);
+        }
+    }
+    hold_cast(win, true);
+}
+
+/// The terminal came back, at `metrics`: everything drawn again as after a
+/// resize, the page in front casting again at the size it is now.
+pub(crate) fn resume_window(
+    term: &mut dyn Terminal,
+    win: &mut Window,
+    shared: &mut Shared,
+    metrics: Metrics,
+) -> Result<(), String> {
+    let Window { tabs, chrome, .. } = win;
+    chrome.metrics = metrics;
+    chrome.scale = chrome.scale_choice.resolve(metrics.cell);
+    chrome.shape = Shape::Default;
+    relayout(term, tabs, chrome, shared)
+}
+
+/// The window is going: every tab closed in the engine, told rather than
+/// asked so that a window of many tabs does not hold the backend for a
+/// deadline each, which takes the engine window with them.
+pub(crate) fn close_window(term: &mut dyn Terminal, win: &mut Window, browser: &mut Client) {
+    end_helpers(term, &win.chrome);
+    win.chrome.wheel.forget();
+    for mut tab in win.tabs.take_all() {
+        let _ = browser.notify(
+            "Target.closeTarget",
+            Json::object(vec![("targetId", Json::string(&tab.target))]),
+        );
+        tab.connection.close();
+    }
+}
+
+/// Stop the page in front casting, or start it again: for a window whose
+/// terminal has gone or stopped taking its frames ([`crate::backend`]), so
+/// that the engine paints nothing nobody will see.
+pub(crate) fn hold_cast(win: &mut Window, held: bool) {
+    let Window { tabs, chrome, .. } = win;
+    let (pixels, cast) = (chrome.layout.pixels(chrome.metrics), chrome.cast);
+    if let Some(tab) = tabs.active_mut().filter(|tab| !tab.is_crashed()) {
+        let stopped = tab.dialog.is_some();
+        if held {
+            let _ = tab.connection.notify("Page.stopScreencast", Json::empty());
+        } else {
+            let _ = restart_screencast(&mut tab.connection, pixels, stopped, cast);
+        }
+    }
+    chrome.motion.reset(Instant::now());
+}
+
+/// The links this window's pages asked to open in a new tab since the last
+/// time, still fresh: see [`Chrome::dispositions`].
+pub(crate) fn take_dispositions(win: &mut Window, now: Instant) -> Vec<(String, Instant)> {
+    let mut taken = std::mem::take(&mut win.chrome.dispositions);
+    taken.retain(|(_, at)| now.saturating_duration_since(*at) < DISPOSITION_WITHIN);
+    taken
+}
+
+/// Whether `target` is one of this window's tabs.
+pub(crate) fn window_holds(win: &Window, target: &str) -> bool {
+    win.tabs.index_of(target).is_some()
+}
+
+/// Which window this is in the session file.
+pub(crate) fn window_id(win: &Window) -> WindowId {
+    win.chrome.id
+}
+
+/// A sentence on the window's row, drawn now: what its terminal said about
+/// something it was asked to do and could not, like start a desktop
+/// browser.
+pub(crate) fn window_note(
+    term: &mut dyn Terminal,
+    win: &mut Window,
+    shared: &Shared,
+    sentence: String,
+) -> Result<(), String> {
+    note(&mut win.tabs, sentence);
+    redraw_row(term, &win.tabs, &win.chrome, shared)
+}
+
+/// The urls of the `--remote` senders read this pass, opened in this
+/// window — the one used last — and each sender told what became of every
+/// url. See [`open_delivered`].
+pub(crate) fn deliver_remote(
+    term: &mut dyn Terminal,
+    win: &mut Window,
+    shared: &mut Shared,
+    browser: &mut Client,
+    deliveries: Vec<remote::Delivery>,
+) -> Result<(), String> {
+    let Window { tabs, chrome, .. } = win;
+    let was = tabs.active_target().map(str::to_string);
+    for delivery in deliveries {
+        let opened = open_delivered(
+            tabs,
+            browser,
+            &chrome.appearance,
+            &shared.identity,
+            &shared.sites,
+            &delivery.lines,
+        );
+        delivery.answer(&opened);
+    }
+    switched(term, tabs, browser, chrome, shared, was)?;
+    redraw_row(term, tabs, chrome, shared)
 }
 
 /// The descriptors a window wants the next poll to watch, beside the
@@ -2084,7 +2184,7 @@ fn take_input(
 ///
 /// A background tab's pipe is not watched — it has no screencast and
 /// nothing urgent to say — but its queue is drained every pass.
-fn window_fds(win: &Window, term: &dyn Terminal) -> Vec<std::os::fd::RawFd> {
+pub(crate) fn window_fds(win: &Window, term: &dyn Terminal) -> Vec<std::os::fd::RawFd> {
     let mut fds: Vec<_> = win
         .tabs
         .active()
@@ -2100,7 +2200,7 @@ fn window_fds(win: &Window, term: &dyn Terminal) -> Vec<std::os::fd::RawFd> {
 /// ([`tick_frames`]), and nothing wakes the poll when the writer finishes;
 /// so while one is owed the passes come often enough that the wait is not
 /// the frame rate.
-fn poll_wait(win: &Window) -> i32 {
+pub(crate) fn poll_wait(win: &Window) -> i32 {
     if win.chrome.unacked.is_some() {
         FRAME_POLL_MS
     } else {
@@ -2111,7 +2211,7 @@ fn poll_wait(win: &Window) -> i32 {
 /// Everything a window does before the poll: whether it is over, the row's
 /// words that change by themselves, the layout and the size, whether the
 /// engine is still there, and the tabs whose sessions have gone.
-fn prepare_window(
+pub(crate) fn prepare_window(
     term: &mut dyn Terminal,
     win: &mut Window,
     shared: &mut Shared,
@@ -2230,12 +2330,14 @@ fn prepare_window(
 /// acknowledgement, what every page said, the answers to what was asked of
 /// the page in front, the still, and the session file. `ready` is what the
 /// poll found readable.
-fn pass_window(
+pub(crate) fn pass_window(
     term: &mut dyn Terminal,
     win: &mut Window,
     shared: &mut Shared,
     browser: &mut Client,
     ready: &[std::os::fd::RawFd],
+    events: Vec<Event>,
+    downloads_moved: bool,
 ) -> Result<Pass, String> {
     let Window {
         tabs,
@@ -2245,10 +2347,6 @@ fn pass_window(
     // A file picker's window that has answered, or whose tab has gone
     // or gone somewhere else.
     pump_picker(term, tabs, chrome, shared, ready)?;
-    // Urls from `blinkterm --remote`, opened now: before the engine's
-    // announcements of targets are read below, so that the tabs are in
-    // the list by then and those announcements are ignored as ours.
-    pump_remote(term, tabs, browser, chrome, shared, ready)?;
     // A password command that has answered, or a page that has answered
     // the fill.
     pump_login(term, tabs, chrome, shared, ready)?;
@@ -2267,9 +2365,6 @@ fn pass_window(
         chrome.motion.input(at);
     }
 
-    if ready.contains(&browser.wake_fd()) {
-        browser.drain_wake();
-    }
     // By the tab that owns the descriptor rather than by whichever tab is
     // active now: handling a key may have switched tabs since the poll,
     // and the pipe that was readable is the one to empty. Only the tab in
@@ -2283,7 +2378,7 @@ fn pass_window(
     // Which pages exist first, then what the page in front is doing: a
     // frame is read from whichever tab is active once the list has settled,
     // and never from one that has just been left behind.
-    handle_target_events(term, tabs, browser, chrome, shared)?;
+    handle_target_events(term, tabs, browser, chrome, shared, events, downloads_moved)?;
     handle_page_events(term, tabs, chrome, shared)?;
     // A click on a file input that a picker is to answer, read just now:
     // started in the same pass, which for one that runs in the terminal
@@ -2348,7 +2443,7 @@ fn pass_window(
 /// out, the wheel's point brought inside the page, the pointer and the
 /// labels forgotten, and the row drawn again — which with the whole pane is
 /// nothing.
-fn relayout(
+pub(crate) fn relayout(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
@@ -2398,7 +2493,7 @@ fn relayout(
 /// the session file holds, which the next start offers back and
 /// `--restore` reopens. Just `why` when nothing was saved, or the session is
 /// kept nowhere — a temporary profile's. The tabs are `window`'s group.
-fn died(why: String, session: &Session, window: WindowId) -> String {
+pub(crate) fn died(why: String, session: &Session, window: WindowId) -> String {
     match session.saved_tabs(window) {
         Some(1) => format!("{why}; the tab you had is saved: blinkterm --restore reopens it"),
         Some(tabs) => {
@@ -3086,7 +3181,7 @@ fn chooser_opened(tab: &mut Tab<Client>, event: &Event, base: &Path, chrome: &Ch
             return true;
         }
     }
-    tab.chooser_event(event, base, upload::home().as_deref(), use_picker)
+    tab.chooser_event(event, base, chrome.home_dir.as_deref(), use_picker)
 }
 
 /// Stop a tab painting, if it is still in the list.
@@ -4268,23 +4363,22 @@ fn handle_target_events(
     browser: &mut Client,
     chrome: &mut Chrome,
     shared: &mut Shared,
+    events: Vec<Event>,
+    downloads_moved: bool,
 ) -> Result<(), String> {
-    let events = browser.events();
     if events.is_empty() {
+        if downloads_moved {
+            redraw_row(term, tabs, chrome, shared)?;
+        }
         return Ok(());
     }
     let was = tabs.active_target().map(str::to_string);
-    let mut redraw = false;
+    let mut redraw = downloads_moved;
     let mut note: Option<String> = None;
     // The tabs whose renderer died in this batch.
     let mut crashed: Vec<String> = Vec::new();
 
     for event in &events {
-        // A download's news comes on this connection and is nobody's tab's.
-        // `tabs.take` ignores these, so they are read first and only here.
-        if shared.downloads.take(event, Instant::now()) {
-            redraw = true;
-        }
         let appearance = chrome.appearance;
         let identity = shared.identity.clone();
         let sites = &shared.sites;
@@ -4554,6 +4648,25 @@ fn handle_page_events(
                             // milliseconds.
                             Err(_) => continue,
                         }
+                    }
+                }
+                // A link this page asked to open in a new tab or window: the
+                // target it makes names no opener, and this is what says
+                // which window it was clicked in. See
+                // [`Chrome::dispositions`].
+                "Page.frameRequestedNavigation" => {
+                    let opens = matches!(
+                        params.get("disposition").and_then(Json::as_str),
+                        Some("newTab" | "newWindow")
+                    );
+                    if let (true, Some(url)) = (opens, params.get("url").and_then(Json::as_str)) {
+                        let now = Instant::now();
+                        chrome.dispositions.retain(|(_, at)| {
+                            now.saturating_duration_since(*at) < DISPOSITION_WITHIN
+                        });
+                        chrome
+                            .dispositions
+                            .push((crate::text::sanitize(url).into_owned(), now));
                     }
                 }
                 "Page.frameNavigated" => {
@@ -6490,53 +6603,6 @@ fn pump_picker(
     redraw_row(term, tabs, chrome, shared)
 }
 
-/// Urls from `blinkterm --remote`, once a pass: every sender that has
-/// connected read, its urls opened, and each told what became of every url.
-///
-/// The first url opened comes to the front, as a desktop browser brings a
-/// link from another program to the front, and the rest go behind it, as
-/// several urls on the command line do. The url bar, if it is open, is left
-/// as it is: it is somebody typing, and what they typed is theirs. A socket
-/// that has gone bad is let go, with a note, rather than woken for on every
-/// pass for ever.
-fn pump_remote(
-    term: &mut dyn Terminal,
-    tabs: &mut Tabs<Client>,
-    browser: &mut Client,
-    chrome: &mut Chrome,
-    shared: &mut Shared,
-    ready: &[std::os::fd::RawFd],
-) -> Result<(), String> {
-    let Some(listener) = shared.remote.as_mut() else {
-        return Ok(());
-    };
-    if !ready.contains(&listener.fd()) {
-        return Ok(());
-    }
-    let deliveries = match listener.accept_ready() {
-        Ok(deliveries) => deliveries,
-        Err(why) => {
-            shared.remote = None;
-            note(tabs, format!("stopped listening for --remote: {why}"));
-            return redraw_row(term, tabs, chrome, shared);
-        }
-    };
-    let was = tabs.active_target().map(str::to_string);
-    for delivery in deliveries {
-        let opened = open_delivered(
-            tabs,
-            browser,
-            &chrome.appearance,
-            &shared.identity,
-            &shared.sites,
-            &delivery.lines,
-        );
-        delivery.answer(&opened);
-    }
-    switched(term, tabs, browser, chrome, shared, was)?;
-    redraw_row(term, tabs, chrome, shared)
-}
-
 /// Open what a `--remote` sender asked for: the first url that was
 /// accepted in a tab in front, loading as the first url on the command line
 /// is, and every other one in a tab behind; and, one for one with `lines`,
@@ -6710,7 +6776,9 @@ fn open_external(
     let job = Helper::External {
         argv: external::argv(&command, &url),
         browser: external::browser_to_pass(browser.as_deref()),
-        home: upload::home(),
+        home: chrome.home_dir.clone(),
+        url,
+        configured: chrome.external.clone(),
     };
     let id = chrome.take_helper_id();
     match term.start_helper(id, job)? {
@@ -6771,8 +6839,10 @@ fn start_login(
         }
     };
     let (target, url) = (tab.target.clone(), tab.url.clone());
-    let dir = upload::home()
-        .or_else(|| std::env::current_dir().ok())
+    let dir = chrome
+        .home_dir
+        .clone()
+        .or_else(|| chrome.cwd.clone())
         .unwrap_or_else(|| PathBuf::from("/"));
     let chosen = chrome
         .logins
@@ -9425,6 +9495,7 @@ mod tests {
     use super::*;
     use crate::bindings::Keymap;
     use crate::input::{Mods, Parser};
+    use crate::route::Payload;
 
     /// The bytes a terminal actually sends for a ctrl+wheel reach [`zooms`]
     /// as a pinch: the report is parsed here rather than built by hand, so

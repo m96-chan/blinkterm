@@ -94,7 +94,10 @@
 //! there.
 
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -490,6 +493,148 @@ fn group_has_living_member(_group: i32) -> bool {
     true
 }
 
+/// The file a backend leaves in a kept profile while its engine runs:
+/// `<pgid>\t<unix seconds>\t<executable>\n`. See [`reap_orphan`].
+pub const PGID_FILE: &str = "engine.pgid";
+
+/// Say in the profile which process group the engine running on it is, so
+/// that the next backend can make sure it has stopped ([`reap_orphan`]).
+/// Written under the profile lock, over whatever was there; a failure is
+/// not a reason not to browse, and is only lost protection against a crash.
+pub fn write_pgid_marker(dir: &Path, engine: &Engine) {
+    let Some(group) = engine.group() else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let text = format!("{group}\t{secs}\t{}\n", engine.path().display());
+    let path = dir.join(PGID_FILE);
+    let fresh = dir.join(format!("{PGID_FILE}.tmp"));
+    let wrote = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&fresh)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .and_then(|()| std::fs::rename(&fresh, &path));
+    if let Err(why) = wrote {
+        eprintln!("blinkterm: cannot write {}: {why}", path.display());
+    }
+}
+
+/// The marker gone: the engine it named has stopped, on purpose.
+pub fn remove_pgid_marker(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(PGID_FILE));
+}
+
+/// The process group and executable a marker names.
+pub fn parse_pgid_marker(text: &str) -> Option<(i32, PathBuf)> {
+    let line = text.lines().next()?;
+    let mut fields = line.splitn(3, '\t');
+    let group = fields.next()?.parse::<i32>().ok().filter(|g| *g > 1)?;
+    let _secs = fields.next()?;
+    let exe = fields.next().filter(|exe| !exe.is_empty())?;
+    Some((group, PathBuf::from(exe)))
+}
+
+/// Make sure no engine a previous backend started is still running on the
+/// profile at `dir`, before another is started on it.
+///
+/// The profile lock says that no blinkterm holds the profile; it does not
+/// say that nothing is writing it. A backend that was killed outright
+/// (`SIGKILL`, a power cut of its own) leaves its engine behind: the
+/// browser exits once its pipe ends, but not every process in its group
+/// does. So a backend leaves [`PGID_FILE`] in the profile while its engine
+/// runs, and the next one reads it, under the lock, before anything else:
+/// if that group still has a process that is that engine — on Linux, one
+/// whose command line names `--user-data-dir=<dir>`; on a Mac, a leader
+/// whose executable is the one written down — the group is killed and
+/// waited for, up to two seconds. A group that is gone, or whose number now
+/// belongs to something else, is left alone. The marker goes either way.
+///
+/// The `Err` is the sentence for a group that would not stop.
+pub fn reap_orphan(dir: &Path) -> Result<(), String> {
+    let path = dir.join(PGID_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    if let Some((group, exe)) = parse_pgid_marker(&text) {
+        if is_engine_group(group, dir, &exe) {
+            signal_all(-group, libc::SIGKILL);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while group_alive(-group) {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "an engine from a previous blinkterm (process group {group}) is still \
+                         running on {} and would not stop; kill it before starting another",
+                        dir.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// Whether process group `group` is an engine started on `dir`: some living
+/// member's command line has `--user-data-dir=<dir>` in it.
+#[cfg(target_os = "linux")]
+fn is_engine_group(group: i32, dir: &Path, _exe: &Path) -> bool {
+    let wanted = format!("--user-data-dir={}", dir.display());
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let in_group = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .and_then(|stat| state_and_group(&stat))
+            .is_some_and(|(state, pgrp)| pgrp == group && state != 'Z');
+        in_group
+            && std::fs::read(entry.path().join("cmdline")).is_ok_and(|cmdline| {
+                cmdline
+                    .split(|&b| b == 0)
+                    .any(|arg| arg == wanted.as_bytes())
+            })
+    })
+}
+
+/// Whether process group `group` is an engine: its leader is alive and is
+/// the executable the marker names, by `proc_pidpath(3)`.
+#[cfg(target_os = "macos")]
+fn is_engine_group(group: i32, _dir: &Path, exe: &Path) -> bool {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `proc_pidpath` writes at most `buffersize` bytes into the
+    // buffer, which is a live local of exactly that many bytes, and returns
+    // how many it wrote, or 0 or less on failure; nothing is kept.
+    let n = unsafe {
+        libc::proc_pidpath(
+            group,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len() as u32,
+        )
+    };
+    if n <= 0 {
+        return false;
+    }
+    buf.truncate(n as usize);
+    let found = PathBuf::from(std::ffi::OsString::from_vec(buf));
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(&found) == canonical(exe)
+}
+
+/// Elsewhere nothing can be asked, and a group that cannot be shown to be
+/// an engine is never signalled.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_engine_group(_group: i32, _dir: &Path, _exe: &Path) -> bool {
+    false
+}
+
 /// Where the engine is, or a sentence about why there is none.
 pub fn locate() -> Result<PathBuf, String> {
     if let Some(named) = std::env::var_os(ENGINE_ENV) {
@@ -701,6 +846,9 @@ pub struct Engine {
     /// and asking again later would be a second round trip for a string that
     /// cannot change while the process lives.
     agent: Option<String>,
+    /// The executable that was started, for the marker a backend leaves in
+    /// the profile ([`write_pgid_marker`]).
+    path: PathBuf,
 }
 
 /// What an [`Engine`] is without its profile: everything that dies with the
@@ -842,6 +990,7 @@ impl Engine {
             process,
             profile,
             agent,
+            path,
         })
     }
 
@@ -861,6 +1010,11 @@ impl Engine {
     /// What the engine calls itself, as `Browser.getVersion` reported it.
     pub fn agent(&self) -> Option<&str> {
         self.agent.as_deref()
+    }
+
+    /// The executable that was started.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The profile it was started with.
@@ -951,6 +1105,7 @@ impl Engine {
             mut process,
             profile,
             agent: _,
+            path: _,
         } = self;
         process.stop();
         profile

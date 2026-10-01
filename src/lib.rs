@@ -124,6 +124,7 @@
 
 pub mod app;
 pub mod appearance;
+pub mod backend;
 pub mod base64;
 pub mod bindings;
 pub mod block;
@@ -141,6 +142,7 @@ pub mod engine;
 pub mod external;
 pub mod find;
 pub mod fit;
+pub mod frontend;
 pub mod fullscreen;
 pub mod graphics;
 pub mod hints;
