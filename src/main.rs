@@ -178,8 +178,8 @@ time: a second one started on the same profile is refused, and told which pid
 has it. A running blinkterm takes urls from \"blinkterm --remote <url>\" over
 blinkterm.sock in its profile, so it can be $BROWSER. The open tabs are saved
 in the profile; --restore reopens them, and after a crash the next start
-offers to. Bookmarks are one file for every
-profile, $XDG_DATA_HOME/blinkterm/bookmarks, one url<TAB>title per line.
+offers to. Bookmarks are kept in the profile too,
+in a file called bookmarks, one url<TAB>title per line.
 Named profiles are listed in $XDG_DATA_HOME/blinkterm/profiles.json, and
 blinkterm profiles makes, renames and removes them. A start with no profile
 chosen opens the default one, and asks which when there is no default.

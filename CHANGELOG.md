@@ -34,6 +34,17 @@ flag, a different default, a raised Rust floor all do.
 
 - `blinkterm profiles` is now the profiles command rather than a url to a
   host called `profiles`; `blinkterm -- profiles` still opens that host.
+- **Bookmarks are per profile now**, in `<profile>/bookmarks`, so profiles
+  no longer share them. The old shared file,
+  `$XDG_DATA_HOME/blinkterm/bookmarks`, is imported into the `Default`
+  profile once, the first time it starts, and is kept where it was; other
+  profiles start with none (copy the file into a profile's directory to
+  give it them). A `--temp-profile` keeps bookmarks for the run only, where
+  before it wrote them to the shared file
+  ([#83](https://github.com/m96-chan/blinkterm/issues/83)).
+- The session file groups its tabs under a `# window` line, after a
+  `# format: 2` line. Nothing changes in what is restored or offered; an
+  older blinkterm still reads the file.
 
 ## [0.4.0] - 2026-10-01
 
