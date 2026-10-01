@@ -2090,10 +2090,22 @@ pub(crate) fn resume_window(
     shared: &mut Shared,
     open: &crate::ipc::Open,
 ) -> Result<(), String> {
+    win.chrome.display = open.display;
+    lay_out_again(term, win, shared, open.metrics)
+}
+
+/// Everything drawn again at `metrics`, as after a resize, the page in
+/// front casting again at the size it is now: a terminal that came back,
+/// or a helper that gave the terminal back.
+pub(crate) fn lay_out_again(
+    term: &mut dyn Terminal,
+    win: &mut Window,
+    shared: &mut Shared,
+    metrics: Metrics,
+) -> Result<(), String> {
     let Window { tabs, chrome, .. } = win;
-    chrome.metrics = open.metrics;
-    chrome.display = open.display;
-    chrome.scale = chrome.scale_choice.resolve(open.metrics.cell);
+    chrome.metrics = metrics;
+    chrome.scale = chrome.scale_choice.resolve(metrics.cell);
     chrome.shape = Shape::Default;
     relayout(term, tabs, chrome, shared)
 }

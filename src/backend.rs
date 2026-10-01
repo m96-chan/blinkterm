@@ -1536,7 +1536,7 @@ impl Backend {
                         .resized
                         .take()
                         .unwrap_or_else(|| app::window_metrics(&slot.win));
-                    let resumed = app::resume_window(
+                    let resumed = app::lay_out_again(
                         &mut slot.term,
                         &mut slot.win,
                         &mut self.shared,
