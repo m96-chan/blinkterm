@@ -1009,26 +1009,28 @@ fn a_stale_backend_sock_and_a_stale_engine_pgid_are_cleaned_under_the_lock() {
     let orphan_group = orphan.id() as i32;
     std::thread::sleep(Duration::from_millis(100));
     a_crash_left(&scratch.0, orphan.id(), exe);
+    // A real orphan's parent is gone, so init or launchd reaps it the moment
+    // it is killed. This one's parent is the test, which must reap it as
+    // promptly, from a thread of its own: a zombie still answers `kill(2)`,
+    // and on a Mac, with no `/proc` to tell it from a living process, the
+    // backend would wait out its deadline on it.
+    let (reaped, reaper) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = reaped.send(orphan.wait());
+    });
     let mut b = Front::open(
         &mut spawn,
         &scratch.0,
         (80, 24),
         std::slice::from_ref(&page),
     );
-    let status = {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match orphan.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                _ if Instant::now() >= deadline => break None,
-                _ => std::thread::sleep(Duration::from_millis(20)),
-            }
+    let status = match reaper.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(status)) => Some(status),
+        _ => {
+            signal(-orphan_group, libc::SIGKILL);
+            None
         }
     };
-    if status.is_none() {
-        signal(-orphan_group, libc::SIGKILL);
-        let _ = orphan.wait();
-    }
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(
         status.and_then(|s| s.signal()),
