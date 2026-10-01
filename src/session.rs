@@ -1343,7 +1343,9 @@ mod tests {
             "a closed group is not offered"
         );
         assert_eq!(
-            session.take_group(TWO).map(|g| g.snapshot.tabs[0].url.clone()),
+            session
+                .take_group(TWO)
+                .map(|g| g.snapshot.tabs[0].url.clone()),
             Some("https://quit.example/".to_string())
         );
         let _ = std::fs::remove_dir_all(&dir);
