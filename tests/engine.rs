@@ -8972,7 +8972,7 @@ fn hints_on_about_blank_and_the_error_page_are_none_and_no_exception() {
 // ---------------------------------------------------------------------------
 
 use blinkterm::fit::Metrics;
-use blinkterm::session::{self, Session, Snapshot, State};
+use blinkterm::session::{self, GroupState, Session, Snapshot, State, WindowId};
 
 /// A page that paints every frame, so that a screencast of it is a count.
 /// No `%` and no `#` in it: this is a url, and `#` would start its fragment.
@@ -9341,7 +9341,7 @@ fn an_engine_that_dies_ends_every_session_at_once_and_leaves_the_session_file_op
         active: 1,
     };
     let now = Instant::now();
-    kept.record(two.clone(), now);
+    kept.record_window(WindowId(1), two.clone(), now);
     kept.flush(now).expect("written");
 
     let group = engine.group().expect("a group of its own");
@@ -9365,18 +9365,26 @@ fn an_engine_that_dies_ends_every_session_at_once_and_leaves_the_session_file_op
     let why = engine.check().unwrap_err();
     eprintln!("{why}");
 
-    let saved = Session::load(&dir).saved().cloned().expect("a session");
+    let read = || {
+        Session::parse(&std::fs::read_to_string(dir.join(session::FILE)).expect("the file"))
+            .expect("a session")
+    };
+    let saved = read();
     assert_eq!(saved.state, State::Open, "the run did not quit");
-    assert_eq!(saved.snapshot, two);
+    assert_eq!(saved.groups.len(), 1, "one window");
+    assert_eq!(saved.groups[0].state, GroupState::Lost);
+    assert_eq!(saved.groups[0].snapshot, two);
     kept.finish(false);
+    let saved = read();
     assert_eq!(
-        Session::load(&dir).saved().map(|saved| saved.state),
-        Some(State::Open)
+        (saved.state, saved.groups[0].state),
+        (State::Open, GroupState::Lost)
     );
     kept.finish(true);
+    let saved = read();
     assert_eq!(
-        Session::load(&dir).saved().map(|saved| saved.state),
-        Some(State::Closed)
+        (saved.state, saved.groups[0].state),
+        (State::Closed, GroupState::Closed)
     );
 
     drop(page);

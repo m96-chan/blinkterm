@@ -79,7 +79,7 @@ use crate::route::{self, Payload, Route, Wrap};
 use crate::save;
 use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
-use crate::session::{self, Offer, Reply, Session, Snapshot};
+use crate::session::{self, Offer, Reply, Session, Snapshot, WindowId};
 use crate::sites::{self, Sites};
 use crate::strip;
 use crate::tablist::{self, TabList};
@@ -330,6 +330,11 @@ impl Relaunches {
         self.last = Some(now);
     }
 }
+
+/// The one window a run has, as the session file records it: its tabs are
+/// one group there ([`crate::session`]), restored, offered and closed as a
+/// window's.
+const WINDOW: WindowId = WindowId(1);
 
 /// How recently the tab list must have shrunk for the tabs it had before to
 /// be the ones a relaunch brings back: see [`Shrunk`].
@@ -596,7 +601,7 @@ struct Chrome {
     focus: Option<Focus>,
     /// The reader's question out with the page in front.
     reader: Option<Reading>,
-    /// The person's bookmarks, one file for every profile; see
+    /// The profile's bookmarks, or this run's for a temporary profile; see
     /// [`crate::bookmarks`].
     bookmarks: Bookmarks,
     /// The profile's name, first of the words at the right of the row, so
@@ -757,12 +762,7 @@ impl Chrome {
             hinting: None,
             focus: None,
             reader: None,
-            // The same file under every profile, a temporary one
-            // included: a bookmark is the person's, not the engine's.
-            bookmarks: match Profile::data_dir() {
-                Ok(dir) => Bookmarks::load(&dir),
-                Err(_) => Bookmarks::in_memory(),
-            },
+            bookmarks: Bookmarks::for_profile(profile),
             profile_label: profile.label().map(str::to_string),
             session: if profile.is_temporary() {
                 Session::in_memory()
@@ -1397,6 +1397,16 @@ pub fn run(options: Options) -> Result<(), String> {
     // Taken before the engine is started, so that a profile another blinkterm
     // is using is refused before anything has written to it.
     let profile = Profile::take_selected(selected)?;
+    // The bookmarks every profile shared before each had its own, copied
+    // into the `Default` profile the first time it is started — under the
+    // profile's lock, so no other blinkterm on it is reading its bookmarks
+    // yet. What was copied is said on the row with the start's problems.
+    let mut copied = match Profile::data_dir() {
+        Ok(data) if !profile.is_temporary() => {
+            crate::bookmarks::migrate_legacy(&data, profile.dir())
+        }
+        _ => None,
+    };
     // The `--remote` socket, bound now that the lock is held — which is what
     // makes whatever a crash left at its path safe to remove — and before the
     // engine is started, so that a sender that comes while it starts waits
@@ -1513,7 +1523,11 @@ pub fn run(options: Options) -> Result<(), String> {
                 // the tabs that were there when it died.
                 let opened = if std::mem::take(&mut opening) {
                     open_first(&mut pane, tabs, browser, &mut chrome, &options).and_then(|()| {
-                        match summary(&std::mem::take(&mut problems)) {
+                        let said = match (summary(&std::mem::take(&mut problems)), copied.take()) {
+                            (Some(problems), Some(copied)) => Some(format!("{problems}; {copied}")),
+                            (problems, copied) => problems.or(copied),
+                        };
+                        match said {
                             Some(said) => {
                                 chrome.startup = Some(said.clone());
                                 note(tabs, said);
@@ -1636,10 +1650,10 @@ fn open_first(
 ) -> Result<(), String> {
     // What the last run left, decided before anything is opened: its tabs,
     // with `--restore`; a question on the row, after a run that did not quit.
-    let plan = session::plan(chrome.session.saved(), options.restore);
+    let plan = session::plan_for_window(chrome.session.next_group(), options.restore);
     let mut restored = false;
     if let Some(snapshot) = plan.restore {
-        chrome.session.take_saved();
+        chrome.session.take_group(WINDOW);
         restore_tabs(
             tabs,
             browser,
@@ -1652,7 +1666,7 @@ fn open_first(
     }
     if let Some(offer) = plan.offer {
         chrome.offer = Some(offer);
-        chrome.session.hold(true);
+        chrome.session.offer_group(WINDOW);
     }
     // The first url on the command line, or the home page when there is none.
     let url = normalise(options.urls.first().unwrap_or(&options.home));
@@ -2129,7 +2143,9 @@ fn drive(
         // which there are many and a missed one is a session that lies. A
         // few string clones; a write only when it differs from the last, at
         // most once every [`session::WRITE_EVERY`].
-        chrome.session.record(Snapshot::of(tabs), Instant::now());
+        chrome
+            .session
+            .record_window(WINDOW, Snapshot::of(tabs), Instant::now());
         shrunk.pass(tabs, Instant::now());
         if let Err(why) = chrome.session.flush(Instant::now()) {
             note(tabs, why);
@@ -2195,7 +2211,7 @@ fn relayout(pane: &mut Pane, tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> Re
 /// `--restore` reopens. Just `why` when nothing was saved, or the session is
 /// kept nowhere — a temporary profile's.
 fn died(why: String, session: &Session) -> String {
-    match session.saved_tabs() {
+    match session.saved_tabs(WINDOW) {
         Some(1) => format!("{why}; the tab you had is saved: blinkterm --restore reopens it"),
         Some(tabs) => {
             format!("{why}; the {tabs} tabs you had are saved: blinkterm --restore reopens them")
@@ -2754,9 +2770,11 @@ fn decline_or_restore(
     yes: bool,
 ) -> Result<(), String> {
     chrome.offer = None;
-    chrome.session.hold(false);
+    // Answered either way, the group is this window's now: a no is not
+    // asked again, and the window's own tabs replace it once it has any.
+    let offered = chrome.session.take_offered(WINDOW);
     if yes {
-        if let Some(saved) = chrome.session.take_saved() {
+        if let Some(saved) = offered {
             let was = tabs.active_target().map(str::to_string);
             restore_tabs(
                 tabs,
@@ -9917,7 +9935,7 @@ mod tests {
             active: 0,
         };
         let now = Instant::now();
-        kept.record(tabs(3), now);
+        kept.record_window(WINDOW, tabs(3), now);
         assert_eq!(
             died(why(), &kept),
             format!(
@@ -9925,7 +9943,7 @@ mod tests {
                 why()
             )
         );
-        kept.record(tabs(1), now + Duration::from_secs(1));
+        kept.record_window(WINDOW, tabs(1), now + Duration::from_secs(1));
         assert_eq!(
             died(why(), &kept),
             format!(
@@ -9934,7 +9952,7 @@ mod tests {
             )
         );
         let mut memory = Session::in_memory();
-        memory.record(tabs(3), now);
+        memory.record_window(WINDOW, tabs(3), now);
         assert_eq!(
             died(why(), &memory),
             why(),
@@ -9967,7 +9985,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let mut kept = Session::load(&dir);
-        kept.record(
+        kept.record_window(
+            WINDOW,
             Snapshot {
                 tabs: (0..3)
                     .map(|i| session::Entry {

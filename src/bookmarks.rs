@@ -6,19 +6,31 @@
 //! a bookmark's when one starts the same way, and Up walks the bookmarks that
 //! match before the history ([`crate::history::Walk`]).
 //!
-//! # One file, for every profile
+//! # A file a profile
 //!
-//! The file is `$XDG_DATA_HOME/blinkterm/bookmarks` (or
-//! `~/.local/share/blinkterm/bookmarks`), beside the default profile rather
-//! than inside any profile, and it is the same file under `--profile <dir>`
-//! and under `--temp-profile`. A profile is the engine's data — the cookie
-//! jar, the site storage, the history of where the engine went — and a
-//! temporary profile is a promise about *that*: nothing the engine did is
-//! kept. A bookmark is not the engine's. It is the one thing here the person
-//! asked for by name to keep, and pressing `ctrl+d` under `--temp-profile` is
-//! asking for exactly that to outlive the run. With neither `$XDG_DATA_HOME`
-//! nor `$HOME` there is nowhere to keep it, and [`Bookmarks::in_memory`]
-//! keeps it for the run and the row says so.
+//! The file is `<profile>/bookmarks`, beside the history and the saved tabs:
+//! the work profile's bookmarks are the work profile's, and a profile made
+//! to keep two identities apart does not hand one's pages to the other. A
+//! temporary profile keeps them in memory ([`Bookmarks::in_memory`]) — a
+//! `ctrl+d` there works for the run, the row says it is for the run only,
+//! and nothing is written, which is what `--temp-profile` promises.
+//!
+//! # The file from before profiles
+//!
+//! Every blinkterm before this one kept one file for every profile,
+//! `$XDG_DATA_HOME/blinkterm/bookmarks` (or
+//! `~/.local/share/blinkterm/bookmarks`), and the first start on the
+//! registry's `Default` profile — the directory those versions used,
+//! `<data>/profile` — copies it in ([`migrate_legacy`]). Once: the copy
+//! leaves `bookmarks.migrated` beside the old file, and a start that finds
+//! it, or finds the profile already has bookmarks, copies nothing. The old
+//! file is left where it is, so that an older blinkterm run afterwards still
+//! has its bookmarks; what either adds after that is its own. The copy is
+//! made under the old file's lock, `<data>/bookmarks.lock`, which an older
+//! blinkterm takes for every change it makes, so the copy is never of a file
+//! half rewritten. Any other profile starts with none: a `--profile <dir>`
+//! or a named profile that should have them gets them with a `cp` of the old
+//! file into its directory.
 //!
 //! # A line per bookmark
 //!
@@ -41,22 +53,23 @@
 //! from the page and again on the way in from the file, since a hand-edited
 //! or hostile file reaches the row by the same path a title does.
 //!
-//! # Two runs at once
+//! # Two writers
 //!
-//! The profile's lock does not cover this file — two runs on two profiles,
-//! or two `--temp-profile` runs, share it — and two things could go wrong: an
-//! append racing a rename (the append lands on the inode the rename just
-//! replaced, and is lost), and a run removing a bookmark from the list *it*
-//! loaded, which lacks what the other run added since. Both are closed by one
-//! rule: every change holds `bookmarks.lock` ([`crate::profile::hold`], a
-//! blocking `flock`) and reads the file again under it before changing it.
-//! The lock is on a separate file that is never renamed over, since a lock on
-//! the bookmarks file itself would be a lock on an inode the next rename
-//! replaces. A hold lasts one read and one write, tens of microseconds.
+//! The profile's lock keeps a second blinkterm off the profile, and so off
+//! its bookmarks; but a person's editor, a script, or the one-time copy
+//! above can write the file while a run has it, and an append racing a
+//! rename would land on the inode the rename just replaced, and be lost. So
+//! every change holds `bookmarks.lock` ([`crate::profile::hold`], a blocking
+//! `flock`) and reads the file again under it before changing it, which also
+//! means a removal never drops a line somebody else added since this run
+//! read it. The lock is on a separate file that is never renamed over, since
+//! a lock on the bookmarks file itself would be a lock on an inode the next
+//! rename replaces. A hold lasts one read and one write, tens of
+//! microseconds.
 //!
-//! What is not done is watching the file for the other run's additions: they
-//! appear in this run's completions after the next `ctrl+d` here, which reads
-//! the file again, or at the next start.
+//! What is not done is watching the file for another writer's additions:
+//! they appear in this run's completions after the next `ctrl+d` here, which
+//! reads the file again, or at the next start.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -64,13 +77,19 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::history::{self, History};
-use crate::{profile, text};
+use crate::profile::Profile;
+use crate::{profile, registry, text};
 
-/// The file, beside the default profile: `$XDG_DATA_HOME/blinkterm/bookmarks`.
+/// The file, in the profile: `<profile>/bookmarks`. The file every profile
+/// shared before has the same name, in the data directory.
 pub const FILE: &str = "bookmarks";
 
 /// The lock file beside it, never renamed over — see [`Bookmarks::toggle`].
 pub const LOCK: &str = "bookmarks.lock";
+
+/// Beside the old shared file once it has been copied into the `Default`
+/// profile: see [`migrate_legacy`].
+pub const MIGRATED: &str = "bookmarks.migrated";
 
 /// One page kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,9 +114,8 @@ enum Item {
 #[derive(Debug)]
 pub struct Bookmarks {
     items: Vec<Item>,
-    /// The file, or `None` when there is nowhere to keep one (no
-    /// `$XDG_DATA_HOME` and no `$HOME`), in which case `ctrl+d` works for the
-    /// run and the row says so.
+    /// The file, or `None` for a temporary profile, in which case `ctrl+d`
+    /// works for the run and the row says so.
     path: Option<PathBuf>,
 }
 
@@ -114,6 +132,16 @@ impl Bookmarks {
         Bookmarks {
             items: Vec::new(),
             path: None,
+        }
+    }
+
+    /// The bookmarks of `profile`: its file, read now, or for a temporary
+    /// profile none, kept in memory.
+    pub fn for_profile(profile: &Profile) -> Bookmarks {
+        if profile.is_temporary() {
+            Bookmarks::in_memory()
+        } else {
+            Bookmarks::load(profile.dir())
         }
     }
 
@@ -304,6 +332,97 @@ impl Bookmarks {
     pub fn matches(&self, typed: &str) -> Vec<&Bookmark> {
         let newest_first: Vec<&Bookmark> = self.all().into_iter().rev().collect();
         history::tiers(&newest_first, |m| &m.url, |m| &m.title, typed)
+    }
+}
+
+/// Copy the bookmarks file every profile shared before profiles had their
+/// own into the profile at `profile`, once, and say so; see the module's
+/// doc. `data` is the data directory, `$XDG_DATA_HOME/blinkterm`.
+///
+/// Only for the registry's `Default` profile at its old place,
+/// `<data>/profile` ([`registry::LEGACY_DIR`]) — the profile whose
+/// bookmarks the old file was as far as anybody using one profile could
+/// tell — and only when that profile has no bookmarks file of its own, the
+/// old file is there, and no `bookmarks.migrated` says it was copied
+/// before. The checks are made again under the old file's lock, which is
+/// held for the copy; the copy is written to `bookmarks.tmp` and renamed
+/// into place, 0600, so a crash leaves no half a file for the next start
+/// to take as the profile's own; then the marker is written. The old file
+/// is not touched.
+///
+/// `None` when there was nothing to do, and quietly when the old file holds
+/// no bookmark (its comments are copied all the same); else the sentence for
+/// the row — what was copied, or why it could not be, in which case nothing
+/// is marked and the next start tries again.
+pub fn migrate_legacy(data: &Path, profile: &Path) -> Option<String> {
+    let default = data.join(registry::LEGACY_DIR);
+    let same = profile == default
+        || matches!(
+            (profile.canonicalize(), default.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        );
+    let legacy = data.join(FILE);
+    let marker = data.join(MIGRATED);
+    let target = profile.join(FILE);
+    let wanted = || !marker.exists() && !target.exists() && legacy.exists();
+    if !same || !wanted() {
+        return None;
+    }
+    let failed = |why: String| {
+        Some(format!(
+            "the bookmarks were not copied into this profile: {why}"
+        ))
+    };
+    let held = match profile::hold(&data.join(LOCK)) {
+        Ok(held) => held,
+        Err(why) => return failed(why),
+    };
+    if !wanted() {
+        return None;
+    }
+    let bytes = match std::fs::read(&legacy) {
+        Ok(bytes) => bytes,
+        Err(e) => return failed(format!("cannot read {}: {e}", legacy.display())),
+    };
+    let fresh = target.with_extension("tmp");
+    let copied = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&fresh)
+        .and_then(|mut file| file.write_all(&bytes))
+        .and_then(|()| std::fs::rename(&fresh, &target));
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&fresh);
+        return failed(format!("cannot write {}: {e}", target.display()));
+    }
+    // The copy is the profile's own file now, which is what stops a second
+    // copy; the marker is what stops one after the person empties or
+    // removes it. A marker that cannot be written is not worth a word.
+    let _ = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&marker)
+        .and_then(|mut file| file.write_all(format!("1\t{}\n", profile.display()).as_bytes()));
+    drop(held);
+    let marks = read(&target)
+        .1
+        .iter()
+        .filter(|item| matches!(item, Item::Mark { .. }))
+        .count();
+    match marks {
+        0 => None,
+        1 => Some(format!(
+            "1 bookmark copied into this profile from {}",
+            legacy.display()
+        )),
+        n => Some(format!(
+            "{n} bookmarks copied into this profile from {}",
+            legacy.display()
+        )),
     }
 }
 
@@ -506,6 +625,155 @@ mod tests {
         assert!(done >= let_go, "the toggle did not wait for the lock");
         assert!(done - started < Duration::from_secs(2));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_profile_has_its_own_bookmarks_and_a_temporary_one_keeps_them_for_the_run() {
+        let root = scratch("profiles");
+        let work = Profile::take_at(root.join("work"), None).expect("work");
+        let home = Profile::take_at(root.join("home"), None).expect("home");
+        let mut marks = Bookmarks::for_profile(&work);
+        assert_eq!(marks.path(), Some(root.join("work").join(FILE).as_path()));
+        marks.toggle("https://work.example/", "W").expect("added");
+        assert_eq!(
+            urls(&Bookmarks::for_profile(&work)),
+            ["https://work.example/"],
+            "read again from the profile"
+        );
+        assert!(
+            Bookmarks::for_profile(&home).all().is_empty(),
+            "another profile has none of them"
+        );
+
+        let temporary = Profile::temporary().expect("a temporary profile");
+        let mut marks = Bookmarks::for_profile(&temporary);
+        assert_eq!(marks.path(), None, "the row says it is for this run");
+        assert_eq!(marks.toggle("https://t.example/", ""), Ok(Toggled::Added));
+        assert!(!temporary.dir().join(FILE).exists(), "nothing written");
+        drop(temporary);
+        drop((work, home));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A data directory with the old shared file in it and the `Default`
+    /// profile's directory made, as the first start after upgrading finds it.
+    fn upgraded(what: &str, old: &str) -> (PathBuf, PathBuf) {
+        let data = scratch(what);
+        std::fs::write(data.join(FILE), old).expect("the old file");
+        let profile = data.join(registry::LEGACY_DIR);
+        std::fs::create_dir_all(&profile).expect("the default profile");
+        (data, profile)
+    }
+
+    #[test]
+    fn the_old_shared_file_is_copied_into_the_default_profile_once_and_kept() {
+        let old = "# mine\nhttps://a.example/\tA\nhttps://b.example/\n";
+        let (data, profile) = upgraded("migrate", old);
+        let said = migrate_legacy(&data, &profile).expect("said on the row");
+        assert_eq!(
+            said,
+            format!(
+                "2 bookmarks copied into this profile from {}",
+                data.join(FILE).display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(profile.join(FILE)).expect("copied"),
+            old,
+            "byte for byte, comments and all"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data.join(FILE)).expect("kept"),
+            old,
+            "the old file is left for an older blinkterm"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data.join(MIGRATED)).expect("a marker"),
+            format!("1\t{}\n", profile.display())
+        );
+        assert!(!profile.join("bookmarks.tmp").exists());
+        for path in [profile.join(FILE), data.join(MIGRATED)] {
+            let mode = std::fs::metadata(&path)
+                .expect("there")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+        assert_eq!(
+            urls(&Bookmarks::load(&profile)),
+            ["https://a.example/", "https://b.example/"]
+        );
+
+        // Once: not again, and not after the person removes the copy.
+        assert_eq!(migrate_legacy(&data, &profile), None);
+        std::fs::remove_file(profile.join(FILE)).expect("removed by hand");
+        assert_eq!(migrate_legacy(&data, &profile), None, "the marker says so");
+        assert!(!profile.join(FILE).exists());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn the_old_file_is_not_copied_into_any_other_profile_nor_over_bookmarks_already_there() {
+        let old = "https://a.example/\tA\n";
+        let (data, default) = upgraded("not-default", old);
+        let managed = data.join(registry::MANAGED_DIR).join("3f9a1c0b7e2d");
+        let elsewhere = scratch("not-default-elsewhere");
+        for profile in [&managed, &elsewhere] {
+            std::fs::create_dir_all(profile).expect("a profile");
+            assert_eq!(
+                migrate_legacy(&data, profile),
+                None,
+                "{}",
+                profile.display()
+            );
+            assert!(!profile.join(FILE).exists());
+        }
+        assert!(!data.join(MIGRATED).exists(), "nothing marked");
+
+        let mine = "https://mine.example/\n";
+        std::fs::write(default.join(FILE), mine).expect("the profile's own");
+        assert_eq!(migrate_legacy(&data, &default), None);
+        assert_eq!(
+            std::fs::read_to_string(default.join(FILE)).expect("kept"),
+            mine,
+            "never written over"
+        );
+
+        // A data directory with no old file has nothing to copy.
+        let fresh = scratch("not-default-fresh");
+        let profile = fresh.join(registry::LEGACY_DIR);
+        std::fs::create_dir_all(&profile).expect("the default profile");
+        assert_eq!(migrate_legacy(&fresh, &profile), None);
+        assert!(!profile.join(FILE).exists());
+        assert!(!fresh.join(MIGRATED).exists());
+
+        // An old file of comments alone is copied, and nothing is said.
+        let (quiet, profile) = upgraded("not-default-quiet", "# nothing yet\n");
+        assert_eq!(migrate_legacy(&quiet, &profile), None);
+        assert!(profile.join(FILE).exists());
+        assert!(quiet.join(MIGRATED).exists());
+        for dir in [data, elsewhere, fresh, quiet] {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn the_copy_waits_for_an_older_blinkterm_holding_the_old_files_lock() {
+        let (data, profile) = upgraded("migrate-lock", "https://a.example/\n");
+        let held = profile::hold(&data.join(LOCK)).expect("the older one holds it");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tx.send(Instant::now()).expect("listening");
+            drop(held);
+        });
+        assert!(migrate_legacy(&data, &profile).is_some());
+        let done = Instant::now();
+        let let_go = rx.recv().expect("the holder let go");
+        holder.join().expect("the holder finishes");
+        assert!(done >= let_go, "the copy did not wait for the lock");
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
