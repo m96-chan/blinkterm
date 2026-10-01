@@ -89,7 +89,8 @@ The Mac keys arrive in a stock Kitty on macOS, where Kitty keeps most `cmd`
 chords and Option is not `alt`; they are the default there (`keymap = mac`),
 and [On a Mac](docs/usage.md#on-a-mac) has the rest.
 
-Everything else — profiles, history, bookmarks, downloads, ad blocking,
+Everything else — named profiles (`blinkterm profiles`, `--profile-name`),
+history, bookmarks, downloads, ad blocking,
 password managers, the page's console, site styles and scripts, rebinding
 keys — is in the docs.
 

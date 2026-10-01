@@ -170,18 +170,76 @@ Under `keymap = mac` the `linux` column still answers underneath, so the
 ## Profiles
 
 Cookies, logins, local storage and the rest of what a site keeps are kept
-between runs, in `$XDG_DATA_HOME/blinkterm/profile` — or
-`~/.local/share/blinkterm/profile` when `XDG_DATA_HOME` is not set. The
-directory is made readable by you alone (0700), since a cookie is a login.
-The same on macOS, rather than `~/Library/Application Support`: this is a
-program run from a shell, the terminals it runs in keep their own settings
-under `~/.config` there too, and a cookie jar is better kept out of what Time
-Machine and iCloud copy about.
+between runs, in a profile: a directory, made readable by you alone (0700),
+since a cookie is a login. You can have several, each with a name — a work
+one, a personal one, one for testing — and each is its own identity, with
+its own cookies, history and saved tabs. The first is `Default`, in
+`$XDG_DATA_HOME/blinkterm/profile` — or `~/.local/share/blinkterm/profile`
+when `XDG_DATA_HOME` is not set. The same on macOS, rather than
+`~/Library/Application Support`: this is a program run from a shell, the
+terminals it runs in keep their own settings under `~/.config` there too, and
+a cookie jar is better kept out of what Time Machine and iCloud copy about.
 
 ```sh
-blinkterm --profile ~/work-profile https://example.com   # somewhere else
+blinkterm profiles create Work                           # a new, empty identity
+blinkterm --profile-name Work https://example.com        # open it by name
+blinkterm --choose-profile                               # ask which
+blinkterm --profile ~/work-profile https://example.com   # a directory of yours
 blinkterm --temp-profile https://example.com             # nothing kept
 ```
+
+### Named profiles
+
+The names are listed in `$XDG_DATA_HOME/blinkterm/profiles.json`, beside the
+profiles, 0600; `blinkterm profiles` reads and changes it:
+
+```sh
+blinkterm profiles                          # the list; * marks the default
+blinkterm profiles create Work              # made under profiles/<id>/
+blinkterm profiles create Testing --dir ~/testing-profile   # one you already have
+blinkterm profiles rename Work Office       # only the name changes
+blinkterm profiles default Office           # what a plain start opens
+blinkterm profiles remove Office
+```
+
+A name is up to 64 characters of plain text, with no `/` or `\` and no space
+or `-` at either end, and two profiles cannot have names that differ only in
+case — `--profile-name work` finds `Work`. A name is never part of a path: a
+profile blinkterm makes lives in `profiles/<id>/` under the data directory,
+where the id is twelve random hex characters, so renaming moves nothing.
+A directory registered with `--dir` stays where it is and is never deleted
+by blinkterm.
+
+Which profile a start opens, highest first: `--profile-name`, `--profile`,
+`--temp-profile` or `--choose-profile` on the command line (one of them;
+two is an error); then `profile-name =`, `profile =`, `temp-profile = true`
+or `choose-profile = true` in the settings file (again one of them); then the
+default profile; then, when there is no default, a question. The question —
+and `--choose-profile` always — is a numbered list on the terminal before
+anything else starts: type a number to open that profile, `n` to make a new
+one (and say whether it should be the default), `d N` to make profile N the
+default, `r N` to rename it, `x N` to remove it, `q` to quit. A start with
+no terminal to ask in — a script, a pipe — never waits: with no default it
+says so and exits 1, and `blinkterm --remote` never asks at all. A name that
+is not in the list is an error rather than a new profile made by a typo.
+`--profile <dir>` and `--temp-profile` do not read the list.
+
+The first start after upgrading writes `profiles.json` with one entry,
+`Default`, pointing at the `profile` directory that was already there: no
+cookie, history entry or saved tab moves, and an older blinkterm run
+afterwards finds everything where it left it. The file has a `version`; one
+that cannot be read, or that a newer blinkterm wrote, is refused with a
+sentence naming it, and never overwritten — `--profile <dir>` works while it
+is being fixed. Every change holds `profiles.lock` and replaces the file
+whole, so two `blinkterm profiles` commands at once both land.
+
+`remove` refuses a profile a running blinkterm is using. A profile blinkterm
+made is moved, not deleted, to `$XDG_DATA_HOME/blinkterm/trash/<id>-<time>/`,
+where its cookies and logins stay until you delete that directory; a `--dir`
+profile is only taken out of the list. Removing the default leaves no
+default, rather than quietly making another identity the one a start opens:
+`blinkterm profiles default <name>` sets a new one. Once there are two
+profiles or more, the status row shows the name of the one in use.
 
 `--temp-profile` makes a fresh profile under the system's temporary directory
 and removes it when `blinkterm` exits, including when it panics; one left by a

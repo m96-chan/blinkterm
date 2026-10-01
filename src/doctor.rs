@@ -80,6 +80,7 @@ use crate::input::{Input, Parser};
 use crate::json::Json;
 use crate::options::{Options, Provenance};
 use crate::profile::{self, Profile};
+use crate::registry;
 use crate::screen;
 
 /// How long the terminal is given to answer everything.
@@ -543,32 +544,43 @@ pub(crate) fn start_once(launch: &engine::Launch) -> Result<(Duration, String), 
     Ok((took, crate::text::sanitize(&product).into_owned()))
 }
 
+/// The profile a run with these options would open, by name when the
+/// registry has it: `Work: /path (exists)`. It is resolved as a run resolves
+/// it ([`registry::select`]), except that it never asks: with no default, the
+/// line is the sentence a start without a terminal would say.
 fn profile_line(choice: &profile::Choice) {
-    let dir = match choice {
-        profile::Choice::Temporary => {
+    match registry::select(
+        choice,
+        registry::Ask::Never("--doctor reports and does not ask"),
+    ) {
+        Ok(registry::Selected { dir: None, .. }) => {
             say("profile", "temporary, thrown away on exit");
-            return;
         }
-        profile::Choice::Default => Profile::default_dir(),
-        profile::Choice::At(dir) if dir.is_absolute() => Ok(dir.clone()),
-        profile::Choice::At(dir) => std::env::current_dir()
-            .map(|cwd| cwd.join(dir))
-            .map_err(|e| format!("cannot tell where {} is: {e}", dir.display())),
-    };
-    match dir {
-        Ok(dir) => say(
-            "profile",
-            &format!(
-                "{} ({})",
-                dir.display(),
-                if dir.is_dir() {
-                    "exists"
-                } else {
-                    "not made yet"
-                }
-            ),
-        ),
-        Err(why) => say("profile", &why),
+        Ok(registry::Selected {
+            dir: Some(dir), id, ..
+        }) => {
+            let name = id
+                .and_then(|id| {
+                    let data = Profile::data_dir().ok()?;
+                    let registry = registry::Registry::load(&data).ok()??;
+                    registry.by_id(&id).map(|entry| entry.name.clone())
+                })
+                .map(|name| format!("{name}: "))
+                .unwrap_or_default();
+            say(
+                "profile",
+                &crate::text::sanitize(&format!(
+                    "{name}{} ({})",
+                    dir.display(),
+                    if dir.is_dir() {
+                        "exists"
+                    } else {
+                        "not made yet"
+                    }
+                )),
+            )
+        }
+        Err(why) => say("profile", &crate::text::sanitize(&why)),
     }
 }
 
