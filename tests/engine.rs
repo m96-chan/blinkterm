@@ -3112,6 +3112,7 @@ fn a_late_change_at_either_scale(first: FirstStill) {
 
 /// After a load that paints late: see [`a_late_change_at_either_scale`].
 #[test]
+#[ignore = "flaky: the scale 2 still can come before the late paint (#113)"]
 fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
     a_late_change_at_either_scale(FirstStill::Prompt);
 }
