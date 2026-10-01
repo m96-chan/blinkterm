@@ -450,8 +450,19 @@ fn install_signals() {
     }
 }
 
-/// Everything the loop owns that is not the terminal, the tabs or the engine.
+/// Everything a window owns that is not its tabs, its terminal or its
+/// profile: the row and everything that can have it, what is out with the
+/// page in front, the pointer, the motion policy, the layout and the size,
+/// and the settings that are a window's ([`Chrome::new`]).
+///
+/// It was everything the loop owned that was not the terminal, the tabs or
+/// the engine; for #83 the profile's half moved to [`Shared`], which a
+/// backend serving several windows keeps once, and the terminal's half to
+/// [`LocalTerminal`]. What is left is what a second window on the same
+/// profile has a second one of. [`Window`] is this beside the tabs.
 struct Chrome {
+    /// Which window this is in the session file ([`crate::session`]).
+    id: WindowId,
     /// Whether the terminal's mouse reports are in pixels rather than
     /// cells: the parser's to know ([`crate::input::Parser`]), told here
     /// before the inputs it read are handled, because a click and a notch
@@ -483,18 +494,10 @@ struct Chrome {
     /// The needle the find prompt last closed with, offered whole by the
     /// next `ctrl+f` as `ctrl+l` offers the url.
     last_needle: String,
-    /// The pages visited, which the url bar offers back; kept in the profile,
-    /// or only in memory for a temporary one. See [`crate::history`].
-    history: History,
     /// `--search-url`, for [`destination`].
     search_url: Option<String>,
     /// The `Page.navigate` that has been sent and not yet answered.
     navigation: Option<Navigation>,
-    /// Every file a page has handed over this run, and what the row says
-    /// about them. The program's rather than a tab's: a download outlives
-    /// the tab it started in, and its events come on the browser's
-    /// connection. See [`crate::download`].
-    downloads: Downloads,
     /// The page being saved as a PDF or a picture, if one is: one at a
     /// time, for whichever tab it was asked of, and said on the row as a
     /// download is. See [`crate::save`] and [`pump_save`].
@@ -514,15 +517,6 @@ struct Chrome {
     /// whichever tab clicked. The terminal runs it ([`Terminal::start_helper`]);
     /// this is what the window needs to know about it. See [`pump_picker`].
     picker: Option<PickerWait>,
-    /// The socket `blinkterm --remote` hands urls over, bound under the
-    /// profile lock; none on a temporary profile, or when it could not be
-    /// made. Here, on the `Chrome`, so that an engine that dies and is
-    /// started again leaves it alone, and so that it goes — and its file with
-    /// it — before the engine is asked to close and the lock let go. A
-    /// sender in the second or two `Browser.close` takes then finds nobody
-    /// and is refused by the lock, which says what to do. See
-    /// [`pump_remote`].
-    remote: Option<Listener>,
     /// The password commands the settings name; none, and `fill-login`
     /// says so. See [`crate::login`].
     logins: login::Programs,
@@ -549,15 +543,9 @@ struct Chrome {
     /// The answer to it for the pane as it is now: terminal pixels per CSS
     /// pixel before the tab's zoom. See [`viewport`].
     scale: f64,
-    /// The zoom levels remembered per host; kept in the profile, or only in
-    /// memory for a temporary one. See [`crate::zoom`].
-    zooms: Zooms,
     /// What every page is told about light and dark, once the terminal has
     /// said. See [`crate::appearance`] and [`prepare_session`].
     appearance: Appearance,
-    /// Who this program says it is, fixed for the run. See
-    /// [`crate::identity`].
-    identity: Identity,
     /// `Some` while the tab list, the history list or the console is open. The person's,
     /// like the bar and the find prompt, and exclusive with them by the
     /// keyboard: whichever is open takes every key, so the other cannot be
@@ -598,16 +586,6 @@ struct Chrome {
     focus: Option<Focus>,
     /// The reader's question out with the page in front.
     reader: Option<Reading>,
-    /// The profile's bookmarks, or this run's for a temporary profile; see
-    /// [`crate::bookmarks`].
-    bookmarks: Bookmarks,
-    /// The profile's name, first of the words at the right of the row, so
-    /// that a work window and a personal one cannot be confused: only once
-    /// the registry holds two profiles or more ([`Profile::label`]).
-    profile_label: Option<String>,
-    /// The tabs as last written, the closed ones, and what the last run
-    /// left; see [`crate::session`].
-    session: Session,
     /// The question after an unclean exit, while it is on the row.
     offer: Option<Offer>,
     /// The watch out on the page in front, if one is armed: the question
@@ -628,9 +606,6 @@ struct Chrome {
     layout: Layout,
     /// The allow line while it is open. See [`Allow`].
     allow: Option<Allow>,
-    /// The origins the person allowed something, kept in the profile, or
-    /// only in memory for a temporary one. See [`crate::permissions`].
-    allowed: Allowed,
     /// The newest frame not yet acknowledged, on a route whose frames are
     /// acknowledged once they have gone to the terminal. See
     /// [`tick_frames`].
@@ -639,29 +614,9 @@ struct Chrome {
     cast: motion::Cast,
     /// Steps the cast's size down when frames wait on the link.
     throttle: motion::Throttle,
-    /// The host lists and what they blocked on which page, shared with the
-    /// pipe's reader thread, which answers every paused request with it;
-    /// `None` with no `block-list`, and then nothing is ever paused. See
-    /// [`crate::block`].
-    blocker: Option<Arc<Blocker>>,
-    /// The sites blocking is off for, kept in the profile, or only in memory
-    /// for a temporary one; the blocker holds a copy for the reader thread.
-    unblocked: Unblocked,
     /// What the row last said about blocking on the page in front, so that
     /// it is drawn again when the count moves and not otherwise.
     blocked_words: Option<String>,
-    /// The site styles and scripts: read once as the run starts, read again
-    /// by `reload-sites`, and told to every session as it is made
-    /// ([`connect_tab`]). See [`crate::sites`].
-    sites: Sites,
-    /// Where they are read from, so that `reload-sites` reads the same
-    /// directory the run started with.
-    sites_location: sites::Location,
-    /// Every page's console, shared with the pipe's reader thread, which
-    /// records every entry as it is read; `None` with `console = false` or
-    /// `--no-console`, and then no page is asked for its console at all. See
-    /// [`crate::console`].
-    console: Option<Arc<Recorder>>,
     /// What the row last said about the console's errors on the page in
     /// front: the twin of `blocked_words`.
     console_words: Option<String>,
@@ -674,6 +629,84 @@ struct Chrome {
     startup: Option<String>,
 }
 
+/// What every window on a profile shares: what is kept in the profile —
+/// the history, the bookmarks, the zooms, the allowances, the sites
+/// blocking is off for, the session file — and what is about the engine as
+/// a whole rather than one page — the downloads, the blocker and the console
+/// on the pipe's reader thread, the site files every session is told, who
+/// the engine says it is, and how it is started again.
+///
+/// One of these per profile, beside however many [`Window`]s: today one,
+/// and the backend #83 is building toward keeps one for all of them. The
+/// engine and the browser's client are not here yet; they stay beside it in
+/// [`run`] until there is a backend process to own them.
+pub struct Shared {
+    /// The pages visited, which the url bar offers back; kept in the profile,
+    /// or only in memory for a temporary one. See [`crate::history`].
+    history: History,
+    /// Every file a page has handed over this run, and what the row says
+    /// about them. The program's rather than a tab's: a download outlives
+    /// the tab it started in, and its events come on the browser's
+    /// connection. See [`crate::download`].
+    downloads: Downloads,
+    /// The socket `blinkterm --remote` hands urls over, bound under the
+    /// profile lock; none on a temporary profile, or when it could not be
+    /// made. Here, on the [`Shared`], so that an engine that dies and is
+    /// started again leaves it alone, and so that it goes — and its file with
+    /// it — before the engine is asked to close and the lock let go. A
+    /// sender in the second or two `Browser.close` takes then finds nobody
+    /// and is refused by the lock, which says what to do. See
+    /// [`pump_remote`].
+    remote: Option<Listener>,
+    /// The zoom levels remembered per host; kept in the profile, or only in
+    /// memory for a temporary one. See [`crate::zoom`].
+    zooms: Zooms,
+    /// Who this program says it is, fixed for the run. See
+    /// [`crate::identity`].
+    identity: Identity,
+    /// The profile's bookmarks, or this run's for a temporary profile; see
+    /// [`crate::bookmarks`].
+    bookmarks: Bookmarks,
+    /// The profile's name, first of the words at the right of the row, so
+    /// that a work window and a personal one cannot be confused: only once
+    /// the registry holds two profiles or more ([`Profile::label`]).
+    profile_label: Option<String>,
+    /// The tabs as last written, the closed ones, and what the last run
+    /// left; see [`crate::session`].
+    session: Session,
+    /// The origins the person allowed something, kept in the profile, or
+    /// only in memory for a temporary one. See [`crate::permissions`].
+    allowed: Allowed,
+    /// The host lists and what they blocked on which page, shared with the
+    /// pipe's reader thread, which answers every paused request with it;
+    /// `None` with no `block-list`, and then nothing is ever paused. See
+    /// [`crate::block`].
+    blocker: Option<Arc<Blocker>>,
+    /// The sites blocking is off for, kept in the profile, or only in memory
+    /// for a temporary one; the blocker holds a copy for the reader thread.
+    unblocked: Unblocked,
+    /// The site styles and scripts: read once as the run starts, read again
+    /// by `reload-sites`, and told to every session as it is made
+    /// ([`connect_tab`]). See [`crate::sites`].
+    sites: Sites,
+    /// Where they are read from, so that `reload-sites` reads the same
+    /// directory the run started with.
+    sites_location: sites::Location,
+    /// Every page's console, shared with the pipe's reader thread, which
+    /// records every entry as it is read; `None` with `console = false` or
+    /// `--no-console`, and then no page is asked for its console at all. See
+    /// [`crate::console`].
+    console: Option<Arc<Recorder>>,
+    /// The directory every engine is told to download into: made once, as
+    /// the run starts ([`download::prepare`]).
+    downloads_dir: PathBuf,
+    /// How every engine is started — path, `--engine-arg`s, user agent,
+    /// proxy — the first and each one after a death.
+    launch: crate::engine::Launch,
+    /// When the engine was last started again: see [`Relaunches`].
+    relaunches: Relaunches,
+}
+
 /// A screencast frame this program has not acknowledged yet: which tab's,
 /// and the number to acknowledge it with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,28 +716,13 @@ struct Unacked {
 }
 
 impl Chrome {
-    /// Everything as a run starts it: nothing typed, nothing out with the
-    /// engine, and what is kept in the profile read from `profile` — or kept
-    /// only in memory, for a temporary one. The allowances come in already
-    /// read, because the engine was told them before there was a `Chrome`
-    /// ([`boot`]), and so do the blocker and its exceptions, for the same
-    /// reason.
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        metrics: Metrics,
-        options: &Options,
-        profile: &Profile,
-        downloads_dir: PathBuf,
-        appearance: Appearance,
-        identity: Identity,
-        allowed: Allowed,
-        blocker: Option<Arc<Blocker>>,
-        unblocked: Unblocked,
-        sites: Sites,
-        console: Option<Arc<Recorder>>,
-    ) -> Chrome {
+    /// A window as a run starts it, at `metrics`: nothing typed, nothing
+    /// out with the engine, and the settings that are a window's — the
+    /// scale, the search url, the paper, the pickers and password commands,
+    /// the external browser, the mode, the keys — from `options`.
+    fn new(id: WindowId, metrics: Metrics, options: &Options, appearance: Appearance) -> Chrome {
         Chrome {
-            identity,
+            id,
             pixel_mouse: false,
             viewport_gen: 0,
             next_helper: 1,
@@ -717,14 +735,8 @@ impl Chrome {
             bar: None,
             find: None,
             last_needle: String::new(),
-            history: if profile.is_temporary() {
-                History::in_memory()
-            } else {
-                History::load(profile.dir())
-            },
             search_url: options.search_url.clone(),
             navigation: None,
-            downloads: Downloads::new(downloads_dir),
             save: None,
             paper: options
                 .pdf_paper
@@ -733,7 +745,6 @@ impl Chrome {
             pickers: options.pickers.clone(),
             display: picker::has_display(|name| std::env::var(name).ok()),
             picker: None,
-            remote: None,
             logins: options.logins.clone(),
             login: None,
             external: options.external_browser.clone(),
@@ -743,11 +754,6 @@ impl Chrome {
             hint: None,
             scale_choice: options.scale,
             scale: options.scale.resolve(metrics.cell),
-            zooms: if profile.is_temporary() {
-                Zooms::in_memory()
-            } else {
-                Zooms::load(profile.dir())
-            },
             appearance,
             list: None,
             list_first: Cell::new(0),
@@ -758,29 +764,16 @@ impl Chrome {
             hinting: None,
             focus: None,
             reader: None,
-            bookmarks: Bookmarks::for_profile(profile),
-            profile_label: profile.label().map(str::to_string),
-            session: if profile.is_temporary() {
-                Session::in_memory()
-            } else {
-                Session::load(profile.dir())
-            },
             offer: None,
             watch: None,
             world_ask: None,
             unwatched: None,
             layout: Layout::default(),
             allow: None,
-            allowed,
             unacked: None,
             cast: motion::Cast::default(),
             throttle: motion::Throttle::default(),
-            blocker,
-            unblocked,
             blocked_words: None,
-            sites,
-            sites_location: options.sites.clone(),
-            console,
             console_words: None,
             startup: None,
         }
@@ -825,8 +818,11 @@ impl Chrome {
     /// password command running for one of them is ended the same way, and
     /// a fill waiting for its answer is forgotten.
     /// Nothing is sent: this is this program's memory only, and the pointer's
-    /// shape is the caller's to give back to the terminal.
-    fn engine_gone(&mut self, now: Instant) {
+    /// shape is the caller's to give back to the terminal. The downloads
+    /// still coming are the profile's, told by the caller
+    /// ([`Downloads::engine_died`]) before this; the page being saved is the
+    /// window's, said on the row in `downloads` here.
+    fn engine_gone(&mut self, downloads: &mut Downloads, now: Instant) {
         self.picker = None;
         self.login = None;
         self.still = None;
@@ -843,10 +839,8 @@ impl Chrome {
         self.hint = None;
         self.motion.reset(now);
         self.wheel.forget();
-        self.downloads.engine_died(now);
         if let Some(job) = self.save.take() {
-            self.downloads
-                .could_not_save(job.name(), "the engine died", now);
+            downloads.could_not_save(job.name(), "the engine died", now);
         }
         self.watch = None;
         self.world_ask = None;
@@ -872,6 +866,80 @@ impl Chrome {
             upload::home().as_deref(),
         )
     }
+}
+
+impl Shared {
+    /// What a profile's windows share as a run starts: what is kept in the
+    /// profile read from `profile` — or kept only in memory, for a temporary
+    /// one. The allowances come in already read, because the engine was told
+    /// them before there was a `Shared` ([`boot`]), and so do the blocker and
+    /// its exceptions, the site files and the console's recorder, for the
+    /// same reason; and who the engine says it is, which [`boot`] worked out.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        options: &Options,
+        profile: &Profile,
+        downloads_dir: PathBuf,
+        identity: Identity,
+        allowed: Allowed,
+        blocker: Option<Arc<Blocker>>,
+        unblocked: Unblocked,
+        sites: Sites,
+        console: Option<Arc<Recorder>>,
+    ) -> Shared {
+        Shared {
+            history: if profile.is_temporary() {
+                History::in_memory()
+            } else {
+                History::load(profile.dir())
+            },
+            downloads: Downloads::new(downloads_dir.clone()),
+            remote: None,
+            zooms: if profile.is_temporary() {
+                Zooms::in_memory()
+            } else {
+                Zooms::load(profile.dir())
+            },
+            identity,
+            bookmarks: Bookmarks::for_profile(profile),
+            profile_label: profile.label().map(str::to_string),
+            session: if profile.is_temporary() {
+                Session::in_memory()
+            } else {
+                Session::load(profile.dir())
+            },
+            allowed,
+            blocker,
+            unblocked,
+            sites,
+            sites_location: options.sites.clone(),
+            console,
+            downloads_dir,
+            launch: options.engine.clone(),
+            relaunches: Relaunches::default(),
+        }
+    }
+}
+
+/// One window: its tabs, and everything else it owns ([`Chrome`]), and
+/// the tabs as they were before the list last shrank ([`Shrunk`]) — what
+/// [`drive`] runs a pass of, through a [`Terminal`] and beside the
+/// profile's [`Shared`].
+///
+/// A run has one. The backend #83 is building toward has one per terminal
+/// attached to it, each driven by the same two halves of a pass
+/// ([`prepare_window`], [`pass_window`]) that drive this one.
+pub struct Window {
+    tabs: Tabs<Client>,
+    chrome: Chrome,
+    shrunk: Shrunk,
+}
+
+/// The engine and the browser's client while they are alive: what
+/// [`boot`] starts, less the first tab, which goes to the [`Window`].
+struct Live {
+    engine: Engine,
+    browser: Client,
 }
 
 /// The url bar while it is open.
@@ -1501,68 +1569,77 @@ pub fn run(options: Options) -> Result<(), String> {
     // `None` once a relaunch has failed: the old engine was stopped and the
     // profile went with the new one that did not start, so there is nothing
     // left at the end to ask to close.
-    let mut booted: Option<Booted>;
-    // Built here rather than in `drive`, so that what it knows about the
-    // downloads is still here when `drive` is over and the engine is being
-    // stopped — and so that it outlives an engine that dies. The rest of it
+    let mut live: Option<Live>;
+    // The window's tabs, once its pass is over: closed below, before the
+    // engine is asked to close, as they always were.
+    let tabs: Option<Tabs<Client>>;
+    // The profile's half — `Shared` — is built here rather than in `drive`,
+    // so that what it knows about the downloads is still here when `drive`
+    // is over and the engine is being stopped, and so that it outlives an
+    // engine that dies; the window beside it likewise. The rest of both
     // goes at the end of this block, before the pane is given back, as it
     // always did.
     let (outcome, downloads) = match term.metrics() {
         Ok(metrics) => {
-            let mut chrome = Chrome::new(
-                metrics,
+            let Booted {
+                engine,
+                browser,
+                tabs: first_tabs,
+                identity,
+            } = first;
+            let mut shared = Shared::new(
                 &options,
-                first.engine.profile(),
-                downloads_dir.clone(),
-                appearance,
-                first.identity.clone(),
+                engine.profile(),
+                downloads_dir,
+                identity,
                 allowed,
                 blocker,
                 unblocked,
                 sites,
                 console,
             );
-            chrome.take_route(route);
-            chrome.remote = listener.take();
-            booted = Some(first);
-            let mut relaunches = Relaunches::default();
-            let mut shrunk = Shrunk::default();
+            shared.remote = listener.take();
+            let mut win = Window {
+                tabs: first_tabs,
+                chrome: Chrome::new(WINDOW, metrics, &options, appearance),
+                shrunk: Shrunk::default(),
+            };
+            win.chrome.take_route(route);
+            live = Some(Live { engine, browser });
             let mut opening = true;
             let outcome = loop {
-                let Some(live) = booted.as_mut() else {
+                let Some(Live { engine, browser }) = live.as_mut() else {
                     break Ok(());
                 };
-                let Booted {
-                    engine,
-                    browser,
-                    tabs,
-                    identity: _,
-                } = live;
                 // What the last run left and what the command line asked
                 // for are opened once, on the first engine; a relaunch opens
                 // the tabs that were there when it died.
                 let opened = if std::mem::take(&mut opening) {
-                    open_first(&mut term, tabs, browser, &mut chrome, &options).and_then(|()| {
-                        let said = match (summary(&std::mem::take(&mut problems)), copied.take()) {
-                            (Some(problems), Some(copied)) => Some(format!("{problems}; {copied}")),
-                            (problems, copied) => problems.or(copied),
-                        };
-                        match said {
-                            Some(said) => {
-                                chrome.startup = Some(said.clone());
-                                note(tabs, said);
-                                redraw_row(&mut term, tabs, &chrome)
+                    let Window { tabs, chrome, .. } = &mut win;
+                    open_first(&mut term, tabs, browser, chrome, &mut shared, &options).and_then(
+                        |()| {
+                            let said =
+                                match (summary(&std::mem::take(&mut problems)), copied.take()) {
+                                    (Some(problems), Some(copied)) => {
+                                        Some(format!("{problems}; {copied}"))
+                                    }
+                                    (problems, copied) => problems.or(copied),
+                                };
+                            match said {
+                                Some(said) => {
+                                    chrome.startup = Some(said.clone());
+                                    note(tabs, said);
+                                    redraw_row(&mut term, tabs, chrome, &shared)
+                                }
+                                None => Ok(()),
                             }
-                            None => Ok(()),
-                        }
-                    })
+                        },
+                    )
                 } else {
                     Ok(())
                 };
                 let driven = opened
-                    .and_then(|()| {
-                        drive(&mut term, tabs, browser, engine, &mut chrome, &mut shrunk)
-                    })
+                    .and_then(|()| drive(&mut term, &mut win, &mut shared, browser, engine))
                     .or_else(|why| ended_by_engine(why, engine, browser));
                 match driven {
                     Ok(Driven::Quit) => break Ok(()),
@@ -1570,27 +1647,20 @@ pub fn run(options: Options) -> Result<(), String> {
                     Ok(Driven::EngineDied(why)) => {
                         // Two deaths in a minute end the program: see
                         // [`Relaunches`].
-                        if !relaunches.allows(Instant::now()) {
-                            break Err(died(gave_up(why), &chrome.session));
+                        if !shared.relaunches.allows(Instant::now()) {
+                            break Err(died(gave_up(why), &shared.session, win.chrome.id));
                         }
-                        let Some(dead) = booted.take() else {
+                        let Some(dead) = live.take() else {
                             break Err(why);
                         };
-                        let snapshot =
-                            shrunk.for_relaunch(Snapshot::of(&dead.tabs), Instant::now());
-                        match relaunch(
-                            &mut term,
-                            dead,
-                            &mut chrome,
-                            &options,
-                            &downloads_dir,
-                            why,
-                            snapshot,
-                        ) {
+                        let snapshot = win
+                            .shrunk
+                            .for_relaunch(Snapshot::of(&win.tabs), Instant::now());
+                        match relaunch(&mut term, &mut win, &mut shared, dead, why, snapshot) {
                             Ok(again) => {
-                                booted = Some(again);
-                                relaunches.relaunched(Instant::now());
-                                shrunk = Shrunk::default();
+                                live = Some(again);
+                                shared.relaunches.relaunched(Instant::now());
+                                win.shrunk = Shrunk::default();
                             }
                             Err(sentence) => break Err(sentence),
                         }
@@ -1600,25 +1670,31 @@ pub fn run(options: Options) -> Result<(), String> {
             // A quit says the session is closed; anything else leaves it
             // open, with what was still waiting to be written, so that the
             // next start offers it back. See [`crate::session`].
-            chrome.session.finish(outcome.is_ok());
-            (outcome, Some(chrome.downloads))
+            shared.session.finish(outcome.is_ok());
+            tabs = Some(win.tabs);
+            (outcome, Some(shared.downloads))
         }
         Err(e) => {
-            booted = Some(first);
+            let Booted {
+                engine,
+                browser,
+                tabs: first_tabs,
+                identity: _,
+            } = first;
+            live = Some(Live { engine, browser });
+            tabs = Some(first_tabs);
             (Err(e), None)
         }
     };
-    // A socket that never reached the `Chrome` — the pane could not be
+    // A socket that never reached the `Shared` — the pane could not be
     // measured — goes now, while the lock that makes it ours is still held.
     drop(listener.take());
     term.leave();
     let mut downloads = downloads;
-    if let Some(Booted {
+    if let Some(Live {
         mut engine,
         mut browser,
-        tabs,
-        identity: _,
-    }) = booted
+    }) = live
     {
         // Dropping the tabs closes every page's session, which is all a tab
         // is once the engine is about to be killed anyway.
@@ -1666,27 +1742,28 @@ fn open_first(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     options: &Options,
 ) -> Result<(), String> {
     // What the last run left, decided before anything is opened: its tabs,
     // with `--restore`; a question on the row, after a run that did not quit.
-    let plan = session::plan_for_window(chrome.session.next_group(), options.restore);
+    let plan = session::plan_for_window(shared.session.next_group(), options.restore);
     let mut restored = false;
     if let Some(snapshot) = plan.restore {
-        chrome.session.take_group(WINDOW);
+        shared.session.take_group(chrome.id);
         restore_tabs(
             tabs,
             browser,
             &chrome.appearance,
-            &chrome.identity,
-            &chrome.sites,
+            &shared.identity,
+            &shared.sites,
             snapshot,
         );
         restored = true;
     }
     if let Some(offer) = plan.offer {
         chrome.offer = Some(offer);
-        chrome.session.offer_group(WINDOW);
+        shared.session.offer_group(chrome.id);
     }
     // The first url on the command line, or the home page when there is none.
     let url = normalise(options.urls.first().unwrap_or(&options.home));
@@ -1695,8 +1772,8 @@ fn open_first(
     // tab in front is the page, and the home page is not opened.
     if restored && !options.urls.is_empty() {
         let appearance = chrome.appearance;
-        let identity = chrome.identity.clone();
-        match open_tab(tabs, browser, &appearance, &identity, &chrome.sites, &url) {
+        let identity = shared.identity.clone();
+        match open_tab(tabs, browser, &appearance, &identity, &shared.sites, &url) {
             Ok(()) => {
                 if let Some(tab) = tabs.active_mut() {
                     tab.note = Some(format!("loading {url}"));
@@ -1707,7 +1784,7 @@ fn open_first(
             Err(why) => note(tabs, why),
         }
     }
-    activate(tabs, browser, chrome)?;
+    activate(tabs, browser, chrome, shared)?;
 
     if !restored {
         if let Some(tab) = tabs.active_mut() {
@@ -1715,7 +1792,7 @@ fn open_first(
             tab.note = Some(format!("loading {url}"));
             tab.loading = true;
         }
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
         if let Some(why) = navigate(tabs, chrome, &url) {
             if let Some(tab) = tabs.active_mut() {
                 tab.note = Some(why);
@@ -1724,9 +1801,9 @@ fn open_first(
     }
     // Whether or not it was an error on the wire: a reply that says the page
     // did not come has replaced the loading note with why.
-    redraw_row(term, tabs, chrome)?;
-    open_the_rest(tabs, browser, chrome, &options.urls);
-    redraw_row(term, tabs, chrome)
+    redraw_row(term, tabs, chrome, shared)?;
+    open_the_rest(tabs, browser, chrome, shared, &options.urls);
+    redraw_row(term, tabs, chrome, shared)
 }
 
 /// An error out of [`drive`] or [`open_first`], read again in the light of
@@ -1781,13 +1858,13 @@ fn ended_by_engine(why: String, engine: &mut Engine, browser: &Client) -> Result
 /// ([`Relaunches`]) is decided before this is called.
 fn relaunch(
     term: &mut dyn Terminal,
-    dead: Booted,
-    chrome: &mut Chrome,
-    options: &Options,
-    downloads_dir: &Path,
+    win: &mut Window,
+    shared: &mut Shared,
+    dead: Live,
     why: String,
     snapshot: Snapshot,
-) -> Result<Booted, String> {
+) -> Result<Live, String> {
+    let Window { tabs, chrome, .. } = win;
     let now = Instant::now();
     // The picture goes, as it does for a renderer that died in front: a dead
     // page that looks alive is a click that does nothing. The row is written
@@ -1799,59 +1876,62 @@ fn relaunch(
         "the engine died; starting it again…",
     ))?;
     end_helpers(term, chrome);
-    chrome.engine_gone(now);
+    shared.downloads.engine_died(now);
+    chrome.engine_gone(&mut shared.downloads, now);
     sync_shape(term, chrome)?;
 
     // Every tab's `Client::close` sees the pipe ended and sends no detach.
-    let Booted {
-        engine,
-        browser,
-        tabs,
-        identity: _,
-    } = dead;
-    drop(tabs);
+    let Live { engine, browser } = dead;
+    drop(tabs.take_all());
     drop(browser);
     let profile = engine.retire();
     // Nothing can be writing the downloads that were coming now; the exit
     // would remove the same files.
-    for partial in chrome.downloads.partials() {
+    for partial in shared.downloads.partials() {
         let _ = std::fs::remove_file(partial);
     }
 
     let Booted {
         engine,
         mut browser,
-        mut tabs,
+        tabs: fresh,
         identity,
     } = match boot(
         profile,
-        &options.engine,
-        downloads_dir,
+        &shared.launch,
+        &shared.downloads_dir,
         &chrome.appearance,
-        &chrome.allowed,
-        chrome.blocker.as_ref(),
-        &chrome.sites,
-        chrome.console.as_ref(),
+        &shared.allowed,
+        shared.blocker.as_ref(),
+        &shared.sites,
+        shared.console.as_ref(),
     ) {
         Ok(booted) => booted,
-        Err(failure) => return Err(died(could_not_restart(why, failure), &chrome.session)),
+        Err(failure) => {
+            return Err(died(
+                could_not_restart(why, failure),
+                &shared.session,
+                chrome.id,
+            ))
+        }
     };
+    *tabs = fresh;
     let saved = snapshot.tabs.len().min(session::RESTORE_CAP);
     // The new engine's one blank tab is untouched, so the first saved tab
     // adopts it; with nothing saved — every tab was blank — it stays in
     // front as it is.
-    chrome.identity = identity.clone();
+    shared.identity = identity.clone();
     restore_tabs(
-        &mut tabs,
+        tabs,
         &mut browser,
         &chrome.appearance,
         &identity,
-        &chrome.sites,
+        &shared.sites,
         snapshot,
     );
     // A failure here is put on the tab rather than returned: whether the
     // engine is gone again is for the next pass's checks to say.
-    let trouble = activate(&mut tabs, &mut browser, chrome).err();
+    let trouble = activate(tabs, &mut browser, chrome, shared).err();
     let mut sentence = relaunched_words(saved, tabs.len());
     if let Some(trouble) = trouble {
         sentence = format!("{sentence}; {trouble}");
@@ -1859,14 +1939,9 @@ fn relaunch(
     // After `activate`, so that it stands in front of the woken tab's
     // "loading …" until the page lands and replaces it; the seconds still
     // count on the right.
-    note(&mut tabs, sentence);
-    redraw_row(term, &tabs, chrome)?;
-    Ok(Booted {
-        engine,
-        browser,
-        identity,
-        tabs,
-    })
+    note(tabs, sentence);
+    redraw_row(term, tabs, chrome, shared)?;
+    Ok(Live { engine, browser })
 }
 
 /// What the row says once the engine has been started again: how many of
@@ -1903,11 +1978,10 @@ fn could_not_restart(why: String, failure: String) -> String {
 /// [`Driven::EngineDied`], and [`run`] decides.
 fn drive(
     term: &mut LocalTerminal,
-    tabs: &mut Tabs<Client>,
+    win: &mut Window,
+    shared: &mut Shared,
     browser: &mut Client,
     engine: &mut Engine,
-    chrome: &mut Chrome,
-    shrunk: &mut Shrunk,
 ) -> Result<Driven, String> {
     let mut last_check = Instant::now();
     let mut buf = [0u8; 8192];
@@ -1916,17 +1990,17 @@ fn drive(
     let mut paste_heard: Option<Instant> = None;
 
     while !QUIT.load(Ordering::SeqCst) {
-        match prepare_window(term, tabs, browser, engine, chrome, &mut last_check)? {
+        match prepare_window(term, win, shared, browser, engine, &mut last_check)? {
             Pass::Continue => {}
             Pass::Quit => return Ok(Driven::Quit),
             Pass::EngineDied(why) => return Ok(Driven::EngineDied(why)),
         }
 
         let mut watching = vec![term.input_fd(), browser.wake_fd()];
-        watching.extend(window_fds(term, tabs));
+        watching.extend(window_fds(win, term));
         // A `blinkterm --remote` knocking; see [`pump_remote`].
-        watching.extend(chrome.remote.as_ref().map(Listener::fd));
-        let ready = tty::poll_readable(&watching, poll_wait(chrome))
+        watching.extend(shared.remote.as_ref().map(Listener::fd));
+        let ready = tty::poll_readable(&watching, poll_wait(win))
             .map_err(|e| format!("cannot wait for input: {e}"))?;
 
         if ready.contains(&term.input_fd()) {
@@ -1934,9 +2008,9 @@ fn drive(
                 Ok(ReadOutcome::Data(n)) => {
                     let inputs = term.parse(&buf[..n]);
                     paste_heard = term.pasting().then(Instant::now);
-                    chrome.pixel_mouse = term.pixel_coordinates();
+                    win.chrome.pixel_mouse = term.pixel_coordinates();
                     for input in inputs {
-                        if !take_input(term, tabs, browser, chrome, input)? {
+                        if !take_input(term, win, shared, browser, input)? {
                             return Ok(Driven::Quit);
                         }
                     }
@@ -1950,18 +2024,18 @@ fn drive(
             // not coming, and what arrived is half of something.
             paste_heard = None;
             if term.abandon_paste() {
-                note(tabs, "paste cut short; try again");
-                redraw_row(term, tabs, chrome)?;
+                note(&mut win.tabs, "paste cut short; try again");
+                redraw_row(term, &win.tabs, &win.chrome, shared)?;
             }
         } else if let Some(input) = term.flush() {
             // Nothing arrived, so a held escape was the Escape key after all.
-            if !take_input(term, tabs, browser, chrome, input)? {
+            if !take_input(term, win, shared, browser, input)? {
                 return Ok(Driven::Quit);
             }
         }
         // A desktop browser started by alt+o that has exited, forgotten.
         term.reap();
-        match pass_window(term, tabs, browser, chrome, shrunk, &ready)? {
+        match pass_window(term, win, shared, browser, &ready)? {
             Pass::Continue => {}
             Pass::Quit => return Ok(Driven::Quit),
             Pass::EngineDied(why) => return Ok(Driven::EngineDied(why)),
@@ -1975,16 +2049,17 @@ fn drive(
 /// [`handle_input`]'s. `false` means quit.
 fn take_input(
     term: &mut LocalTerminal,
-    tabs: &mut Tabs<Client>,
+    win: &mut Window,
+    shared: &mut Shared,
     browser: &mut Client,
-    chrome: &mut Chrome,
     input: Input,
 ) -> Result<bool, String> {
+    let Window { tabs, chrome, .. } = win;
     if let Input::CellSize { width, height } = input {
         term.cell_size(width, height, chrome.metrics.cell);
         return Ok(true);
     }
-    handle_input(term, tabs, browser, chrome, input)
+    handle_input(term, tabs, browser, chrome, shared, input)
 }
 
 /// The descriptors a window wants the next poll to watch, beside the
@@ -1995,8 +2070,9 @@ fn take_input(
 ///
 /// A background tab's pipe is not watched — it has no screencast and
 /// nothing urgent to say — but its queue is drained every pass.
-fn window_fds(term: &dyn Terminal, tabs: &Tabs<Client>) -> Vec<std::os::fd::RawFd> {
-    let mut fds: Vec<_> = tabs
+fn window_fds(win: &Window, term: &dyn Terminal) -> Vec<std::os::fd::RawFd> {
+    let mut fds: Vec<_> = win
+        .tabs
         .active()
         .map(|tab| tab.connection.wake_fd())
         .into_iter()
@@ -2010,8 +2086,8 @@ fn window_fds(term: &dyn Terminal, tabs: &Tabs<Client>) -> Vec<std::os::fd::RawF
 /// ([`tick_frames`]), and nothing wakes the poll when the writer finishes;
 /// so while one is owed the passes come often enough that the wait is not
 /// the frame rate.
-fn poll_wait(chrome: &Chrome) -> i32 {
-    if chrome.unacked.is_some() {
+fn poll_wait(win: &Window) -> i32 {
+    if win.chrome.unacked.is_some() {
         FRAME_POLL_MS
     } else {
         POLL_MS
@@ -2023,12 +2099,13 @@ fn poll_wait(chrome: &Chrome) -> i32 {
 /// engine is still there, and the tabs whose sessions have gone.
 fn prepare_window(
     term: &mut dyn Terminal,
-    tabs: &mut Tabs<Client>,
+    win: &mut Window,
+    shared: &mut Shared,
     browser: &mut Client,
     engine: &mut Engine,
-    chrome: &mut Chrome,
     last_check: &mut Instant,
 ) -> Result<Pass, String> {
+    let Window { tabs, chrome, .. } = win;
     if tabs.is_empty() {
         // The last tab closed itself, which is the page saying the browser
         // is over — the same thing `ctrl+w` on the last tab means. Or
@@ -2052,8 +2129,8 @@ fn prepare_window(
         }
     }
     // A download's last word has been on the row long enough.
-    if chrome.downloads.expire(Instant::now()) {
-        redraw_row(term, tabs, chrome)?;
+    if shared.downloads.expire(Instant::now()) {
+        redraw_row(term, tabs, chrome, shared)?;
     }
     // A load's seconds, counted up: a redraw when the number changes,
     // which is once a second while something is loading and never
@@ -2064,25 +2141,25 @@ fn prepare_window(
         .map(|tab| load::loading_hint(tab.loading_for(Instant::now())));
     if hint != chrome.hint {
         chrome.hint = hint;
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
     }
     // What was blocked on the page in front. The reader thread counts
     // it and does not wake this loop — a paused request is answered and
     // consumed there — so it is read here, a pass late at most: 50 ms
     // ([`POLL_MS`]), which a count on the row does not need to beat.
-    let blocked = blocked_words(tabs, chrome);
+    let blocked = blocked_words(tabs, shared);
     if blocked != chrome.blocked_words {
         chrome.blocked_words = blocked;
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
     }
     // The errors the page in front logged since its console was last
     // opened: counted on the reader thread, which consumes the console's
     // events and wakes nobody, so read here for the same reason and a
     // pass late at most, 50 ms.
-    let errors = console_words(tabs, chrome);
+    let errors = console_words(tabs, shared);
     if errors != chrome.console_words {
         chrome.console_words = errors;
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
     }
     // The whole pane for a page that is fullscreen, unless something
     // needs the row: decided every pass, and a change is a resize as far
@@ -2111,9 +2188,9 @@ fn prepare_window(
         // The picture moves to another row: the old placement goes, so
         // that the row coming back is not under it until the next frame.
         term.clear_picture()?;
-        relayout(term, tabs, chrome)?;
+        relayout(term, tabs, chrome, shared)?;
     } else if resized.is_some() {
-        relayout(term, tabs, chrome)?;
+        relayout(term, tabs, chrome, shared)?;
     }
 
     // The engine is a child process and can die at any point; without this
@@ -2130,7 +2207,7 @@ fn prepare_window(
             "the engine stopped talking: {ended}"
         )));
     }
-    reap_dead_tabs(term, tabs, browser, chrome)?;
+    reap_dead_tabs(term, tabs, browser, chrome, shared)?;
     Ok(Pass::Continue)
 }
 
@@ -2141,25 +2218,29 @@ fn prepare_window(
 /// poll found readable.
 fn pass_window(
     term: &mut dyn Terminal,
-    tabs: &mut Tabs<Client>,
+    win: &mut Window,
+    shared: &mut Shared,
     browser: &mut Client,
-    chrome: &mut Chrome,
-    shrunk: &mut Shrunk,
     ready: &[std::os::fd::RawFd],
 ) -> Result<Pass, String> {
+    let Window {
+        tabs,
+        chrome,
+        shrunk,
+    } = win;
     // A file picker's window that has answered, or whose tab has gone
     // or gone somewhere else.
-    pump_picker(term, tabs, chrome, ready)?;
+    pump_picker(term, tabs, chrome, shared, ready)?;
     // Urls from `blinkterm --remote`, opened now: before the engine's
     // announcements of targets are read below, so that the tabs are in
     // the list by then and those announcements are ignored as ours.
-    pump_remote(term, tabs, browser, chrome, ready)?;
+    pump_remote(term, tabs, browser, chrome, shared, ready)?;
     // A password command that has answered, or a page that has answered
     // the fill.
-    pump_login(term, tabs, chrome, ready)?;
+    pump_login(term, tabs, chrome, shared, ready)?;
     // Whatever the pointer did in all the reports just read, told to the
     // page and asked about once: see [`crate::hover`].
-    tick_hover(term, tabs, chrome)?;
+    tick_hover(term, tabs, chrome, shared)?;
     // Frames that have gone to the terminal, acknowledged; see
     // [`tick_frames`].
     tick_frames(term, tabs, chrome)?;
@@ -2188,12 +2269,12 @@ fn pass_window(
     // Which pages exist first, then what the page in front is doing: a
     // frame is read from whichever tab is active once the list has settled,
     // and never from one that has just been left behind.
-    handle_target_events(term, tabs, browser, chrome)?;
-    handle_page_events(term, tabs, chrome)?;
+    handle_target_events(term, tabs, browser, chrome, shared)?;
+    handle_page_events(term, tabs, chrome, shared)?;
     // A click on a file input that a picker is to answer, read just now:
     // started in the same pass, which for one that runs in the terminal
     // means the loop stops here until it has exited.
-    start_picker(term, tabs, chrome)?;
+    start_picker(term, tabs, chrome, shared)?;
     // The answer to a navigation, which may have been held for as long as
     // a page's "leave this page?" was on the row. After the page's events,
     // so that a dialog which arrived on the same pass is already drawn.
@@ -2201,44 +2282,44 @@ fn pass_window(
         let before = tabs.active().map(Tab::line);
         collect_navigation(tabs, chrome);
         if tabs.active().map(Tab::line) != before {
-            redraw_row(term, tabs, chrome)?;
+            redraw_row(term, tabs, chrome, shared)?;
         }
     }
     // The answer to a search, and the next one if keys were typed while it
     // was out. After the page's events, so that a navigation which took
     // the document away has already closed the prompt.
     if pump_find(tabs, chrome) {
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
     }
     // The same for the hints' collect, and for the question after a
     // click in normal mode: whether it landed in a field.
     // And for the reader's toggle.
     if pump_hints(tabs, chrome) | pump_focus(tabs, chrome) | pump_reader(tabs, chrome) {
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
     }
     // The fullscreen watch on the page in front: its answer, and the
     // next one armed. What it heard is laid out at the top of the next
     // pass.
     pump_fullscreen(tabs, chrome);
     // The page being saved: the next step of it, or its file.
-    if pump_save(tabs, chrome) {
-        redraw_row(term, tabs, chrome)?;
+    if pump_save(tabs, chrome, shared) {
+        redraw_row(term, tabs, chrome, shared)?;
     }
     // And last, because it is the thing to do when nothing else happened:
     // a page that has stopped moving gets its lossless picture.
-    rest_shot(term, tabs, chrome)?;
+    rest_shot(term, tabs, chrome, shared)?;
     // The tabs as they now are, for the session file: once a pass rather
     // than at every place the list or a tab's url or title changes, of
     // which there are many and a missed one is a session that lies. A
     // few string clones; a write only when it differs from the last, at
     // most once every [`session::WRITE_EVERY`].
-    chrome
+    shared
         .session
-        .record_window(WINDOW, Snapshot::of(tabs), Instant::now());
+        .record_window(chrome.id, Snapshot::of(tabs), Instant::now());
     shrunk.pass(tabs, Instant::now());
-    if let Err(why) = chrome.session.flush(Instant::now()) {
+    if let Err(why) = shared.session.flush(Instant::now()) {
         note(tabs, why);
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
     }
     Ok(Pass::Continue)
 }
@@ -2257,6 +2338,7 @@ fn relayout(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
     // The clear takes any placeholder cells with it, and the picture may now
     // be another number of them: the next paint writes them again.
@@ -2295,15 +2377,15 @@ fn relayout(
     // labels.
     forget_hover(term, chrome)?;
     cancel_hints(tabs, chrome);
-    redraw_row(term, tabs, chrome)
+    redraw_row(term, tabs, chrome, shared)
 }
 
 /// The sentence for an engine that died, with what was not lost: the tabs
 /// the session file holds, which the next start offers back and
 /// `--restore` reopens. Just `why` when nothing was saved, or the session is
-/// kept nowhere — a temporary profile's.
-fn died(why: String, session: &Session) -> String {
-    match session.saved_tabs(WINDOW) {
+/// kept nowhere — a temporary profile's. The tabs are `window`'s group.
+fn died(why: String, session: &Session, window: WindowId) -> String {
+    match session.saved_tabs(window) {
         Some(1) => format!("{why}; the tab you had is saved: blinkterm --restore reopens it"),
         Some(tabs) => {
             format!("{why}; the {tabs} tabs you had are saved: blinkterm --restore reopens them")
@@ -2621,6 +2703,7 @@ fn activate(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
     let Some(target) = tabs.active_target().map(str::to_string) else {
         return Ok(());
@@ -2673,7 +2756,7 @@ fn activate(
     // have changed while this one was behind. A page with no host keeps the
     // tab's own.
     if let Some(host) = zoom::host_key(&tab.url) {
-        tab.zoom = chrome.zooms.get(Some(&host));
+        tab.zoom = shared.zooms.get(Some(&host));
     }
     let viewport = viewport(chrome, tab);
     emulate(&mut tab.connection, viewport, stopped)?;
@@ -2859,12 +2942,13 @@ fn decline_or_restore(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     yes: bool,
 ) -> Result<(), String> {
     chrome.offer = None;
     // Answered either way, the group is this window's now: a no is not
     // asked again, and the window's own tabs replace it once it has any.
-    let offered = chrome.session.take_offered(WINDOW);
+    let offered = shared.session.take_offered(chrome.id);
     if yes {
         if let Some(saved) = offered {
             let was = tabs.active_target().map(str::to_string);
@@ -2872,17 +2956,17 @@ fn decline_or_restore(
                 tabs,
                 browser,
                 &chrome.appearance,
-                &chrome.identity,
-                &chrome.sites,
+                &shared.identity,
+                &shared.sites,
                 saved.snapshot,
             );
-            switched(term, tabs, browser, chrome, was)?;
+            switched(term, tabs, browser, chrome, shared, was)?;
             // The tab the program started with, adopted and still in front,
             // was not switched to and is woken here.
             wake_dormant(tabs, chrome);
         }
     }
-    redraw_row(term, tabs, chrome)
+    redraw_row(term, tabs, chrome, shared)
 }
 
 /// Everything a crashed page's new renderer needs told again, once it has
@@ -3033,6 +3117,7 @@ fn switched(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     was: Option<String>,
 ) -> Result<(), String> {
     let now = tabs.active_target().map(str::to_string);
@@ -3082,7 +3167,7 @@ fn switched(
     // the new tab's title would be a lie for all of it.
     term.clear_picture()?;
     term.write(b"\x1b[2;1H\x1b[J")?;
-    if let Err(why) = activate(tabs, browser, chrome) {
+    if let Err(why) = activate(tabs, browser, chrome, shared) {
         if let Some(tab) = tabs.active_mut() {
             tab.note = Some(why);
         }
@@ -3108,15 +3193,21 @@ fn switched(
 ///
 /// After a restore the first url's tab is in front of the restored ones, and
 /// these go at the end, after it.
-fn open_the_rest(tabs: &mut Tabs<Client>, browser: &mut Client, chrome: &Chrome, urls: &[String]) {
+fn open_the_rest(
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &Chrome,
+    shared: &Shared,
+    urls: &[String],
+) {
     for url in urls.iter().skip(1) {
         let url = normalise(url);
         if let Err(why) = open_behind(
             tabs,
             browser,
             &chrome.appearance,
-            &chrome.identity,
-            &chrome.sites,
+            &shared.identity,
+            &shared.sites,
             &url,
         ) {
             if let Some(first) = tabs.active_mut() {
@@ -3612,6 +3703,7 @@ fn reap_dead_tabs(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
     let dead: Vec<usize> = tabs
         .iter()
@@ -3627,15 +3719,15 @@ fn reap_dead_tabs(
         // A page that closed itself, heard here first rather than as
         // `Target.targetDestroyed`: `ctrl+shift+t` brings it back either way.
         if let Some(tab) = tabs.close(index) {
-            chrome.session.closed(closed_entry(&tab));
+            shared.session.closed(closed_entry(&tab));
         }
     }
     if tabs.is_empty() {
         // The loop's own check ends the program, cleanly.
         return Ok(());
     }
-    switched(term, tabs, browser, chrome, was)?;
-    redraw_row(term, tabs, chrome)
+    switched(term, tabs, browser, chrome, shared, was)?;
+    redraw_row(term, tabs, chrome, shared)
 }
 
 /// Draw the top row.
@@ -3697,7 +3789,12 @@ fn reap_dead_tabs(
 /// needing the row ([`Chrome::layout`]): the row is the page's picture then,
 /// and anything written would be under it. The strip, the words and the
 /// news come back with the row.
-fn redraw_row(term: &mut dyn Terminal, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(), String> {
+fn redraw_row(
+    term: &mut dyn Terminal,
+    tabs: &Tabs<Client>,
+    chrome: &Chrome,
+    shared: &Shared,
+) -> Result<(), String> {
     if chrome.layout.whole {
         return Ok(());
     }
@@ -3716,14 +3813,14 @@ fn redraw_row(term: &mut dyn Terminal, tabs: &Tabs<Client>, chrome: &Chrome) -> 
         // The rows under the row are the list's while it is open, and are
         // written first: the row after them is what puts the cursor back
         // where the typing is.
-        term.write(&list_screen(tabs, chrome, list))?;
+        term.write(&list_screen(tabs, chrome, shared, list))?;
     }
     let bytes = if let Some(owner) = owner {
         // Whatever owns the row, the strip is not on it to be clicked.
         chrome.row_spans.borrow_mut().clear();
         owned_row(chrome.metrics.cols, tabs, owner)
     } else {
-        plain_row(tabs, active, chrome)
+        plain_row(tabs, active, chrome, shared)
     };
     term.write(&bytes)
 }
@@ -3733,20 +3830,25 @@ fn redraw_row(term: &mut dyn Terminal, tabs: &Tabs<Client>, chrome: &Chrome) -> 
 /// the spans a click is read against, as a side effect. The half of
 /// [`redraw_row`] that has no terminal, so that a test can read what it
 /// draws.
-fn plain_row(tabs: &Tabs<Client>, active: &Tab<Client>, chrome: &Chrome) -> Vec<u8> {
+fn plain_row(
+    tabs: &Tabs<Client>,
+    active: &Tab<Client>,
+    chrome: &Chrome,
+    shared: &Shared,
+) -> Vec<u8> {
     let cols = chrome.metrics.cols;
-    let label = chrome.profile_label.as_deref();
+    let label = shared.profile_label.as_deref();
     let now = Instant::now();
-    let downloading = chrome.downloads.line(now);
+    let downloading = shared.downloads.line(now);
     let hovered = &chrome.hover.shown().href;
     let pointing = (!hovered.is_empty()).then(|| hover::words(hovered));
     let loading = active
         .loading
         .then(|| load::loading_hint(active.loading_for(now)));
     let marker = active.zoom.marker();
-    let blocked = blocked_words(tabs, chrome);
+    let blocked = blocked_words(tabs, shared);
     let reader = active.reader.then_some("reader");
-    let errors = console_words(tabs, chrome);
+    let errors = console_words(tabs, shared);
     let mode = mode_words(&chrome.mode, chrome.hinting.as_ref());
     if tabs.len() < 2 {
         // One tab: the row is the url, all of it, as far as a press goes.
@@ -3834,16 +3936,16 @@ fn plain_row(tabs: &Tabs<Client>, active: &Tab<Client>, chrome: &Chrome) -> Vec<
 
 /// What the row says about blocking on the page in front: `12 blocked`,
 /// `unblocked`, or nothing. See [`Blocker::words`].
-fn blocked_words(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<String> {
+fn blocked_words(tabs: &Tabs<Client>, shared: &Shared) -> Option<String> {
     let session = tabs.active()?.connection.session();
-    chrome.blocker.as_ref()?.words(session)
+    shared.blocker.as_ref()?.words(session)
 }
 
 /// What the row says about the console of the page in front: `1 error`,
 /// `2 errors`, or nothing. See [`Recorder::words`].
-fn console_words(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<String> {
+fn console_words(tabs: &Tabs<Client>, shared: &Shared) -> Option<String> {
     let session = tabs.active()?.connection.session();
-    chrome.console.as_ref()?.words(session)
+    shared.console.as_ref()?.words(session)
 }
 
 /// The tab list's rows under the status row, for the list as it is now,
@@ -3852,10 +3954,10 @@ fn console_words(tabs: &Tabs<Client>, chrome: &Chrome) -> Option<String> {
 /// As many rows as the page had, which is every row but the status row:
 /// the picture is off the screen while the list is up (see
 /// [`open_list_screen`]), and text under a placement would not be seen.
-fn list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &Overlay) -> Vec<u8> {
+fn list_screen(tabs: &Tabs<Client>, chrome: &Chrome, shared: &Shared, list: &Overlay) -> Vec<u8> {
     match list {
         Overlay::Tabs(list) => tab_list_screen(tabs, chrome, list),
-        Overlay::History(list) => history_list_screen(chrome, list),
+        Overlay::History(list) => history_list_screen(chrome, shared, list),
         Overlay::Console(list) => console_list_screen(chrome, list),
     }
 }
@@ -3896,7 +3998,7 @@ fn tab_list_screen(tabs: &Tabs<Client>, chrome: &Chrome, list: &TabList) -> Vec<
 /// after the url, because a row too long for the pane is cut at the right.
 /// A page that never had a title shows its url in the title's place, rather
 /// than a gap and a dash.
-fn history_list_screen(chrome: &Chrome, list: &HistoryList) -> Vec<u8> {
+fn history_list_screen(chrome: &Chrome, shared: &Shared, list: &HistoryList) -> Vec<u8> {
     let rows = chrome.metrics.usable_rows();
     let now = unix_now();
     let matches = list.matches();
@@ -3910,7 +4012,7 @@ fn history_list_screen(chrome: &Chrome, list: &HistoryList) -> Vec<u8> {
     let leads: Vec<String> = shown
         .iter()
         .map(|entry| {
-            let mark = if chrome.bookmarks.has(entry.url) {
+            let mark = if shared.bookmarks.has(entry.url) {
                 " *"
             } else {
                 ""
@@ -4151,6 +4253,7 @@ fn handle_target_events(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
     let events = browser.events();
     if events.is_empty() {
@@ -4165,12 +4268,12 @@ fn handle_target_events(
     for event in &events {
         // A download's news comes on this connection and is nobody's tab's.
         // `tabs.take` ignores these, so they are read first and only here.
-        if chrome.downloads.take(event, Instant::now()) {
+        if shared.downloads.take(event, Instant::now()) {
             redraw = true;
         }
         let appearance = chrome.appearance;
-        let identity = chrome.identity.clone();
-        let sites = &chrome.sites;
+        let identity = shared.identity.clone();
+        let sites = &shared.sites;
         let mut frame = None;
         let mut scripts = Vec::new();
         let outcome = tabs.take(event, |target| {
@@ -4201,7 +4304,7 @@ fn handle_target_events(
             Outcome::Renamed => redraw = true,
             Outcome::Gone { mut tab } => {
                 // A page that closed itself: `ctrl+shift+t` brings it back.
-                chrome.session.closed(closed_entry(&tab));
+                shared.session.closed(closed_entry(&tab));
                 tab.connection.close();
                 redraw = true;
             }
@@ -4229,7 +4332,7 @@ fn handle_target_events(
     if let (Some(note), Some(tab)) = (note, tabs.active_mut()) {
         tab.note = Some(note);
     }
-    switched(term, tabs, browser, chrome, was)?;
+    switched(term, tabs, browser, chrome, shared, was)?;
     let front = tabs.active().filter(|tab| tab.is_crashed());
     if let Some(target) = front.map(|tab| tab.target.clone()) {
         if crashed.contains(&target) {
@@ -4237,7 +4340,7 @@ fn handle_target_events(
         }
     }
     if redraw {
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
     }
     Ok(())
 }
@@ -4309,6 +4412,7 @@ fn handle_page_events(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
     let active = tabs.active_index();
     // The newest frame worth painting, still encoded.
@@ -4345,7 +4449,7 @@ fn handle_page_events(
                     redraw |= index == active;
                 }
             }
-            record_visit(tab, &mut chrome.history);
+            record_visit(tab, &mut shared.history);
         }
         let events = tab.connection.events();
         if events.is_empty() {
@@ -4512,7 +4616,7 @@ fn handle_page_events(
                         // already be asking something — and a tab behind is
                         // told when it comes to the front.
                         let wanted =
-                            zoom::host_key(&tab.url).map(|host| chrome.zooms.get(Some(&host)));
+                            zoom::host_key(&tab.url).map(|host| shared.zooms.get(Some(&host)));
                         if let Some(wanted) = wanted.filter(|&wanted| wanted != tab.zoom) {
                             tab.zoom = wanted;
                             if index == active && !tab.is_crashed() {
@@ -4672,8 +4776,8 @@ fn handle_page_events(
                 viewport,
                 chrome.metrics,
                 chrome.cast,
-                &chrome.identity,
-                &chrome.sites,
+                &shared.identity,
+                &shared.sites,
                 &mut tab.site_scripts,
             );
             chrome.motion.reset(Instant::now());
@@ -4690,7 +4794,7 @@ fn handle_page_events(
                 // and its title are both known: this is a visit. A tab behind
                 // is in this loop too, so a page opened in a new window
                 // counts.
-                record_visit(tab, &mut chrome.history);
+                record_visit(tab, &mut shared.history);
             }
         }
     }
@@ -4705,7 +4809,7 @@ fn handle_page_events(
         forget_hover(term, chrome)?;
     }
     if redraw {
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
     }
     if let Some(frame) = newest_frame {
         // A PNG on the route that sends the engine's PNG, as it came; a JPEG
@@ -4719,7 +4823,7 @@ fn handle_page_events(
         } else {
             Encoded::Jpeg(&frame)
         };
-        paint(term, tabs, chrome, payload)?;
+        paint(term, tabs, chrome, shared, payload)?;
     }
     Ok(())
 }
@@ -4729,6 +4833,7 @@ fn paint(
     term: &mut dyn Terminal,
     tabs: &Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     payload: Encoded<'_>,
 ) -> Result<bool, String> {
     // The tab list has the rows the picture would go on. The frame was
@@ -4752,7 +4857,7 @@ fn paint(
     // the cursor's position when something is being typed on it, so it is
     // written again rather than left where the last frame found it.
     if row_owns_cursor(tabs, chrome) {
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
     }
     Ok(true)
 }
@@ -4838,8 +4943,9 @@ fn rest_shot(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
-    collect_still(term, tabs, chrome)?;
+    collect_still(term, tabs, chrome, shared)?;
     request_still(tabs, chrome);
     Ok(())
 }
@@ -4856,6 +4962,7 @@ fn collect_still(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
     let Some(still) = chrome.still.as_ref() else {
         return Ok(());
@@ -4897,7 +5004,7 @@ fn collect_still(
     // came, and on the others it is decoded and fitted to the pane beside
     // the terminal ([`crate::graphics::Canvas::paint`]).
     let painted = match png {
-        Some(png) => paint(term, tabs, chrome, Encoded::Png(&png))?,
+        Some(png) => paint(term, tabs, chrome, shared, Encoded::Png(&png))?,
         None => false,
     };
     if !painted {
@@ -5127,8 +5234,9 @@ fn tick_hover(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
-    collect_hover(term, tabs, chrome)?;
+    collect_hover(term, tabs, chrome, shared)?;
     let owned = row_owner(
         tabs,
         chrome.bar.as_ref(),
@@ -5199,6 +5307,7 @@ fn collect_hover(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
     let Some(ask) = chrome.asking.as_ref() else {
         return Ok(());
@@ -5222,7 +5331,7 @@ fn collect_hover(
         return Ok(());
     };
     if chrome.hover.answered(at, hovered) {
-        redraw_row(term, tabs, chrome)?;
+        redraw_row(term, tabs, chrome, shared)?;
     }
     sync_shape(term, chrome)
 }
@@ -5280,6 +5389,7 @@ fn handle_input(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     input: Input,
 ) -> Result<bool, String> {
     match input {
@@ -5294,7 +5404,7 @@ fn handle_input(
                     // Not a crashed page, which is sent no `Emulation` at all
                     // ([`revive`]); its landing tells it.
                     if let Some(tab) = tabs.get_mut(index).filter(|tab| !tab.is_crashed()) {
-                        prepare_session(&mut tab.connection, &chrome.appearance, &chrome.identity);
+                        prepare_session(&mut tab.connection, &chrome.appearance, &shared.identity);
                     }
                 }
             }
@@ -5315,12 +5425,12 @@ fn handle_input(
                     crate::input::PASTE_LIMIT / 1024
                 ),
             );
-            redraw_row(term, tabs, chrome)?;
+            redraw_row(term, tabs, chrome, shared)?;
         }
         Input::Paste(text) => {
             // A paste is a person working on this page, as a key is.
             chrome.motion.input(Instant::now());
-            paste(term, tabs, chrome, &text)?;
+            paste(term, tabs, chrome, shared, &text)?;
         }
         Input::Key(key) => {
             // A key is a person working on this page, which is a reason not to
@@ -5333,10 +5443,10 @@ fn handle_input(
             // A line being typed on the row is asked about every key first;
             // a `prompt()` is answered below, with the dialog it belongs to.
             match typing_line(tabs, chrome) {
-                Some(Typing::Url) => return edit_url(term, tabs, chrome, key),
-                Some(Typing::Find) => return edit_find(term, tabs, chrome, key),
-                Some(Typing::List) => return edit_list(term, tabs, browser, chrome, key),
-                Some(Typing::Allow) => return edit_allow(term, tabs, browser, chrome, key),
+                Some(Typing::Url) => return edit_url(term, tabs, chrome, shared, key),
+                Some(Typing::Find) => return edit_find(term, tabs, chrome, shared, key),
+                Some(Typing::List) => return edit_list(term, tabs, browser, chrome, shared, key),
+                Some(Typing::Allow) => return edit_allow(term, tabs, browser, chrome, shared, key),
                 // A `prompt()` and a file input's path are answered below,
                 // after the program's own keys have had their say.
                 Some(Typing::Prompt | Typing::Upload) | None => {}
@@ -5361,14 +5471,14 @@ fn handle_input(
                 match offer.reply(&key) {
                     Reply::Waiting => return Ok(true),
                     Reply::Yes => {
-                        decline_or_restore(term, tabs, browser, chrome, true)?;
+                        decline_or_restore(term, tabs, browser, chrome, shared, true)?;
                         return Ok(true);
                     }
                     Reply::No => {
-                        decline_or_restore(term, tabs, browser, chrome, false)?;
+                        decline_or_restore(term, tabs, browser, chrome, shared, false)?;
                         return Ok(true);
                     }
-                    Reply::Pass => decline_or_restore(term, tabs, browser, chrome, false)?,
+                    Reply::Pass => decline_or_restore(term, tabs, browser, chrome, shared, false)?,
                 }
             }
             // Hints showing take every key that is not one of the program's
@@ -5388,10 +5498,10 @@ fn handle_input(
                 .is_some();
                 let own_key = keyed(&chrome.bindings, &key).is_some();
                 if !own_key && !owned {
-                    return hint_key(term, tabs, browser, chrome, key);
+                    return hint_key(term, tabs, browser, chrome, shared, key);
                 }
                 cancel_hints(tabs, chrome);
-                redraw_row(term, tabs, chrome)?;
+                redraw_row(term, tabs, chrome, shared)?;
                 if !own_key {
                     return Ok(true);
                 }
@@ -5415,13 +5525,13 @@ fn handle_input(
                             .map(|dialog| dialog.line.text().to_string());
                         if let Some(typed) = typed {
                             copy_out(term, tabs, &typed, Copied::Text)?;
-                            redraw_row(term, tabs, chrome)?;
+                            redraw_row(term, tabs, chrome, shared)?;
                         }
                         return Ok(true);
                     }
                     Some(command) if survives_dialog(command) => {}
                     Some(_) => return Ok(true),
-                    None => return answer_dialog(term, tabs, chrome, key),
+                    None => return answer_dialog(term, tabs, chrome, shared, key),
                 }
             }
             if tabs.active().is_some_and(|tab| tab.upload.is_some()) {
@@ -5438,12 +5548,12 @@ fn handle_input(
                             .map(|upload| upload.line.text().to_string())
                             .unwrap_or_default();
                         copy_out(term, tabs, &typed, Copied::Text)?;
-                        redraw_row(term, tabs, chrome)?;
+                        redraw_row(term, tabs, chrome, shared)?;
                         return Ok(true);
                     }
                     Some(command) if survives_dialog(command) => {}
                     Some(_) => return Ok(true),
-                    None => return answer_upload(term, tabs, chrome, key),
+                    None => return answer_upload(term, tabs, chrome, shared, key),
                 }
             }
             // Only now, with nothing on the row and no question up, is a key
@@ -5456,7 +5566,7 @@ fn handle_input(
             let before = chrome.mode.word();
             let action = chrome.mode.step(&key);
             if chrome.mode.word() != before {
-                redraw_row(term, tabs, chrome)?;
+                redraw_row(term, tabs, chrome, shared)?;
             }
             let command = command.or(match action {
                 normal::Action::Back => Some(Command::Back),
@@ -5474,7 +5584,7 @@ fn handle_input(
                         cancel_hints(tabs, chrome);
                     }
                     chrome.mode.toggle();
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(
                     Command::CopySelection
@@ -5486,21 +5596,21 @@ fn handle_input(
                     // They all ask the page, and a dead renderer would hold
                     // the question until the deadline.
                     note(tabs, load::sentence(&Problem::Crashed));
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::EditUrl) => {
                     chrome.bar = tabs
                         .active()
                         .map(|tab| UrlBar::new(Line::selected(tab.url.clone())));
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::Find) => {
                     open_find(tabs, chrome);
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::Permissions) => {
-                    open_allow(tabs, chrome);
-                    redraw_row(term, tabs, chrome)?;
+                    open_allow(tabs, chrome, shared);
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(what @ (Command::SavePdf | Command::SaveScreenshot)) => {
                     let kind = if what == Command::SavePdf {
@@ -5508,47 +5618,47 @@ fn handle_input(
                     } else {
                         save::Kind::Screenshot
                     };
-                    start_save(tabs, chrome, kind);
-                    redraw_row(term, tabs, chrome)?;
+                    start_save(tabs, chrome, shared, kind);
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::Block) => {
-                    toggle_block(tabs, chrome);
-                    redraw_row(term, tabs, chrome)?;
+                    toggle_block(tabs, shared);
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::ReloadSites) => {
-                    reload_sites(tabs, chrome);
-                    redraw_row(term, tabs, chrome)?;
+                    reload_sites(tabs, shared);
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::FillLogin) => {
                     start_login(term, tabs, chrome)?;
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::Reader) => {
                     toggle_reader(tabs, chrome);
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::ListTabs) => {
                     chrome.list = Some(Overlay::Tabs(TabList::open(tabs.active_index())));
                     chrome.list_first.set(0);
                     open_list_screen(term, chrome)?;
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::History) => {
                     // An empty list over the whole screen would be a page
                     // gone for nothing to pick; a sentence on the row says
                     // the same and leaves the page where it was.
-                    if chrome.history.entries().is_empty() {
+                    if shared.history.entries().is_empty() {
                         note(tabs, "nothing visited yet");
                     } else {
-                        let list = HistoryList::open(chrome.history.entries());
+                        let list = HistoryList::open(shared.history.entries());
                         chrome.list = Some(Overlay::History(list));
                         chrome.list_first.set(0);
                         open_list_screen(term, chrome)?;
                     }
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::Console) => {
-                    match chrome.console.clone() {
+                    match shared.console.clone() {
                         None => note(tabs, consolelist::OFF),
                         Some(console) => {
                             // Opened even on nothing, unlike the history
@@ -5570,7 +5680,7 @@ fn handle_input(
                             open_list_screen(term, chrome)?;
                         }
                     }
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::Reload) => {
                     // A page that did not come has no document to reload, and
@@ -5596,13 +5706,13 @@ fn handle_input(
                                 tab.note = Some(format!("loading {url}"));
                                 tab.loading = true;
                             }
-                            redraw_row(term, tabs, chrome)?;
+                            redraw_row(term, tabs, chrome, shared)?;
                             if let Some(why) = navigate(tabs, chrome, &url) {
                                 if let Some(tab) = tabs.active_mut() {
                                     tab.note = Some(why);
                                 }
                             }
-                            redraw_row(term, tabs, chrome)?;
+                            redraw_row(term, tabs, chrome, shared)?;
                         }
                         None => {
                             if let Some(tab) = tabs.active_mut() {
@@ -5615,17 +5725,17 @@ fn handle_input(
                 Some(Command::Forward) => go(tabs, 1),
                 Some(Command::NewTab) => {
                     let appearance = chrome.appearance;
-                    let identity = chrome.identity.clone();
+                    let identity = shared.identity.clone();
                     match open_tab(
                         tabs,
                         browser,
                         &appearance,
                         &identity,
-                        &chrome.sites,
+                        &shared.sites,
                         "about:blank",
                     ) {
                         Ok(()) => {
-                            switched(term, tabs, browser, chrome, was)?;
+                            switched(term, tabs, browser, chrome, shared, was)?;
                             // A new tab is a tab somebody is about to type an
                             // address into, so it opens with the cursor in the
                             // url bar — and with nothing in it, because there
@@ -5638,7 +5748,7 @@ fn handle_input(
                             }
                         }
                     }
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::CloseTab) => {
                     // Closing the only tab is closing the browser, which is
@@ -5647,13 +5757,13 @@ fn handle_input(
                         return Ok(false);
                     }
                     if let Some(entry) = close_tab(tabs, browser, tabs.active_index()) {
-                        chrome.session.closed(entry);
+                        shared.session.closed(entry);
                     }
-                    switched(term, tabs, browser, chrome, was)?;
-                    redraw_row(term, tabs, chrome)?;
+                    switched(term, tabs, browser, chrome, shared, was)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::ReopenTab) => {
-                    match chrome.session.reopen() {
+                    match shared.session.reopen() {
                         Some(entry) => {
                             // Dormant, and woken at once by being brought to
                             // the front: the same road as a restored tab.
@@ -5661,26 +5771,26 @@ fn handle_input(
                                 tabs,
                                 browser,
                                 &chrome.appearance,
-                                &chrome.identity,
-                                &chrome.sites,
+                                &shared.identity,
+                                &shared.sites,
                                 entry,
                             ) {
                                 note(tabs, why);
                             }
-                            switched(term, tabs, browser, chrome, was)?;
+                            switched(term, tabs, browser, chrome, shared, was)?;
                         }
                         None => note(tabs, "nothing to reopen"),
                     }
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::Bookmark) => {
                     let (url, title) = tabs
                         .active()
                         .map(|tab| (tab.url.clone(), tab.title.clone()))
                         .unwrap_or_default();
-                    let sentence = bookmarked(&mut chrome.bookmarks, &url, &title);
+                    let sentence = bookmarked(&mut shared.bookmarks, &url, &title);
                     note(tabs, sentence);
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(
                     what @ (Command::NextTab
@@ -5696,25 +5806,25 @@ fn handle_input(
                         _ => false,
                     };
                     if moved {
-                        switched(term, tabs, browser, chrome, was)?;
-                        redraw_row(term, tabs, chrome)?;
+                        switched(term, tabs, browser, chrome, shared, was)?;
+                        redraw_row(term, tabs, chrome, shared)?;
                     }
                 }
                 Some(Command::MoveTab(direction)) => {
                     // Nothing switched: the same page is in front, under a
                     // different number.
                     if tabs.move_active(direction) {
-                        redraw_row(term, tabs, chrome)?;
+                        redraw_row(term, tabs, chrome, shared)?;
                     }
                 }
                 Some(Command::CopyUrl) => {
                     let url = tabs.active().map(|tab| tab.url.clone()).unwrap_or_default();
                     copy_out(term, tabs, &url, Copied::Url)?;
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(Command::OpenExternal) => {
                     open_external(term, tabs, chrome)?;
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 Some(what @ (Command::ZoomIn | Command::ZoomOut | Command::ZoomReset)) => {
                     let now = tabs.active().map(|tab| tab.zoom).unwrap_or_default();
@@ -5723,7 +5833,7 @@ fn handle_input(
                         Command::ZoomOut => now.step_out(),
                         _ => Zoom::DEFAULT,
                     };
-                    rezoom(term, tabs, chrome, wanted)?;
+                    rezoom(term, tabs, chrome, shared, wanted)?;
                 }
                 Some(Command::CopySelection) => {
                     let answer = tabs.active_mut().map(|tab| {
@@ -5740,7 +5850,7 @@ fn handle_input(
                         Some(Err(_)) => note(tabs, "the page did not answer"),
                         _ => note(tabs, "nothing selected"),
                     }
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 None => match action {
                     // Both send to the page, and a dead renderer is sent
@@ -5751,17 +5861,17 @@ fn handle_input(
                     {
                         if tabs.active().is_some_and(Tab::is_crashed) {
                             note(tabs, load::sentence(&Problem::Crashed));
-                            redraw_row(term, tabs, chrome)?;
+                            redraw_row(term, tabs, chrome, shared)?;
                         }
                     }
                     normal::Action::Scroll(scroll) => scroll_by_key(tabs, chrome, scroll),
                     normal::Action::Hints { new_tab } => {
                         open_hints(tabs, chrome, new_tab);
-                        redraw_row(term, tabs, chrome)?;
+                        redraw_row(term, tabs, chrome, shared)?;
                     }
                     normal::Action::Insert => {
                         chrome.mode.insert();
-                        redraw_row(term, tabs, chrome)?;
+                        redraw_row(term, tabs, chrome, shared)?;
                     }
                     // A stray letter, or the first `g`, whose word is
                     // already on the row.
@@ -5800,7 +5910,7 @@ fn handle_input(
                                 exit_fullscreen(tab, world);
                             }
                         } else if escape == Some(Escapes::StopLoading) {
-                            stop_loading(term, tabs, chrome)?;
+                            stop_loading(term, tabs, chrome, shared)?;
                         } else if let Some(tab) = tabs.active_mut().filter(|tab| accepts_input(tab))
                         {
                             send_key(&mut tab.connection, &key);
@@ -5816,7 +5926,7 @@ fn handle_input(
             // has the row over a dialog too.
             if chrome.list.is_some() {
                 if routes_to_list(&report, true) {
-                    return click_list(term, tabs, browser, chrome, &report);
+                    return click_list(term, tabs, browser, chrome, shared, &report);
                 }
                 return Ok(true);
             }
@@ -5832,7 +5942,7 @@ fn handle_input(
             // a question can still be switched to or closed, as it can with
             // the keys. See [`crate::strip`].
             if report.kind == MouseKind::Press && point.1 < 0 {
-                return click_row(term, tabs, browser, chrome, &report);
+                return click_row(term, tabs, browser, chrome, shared, &report);
             }
             // A page with a question open is not a page to click on or
             // scroll. What was sent would not be lost — the engine queues it
@@ -5848,7 +5958,7 @@ fn handle_input(
                 && matches!(report.kind, MouseKind::Press | MouseKind::Wheel)
             {
                 cancel_hints(tabs, chrome);
-                redraw_row(term, tabs, chrome)?;
+                redraw_row(term, tabs, chrome, shared)?;
             }
             // Only the wheel. A hand on a wheel is what the still has to keep
             // out of the way of; a pointer drifting across a page is
@@ -5865,7 +5975,7 @@ fn handle_input(
                     } else {
                         now.step_out()
                     };
-                    rezoom(term, tabs, chrome, wanted)?;
+                    rezoom(term, tabs, chrome, shared, wanted)?;
                     return Ok(true);
                 }
                 chrome.motion.input(Instant::now());
@@ -5889,7 +5999,7 @@ fn handle_input(
                 let shown = !chrome.hover.shown().href.is_empty();
                 forget_hover(term, chrome)?;
                 if shown {
-                    redraw_row(term, tabs, chrome)?;
+                    redraw_row(term, tabs, chrome, shared)?;
                 }
                 return Ok(true);
             }
@@ -6109,6 +6219,7 @@ fn answer_dialog(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     key: KeyInput,
 ) -> Result<bool, String> {
     let Some(tab) = tabs.active_mut() else {
@@ -6131,7 +6242,7 @@ fn answer_dialog(
             }
         }
     }
-    redraw_row(term, tabs, chrome)?;
+    redraw_row(term, tabs, chrome, shared)?;
     Ok(true)
 }
 
@@ -6150,6 +6261,7 @@ fn answer_upload(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     key: KeyInput,
 ) -> Result<bool, String> {
     let Some(tab) = tabs.active_mut() else {
@@ -6181,7 +6293,7 @@ fn answer_upload(
             cancel_chooser(&mut tab.connection, session.as_deref(), node);
         }
     }
-    redraw_row(term, tabs, chrome)?;
+    redraw_row(term, tabs, chrome, shared)?;
     Ok(true)
 }
 
@@ -6255,6 +6367,7 @@ fn start_picker(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
     let Some(index) = tabs
         .iter()
@@ -6320,7 +6433,7 @@ fn start_picker(
             );
         }
     }
-    redraw_row(term, tabs, chrome)
+    redraw_row(term, tabs, chrome, shared)
 }
 
 /// A file picker's window, once a pass: its answer read if it has printed
@@ -6336,6 +6449,7 @@ fn pump_picker(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     ready: &[std::os::fd::RawFd],
 ) -> Result<(), String> {
     let Some(wait) = chrome.picker.as_ref() else {
@@ -6352,14 +6466,14 @@ fn pump_picker(
     let Some(index) = index else {
         term.end_helper(id);
         chrome.picker = None;
-        return redraw_row(term, tabs, chrome);
+        return redraw_row(term, tabs, chrome, shared);
     };
     let Some(HelperOutcome::Picker(outcome)) = term.poll_helper(id, ready) else {
         return Ok(());
     };
     chrome.picker = None;
     finish_picker(tabs, chrome, index, outcome);
-    redraw_row(term, tabs, chrome)
+    redraw_row(term, tabs, chrome, shared)
 }
 
 /// Urls from `blinkterm --remote`, once a pass: every sender that has
@@ -6376,9 +6490,10 @@ fn pump_remote(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     ready: &[std::os::fd::RawFd],
 ) -> Result<(), String> {
-    let Some(listener) = chrome.remote.as_mut() else {
+    let Some(listener) = shared.remote.as_mut() else {
         return Ok(());
     };
     if !ready.contains(&listener.fd()) {
@@ -6387,9 +6502,9 @@ fn pump_remote(
     let deliveries = match listener.accept_ready() {
         Ok(deliveries) => deliveries,
         Err(why) => {
-            chrome.remote = None;
+            shared.remote = None;
             note(tabs, format!("stopped listening for --remote: {why}"));
-            return redraw_row(term, tabs, chrome);
+            return redraw_row(term, tabs, chrome, shared);
         }
     };
     let was = tabs.active_target().map(str::to_string);
@@ -6398,14 +6513,14 @@ fn pump_remote(
             tabs,
             browser,
             &chrome.appearance,
-            &chrome.identity,
-            &chrome.sites,
+            &shared.identity,
+            &shared.sites,
             &delivery.lines,
         );
         delivery.answer(&opened);
     }
-    switched(term, tabs, browser, chrome, was)?;
-    redraw_row(term, tabs, chrome)
+    switched(term, tabs, browser, chrome, shared, was)?;
+    redraw_row(term, tabs, chrome, shared)
 }
 
 /// Open what a `--remote` sender asked for: the first url that was
@@ -6701,6 +6816,7 @@ fn pump_login(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     ready: &[std::os::fd::RawFd],
 ) -> Result<(), String> {
     match chrome.login.as_mut() {
@@ -6710,7 +6826,7 @@ fn pump_login(
             let Some(index) = tabs.index_of(tab) else {
                 term.end_helper(id);
                 chrome.login = None;
-                return redraw_row(term, tabs, chrome);
+                return redraw_row(term, tabs, chrome, shared);
             };
             let Some(HelperOutcome::Login(outcome)) = term.poll_helper(id, ready) else {
                 return Ok(());
@@ -6718,7 +6834,7 @@ fn pump_login(
             let (site, url) = (site.clone(), url.clone());
             chrome.login = None;
             finish_login(tabs, chrome, index, &site, &url, outcome);
-            redraw_row(term, tabs, chrome)
+            redraw_row(term, tabs, chrome, shared)
         }
         Some(LoginState::Filling {
             target,
@@ -6740,7 +6856,7 @@ fn pump_login(
             };
             tab.note = Some(sentence);
             chrome.login = None;
-            redraw_row(term, tabs, chrome)
+            redraw_row(term, tabs, chrome, shared)
         }
     }
 }
@@ -6936,6 +7052,7 @@ fn stop_loading(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
 ) -> Result<(), String> {
     let Some(tab) = tabs.active_mut() else {
         return Ok(());
@@ -6945,7 +7062,7 @@ fn stop_loading(
     chrome.navigation = None;
     stop(tab);
     forget_hover(term, chrome)?;
-    redraw_row(term, tabs, chrome)
+    redraw_row(term, tabs, chrome, shared)
 }
 
 /// What `esc` does to a loading tab: the engine told to stop, and the tab put
@@ -7293,6 +7410,7 @@ fn rezoom(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     level: Zoom,
 ) -> Result<(), String> {
     let Some(tab) = tabs.active_mut() else {
@@ -7305,11 +7423,11 @@ fn rezoom(
     // the engine down ([`revive`]).
     if tab.is_crashed() {
         tab.note = Some(load::sentence(&Problem::Crashed));
-        return redraw_row(term, tabs, chrome);
+        return redraw_row(term, tabs, chrome, shared);
     }
     tab.zoom = level;
     if let Some(host) = zoom::host_key(&tab.url) {
-        let _ = chrome.zooms.set(&host, level);
+        let _ = shared.zooms.set(&host, level);
     }
     let viewport = viewport(chrome, tab);
     let stopped = tab.dialog.is_some();
@@ -7329,7 +7447,7 @@ fn rezoom(
     chrome.hover.scrolled();
     // The labels are where the old layout had the things they label.
     cancel_hints(tabs, chrome);
-    redraw_row(term, tabs, chrome)
+    redraw_row(term, tabs, chrome, shared)
 }
 
 /// Type into the url bar. Returns `false` only if the person quit.
@@ -7337,6 +7455,7 @@ fn edit_url(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     key: KeyInput,
 ) -> Result<bool, String> {
     if key.action == KeyAction::Release {
@@ -7353,7 +7472,7 @@ fn edit_url(
     let Some(bar) = chrome.bar.as_mut() else {
         return Ok(true);
     };
-    match bar_step(bar, &chrome.history, &chrome.bookmarks, &key) {
+    match bar_step(bar, &shared.history, &shared.bookmarks, &key) {
         Edit::Typing | Edit::Inserted | Edit::Previous | Edit::Next => {}
         Edit::Quit if quits(&chrome.bindings, &key) => return Ok(false),
         Edit::Quit => {}
@@ -7373,7 +7492,7 @@ fn edit_url(
             }
         }
     }
-    redraw_row(term, tabs, chrome)?;
+    redraw_row(term, tabs, chrome, shared)?;
     Ok(true)
 }
 
@@ -7422,11 +7541,11 @@ fn through_row(
 /// it is allowed now, all selected as the url bar's url is; or say that
 /// the page has none — `about:blank`, `data:`, `file:`, the engine's error
 /// page — and open nothing.
-fn open_allow(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+fn open_allow(tabs: &mut Tabs<Client>, chrome: &mut Chrome, shared: &mut Shared) {
     let Some(url) = tabs.active().map(|tab| tab.url.clone()) else {
         return;
     };
-    match Allow::open(&url, &chrome.allowed) {
+    match Allow::open(&url, &shared.allowed) {
         Ok(allow) => chrome.allow = Some(allow),
         Err(sentence) => note(tabs, sentence),
     }
@@ -7441,14 +7560,14 @@ fn open_allow(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
 /// would print either as an empty page. The directory is made here, as a
 /// download's first event makes it, so that the reason it cannot be is
 /// said before anything is asked of the engine.
-fn start_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome, kind: save::Kind) {
+fn start_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome, shared: &mut Shared, kind: save::Kind) {
     let now = Instant::now();
     if let Some(job) = &chrome.save {
         let words = format!(
             "still saving {}",
             screen::clip_to(job.name(), download::NAME_CELLS)
         );
-        chrome.downloads.announce(words, now);
+        shared.downloads.announce(words, now);
         return;
     }
     let nothing = tabs.active().map(|tab| {
@@ -7468,9 +7587,9 @@ fn start_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome, kind: save::Kind) {
     let Some(tab) = tabs.active_mut() else {
         return;
     };
-    if let Err(why) = chrome.downloads.ensure() {
+    if let Err(why) = shared.downloads.ensure() {
         let name = save::file_name(&tab.title, &tab.url, kind);
-        chrome.downloads.could_not_save(&name, &why, now);
+        shared.downloads.could_not_save(&name, &why, now);
         return;
     }
     let (target, title, url) = (tab.target.clone(), tab.title.clone(), tab.url.clone());
@@ -7491,12 +7610,12 @@ fn start_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome, kind: save::Kind) {
                 "saving {}",
                 screen::clip_to(job.name(), download::NAME_CELLS)
             );
-            chrome.downloads.announce(words, now);
+            shared.downloads.announce(words, now);
             chrome.save = Some(job.keyed(chrome.appearance.keys()));
         }
         Err(why) => {
             let name = save::file_name(&title, &url, kind);
-            chrome.downloads.could_not_save(&name, &why, now);
+            shared.downloads.could_not_save(&name, &why, now);
         }
     }
 }
@@ -7510,18 +7629,18 @@ fn start_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome, kind: save::Kind) {
 /// closed ends it. A picture taken of the tab in front leaves its motion
 /// clock where the capture found it, so it is started again with no still
 /// out, and the page gets a fresh lossless still a rest interval later.
-fn pump_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
+fn pump_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome, shared: &mut Shared) -> bool {
     let Some(mut job) = chrome.save.take() else {
         return false;
     };
     let now = Instant::now();
     let in_front = tabs.active_target() == Some(job.target());
     let Some(tab) = tabs.index_of(job.target()).and_then(|i| tabs.get_mut(i)) else {
-        return chrome
+        return shared
             .downloads
             .could_not_save(job.name(), "the tab closed", now);
     };
-    match job.poll(&mut tab.connection, chrome.downloads.dir(), now) {
+    match job.poll(&mut tab.connection, shared.downloads.dir(), now) {
         save::Progress::Waiting => {
             chrome.save = Some(job);
             false
@@ -7532,9 +7651,9 @@ fn pump_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
                 chrome.still = None;
             }
             let more = cut.map(|(rows, height)| format!("the top {rows} of {height} px"));
-            chrome.downloads.saved(&path, more, now)
+            shared.downloads.saved(&path, more, now)
         }
-        save::Progress::Done(Err(why)) => chrome.downloads.could_not_save(job.name(), &why, now),
+        save::Progress::Done(Err(why)) => shared.downloads.could_not_save(job.name(), &why, now),
     }
 }
 
@@ -7545,8 +7664,8 @@ fn pump_save(tabs: &mut Tabs<Client>, chrome: &mut Chrome) -> bool {
 /// for, as it is in a browser with an ad blocker. The row says which, and
 /// a file that cannot be written is said too; the change stands for this
 /// run, as a zoom level does.
-fn toggle_block(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
-    let Some(blocker) = chrome.blocker.clone() else {
+fn toggle_block(tabs: &mut Tabs<Client>, shared: &mut Shared) {
+    let Some(blocker) = shared.blocker.clone() else {
         note(tabs, block::NO_LISTS);
         return;
     };
@@ -7554,8 +7673,8 @@ fn toggle_block(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
         note(tabs, block::NO_SITE);
         return;
     };
-    let written = chrome.unblocked.toggle(&site);
-    let now = chrome.unblocked.contains(&site);
+    let written = shared.unblocked.toggle(&site);
+    let now = shared.unblocked.contains(&site);
     blocker.set_unblocked(&site, now);
     let sentence = match written {
         Ok(_) => block::toggled(&site, now),
@@ -7573,8 +7692,8 @@ fn toggle_block(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
 /// files (a crashed one is given the new ones when it comes back, in
 /// [`revive`]), and the row says how many. A directory that has gone is said
 /// on the row, and the files already told stay.
-fn reload_sites(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
-    chrome.sites = match sites::load(&chrome.sites_location) {
+fn reload_sites(tabs: &mut Tabs<Client>, shared: &mut Shared) {
+    shared.sites = match sites::load(&shared.sites_location) {
         Ok(read) => read,
         Err(why) => {
             note(tabs, why);
@@ -7592,9 +7711,9 @@ fn reload_sites(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
         }
         let old = std::mem::take(&mut tab.site_scripts);
         sites::remove(&mut tab.connection, &old);
-        tab.site_scripts = sites::install(&mut tab.connection, &chrome.sites, false);
+        tab.site_scripts = sites::install(&mut tab.connection, &shared.sites, false);
     }
-    note(tabs, reloaded_words(&chrome.sites, waiting));
+    note(tabs, reloaded_words(&shared.sites, waiting));
 }
 
 /// What the row says after `reload-sites`: what was read, that the scripts
@@ -7723,6 +7842,7 @@ fn edit_allow(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     key: KeyInput,
 ) -> Result<bool, String> {
     if key.action == KeyAction::Release {
@@ -7753,14 +7873,14 @@ fn edit_allow(
                 // the allowance for the one that comes after.
                 let _ = browser.notify(method, params);
             }
-            let sentence = match chrome.allowed.set(&origin, &set) {
+            let sentence = match shared.allowed.set(&origin, &set) {
                 Ok(()) => permissions::applied(&origin, &set),
                 Err(why) => format!("{}; {why}", permissions::applied(&origin, &set)),
             };
             note(tabs, sentence);
         }
     }
-    redraw_row(term, tabs, chrome)?;
+    redraw_row(term, tabs, chrome, shared)?;
     Ok(true)
 }
 
@@ -7992,6 +8112,7 @@ fn hint_key(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     key: KeyInput,
 ) -> Result<bool, String> {
     let Some(hinting) = chrome.hinting.as_mut() else {
@@ -8024,10 +8145,10 @@ fn hint_key(
             // the labels ignore the pointer anyway, but the page should not
             // be photographed with them over what the click changed.
             cancel_hints(tabs, chrome);
-            follow_hint(tabs, browser, chrome, hint, new_tab)?;
+            follow_hint(tabs, browser, chrome, shared, hint, new_tab)?;
         }
     }
-    redraw_row(term, tabs, chrome)?;
+    redraw_row(term, tabs, chrome, shared)?;
     Ok(true)
 }
 
@@ -8047,18 +8168,19 @@ fn follow_hint(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     hint: hints::Hint,
     new_tab: bool,
 ) -> Result<(), String> {
     if new_tab && hint.kind == hints::Kind::Link && !hint.href.is_empty() {
         let appearance = chrome.appearance;
-        let identity = chrome.identity.clone();
+        let identity = shared.identity.clone();
         match open_behind(
             tabs,
             browser,
             &appearance,
             &identity,
-            &chrome.sites,
+            &shared.sites,
             &hint.href,
         ) {
             Ok(_) => {}
@@ -8259,6 +8381,7 @@ fn edit_find(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     key: KeyInput,
 ) -> Result<bool, String> {
     if key.action == KeyAction::Release {
@@ -8283,7 +8406,7 @@ fn edit_find(
         find::Step::Quit => {}
     }
     pump_find(tabs, chrome);
-    redraw_row(term, tabs, chrome)?;
+    redraw_row(term, tabs, chrome, shared)?;
     Ok(true)
 }
 
@@ -8440,6 +8563,7 @@ fn edit_list(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     key: KeyInput,
 ) -> Result<bool, String> {
     if key.action == KeyAction::Release {
@@ -8462,7 +8586,7 @@ fn edit_list(
                 tablist::Step::Quit if !quits(&chrome.bindings, &key) => tablist::Step::Typing,
                 step => step,
             };
-            list_step(term, tabs, browser, chrome, step)
+            list_step(term, tabs, browser, chrome, shared, step)
         }
         Some(Overlay::History(list)) => {
             let step = match list.step(&key, page) {
@@ -8471,7 +8595,7 @@ fn edit_list(
                 }
                 step => step,
             };
-            history_step(term, tabs, browser, chrome, step)
+            history_step(term, tabs, browser, chrome, shared, step)
         }
         Some(Overlay::Console(list)) => {
             let step = match list.step(&key, page) {
@@ -8480,7 +8604,7 @@ fn edit_list(
                 }
                 step => step,
             };
-            console_step(term, tabs, chrome, step)
+            console_step(term, tabs, chrome, shared, step)
         }
     }
 }
@@ -8494,6 +8618,7 @@ fn click_list(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     report: &MouseInput,
 ) -> Result<bool, String> {
     let cell = chrome.metrics.cell;
@@ -8515,17 +8640,17 @@ fn click_list(
             let matched: Vec<usize> = list.matches(tabs).iter().map(|entry| entry.index).collect();
             let window = list.window(matched.len(), rows, first);
             let step = list.click(row, &window, &matched);
-            list_step(term, tabs, browser, chrome, step)
+            list_step(term, tabs, browser, chrome, shared, step)
         }
         Some(Overlay::History(list)) => {
             let window = list.window(list.matches().len(), rows, first);
             let step = list.click(row, &window, report.button == Some(1));
-            history_step(term, tabs, browser, chrome, step)
+            history_step(term, tabs, browser, chrome, shared, step)
         }
         Some(Overlay::Console(list)) => {
             let window = list.window(list.matches().len(), rows, first);
             let step = list.click(row, &window);
-            console_step(term, tabs, chrome, step)
+            console_step(term, tabs, chrome, shared, step)
         }
     }
 }
@@ -8542,6 +8667,7 @@ fn click_row(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     report: &MouseInput,
 ) -> Result<bool, String> {
     let (column, _) = crate::input::row_cell(report, chrome.pixel_mouse, chrome.metrics.cell);
@@ -8564,14 +8690,14 @@ fn click_row(
         strip::Step::Nothing => {}
         strip::Step::Switch(index) => {
             if tabs.switch_to(index) {
-                switched(term, tabs, browser, chrome, was)?;
+                switched(term, tabs, browser, chrome, shared, was)?;
             }
         }
         strip::Step::Close(index) => {
             if let Some(entry) = close_tab(tabs, browser, index) {
-                chrome.session.closed(entry);
+                shared.session.closed(entry);
             }
-            switched(term, tabs, browser, chrome, was)?;
+            switched(term, tabs, browser, chrome, shared, was)?;
         }
         strip::Step::EditUrl => {
             chrome.bar = tabs
@@ -8579,7 +8705,7 @@ fn click_row(
                 .map(|tab| UrlBar::new(Line::selected(tab.url.clone())));
         }
     }
-    redraw_row(term, tabs, chrome)?;
+    redraw_row(term, tabs, chrome, shared)?;
     Ok(true)
 }
 
@@ -8589,6 +8715,7 @@ fn list_step(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     step: tablist::Step,
 ) -> Result<bool, String> {
     match step {
@@ -8599,11 +8726,11 @@ fn list_step(
             close_list(term, chrome)?;
             let was = tabs.active_target().map(str::to_string);
             if tabs.switch_to(index) {
-                switched(term, tabs, browser, chrome, was)?;
+                switched(term, tabs, browser, chrome, shared, was)?;
             }
         }
     }
-    redraw_row(term, tabs, chrome)?;
+    redraw_row(term, tabs, chrome, shared)?;
     Ok(true)
 }
 
@@ -8626,6 +8753,7 @@ fn history_step(
     tabs: &mut Tabs<Client>,
     browser: &mut Client,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     step: historylist::Step,
 ) -> Result<bool, String> {
     match step {
@@ -8650,14 +8778,14 @@ fn history_step(
             close_list(term, chrome)?;
             let was = tabs.active_target().map(str::to_string);
             let appearance = chrome.appearance;
-            let identity = chrome.identity.clone();
-            match open_tab(tabs, browser, &appearance, &identity, &chrome.sites, &url) {
-                Ok(()) => switched(term, tabs, browser, chrome, was)?,
+            let identity = shared.identity.clone();
+            match open_tab(tabs, browser, &appearance, &identity, &shared.sites, &url) {
+                Ok(()) => switched(term, tabs, browser, chrome, shared, was)?,
                 Err(why) => note(tabs, why),
             }
         }
         historylist::Step::Forget(url) => {
-            let written = chrome.history.forget(&url);
+            let written = shared.history.forget(&url);
             if let Some(Overlay::History(list)) = chrome.list.as_mut() {
                 list.forgotten(&url);
                 if let Err(why) = written {
@@ -8666,7 +8794,7 @@ fn history_step(
             }
         }
     }
-    redraw_row(term, tabs, chrome)?;
+    redraw_row(term, tabs, chrome, shared)?;
     Ok(true)
 }
 
@@ -8676,6 +8804,7 @@ fn console_step(
     term: &mut dyn Terminal,
     tabs: &Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     step: consolelist::Step,
 ) -> Result<bool, String> {
     match step {
@@ -8683,7 +8812,7 @@ fn console_step(
         consolelist::Step::Quit => return Ok(false),
         consolelist::Step::Close => close_list(term, chrome)?,
     }
-    redraw_row(term, tabs, chrome)?;
+    redraw_row(term, tabs, chrome, shared)?;
     Ok(true)
 }
 
@@ -8720,6 +8849,7 @@ fn paste(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
+    shared: &mut Shared,
     text: &str,
 ) -> Result<(), String> {
     match typing_line(tabs, chrome) {
@@ -8731,14 +8861,14 @@ fn paste(
                     bar.walk = None;
                     let text = bar.line.text();
                     bar.line.suggest(
-                        chrome
+                        shared
                             .bookmarks
                             .complete(text)
-                            .or_else(|| chrome.history.complete(text)),
+                            .or_else(|| shared.history.complete(text)),
                     );
                 }
             }
-            return redraw_row(term, tabs, chrome);
+            return redraw_row(term, tabs, chrome, shared);
         }
         Some(Typing::Find) => {
             if let Some(find) = chrome.find.as_mut() {
@@ -8749,13 +8879,13 @@ fn paste(
                 }
             }
             pump_find(tabs, chrome);
-            return redraw_row(term, tabs, chrome);
+            return redraw_row(term, tabs, chrome, shared);
         }
         Some(Typing::List) => {
             if let Some(list) = chrome.list.as_mut() {
                 paste_into_line(list.line_mut(), text);
             }
-            return redraw_row(term, tabs, chrome);
+            return redraw_row(term, tabs, chrome, shared);
         }
         Some(Typing::Allow) => {
             if let Some(allow) = chrome.allow.as_mut() {
@@ -8763,7 +8893,7 @@ fn paste(
                     allow.refused = None;
                 }
             }
-            return redraw_row(term, tabs, chrome);
+            return redraw_row(term, tabs, chrome, shared);
         }
         Some(Typing::Prompt | Typing::Upload) | None => {}
     }
@@ -8773,7 +8903,7 @@ fn paste(
             .and_then(|tab| tab.dialog.as_mut())
             .is_some_and(|dialog| paste_into_dialog(dialog, text));
         if pasted {
-            redraw_row(term, tabs, chrome)?;
+            redraw_row(term, tabs, chrome, shared)?;
         }
         return Ok(());
     }
@@ -8782,7 +8912,7 @@ fn paste(
     // lines above.
     if let Some(prompt) = tabs.active_mut().and_then(|tab| tab.upload.as_mut()) {
         prompt.paste(&clipboard::one_line(text), &upload::Disk);
-        return redraw_row(term, tabs, chrome);
+        return redraw_row(term, tabs, chrome, shared);
     }
     if let Some(tab) = tabs.active_mut().filter(|tab| accepts_input(tab)) {
         let _ = tab
@@ -9990,7 +10120,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let mut kept = Session::load(&dir);
-        assert_eq!(died(why(), &kept), why(), "nothing saved yet");
+        assert_eq!(died(why(), &kept, WINDOW), why(), "nothing saved yet");
         let tabs = |n: usize| Snapshot {
             tabs: (0..n)
                 .map(|i| session::Entry {
@@ -10003,7 +10133,7 @@ mod tests {
         let now = Instant::now();
         kept.record_window(WINDOW, tabs(3), now);
         assert_eq!(
-            died(why(), &kept),
+            died(why(), &kept, WINDOW),
             format!(
                 "{}; the 3 tabs you had are saved: blinkterm --restore reopens them",
                 why()
@@ -10011,7 +10141,7 @@ mod tests {
         );
         kept.record_window(WINDOW, tabs(1), now + Duration::from_secs(1));
         assert_eq!(
-            died(why(), &kept),
+            died(why(), &kept, WINDOW),
             format!(
                 "{}; the tab you had is saved: blinkterm --restore reopens it",
                 why()
@@ -10020,7 +10150,7 @@ mod tests {
         let mut memory = Session::in_memory();
         memory.record_window(WINDOW, tabs(3), now);
         assert_eq!(
-            died(why(), &memory),
+            died(why(), &memory, WINDOW),
             why(),
             "a temporary profile keeps none"
         );
@@ -10066,7 +10196,7 @@ mod tests {
         );
         let saved = "the 3 tabs you had are saved: blinkterm --restore reopens them";
         assert_eq!(
-            died(gave_up(why()), &kept),
+            died(gave_up(why()), &kept, WINDOW),
             format!(
                 "{}; it died a second time within a minute of being started again, \
                  so it is not started a third time; {saved}",
@@ -10074,12 +10204,20 @@ mod tests {
             )
         );
         assert_eq!(
-            died(could_not_restart(why(), "no engine".to_string()), &kept),
+            died(
+                could_not_restart(why(), "no engine".to_string()),
+                &kept,
+                WINDOW
+            ),
             format!("{}; starting it again failed: no engine; {saved}", why())
         );
         let memory = Session::in_memory();
         assert_eq!(
-            died(could_not_restart(why(), "no engine".to_string()), &memory),
+            died(
+                could_not_restart(why(), "no engine".to_string()),
+                &memory,
+                WINDOW
+            ),
             format!("{}; starting it again failed: no engine", why())
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -10162,29 +10300,19 @@ mod tests {
             crate::options::Settings::default(),
         )
         .expect("the defaults");
-        let profile = Profile::temporary().expect("a temporary profile");
-        let downloads =
-            std::env::temp_dir().join(format!("blinkterm-app-alpha-{}", std::process::id()));
         let mut chrome = Chrome::new(
+            WINDOW,
             Metrics {
                 cols: 80,
                 rows: 24,
                 cell: (8, 16),
             },
             &options,
-            &profile,
-            downloads.clone(),
             Appearance::new(
                 crate::appearance::Choice::default(),
                 false,
                 crate::appearance::Alpha::On(100),
             ),
-            Identity::new(None, None, "C"),
-            Allowed::in_memory(),
-            None,
-            Unblocked::in_memory(),
-            Sites::none(),
-            Some(Arc::new(Recorder::new())),
         );
         let local = Route::local(true);
         chrome.take_route(local);
@@ -10194,12 +10322,16 @@ mod tests {
             ..local
         });
         assert!(chrome.cast.png, "the PNG route's frames, as without it");
-        std::fs::remove_dir_all(&downloads).ok();
     }
 
-    /// A `Chrome` for a test that draws, on a temporary profile, with its
-    /// downloads directory to remove.
-    fn drawing_chrome(what: &str, console: Arc<Recorder>) -> (Chrome, PathBuf) {
+    /// A window's `Chrome` and its profile's `Shared` for a test, at
+    /// `metrics`, on a temporary profile, with its downloads directory to
+    /// remove.
+    fn test_window(
+        what: &str,
+        metrics: Metrics,
+        console: Arc<Recorder>,
+    ) -> (Chrome, Shared, PathBuf) {
         let options = crate::options::resolve(
             crate::options::Settings::default(),
             crate::options::Settings::default(),
@@ -10210,19 +10342,19 @@ mod tests {
         let downloads =
             std::env::temp_dir().join(format!("blinkterm-app-{what}-{}", std::process::id()));
         let chrome = Chrome::new(
-            Metrics {
-                cols: 80,
-                rows: 6,
-                cell: (8, 16),
-            },
+            WINDOW,
+            metrics,
             &options,
-            &profile,
-            downloads.clone(),
             Appearance::new(
                 crate::appearance::Choice::default(),
                 false,
                 crate::appearance::Alpha::Off,
             ),
+        );
+        let shared = Shared::new(
+            &options,
+            &profile,
+            downloads.clone(),
             Identity::new(None, None, "C"),
             Allowed::in_memory(),
             None,
@@ -10230,13 +10362,23 @@ mod tests {
             Sites::none(),
             Some(console),
         );
-        (chrome, downloads)
+        (chrome, shared, downloads)
+    }
+
+    /// [`test_window`] at 80x6, for a test that draws.
+    fn drawing_chrome(what: &str, console: Arc<Recorder>) -> (Chrome, Shared, PathBuf) {
+        let metrics = Metrics {
+            cols: 80,
+            rows: 6,
+            cell: (8, 16),
+        };
+        test_window(what, metrics, console)
     }
 
     #[test]
     fn the_console_panel_draws_its_rows_with_the_level_first_and_says_nothing_logged_when_empty() {
         use crate::console::{Entry, Level, Source};
-        let (chrome, downloads) = drawing_chrome("console", Arc::new(Recorder::new()));
+        let (chrome, _shared, downloads) = drawing_chrome("console", Arc::new(Recorder::new()));
         let entry = |level, source, text: &str, place: &str| Entry {
             level,
             source,
@@ -10306,21 +10448,21 @@ mod tests {
         let client = Client::on(&exchange, Some("S1".to_string())).expect("a page client");
         let tabs = Tabs::new(Tab::new("a", client, "https://a.example/"));
         let recorder = Arc::new(Recorder::new());
-        let (chrome, downloads) = drawing_chrome("console-words", Arc::clone(&recorder));
+        let (_chrome, shared, downloads) = drawing_chrome("console-words", Arc::clone(&recorder));
         let error = || Entry {
             level: Level::Error,
             source: Source::Exception,
             text: "Uncaught Error: boom".to_string(),
             place: String::new(),
         };
-        assert_eq!(console_words(&tabs, &chrome), None);
+        assert_eq!(console_words(&tabs, &shared), None);
         recorder.record("S1", error());
-        assert_eq!(console_words(&tabs, &chrome).as_deref(), Some("1 error"));
+        assert_eq!(console_words(&tabs, &shared).as_deref(), Some("1 error"));
         recorder.record("S1", error());
         recorder.record("S2", error());
-        assert_eq!(console_words(&tabs, &chrome).as_deref(), Some("2 errors"));
+        assert_eq!(console_words(&tabs, &shared).as_deref(), Some("2 errors"));
         recorder.opened("S1");
-        assert_eq!(console_words(&tabs, &chrome), None);
+        assert_eq!(console_words(&tabs, &shared), None);
         drop(tabs);
         drop(commands);
         drop(replies);
@@ -10339,30 +10481,39 @@ mod tests {
             Client::on(&exchange, Some(session.to_string())).expect("a page client")
         };
         let mut tabs = Tabs::new(Tab::new("a", client("S1"), "https://a.example/"));
-        let (mut chrome, downloads) = drawing_chrome("profile-label", Arc::new(Recorder::new()));
+        let (mut chrome, mut shared, downloads) =
+            drawing_chrome("profile-label", Arc::new(Recorder::new()));
         chrome.mode = normal::Mode::starting(true);
-        let row = |tabs: &Tabs<Client>, chrome: &Chrome| {
+        let row = |tabs: &Tabs<Client>, chrome: &Chrome, shared: &Shared| {
             let active = tabs.active().expect("a tab");
-            String::from_utf8(plain_row(tabs, active, chrome)).expect("text")
+            String::from_utf8(plain_row(tabs, active, chrome, shared)).expect("text")
         };
 
-        let one_without = row(&tabs, &chrome);
-        chrome.profile_label = Some("Work".to_string());
-        let one_with = row(&tabs, &chrome);
+        let one_without = row(&tabs, &chrome, &shared);
+        shared.profile_label = Some("Work".to_string());
+        let one_with = row(&tabs, &chrome, &shared);
         assert!(one_with.contains("Work  normal"), "{one_with:?}");
-        chrome.profile_label = None;
-        assert_eq!(row(&tabs, &chrome), one_without, "no name, no change");
+        shared.profile_label = None;
+        assert_eq!(
+            row(&tabs, &chrome, &shared),
+            one_without,
+            "no name, no change"
+        );
 
         tabs.open(Tab::new("b", client("S2"), "https://b.example/"));
-        let two_without = row(&tabs, &chrome);
-        chrome.profile_label = Some("Work".to_string());
-        let two_with = row(&tabs, &chrome);
+        let two_without = row(&tabs, &chrome, &shared);
+        shared.profile_label = Some("Work".to_string());
+        let two_with = row(&tabs, &chrome, &shared);
         assert!(
             two_with.contains("Work  normal  https://b.example/"),
             "{two_with:?}"
         );
-        chrome.profile_label = None;
-        assert_eq!(row(&tabs, &chrome), two_without, "no name, no change");
+        shared.profile_label = None;
+        assert_eq!(
+            row(&tabs, &chrome, &shared),
+            two_without,
+            "no name, no change"
+        );
 
         drop(tabs);
         drop(commands);
@@ -10379,32 +10530,8 @@ mod tests {
             rows: 24,
             cell: (8, 16),
         };
-        let options = crate::options::resolve(
-            crate::options::Settings::default(),
-            crate::options::Settings::default(),
-            crate::options::Settings::default(),
-        )
-        .expect("the defaults");
-        let profile = Profile::temporary().expect("a temporary profile");
-        let downloads =
-            std::env::temp_dir().join(format!("blinkterm-app-engine-gone-{}", std::process::id()));
-        let mut chrome = Chrome::new(
-            metrics,
-            &options,
-            &profile,
-            downloads.clone(),
-            Appearance::new(
-                crate::appearance::Choice::default(),
-                false,
-                crate::appearance::Alpha::Off,
-            ),
-            Identity::new(None, None, "C"),
-            Allowed::in_memory(),
-            None,
-            Unblocked::in_memory(),
-            Sites::none(),
-            Some(Arc::new(Recorder::new())),
-        );
+        let (mut chrome, mut shared, downloads) =
+            test_window("engine-gone", metrics, Arc::new(Recorder::new()));
         chrome.find = Some(Find {
             target: "a".to_string(),
             finder: find::Finder::open("needle"),
@@ -10437,13 +10564,13 @@ mod tests {
         chrome.unwatched = Some("a".to_string());
         chrome.layout = Layout { whole: true };
         chrome.allow =
-            Some(Allow::open("https://meet.example/room", &chrome.allowed).expect("an origin"));
-        chrome
+            Some(Allow::open("https://meet.example/room", &shared.allowed).expect("an origin"));
+        shared
             .allowed
             .set("https://meet.example", &[Permission::Camera])
             .expect("kept");
 
-        chrome.engine_gone(Instant::now());
+        chrome.engine_gone(&mut shared.downloads, Instant::now());
 
         assert!(chrome.find.is_none());
         assert_eq!(chrome.last_needle, "needle", "the needle is the person's");
@@ -10473,12 +10600,12 @@ mod tests {
             "the line names an origin, not a target"
         );
         assert_eq!(
-            chrome.allowed.get("https://meet.example"),
+            shared.allowed.get("https://meet.example"),
             [Permission::Camera],
             "the profile's"
         );
         drop(chrome);
-        drop(profile);
+        drop(shared);
         let _ = std::fs::remove_dir_all(&downloads);
     }
 
