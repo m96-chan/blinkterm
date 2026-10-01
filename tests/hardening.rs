@@ -1249,6 +1249,14 @@ fn cookies_set_before_the_last_window_goes_are_there_at_the_next_start() {
     assert!(!scratch.0.join(engine::PGID_FILE).exists());
 
     let mut again = Front::open(&mut spawn, &scratch.0, (80, 24), &[format!("{page}show")]);
+    // The window that went without a word is offered back, ahead of the one
+    // that quit; declined, the row shows the page.
+    assert!(
+        again.pump(PATIENCE, |f| f.says("restore 1 tab from last time?")),
+        "{}",
+        again.said()
+    );
+    again.key('n');
     assert!(
         again.pump(PATIENCE, |f| f.says("cookie=kept=yes")),
         "the cookie was not kept: {}",
