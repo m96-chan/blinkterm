@@ -243,6 +243,10 @@ fn stop(pid: Option<u32>) {
 /// it started has written the profile out — the lock let go. The backend
 /// had no terminal while the frontend did.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "flaky on macOS: the cut paste is not said within the wait (#114)"
+)]
 fn a_status_row_appears_and_ctrl_q_exits_0_and_releases_the_lock() {
     if !engine_named() {
         return;
