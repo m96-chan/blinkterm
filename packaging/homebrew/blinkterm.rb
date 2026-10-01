@@ -8,8 +8,8 @@ class Blinkterm < Formula
   # GitHub's archive of the tag; RELEASING.md ("Homebrew") says how both lines
   # are made on each release. `head` stays below, so `--HEAD` keeps installing
   # main.
-  url "https://github.com/m96-chan/blinkterm/archive/refs/tags/v0.3.0.tar.gz"
-  sha256 "848b7f1cb433fb43a98e8bf61c5182ea1254349a118233b4c69e510bb490b125"
+  url "https://github.com/m96-chan/blinkterm/archive/refs/tags/v0.4.0.tar.gz"
+  sha256 "39ff09ddf2596fc843ec98bd5e108a8a038f081dd144054a34a7e7cb52494832"
   license "MIT"
   head "https://github.com/m96-chan/blinkterm.git", branch: "main"
 
