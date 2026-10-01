@@ -2097,4 +2097,176 @@ pub(crate) mod tests {
             "the key clear, the page at the amount"
         );
     }
+
+    // -----------------------------------------------------------------
+    // The canvas: what the window hands over, made into what the painter
+    // sent before the decode moved here
+    // -----------------------------------------------------------------
+
+    /// A painter that cannot use shared memory, on `route`: every frame
+    /// inline, so that two of them make the same bytes for the same frame.
+    fn inline_painter(route: Route) -> Painter {
+        Painter::at_with(Path::new("/nonexistent-for-a-test"), route)
+    }
+
+    fn raw_route() -> Route {
+        Route::local(false)
+    }
+
+    fn png_route() -> Route {
+        Route {
+            placement: Placement::Direct,
+            wrap: Wrap::None,
+            ..tmux_route()
+        }
+    }
+
+    /// A frame as the window hands it over, at 10x5 cells from row 2.
+    fn frame_of(payload: Encoded<'_>, pixels: (u32, u32)) -> FrameOut<'_> {
+        FrameOut {
+            payload,
+            cells: cells(10, 5),
+            row: 2,
+            pixels,
+            viewport_gen: 0,
+        }
+    }
+
+    const JPEG: &[u8] = include_bytes!("../tests/jpeg/420.jpg");
+
+    #[test]
+    fn a_jpeg_frame_is_the_raw_frame_the_painter_made_of_its_decode() {
+        let mut canvas = Canvas::new(inline_painter(raw_route()), false, None);
+        let strokes = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+
+        let image = crate::jpeg::decode(JPEG, FRAME_BUDGET).expect("the fixture decodes");
+        let mut painter = inline_painter(raw_route());
+        let before = painter.frame(
+            Raw::rgb(&image.rgb, image.width, image.height),
+            cells(10, 5),
+            2,
+            1,
+        );
+        assert_eq!(strokes.bytes, before, "byte for byte what the loop sent");
+        assert!(strokes.placeholders.is_empty(), "placed at the cursor");
+        assert!(!strokes.named, "inline, written as text");
+        let bodies = apc_bodies(&strokes.bytes);
+        let control = String::from_utf8_lossy(&bodies[0]);
+        assert!(control.contains("f=24"), "RGB: {control}");
+        assert!(
+            control.contains(&format!("s={},v={}", image.width, image.height)),
+            "the picture's own size: {control}"
+        );
+    }
+
+    #[test]
+    fn a_keyed_jpeg_is_keyed_despilled_and_taken_to_the_amount() {
+        let mut canvas = Canvas::new(inline_painter(raw_route()), true, Some(179));
+        let strokes = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+
+        let mut image = crate::jpeg::decode_rgba_with(JPEG, FRAME_BUDGET, crate::chroma::key_pixel)
+            .expect("the fixture decodes");
+        crate::chroma::despill(&mut image.rgba, image.width, image.height);
+        scale_alpha(&mut image.rgba, 179);
+        let mut painter = inline_painter(raw_route());
+        let before = painter.frame(
+            Raw::rgba(&image.rgba, image.width, image.height),
+            cells(10, 5),
+            2,
+            1,
+        );
+        assert_eq!(strokes.bytes, before);
+        let bodies = apc_bodies(&strokes.bytes);
+        assert!(String::from_utf8_lossy(&bodies[0]).contains("f=32"));
+    }
+
+    #[test]
+    fn a_still_is_decoded_and_fitted_to_the_pane_where_pixels_go() {
+        let rgba: Vec<u8> = (0..16u8)
+            .flat_map(|i| [i * 10, i * 5, 255 - i * 10, 255])
+            .collect();
+        let png = crate::png::encode_rgba(4, 4, &rgba);
+        let mut canvas = Canvas::new(inline_painter(raw_route()), false, Some(179));
+        let strokes = canvas
+            .paint(frame_of(Encoded::Png(&png), (5, 4)))
+            .expect("it decodes");
+
+        let image = crate::png::decode(&png, FRAME_BUDGET).expect("ours decodes");
+        let (pixels, (width, height)) = fitted_still(image, (5, 4), false, Some(179));
+        let mut painter = inline_painter(raw_route());
+        let before = painter.frame(Raw::rgba(&pixels, width, height), cells(10, 5), 2, 1);
+        assert_eq!(strokes.bytes, before);
+        let control = String::from_utf8_lossy(&apc_bodies(&strokes.bytes)[0]).into_owned();
+        assert!(control.contains("s=5,v=4"), "fitted to the pane: {control}");
+    }
+
+    #[test]
+    fn a_png_on_the_png_route_goes_as_it_came() {
+        let png = png_1x1();
+        let mut canvas = Canvas::new(inline_painter(png_route()), false, None);
+        assert!(canvas.png_route());
+        let strokes = canvas
+            .paint(frame_of(Encoded::Png(&png), (80, 80)))
+            .expect("nothing to decode");
+        let mut painter = inline_painter(png_route());
+        assert_eq!(strokes.bytes, painter.png_frame(&png, cells(10, 5), 2, 1));
+        // Not even looked at: what the terminal makes of it is the
+        // terminal's.
+        let mut canvas = Canvas::new(inline_painter(png_route()), false, None);
+        assert!(canvas
+            .paint(frame_of(Encoded::Png(b"not a png"), (80, 80)))
+            .is_some());
+    }
+
+    #[test]
+    fn a_frame_that_will_not_decode_is_nothing() {
+        let mut canvas = Canvas::new(inline_painter(raw_route()), false, None);
+        assert_eq!(
+            canvas.paint(frame_of(Encoded::Jpeg(b"not a jpeg"), (80, 80))),
+            None
+        );
+        assert_eq!(
+            canvas.paint(frame_of(Encoded::Png(b"not a png"), (80, 80))),
+            None
+        );
+        let mut keyed = Canvas::new(inline_painter(raw_route()), true, None);
+        assert_eq!(
+            keyed.paint(frame_of(Encoded::Jpeg(&JPEG[..40]), (80, 80))),
+            None
+        );
+    }
+
+    #[test]
+    fn under_placeholders_the_cells_go_first_once_and_again_after_a_clear() {
+        let route = Route {
+            payload: Payload::Raw,
+            ..tmux_route()
+        };
+        let mut canvas = Canvas::new(inline_painter(route), false, None);
+        let first = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+        assert_eq!(
+            first.placeholders,
+            placeholder_pane(PLACEHOLDER_IMAGE_ID, cells(10, 5), 2)
+        );
+        let second = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+        assert!(second.placeholders.is_empty(), "already on the screen");
+        canvas.invalidate_placeholders();
+        let third = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+        assert_eq!(third.placeholders, first.placeholders, "written again");
+        canvas.clear();
+        let fourth = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+        assert_eq!(fourth.placeholders, first.placeholders, "and after a clear");
+    }
 }

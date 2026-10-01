@@ -22,6 +22,19 @@
 //! because it is a policy with a measurement behind it and it can be tested
 //! without an engine, a terminal or a pane.
 //!
+//! What the loop holds is in three parts, cut where #83's backend will cut
+//! them: a `Window` — its tabs, and everything else a window owns
+//! (`Chrome`: the row and whatever can have it, what is out with the page
+//! in front, the pointer, the motion policy, the layout) — beside the
+//! profile's `Shared` — the history, the bookmarks, the session file, the
+//! downloads, the blocker, who the engine says it is — and drawn through a
+//! [`Terminal`]. A pass is `prepare_window`, the poll, the terminal's
+//! input, and `pass_window`; `drive` is the loop of them for the one window
+//! and the one terminal ([`LocalTerminal`]) a run has today. Nothing below
+//! `drive` writes to the pane, decodes a frame or runs a helper program
+//! itself: it asks the terminal ([`crate::terminal`]), which is what lets the
+//! same window one day be drawn on a terminal in another process.
+//!
 //! The other thing that is not here is the wheel's animation. It was, and a
 //! loop that spends nine milliseconds decoding a frame is a loop that sends a
 //! scroll's ticks in bursts, which the engine applies as jumps — so the ticks
@@ -640,7 +653,7 @@ struct Chrome {
 /// and the backend #83 is building toward keeps one for all of them. The
 /// engine and the browser's client are not here yet; they stay beside it in
 /// [`run`] until there is a backend process to own them.
-pub struct Shared {
+struct Shared {
     /// The pages visited, which the url bar offers back; kept in the profile,
     /// or only in memory for a temporary one. See [`crate::history`].
     history: History,
@@ -814,9 +827,10 @@ impl Chrome {
     /// terminal and not about the engine.
     /// What was on the tabs — a dialog, a file input's half-typed path — goes
     /// with them, and so does a file picker's window that is open for one of
-    /// them, ended as it is dropped: the input it would answer is gone. A
-    /// password command running for one of them is ended the same way, and
-    /// a fill waiting for its answer is forgotten.
+    /// them: the input it would answer is gone. A password command running
+    /// for one of them goes the same way, and a fill waiting for its answer
+    /// is forgotten. Both are forgotten here; the terminal running them is
+    /// told to end them by the caller, first ([`end_helpers`]).
     /// Nothing is sent: this is this program's memory only, and the pointer's
     /// shape is the caller's to give back to the terminal. The downloads
     /// still coming are the profile's, told by the caller
@@ -929,7 +943,7 @@ impl Shared {
 /// A run has one. The backend #83 is building toward has one per terminal
 /// attached to it, each driven by the same two halves of a pass
 /// ([`prepare_window`], [`pass_window`]) that drive this one.
-pub struct Window {
+struct Window {
     tabs: Tabs<Client>,
     chrome: Chrome,
     shrunk: Shrunk,
@@ -4833,7 +4847,7 @@ fn paint(
     term: &mut dyn Terminal,
     tabs: &Tabs<Client>,
     chrome: &mut Chrome,
-    shared: &mut Shared,
+    shared: &Shared,
     payload: Encoded<'_>,
 ) -> Result<bool, String> {
     // The tab list has the rows the picture would go on. The frame was
@@ -11661,5 +11675,678 @@ mod tests {
         };
         assert_eq!(at(1.0), (20.0, 8.0));
         assert_eq!(at(2.0), (10.0, 4.0));
+    }
+
+    // -----------------------------------------------------------------
+    // A window through a terminal that is not one: what the loop asks of
+    // the terminal, and what it does with the answers
+    // -----------------------------------------------------------------
+
+    /// A terminal that records what a window asks of it and answers what
+    /// the test says: the frames painted or not, the helpers started and
+    /// their answers whenever the test hands them over.
+    #[derive(Default)]
+    struct FakeTerminal {
+        written: Vec<u8>,
+        pictures_cleared: usize,
+        screens_cleared: usize,
+        /// What each frame was, in order: a PNG or not, its bytes, its row,
+        /// and the window's count of its sizes.
+        frames: Vec<(bool, Vec<u8>, u32, u32)>,
+        /// What `frame` answers: whether it decoded.
+        decodes: bool,
+        paced: bool,
+        png: bool,
+        /// What `painted` answers, one a call; nothing owed after.
+        painted: std::collections::VecDeque<crate::terminal::Painted>,
+        shapes: Vec<Shape>,
+        started: Vec<(u64, Helper)>,
+        /// The sentence for the next start that fails.
+        refuse: Option<String>,
+        /// An answer there as soon as the next helper starts: a helper
+        /// that had the terminal, run to the end inside the start.
+        on_start: Option<HelperOutcome>,
+        answers: Vec<(u64, HelperOutcome)>,
+        polled: Vec<u64>,
+        ended: Vec<u64>,
+    }
+
+    impl FakeTerminal {
+        fn decoding() -> FakeTerminal {
+            FakeTerminal {
+                decodes: true,
+                ..FakeTerminal::default()
+            }
+        }
+    }
+
+    impl Terminal for FakeTerminal {
+        fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+            self.written.extend_from_slice(bytes);
+            Ok(())
+        }
+        fn clear_picture(&mut self) -> Result<(), String> {
+            self.pictures_cleared += 1;
+            Ok(())
+        }
+        fn clear_screen(&mut self) -> Result<(), String> {
+            self.screens_cleared += 1;
+            Ok(())
+        }
+        fn frame(&mut self, frame: FrameOut<'_>) -> Result<bool, String> {
+            let (png, bytes) = match frame.payload {
+                Encoded::Png(bytes) => (true, bytes),
+                Encoded::Jpeg(bytes) => (false, bytes),
+            };
+            self.frames
+                .push((png, bytes.to_vec(), frame.row, frame.viewport_gen));
+            Ok(self.decodes)
+        }
+        fn painted(&mut self) -> crate::terminal::Painted {
+            self.painted.pop_front().unwrap_or_default()
+        }
+        fn paced(&self) -> bool {
+            self.paced
+        }
+        fn png_route(&self) -> bool {
+            self.png
+        }
+        fn shape(&mut self, shape: Shape) -> Result<(), String> {
+            self.shapes.push(shape);
+            Ok(())
+        }
+        fn resized(&mut self) -> Result<Option<Metrics>, String> {
+            Ok(None)
+        }
+        fn start_helper(&mut self, id: u64, job: Helper) -> Result<Started, String> {
+            self.started.push((id, job));
+            if let Some(why) = self.refuse.take() {
+                return Ok(Started::Failed(why));
+            }
+            if let Some(outcome) = self.on_start.take() {
+                self.answers.push((id, outcome));
+            }
+            Ok(Started::Running)
+        }
+        fn helper_fds(&self) -> Vec<std::os::fd::RawFd> {
+            Vec::new()
+        }
+        fn poll_helper(&mut self, id: u64, _ready: &[std::os::fd::RawFd]) -> Option<HelperOutcome> {
+            self.polled.push(id);
+            let at = self.answers.iter().position(|(answer, _)| *answer == id)?;
+            Some(self.answers.remove(at).1)
+        }
+        fn end_helper(&mut self, id: u64) {
+            self.ended.push(id);
+            self.answers.retain(|(answer, _)| *answer != id);
+        }
+    }
+
+    /// A command a [`FakeEngine`] read: its method, params and session.
+    type Heard = (String, Json, Option<String>);
+
+    /// An engine at the other end of a pipe: every command it reads is
+    /// recorded — method, params, session — and every one with an id is
+    /// answered `{}` on its session, so that nothing the window waits for
+    /// waits.
+    struct FakeEngine {
+        exchange: Arc<crate::cdp::Exchange>,
+        heard: Arc<std::sync::Mutex<Vec<Heard>>>,
+    }
+
+    impl FakeEngine {
+        fn start() -> FakeEngine {
+            use std::io::{Read, Write};
+            use std::os::unix::io::IntoRawFd;
+            let (mut commands, ours_write) = std::io::pipe().expect("a pipe");
+            let (ours_read, mut replies) = std::io::pipe().expect("a pipe");
+            let exchange =
+                crate::cdp::Exchange::over(ours_read.into_raw_fd(), ours_write.into_raw_fd());
+            let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = Arc::clone(&heard);
+            std::thread::spawn(move || {
+                let mut text = Vec::new();
+                let mut byte = [0u8; 1];
+                while commands.read_exact(&mut byte).is_ok() {
+                    if byte[0] != 0 {
+                        text.push(byte[0]);
+                        continue;
+                    }
+                    let Ok(command) = Json::parse(&String::from_utf8_lossy(&text)) else {
+                        text.clear();
+                        continue;
+                    };
+                    text.clear();
+                    let method = command
+                        .get("method")
+                        .and_then(Json::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let session = command
+                        .get("sessionId")
+                        .and_then(Json::as_str)
+                        .map(str::to_string);
+                    let params = command.get("params").cloned().unwrap_or(Json::empty());
+                    if let Ok(mut heard) = log.lock() {
+                        heard.push((method, params, session.clone()));
+                    }
+                    if let Some(id) = command.get("id").and_then(Json::as_i64) {
+                        let mut fields = vec![("id", Json::number(id as f64))];
+                        if let Some(session) = &session {
+                            fields.push(("sessionId", Json::string(session)));
+                        }
+                        fields.push(("result", Json::empty()));
+                        let reply = format!("{}\0", Json::object(fields));
+                        if replies.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            FakeEngine { exchange, heard }
+        }
+
+        /// A page's client on session `session`.
+        fn page(&self, session: &str) -> Client {
+            Client::on(&self.exchange, Some(session.to_string())).expect("a page client")
+        }
+
+        /// What was sent of `method` so far, after giving the pipe a moment;
+        /// the params of each, with the session it went on.
+        fn heard(&self, method: &str) -> Vec<(Json, Option<String>)> {
+            std::thread::sleep(Duration::from_millis(50));
+            self.heard
+                .lock()
+                .expect("the log")
+                .iter()
+                .filter(|(sent, _, _)| sent == method)
+                .map(|(_, params, session)| (params.clone(), session.clone()))
+                .collect()
+        }
+    }
+
+    impl Drop for FakeEngine {
+        fn drop(&mut self) {
+            self.exchange.shutdown();
+        }
+    }
+
+    /// A window's state, its profile's, and a tab `a` on session `S1`.
+    fn fake_window(what: &str, engine: &FakeEngine) -> (Tabs<Client>, Chrome, Shared, PathBuf) {
+        let metrics = Metrics {
+            cols: 80,
+            rows: 24,
+            cell: (8, 16),
+        };
+        let (chrome, shared, downloads) = test_window(what, metrics, Arc::new(Recorder::new()));
+        let tabs = Tabs::new(Tab::new("a", engine.page("S1"), "https://a.example/"));
+        (tabs, chrome, shared, downloads)
+    }
+
+    /// A file input on tab `a`, node 7, as [`Tab::chooser_event`] leaves it
+    /// for a picker: `started` once the loop has got to it.
+    fn picking(started: bool) -> picker::Picking {
+        picker::Picking {
+            chooser: upload::Chooser {
+                backend_node_id: 7,
+                multiple: false,
+                frame_id: "F".to_string(),
+                session: None,
+            },
+            started,
+        }
+    }
+
+    /// A file that is there, for a picker to choose.
+    fn chosen_file(what: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("blinkterm-app-{what}-{}.txt", std::process::id()));
+        std::fs::write(&path, b"x").expect("a file");
+        path
+    }
+
+    #[test]
+    fn a_paced_frame_is_acknowledged_once_the_terminal_says_it_has_gone_out() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, _shared, downloads) = fake_window("paced", &engine);
+        let mut term = FakeTerminal {
+            paced: true,
+            ..FakeTerminal::default()
+        };
+        chrome.unacked = Some(Unacked {
+            target: "a".to_string(),
+            session: 7,
+        });
+        term.painted.push_back(crate::terminal::Painted {
+            all: false,
+            waited: None,
+        });
+        tick_frames(&mut term, &mut tabs, &mut chrome).expect("a pass");
+        assert!(chrome.unacked.is_some(), "still going out: still owed");
+        assert!(engine.heard("Page.screencastFrameAck").is_empty());
+
+        term.painted.push_back(crate::terminal::Painted {
+            all: true,
+            waited: None,
+        });
+        tick_frames(&mut term, &mut tabs, &mut chrome).expect("a pass");
+        assert!(chrome.unacked.is_none());
+        let acks = engine.heard("Page.screencastFrameAck");
+        assert_eq!(acks.len(), 1, "{acks:?}");
+        assert_eq!(acks[0].0.get("sessionId").and_then(Json::as_i64), Some(7));
+        assert_eq!(acks[0].1.as_deref(), Some("S1"), "on the page's session");
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_frame_owed_by_a_tab_behind_is_acknowledged_whatever_the_terminal_says() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, _shared, downloads) = fake_window("paced-behind", &engine);
+        tabs.open(Tab::new("b", engine.page("S2"), "https://b.example/"));
+        let mut term = FakeTerminal {
+            paced: true,
+            ..FakeTerminal::default()
+        };
+        chrome.unacked = Some(Unacked {
+            target: "a".to_string(),
+            session: 3,
+        });
+        term.painted.push_back(crate::terminal::Painted {
+            all: false,
+            waited: None,
+        });
+        tick_frames(&mut term, &mut tabs, &mut chrome).expect("a pass");
+        assert!(chrome.unacked.is_none(), "no tab is left waiting");
+        let acks = engine.heard("Page.screencastFrameAck");
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].1.as_deref(), Some("S1"), "the tab it was owed by");
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn off_a_paced_route_the_pass_takes_the_wait_and_acknowledges_nothing() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, _shared, downloads) = fake_window("unpaced", &engine);
+        let mut term = FakeTerminal::default();
+        chrome.unacked = Some(Unacked {
+            target: "a".to_string(),
+            session: 1,
+        });
+        term.painted.push_back(crate::terminal::Painted {
+            all: true,
+            waited: Some(Duration::from_millis(500)),
+        });
+        tick_frames(&mut term, &mut tabs, &mut chrome).expect("a pass");
+        assert!(term.painted.is_empty(), "asked once a pass, paced or not");
+        assert!(chrome.unacked.is_some());
+        assert!(engine.heard("Page.screencastFrameAck").is_empty());
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_picker_with_a_window_is_started_and_left_to_run() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, mut shared, downloads) = fake_window("gui-picker", &engine);
+        chrome.pickers.gui = Some(picker::Command::parse("file-picker", "zenity").expect("words"));
+        chrome.display = true;
+        tabs.active_mut().expect("a tab").picking = Some(picking(false));
+        let mut term = FakeTerminal::default();
+
+        start_picker(&mut term, &mut tabs, &mut chrome, &mut shared).expect("a pass");
+
+        assert_eq!(term.started.len(), 1);
+        let (id, job) = &term.started[0];
+        match job {
+            Helper::Picker {
+                tab,
+                chooser,
+                kind,
+                dir,
+                ..
+            } => {
+                assert_eq!(tab, "a");
+                assert_eq!(chooser.backend_node_id, 7);
+                assert_eq!(*kind, picker::Kind::Gui);
+                assert_eq!(*dir, chrome.upload_base());
+            }
+            other => panic!("not a picker: {other:?}"),
+        }
+        let wait = chrome.picker.as_ref().expect("waited for");
+        assert_eq!((wait.id, wait.tab.as_str(), wait.node), (*id, "a", 7));
+        assert!(term.polled.is_empty(), "heard on its descriptor, later");
+        assert!(tabs
+            .active()
+            .and_then(|tab| tab.picking.as_ref())
+            .is_some_and(|p| p.started));
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_picker_with_a_window_is_answered_on_the_pass_its_terminal_has_the_answer() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, mut shared, downloads) = fake_window("gui-answer", &engine);
+        tabs.active_mut().expect("a tab").picking = Some(picking(true));
+        chrome.picker = Some(PickerWait {
+            id: 3,
+            tab: "a".to_string(),
+            node: 7,
+        });
+        let mut term = FakeTerminal::default();
+
+        pump_picker(&mut term, &mut tabs, &mut chrome, &mut shared, &[]).expect("a pass");
+        assert_eq!(term.polled, [3]);
+        assert!(chrome.picker.is_some(), "no answer yet");
+        assert!(term.written.is_empty(), "nothing to draw");
+
+        let file = chosen_file("gui-answer");
+        term.answers.push((
+            3,
+            HelperOutcome::Picker(picker::Outcome::Files(vec![file.clone()])),
+        ));
+        pump_picker(&mut term, &mut tabs, &mut chrome, &mut shared, &[]).expect("a pass");
+        assert!(chrome.picker.is_none());
+        let tab = tabs.active().expect("a tab");
+        assert!(tab.picking.is_none());
+        assert_eq!(
+            tab.note.as_deref(),
+            Some(upload::sentence(std::slice::from_ref(&file)).as_str())
+        );
+        assert_eq!(chrome.upload_dir.as_deref(), file.parent());
+        assert!(!term.written.is_empty(), "the row drawn again");
+        let sent = engine.heard("DOM.setFileInputFiles");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].0.get("backendNodeId").and_then(Json::as_i64),
+            Some(7)
+        );
+        drop(tabs);
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_picker_whose_input_went_is_ended_without_a_word() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, mut shared, downloads) = fake_window("gui-gone", &engine);
+        chrome.picker = Some(PickerWait {
+            id: 4,
+            tab: "a".to_string(),
+            node: 7,
+        });
+        let mut term = FakeTerminal::default();
+        pump_picker(&mut term, &mut tabs, &mut chrome, &mut shared, &[]).expect("a pass");
+        assert_eq!(term.ended, [4]);
+        assert!(term.polled.is_empty());
+        assert!(chrome.picker.is_none());
+        assert_eq!(tabs.active().and_then(|tab| tab.note.clone()), None);
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_picker_that_has_the_terminal_is_answered_in_the_same_pass() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, mut shared, downloads) = fake_window("tty-picker", &engine);
+        chrome.pickers.terminal =
+            Some(picker::Command::parse("file-picker-terminal", "fzf").expect("words"));
+        chrome.display = false;
+        chrome.shape = Shape::Pointer;
+        tabs.active_mut().expect("a tab").picking = Some(picking(false));
+        let file = chosen_file("tty-picker");
+        let mut term = FakeTerminal {
+            on_start: Some(HelperOutcome::Picker(picker::Outcome::Files(vec![
+                file.clone()
+            ]))),
+            ..FakeTerminal::default()
+        };
+
+        start_picker(&mut term, &mut tabs, &mut chrome, &mut shared).expect("a pass");
+
+        assert!(matches!(
+            term.started.as_slice(),
+            [(
+                _,
+                Helper::Picker {
+                    kind: picker::Kind::Terminal,
+                    ..
+                }
+            )]
+        ));
+        assert_eq!(term.polled.len(), 1, "asked at once");
+        assert!(chrome.picker.is_none(), "answered, not waited for");
+        assert_eq!(
+            chrome.shape,
+            Shape::Default,
+            "the terminal has its arrow back"
+        );
+        let tab = tabs.active().expect("a tab");
+        assert!(tab.picking.is_none());
+        assert_eq!(
+            tab.note.as_deref(),
+            Some(upload::sentence(std::slice::from_ref(&file)).as_str())
+        );
+        assert_eq!(engine.heard("DOM.setFileInputFiles").len(), 1);
+        drop(tabs);
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_picker_that_will_not_start_says_why_and_the_page_hears_cancel() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, mut shared, downloads) = fake_window("gui-refused", &engine);
+        chrome.pickers.gui = Some(picker::Command::parse("file-picker", "zenity").expect("words"));
+        chrome.display = true;
+        tabs.active_mut().expect("a tab").picking = Some(picking(false));
+        let mut term = FakeTerminal {
+            refuse: Some("cannot start zenity".to_string()),
+            ..FakeTerminal::default()
+        };
+        start_picker(&mut term, &mut tabs, &mut chrome, &mut shared).expect("a pass");
+        assert!(chrome.picker.is_none());
+        let tab = tabs.active().expect("a tab");
+        assert!(tab.picking.is_none());
+        assert_eq!(tab.note.as_deref(), Some("cannot start zenity"));
+        // `cancel` is found by the node first; the engine here has no node.
+        let resolved = engine.heard("DOM.resolveNode");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].0.get("backendNodeId").and_then(Json::as_i64),
+            Some(7)
+        );
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_password_command_that_has_the_terminal_is_answered_in_the_same_pass() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, _shared, downloads) = fake_window("tty-login", &engine);
+        chrome.logins.terminal = Some(
+            picker::Command::parse("password-command-terminal", "pass show {domain}")
+                .expect("words"),
+        );
+        chrome.display = false;
+        chrome.shape = Shape::Text;
+        let mut term = FakeTerminal {
+            on_start: Some(HelperOutcome::Login(login::Outcome::None)),
+            ..FakeTerminal::default()
+        };
+
+        start_login(&mut term, &mut tabs, &mut chrome).expect("a key");
+
+        match term.started.as_slice() {
+            [(
+                _,
+                Helper::Login {
+                    tab,
+                    url,
+                    site,
+                    kind,
+                    ..
+                },
+            )] => {
+                assert_eq!((tab.as_str(), url.as_str()), ("a", "https://a.example/"));
+                assert_eq!(site.host, "a.example");
+                assert_eq!(*kind, picker::Kind::Terminal);
+            }
+            other => panic!("not one login: {other:?}"),
+        }
+        assert!(chrome.login.is_none(), "answered, not waited for");
+        assert_eq!(chrome.shape, Shape::Default);
+        assert_eq!(
+            tabs.active().and_then(|tab| tab.note.clone()),
+            Some(login::no_login("a.example"))
+        );
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_password_command_with_a_window_waits_and_one_whose_tab_went_is_ended() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, mut shared, downloads) = fake_window("gui-login", &engine);
+        chrome.logins.gui =
+            Some(picker::Command::parse("password-command", "rbw get {host}").expect("words"));
+        chrome.display = true;
+        let mut term = FakeTerminal::default();
+        start_login(&mut term, &mut tabs, &mut chrome).expect("a key");
+        let id = match &chrome.login {
+            Some(LoginState::Fetching { id, tab, .. }) => {
+                assert_eq!(tab, "a");
+                *id
+            }
+            _ => panic!("not fetching"),
+        };
+        assert_eq!(
+            tabs.active().and_then(|tab| tab.note.clone()),
+            Some(login::asking("a.example"))
+        );
+        assert!(term.polled.is_empty());
+
+        start_login(&mut term, &mut tabs, &mut chrome).expect("a key");
+        assert_eq!(term.started.len(), 1, "one at a time");
+
+        pump_login(&mut term, &mut tabs, &mut chrome, &mut shared, &[]).expect("a pass");
+        assert_eq!(term.polled, [id], "asked, and not answered yet");
+        assert!(chrome.login.is_some());
+
+        if let Some(LoginState::Fetching { tab, .. }) = chrome.login.as_mut() {
+            *tab = "gone".to_string();
+        }
+        pump_login(&mut term, &mut tabs, &mut chrome, &mut shared, &[]).expect("a pass");
+        assert_eq!(term.ended, [id]);
+        assert!(chrome.login.is_none());
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn alt_o_hands_the_terminal_the_browser_and_says_what_it_did() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, _shared, downloads) = fake_window("external", &engine);
+        chrome.external =
+            Some(picker::Command::parse("external-browser", "firefox {url}").expect("words"));
+        let mut term = FakeTerminal::default();
+        open_external(&mut term, &mut tabs, &mut chrome).expect("a key");
+        match term.started.as_slice() {
+            [(_, Helper::External { argv, .. })] => {
+                assert_eq!(argv, &["firefox", "https://a.example/"]);
+            }
+            other => panic!("not one browser: {other:?}"),
+        }
+        assert_eq!(
+            tabs.active().and_then(|tab| tab.note.clone()),
+            Some("sent to firefox".to_string())
+        );
+
+        term.refuse = Some("cannot start firefox".to_string());
+        open_external(&mut term, &mut tabs, &mut chrome).expect("a key");
+        assert_eq!(
+            tabs.active().and_then(|tab| tab.note.clone()),
+            Some("cannot start firefox".to_string())
+        );
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn an_engine_gone_ends_the_helpers_its_pages_were_waiting_on() {
+        let engine = FakeEngine::start();
+        let (tabs, mut chrome, _shared, downloads) = fake_window("helpers-gone", &engine);
+        chrome.picker = Some(PickerWait {
+            id: 1,
+            tab: "a".to_string(),
+            node: 7,
+        });
+        chrome.login = Some(LoginState::Fetching {
+            id: 2,
+            tab: "a".to_string(),
+            url: "https://a.example/".to_string(),
+            site: login::site("https://a.example/").expect("https"),
+        });
+        let mut term = FakeTerminal::default();
+        end_helpers(&mut term, &chrome);
+        assert_eq!(term.ended, [1, 2]);
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_frame_goes_to_the_terminal_encoded_at_the_layout_and_the_row_follows_the_typing() {
+        let engine = FakeEngine::start();
+        let (tabs, mut chrome, shared, downloads) = fake_window("paint", &engine);
+        let mut term = FakeTerminal::decoding();
+        chrome.viewport_gen = 5;
+
+        assert!(paint(
+            &mut term,
+            &tabs,
+            &mut chrome,
+            &shared,
+            Encoded::Jpeg(b"jpeg")
+        )
+        .expect("drawn"));
+        assert_eq!(term.frames, [(false, b"jpeg".to_vec(), 2, 5)]);
+        assert!(term.written.is_empty(), "nothing typed: the row stays");
+
+        chrome.bar = Some(UrlBar::new(Line::empty()));
+        assert!(
+            paint(&mut term, &tabs, &mut chrome, &shared, Encoded::Png(b"png")).expect("drawn")
+        );
+        assert!(term.frames[1].0, "a PNG");
+        assert!(
+            !term.written.is_empty(),
+            "the row owns the cursor and is written again"
+        );
+
+        chrome.list = Some(Overlay::Tabs(TabList::open(0)));
+        assert!(paint(
+            &mut term,
+            &tabs,
+            &mut chrome,
+            &shared,
+            Encoded::Jpeg(b"jpeg")
+        )
+        .expect("not drawn"));
+        assert_eq!(term.frames.len(), 2, "the list has the rows");
+
+        chrome.list = None;
+        chrome.bar = None;
+        term.decodes = false;
+        assert!(!paint(
+            &mut term,
+            &tabs,
+            &mut chrome,
+            &shared,
+            Encoded::Jpeg(b"jpeg")
+        )
+        .expect("a frame"));
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
     }
 }
