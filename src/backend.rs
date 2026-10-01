@@ -90,8 +90,10 @@
 //! ([`crate::engine::reap_orphan`]).
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -102,6 +104,7 @@ use crate::cdp::Client;
 use crate::cdp::Event;
 use crate::engine;
 use crate::fit::Metrics;
+use crate::frontend::{LOG_FILE, LOG_KEPT};
 use crate::hover::Shape;
 use crate::ipc::{
     self, BrowserSettings, CloseWhy, FrameKind, Job, Outcome, Picked, RouteFlags, ToBackend,
@@ -845,7 +848,10 @@ fn start(
         Choice::Temporary => Profile::temporary()?,
         Choice::At(dir) => {
             match Profile::try_take_at(dir.clone(), options.profile_label.clone())? {
-                TakeAt::Taken(profile) => profile,
+                TakeAt::Taken(profile) => {
+                    take_log(profile.dir());
+                    profile
+                }
                 TakeAt::Held(pid) => {
                     let _ = pair.write_all(&ipc::encode(&ToFrontend::Busy {
                         pid: pid.unwrap_or(0),
@@ -874,6 +880,72 @@ fn generation() -> u64 {
         .map(|d| d.as_micros() as u64)
         .unwrap_or_default()
         & ((1 << 53) - 1)
+}
+
+/// Make the profile's log this backend's: the previous run's kept as
+/// [`LOG_KEPT`], a fresh [`LOG_FILE`] in its place, and this process's
+/// stderr moved there.
+///
+/// Every candidate a frontend starts appends to the log
+/// ([`crate::frontend::spawn_candidate`]), because until it holds the lock it
+/// cannot know whether a backend is running and writing there; truncating
+/// it then cut the running backend's log whenever a second terminal started
+/// on the profile (#107). Only the holder of the lock can tell that the log
+/// is no longer anybody's, so this is called right after the lock is taken
+/// and before anything else is said: an engine missing, a socket that will
+/// not bind, the engine's own stderr, all land in the fresh file.
+///
+/// Best effort: a profile whose log cannot be rotated is still served, and
+/// the sentence goes to the stderr this process was started with.
+fn take_log(dir: &Path) {
+    match rotate_log(dir) {
+        Ok(fresh) => {
+            // SAFETY: `dup2(2)` takes two descriptors and reads no memory;
+            // `fresh` was opened for this call and is open throughout it, and
+            // 2 is this process's stderr, which nothing here owns as a Rust
+            // value. No thread of this process is running yet — the reader
+            // of the engine's stderr starts with the engine, later — and
+            // `dup2` replaces 2 atomically besides, so a write cannot find it
+            // closed. `fresh` itself is closed when it is dropped; the copy
+            // at 2 stays.
+            if unsafe { libc::dup2(fresh.as_raw_fd(), 2) } < 0 {
+                eprintln!(
+                    "blinkterm: cannot move stderr to {}: {}",
+                    dir.join(LOG_FILE).display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        Err(why) => eprintln!(
+            "blinkterm: cannot rotate {}: {why}",
+            dir.join(LOG_FILE).display()
+        ),
+    }
+}
+
+/// [`LOG_FILE`] in `dir` renamed to [`LOG_KEPT`], replacing the one before,
+/// and a new empty [`LOG_FILE`], 0600, opened to write.
+///
+/// An empty log is not kept: the first start on a profile, or a run that
+/// said nothing, would otherwise replace a [`LOG_KEPT`] that does say
+/// something with nothing. The new file is opened with `truncate` rather
+/// than `create_new` because another frontend's candidate may have made an
+/// empty one, to append to, between the rename and the open; that one is
+/// simply taken over. Such a candidate loses the lock and so writes nothing.
+fn rotate_log(dir: &Path) -> std::io::Result<File> {
+    let log = dir.join(LOG_FILE);
+    match std::fs::metadata(&log) {
+        Ok(meta) if meta.len() > 0 => std::fs::rename(&log, dir.join(LOG_KEPT))?,
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&log)
 }
 
 impl Backend {
@@ -1987,5 +2059,39 @@ mod tests {
             outcome_for(Outcome::External(Err("no".to_string()))).err(),
             Some("no".to_string())
         );
+    }
+
+    #[test]
+    fn the_log_is_rotated_and_an_empty_one_does_not_replace_the_kept_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("blinkterm-unit-rotate-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        std::fs::write(dir.join(LOG_FILE), "previous run\n").expect("seeded");
+        let mut fresh = rotate_log(&dir).expect("rotated");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LOG_KEPT)).unwrap(),
+            "previous run\n"
+        );
+        assert_eq!(fresh.metadata().unwrap().len(), 0, "a fresh log");
+        assert_eq!(mode(&dir.join(LOG_FILE)), 0o600);
+        writeln!(fresh, "this run").expect("written");
+        drop(fresh);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LOG_FILE)).unwrap(),
+            "this run\n"
+        );
+
+        // A run that said nothing is not kept over one that did.
+        std::fs::write(dir.join(LOG_FILE), "").expect("emptied");
+        drop(rotate_log(&dir).expect("rotated again"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LOG_KEPT)).unwrap(),
+            "previous run\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

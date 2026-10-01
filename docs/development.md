@@ -85,8 +85,8 @@ The grace a vanished frontend gets is fifteen seconds (`backend::GRACE`);
 the tests pass the hidden `--grace-ms <n>`, which only a run with
 `--serve-fd` accepts, to make it shorter. When a test leaves something
 running, or a real run misbehaves, the backend's standard error is
-`<profile>/backend.log`, rewritten by each backend a frontend starts: the
-engine's warnings, a window that lost its terminal, a page that was closed
+`<profile>/backend.log`, rotated by the backend that takes the profile lock
+(the run before is `backend.log.1`): the engine's warnings, a window that lost its terminal, a page that was closed
 because no window could be shown to have asked for it.
 
 ### Several terminals on one profile: the failure modes
@@ -125,8 +125,11 @@ inline (the tests set `SSH_CONNECTION`), because the terminal's reader looks
 for shared memory under `/dev/shm`. CI's macOS job runs both files beside the
 engine suite.
 
-Reading `backend.log` after a failure: it is truncated by each candidate
-backend a frontend starts, so it is the log of the latest run. Each line starts
+Reading `backend.log` after a failure: it is the log of the latest run, and
+`backend.log.1` the one before. Every candidate backend a frontend starts
+appends to it, and only the one that takes the profile lock rotates it, so a
+candidate that loses appends nothing and removes nothing; one that fails
+before the lock may add a line to the end. Each line starts
 `blinkterm:` and says which window (`window 2 lost its terminal: …`, `window
 2 was not taken back; its tabs are saved`), what was closed and why
 (`closed a page the engine opened (<target>): no window asked for it`), and

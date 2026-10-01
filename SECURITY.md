@@ -91,8 +91,8 @@ machine. It prints a warning when it does. Do not browse as root.
   TCP listener anywhere.
 
 - **The backend's log.** The backend has no terminal; its standard error
-  goes to `<profile>/backend.log` (0600, rewritten by each backend a
-  terminal starts). That is mostly the engine's own stderr, which can quote
+  goes to `<profile>/backend.log` (0600, with the previous run kept as
+  `backend.log.1`, also 0600). That is mostly the engine's own stderr, which can quote
   a url you visited, and the lines the backend writes about windows and the
   pages it closed, which can too. It is in the profile, beside the history,
   and as private as it is.

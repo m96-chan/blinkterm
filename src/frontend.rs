@@ -18,7 +18,10 @@
 //! that choose a profile or say what to open ([`argv_for_backend`]), in a
 //! session of its own (`setsid`, so that no signal for this terminal reaches
 //! it), with a socket pair at its descriptor 3 and its stderr in
-//! `<profile>/backend.log`. It takes the profile lock first; if another
+//! `<profile>/backend.log`, appended to: the candidate that takes the
+//! profile lock rotates it (`backend.log` to `backend.log.1`, see
+//! [`crate::backend`]), so one that loses never touches the log of the
+//! backend that is running. It takes the profile lock first; if another
 //! candidate took it first, it says `busy` and exits, and this frontend tries
 //! the socket again until the winner listens. A backend on its way out says
 //! so (`refused`, try again), and once it has gone, a fresh one is started.
@@ -107,6 +110,9 @@ const FRAME_POLL_MS: i32 = 4;
 
 /// The backend's log, in the profile: its standard error.
 pub const LOG_FILE: &str = "backend.log";
+
+/// Where the previous backend's log goes when a new one takes the profile.
+pub const LOG_KEPT: &str = "backend.log.1";
 
 // ---------------------------------------------------------------------------
 // The link.
@@ -536,6 +542,13 @@ pub fn argv_for_backend(args: &[String], dir: Option<&Path>, label: Option<&str>
 /// profile with none), and wait for what it says on the pair: see the
 /// module's section. The child is kept in `children`, to be reaped once it
 /// exits.
+///
+/// Its stderr is [`LOG_FILE`] opened to append, never truncated: until it
+/// holds the profile lock a candidate does not know whether a backend is
+/// already running and writing there, and one that loses must not cut that
+/// backend's log. The one that wins rotates the file and moves its stderr to
+/// a fresh one ([`crate::backend::serve`]); what a candidate says before
+/// the lock, should it fail there, is a line added to the end.
 pub fn spawn_candidate(
     exe: &Path,
     argv: &[String],
@@ -549,9 +562,8 @@ pub fn spawn_candidate(
             crate::profile::make_private_dir(dir)?;
             let path = dir.join(LOG_FILE);
             std::fs::OpenOptions::new()
-                .write(true)
+                .append(true)
                 .create(true)
-                .truncate(true)
                 .mode(0o600)
                 .open(&path)
                 .map(Stdio::from)

@@ -401,7 +401,8 @@ named. Every other setting is each window's own. See
 When something goes wrong that the row cannot say, the backend's standard
 error is `backend.log` in the profile directory: the engine's own warnings,
 and a line for each window that lost its terminal or page that was closed
-because no window could be shown to have asked for it.
+because no window could be shown to have asked for it. The run before it is
+`backend.log.1`.
 
 ## Opening a url from another program
 

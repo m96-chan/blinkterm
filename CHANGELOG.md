@@ -83,6 +83,10 @@ flag, a different default, a raised Rust floor all do.
   the next start, as a crash's are. Only `ctrl+q`, or `ctrl+w` on the last
   tab, leaves tabs for `--restore` alone
   ([#106](https://github.com/m96-chan/blinkterm/issues/106)).
+- A second blinkterm started while a backend runs, or two started at once,
+  no longer empties `backend.log`: only the backend that takes the profile
+  starts a fresh log, and keeps the previous one as `backend.log.1`
+  ([#107](https://github.com/m96-chan/blinkterm/issues/107)).
 
 ## [0.4.0] - 2026-10-01
 
