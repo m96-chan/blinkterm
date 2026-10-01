@@ -76,6 +76,13 @@ flag, a different default, a raised Rust floor all do.
 - A site file that is refused is said on the first window's row and in
   `backend.log`, rather than in the shell before the page.
 
+### Fixed
+
+- A second blinkterm started while a backend runs, or two started at once,
+  no longer empties `backend.log`: only the backend that takes the profile
+  starts a fresh log, and keeps the previous one as `backend.log.1`
+  ([#107](https://github.com/m96-chan/blinkterm/issues/107)).
+
 ## [0.4.0] - 2026-10-01
 
 ### Added
