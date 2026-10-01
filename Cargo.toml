@@ -32,6 +32,19 @@ path = "src/main.rs"
 name = "blinkterm"
 path = "src/lib.rs"
 
+# What `cargo binstall blinkterm` fetches instead of compiling: the archives
+# .github/workflows/release.yml puts on the GitHub Release of each tag. The
+# names must agree; tests/release.rs holds them to each other. The suffix is
+# spelled out rather than `{ archive-suffix }`, which renders `.tgz` for this
+# format; the archives are `.tar.gz` and binstall takes any suffix once the
+# format is given. There is no `overrides` table: the six targets are built
+# into archives of one shape, and binstall picks the one for its host (gnu
+# before musl on Linux).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 # One dependency, and it is `libc`. The PNG and JPEG decoders, inflate, the
 # tty helpers and the cell arithmetic used to come from tOS as git revisions;
 # they live in `src/` now (`png.rs`, `jpeg.rs`, `inflate.rs`, `tty.rs`,
@@ -63,6 +76,13 @@ exclude = ["vendor/tos-term"]
 opt-level = 3
 lto = "thin"
 panic = "abort"
+# The release archives are what this profile builds, and cargo's default
+# (`strip = "debuginfo"`) still leaves the symbol table in: 1.78 MB against
+# 1.43 MB stripped on arm64 macOS, measured. `panic = "abort"` already means
+# no unwinding backtrace is printed for anybody, so they bought nothing a user
+# sees.
+# The engine jobs build `--release` too, so this is exercised on every push.
+strip = true
 
 # The standard lives here rather than only in the CI invocation, so that
 # `cargo clippy` on a laptop and `cargo clippy` in the workflow are the same

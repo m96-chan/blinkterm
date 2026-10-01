@@ -17,6 +17,15 @@ somewhere private.
 There is no release cadence to promise a fix against yet, and one person
 maintains this. Expect a first reply rather than a patch.
 
+## What you download
+
+The archives on a GitHub Release are built by GitHub's runners from the tagged
+commit, in `.github/workflows/release.yml`, and each carries a build provenance
+attestation signed through Sigstore; nobody's laptop is in between.
+`gh attestation verify <archive> --repo m96-chan/blinkterm` checks it, and
+[docs/install.md](docs/install.md#prebuilt-binaries) has that and the
+`SHA256SUMS` check spelled out.
+
 ## What is whose problem
 
 **The engine's.** Everything about parsing and executing the page: HTML, CSS,
@@ -232,6 +241,17 @@ machine. It prints a warning when it does. Do not browse as root.
   A Chromium left running after `blinkterm` has gone — holding your profile,
   and with `chromium-shell` an open debugging port — would be a security
   problem, so failures of that machinery count here.
+
+- **The engine download.** `blinkterm --install-engine` is the only network
+  access the program makes of its own, and it happens only when that switch
+  is typed: no setting, key or page can start it. It runs `curl` over https
+  only, with redirects to https only, fetches the one `chrome-headless-shell`
+  version the tests pass against from Chrome for Testing, and checks the zip
+  against a SHA-256 compiled into `blinkterm` before anything is unpacked; a
+  mismatch installs nothing. The engine is unpacked under the 0700
+  `$XDG_DATA_HOME/blinkterm/engine/`. A way to make it run code that is not
+  the zip the maintainer hashed counts here
+  ([#91](https://github.com/m96-chan/blinkterm/issues/91)).
 
 ## Out of scope
 

@@ -29,7 +29,7 @@
 //! side is a notch handed over as it is read and a timestamp read back once a
 //! pass.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +80,7 @@ use crate::screen::{self, Pane};
 use crate::scroll::{self, Step};
 use crate::session::{self, Offer, Reply, Session, Snapshot};
 use crate::sites::{self, Sites};
+use crate::strip;
 use crate::tablist::{self, TabList};
 use crate::tabs::{Counted, Outcome, Tab, Tabs};
 use crate::upload::{self, Upload};
@@ -573,6 +574,15 @@ struct Chrome {
     /// strip scrolls only when the tab in front leaves it. See
     /// [`screen::tab_line_from`].
     strip_first: Cell<usize>,
+    /// Where the last draw of the row put each tab, marker and the url, in
+    /// cells, for a press on the row to be read against: see
+    /// [`crate::strip`]. Empty while anything else owns the row, which is
+    /// what makes a press there do nothing.
+    ///
+    /// A `RefCell` for the reason [`Chrome::strip_first`] is a `Cell`: it is
+    /// a fact about the last draw, written by [`redraw_row`] through the
+    /// shared borrow every path through the loop draws with.
+    row_spans: RefCell<Vec<strip::Span>>,
     /// Insert or normal: whether an unmodified letter is the page's or the
     /// program's. See [`crate::normal`].
     mode: normal::Mode,
@@ -736,6 +746,7 @@ impl Chrome {
             list: None,
             list_first: Cell::new(0),
             strip_first: Cell::new(0),
+            row_spans: RefCell::new(Vec::new()),
             mode: normal::Mode::starting(options.normal_mode),
             bindings: options.bindings.clone(),
             hinting: None,
@@ -826,6 +837,7 @@ impl Chrome {
         self.list = None;
         self.list_first.set(0);
         self.strip_first.set(0);
+        self.row_spans.borrow_mut().clear();
         self.hint = None;
         self.motion.reset(now);
         self.wheel.forget();
@@ -3519,8 +3531,16 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
             .map_err(|e| e.to_string())?;
     }
     let bytes = if let Some(owner) = owner {
+        // Whatever owns the row, the strip is not on it to be clicked.
+        chrome.row_spans.borrow_mut().clear();
         owned_row(cols, tabs, owner)
     } else if tabs.len() < 2 {
+        // One tab: the row is the url, all of it, as far as a press goes.
+        *chrome.row_spans.borrow_mut() = vec![strip::Span {
+            part: strip::Part::Url,
+            from: 0,
+            to: cols as usize,
+        }];
         let left = pointing.unwrap_or_else(|| active.line());
         // The download's words or the loading hint, then the level.
         match words(&[
@@ -3553,7 +3573,9 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         // After the strip, the download, the link or the hint in the url's
         // place and the level after it; or the level, the transport's warning
         // and the url, which is the one to run out of room.
-        let right = match downloading.or(pointing).or(loading) {
+        let news = downloading.or(pointing).or(loading);
+        let showing_url = news.is_none();
+        let right = match news {
             Some(news) => words(&[
                 Some(&news),
                 marker.as_deref(),
@@ -3574,14 +3596,21 @@ fn redraw_row(pane: &mut Pane, tabs: &Tabs<Client>, chrome: &Chrome) -> Result<(
         };
         // From where the strip's window started last time, so that it moves
         // only when the tab in front leaves it.
-        let (bytes, first) = screen::tab_line_from(
+        let drawn = screen::tab_line_from(
             cols,
             &labels,
             right.as_deref().unwrap_or_default(),
             chrome.strip_first.get(),
         );
-        chrome.strip_first.set(first);
-        bytes
+        chrome.strip_first.set(drawn.first);
+        // With news in the url's place, a press there is on the news, and
+        // the news is not the url bar's to open.
+        let mut spans = drawn.spans;
+        if !showing_url {
+            spans.retain(|span| span.part != strip::Part::Url);
+        }
+        *chrome.row_spans.borrow_mut() = spans;
+        drawn.bytes
     };
     pane.write(&bytes).map_err(|e| e.to_string())
 }
@@ -5678,6 +5707,20 @@ fn handle_input(
                 }
                 return Ok(true);
             }
+            let cell = chrome.metrics.cell;
+            let pixels = chrome.parser.pixel_coordinates();
+            // In the terminal's pixels, inside the page: whether it is on the
+            // row, and how far the pointer has moved, are about the screen.
+            // The page's pixels come after, at the one place they are made.
+            let reserved = chrome.layout.reserved_rows();
+            let point = crate::input::page_point(&report, pixels, cell, reserved);
+            // The row is this program's. A press on it is read against what
+            // the last draw put there, before the dialog's rule: a tab behind
+            // a question can still be switched to or closed, as it can with
+            // the keys. See [`crate::strip`].
+            if report.kind == MouseKind::Press && point.1 < 0 {
+                return click_row(pane, tabs, browser, chrome, &report);
+            }
             // A page with a question open is not a page to click on or
             // scroll. What was sent would not be lost — the engine queues it
             // behind the dialog — which is worse: a click meant for the
@@ -5721,13 +5764,6 @@ fn handle_input(
                 chrome.hover.scrolled();
                 return Ok(true);
             }
-            let cell = chrome.metrics.cell;
-            let pixels = chrome.parser.pixel_coordinates();
-            // In the terminal's pixels, inside the page: whether it is on the
-            // row, and how far the pointer has moved, are about the screen.
-            // The page's pixels come after, at the one place they are made.
-            let reserved = chrome.layout.reserved_rows();
-            let point = crate::input::page_point(&report, pixels, cell, reserved);
             // A bare motion is the hover's: remembered here and told to the
             // page once a pass by `tick_hover`, since a terminal in any-event
             // mode can send a thousand of them a second. Over the row it is
@@ -8373,6 +8409,63 @@ fn click_list(
     }
 }
 
+/// A press on the status row: read against the spans the last draw left in
+/// [`Chrome::row_spans`], and answered with what the keys would do — a tab
+/// switched to as `alt+N` does, closed as `ctrl+w` does (never the last one:
+/// [`strip::step`] refuses it), or the url bar opened as `ctrl+l` does. What
+/// is on the row when anything else owns it is no spans at all, so a press
+/// there does nothing. Nothing about it reaches the page, and its release
+/// will not either: see [`forwards_release`].
+fn click_row(
+    pane: &mut Pane,
+    tabs: &mut Tabs<Client>,
+    browser: &mut Client,
+    chrome: &mut Chrome,
+    report: &MouseInput,
+) -> Result<bool, String> {
+    let (column, _) = crate::input::row_cell(
+        report,
+        chrome.parser.pixel_coordinates(),
+        chrome.metrics.cell,
+    );
+    // The borrow ends here, before anything below draws the row again.
+    let part = {
+        let spans = chrome.row_spans.borrow();
+        strip::hit(&spans, column)
+    };
+    let step = strip::step(part, report.button, tabs.len());
+    if step == strip::Step::Nothing {
+        return Ok(true);
+    }
+    // A press leaves every label where the thing it named no longer is, on
+    // the row as on the page.
+    if chrome.hinting.is_some() {
+        cancel_hints(tabs, chrome);
+    }
+    let was = tabs.active_target().map(str::to_string);
+    match step {
+        strip::Step::Nothing => {}
+        strip::Step::Switch(index) => {
+            if tabs.switch_to(index) {
+                switched(pane, tabs, browser, chrome, was)?;
+            }
+        }
+        strip::Step::Close(index) => {
+            if let Some(entry) = close_tab(tabs, browser, index) {
+                chrome.session.closed(entry);
+            }
+            switched(pane, tabs, browser, chrome, was)?;
+        }
+        strip::Step::EditUrl => {
+            chrome.bar = tabs
+                .active()
+                .map(|tab| UrlBar::new(Line::selected(tab.url.clone())));
+        }
+    }
+    redraw_row(pane, tabs, chrome)?;
+    Ok(true)
+}
+
 /// What a key or a click did to the tab list, done.
 fn list_step(
     pane: &mut Pane,
@@ -8796,6 +8889,20 @@ fn button_name(button: Option<u32>) -> &'static str {
     }
 }
 
+/// Whether a release goes to the page: only when the page was told the
+/// button went down. A release of a button the page never saw pressed —
+/// pressed on the row, which is this program's ([`click_row`]), or while the
+/// list had the screen — is half a click, and the page gets nothing
+/// half-done: a release on its own would end a drag the page never began,
+/// or fire a `mouseup` a page might act on.
+///
+/// A drag that began on the page and ended on the row still ends there: its
+/// bit is set, so its release goes. A button held through an engine death
+/// keeps its bit, so that release still goes too.
+fn forwards_release(buttons: u32, button: Option<u32>) -> bool {
+    buttons & button_bit(button) != 0
+}
+
 /// The `buttons` mask CDP wants: left 1, right 2, middle 4.
 fn button_bit(button: Option<u32>) -> u32 {
     match button {
@@ -8860,6 +8967,9 @@ fn send_mouse(
         if report.kind != MouseKind::Release {
             return;
         }
+    }
+    if report.kind == MouseKind::Release && !forwards_release(*buttons, report.button) {
+        return;
     }
     let y = y.max(0);
 
@@ -10206,6 +10316,11 @@ mod tests {
         chrome.list = Some(Overlay::Tabs(TabList::open(2)));
         chrome.list_first.set(3);
         chrome.strip_first.set(4);
+        *chrome.row_spans.borrow_mut() = vec![strip::Span {
+            part: strip::Part::Tab(0),
+            from: 0,
+            to: 5,
+        }];
         chrome.hinting = Some(Hinting {
             target: "a".to_string(),
             new_tab: false,
@@ -10237,6 +10352,10 @@ mod tests {
         assert!(chrome.hint.is_none());
         assert_eq!(chrome.list_first.get(), 0);
         assert_eq!(chrome.strip_first.get(), 0);
+        assert!(
+            chrome.row_spans.borrow().is_empty(),
+            "the row spans go with the engine: nothing is drawn to click"
+        );
         assert!(!chrome.motion.still_in_flight());
         assert_eq!(
             chrome.bar.as_ref().map(|bar| bar.line.text()),
@@ -11217,6 +11336,41 @@ mod tests {
         assert!(!routes_to_hover(&report(b"\x1b[<0;10;5M")));
         assert!(!routes_to_hover(&report(b"\x1b[<0;10;5m")));
         assert!(!routes_to_hover(&report(b"\x1b[<64;10;5M")));
+    }
+
+    #[test]
+    fn a_release_of_a_button_the_page_never_saw_pressed_is_not_forwarded() {
+        assert!(!forwards_release(0, Some(0)), "pressed on the row");
+        assert!(forwards_release(1, Some(0)), "pressed on the page");
+        assert!(forwards_release(4, Some(1)), "a middle press on the page");
+        assert!(
+            !forwards_release(1, Some(1)),
+            "the left held, the middle not"
+        );
+        assert!(forwards_release(1 | 4, Some(1)));
+    }
+
+    #[test]
+    fn a_press_on_the_row_is_the_rows_and_a_release_there_is_still_the_pages() {
+        let report = |bytes: &[u8]| match Parser::new().feed(bytes).as_slice() {
+            [Input::Mouse(report)] => *report,
+            other => panic!("{bytes:?} is not one mouse report: {other:?}"),
+        };
+        let press = report(b"\x1b[<0;10;1M");
+        let release = report(b"\x1b[<0;10;1m");
+        assert_eq!(press.kind, MouseKind::Press);
+        assert_eq!(release.kind, MouseKind::Release);
+        // In cells: both on the row, which the loop reads as `y < 0`.
+        assert!(crate::input::page_point(&press, false, (8, 16), 1).1 < 0);
+        assert!(crate::input::page_point(&release, false, (8, 16), 1).1 < 0);
+        assert_eq!(crate::input::row_cell(&press, false, (8, 16)), (9, 0));
+        // In pixels: x 80 is the tenth cell, y 16 the last pixel of the row.
+        let in_pixels = report(b"\x1b[<0;80;16M");
+        assert!(crate::input::page_point(&in_pixels, true, (8, 16), 1).1 < 0);
+        assert_eq!(crate::input::row_cell(&in_pixels, true, (8, 16)), (9, 0));
+        // The press is the row's; the release after it is not forwarded
+        // either, since the page's buttons never had it.
+        assert!(!forwards_release(0, release.button));
     }
 
     #[test]

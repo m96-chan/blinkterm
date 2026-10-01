@@ -377,7 +377,7 @@ fn temporary_pid(name: &str) -> Option<i32> {
 }
 
 /// Whether there is a process with this pid, as far as `kill(2)` can tell.
-fn process_exists(pid: i32) -> bool {
+pub(crate) fn process_exists(pid: i32) -> bool {
     // SAFETY: signal 0 sends nothing and only asks whether it could, and
     // `kill(2)` reads no memory. `pid` is positive — `temporary_pid` filters
     // out everything else — so this is one process and never a group.
@@ -389,7 +389,7 @@ fn process_exists(pid: i32) -> bool {
 
 /// `remove_dir_all`, again and again for [`REMOVE_FOR`] while it fails and
 /// the directory is still there.
-fn remove_tree(dir: &Path) {
+pub(crate) fn remove_tree(dir: &Path) {
     let deadline = Instant::now() + REMOVE_FOR;
     loop {
         match std::fs::remove_dir_all(dir) {
