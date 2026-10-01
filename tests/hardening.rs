@@ -169,6 +169,7 @@ fn an_open(size: (u32, u32), urls: &[String], browser: &Options, paced: bool) ->
         problems: Vec::new(),
         cwd: std::env::temp_dir(),
         home_dir: None,
+        display: false,
     }
 }
 

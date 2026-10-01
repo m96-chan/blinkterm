@@ -12,12 +12,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use blinkterm::bindings::{self, Action};
 use blinkterm::engine;
 use blinkterm::fit::Metrics;
 use blinkterm::frontend::{self, Link, Spawn};
 use blinkterm::input::{Input, Key, KeyAction, KeyInput, Mods, MouseInput, MouseKind};
 use blinkterm::ipc::{
-    self, BrowserSettings, CloseWhy, FrameKind, Open, RouteFlags, ToBackend, ToFrontend,
+    self, BrowserSettings, CloseWhy, FrameKind, Job, Open, RouteFlags, ToBackend, ToFrontend,
     WindowSettings,
 };
 use blinkterm::options::{self, Invocation, Options};
@@ -166,21 +167,27 @@ struct Front {
     text: Vec<u8>,
     frames: Vec<(u32, u32)>,
     closed: Option<(String, u8)>,
+    /// The helpers the backend asked this terminal to run, which a real
+    /// frontend would start.
+    helpers: Vec<Job>,
 }
 
 impl Front {
     /// Attach to the profile at `dir`, starting its backend if need be, and
     /// open a window at `size` on `urls`.
     fn open(spawn: &mut Spawn, dir: &Path, size: (u32, u32), urls: &[String]) -> Front {
-        Front::open_with(spawn, dir, size, urls, false)
+        Front::open_with(spawn, dir, size, urls, false, false)
     }
 
+    /// [`Front::open`], with `--restore` as `restore` says and a terminal
+    /// that has a display or not as `display` says.
     fn open_with(
         spawn: &mut Spawn,
         dir: &Path,
         size: (u32, u32),
         urls: &[String],
         restore: bool,
+        display: bool,
     ) -> Front {
         let mut link = frontend::attach(spawn, Some(dir)).expect("attached");
         let options = options();
@@ -203,6 +210,7 @@ impl Front {
             problems: Vec::new(),
             cwd: std::env::temp_dir(),
             home_dir: None,
+            display,
         })
         .expect("a window");
         Front {
@@ -211,6 +219,7 @@ impl Front {
             text: Vec::new(),
             frames: Vec::new(),
             closed: None,
+            helpers: Vec::new(),
         }
     }
 
@@ -252,6 +261,7 @@ impl Front {
                 });
             }
             ToFrontend::Closed { why, exit } => self.closed = Some((why, exit)),
+            ToFrontend::Helper { job, .. } => self.helpers.push(job),
             _ => {}
         }
     }
@@ -275,12 +285,29 @@ impl Front {
     }
 
     fn key(&mut self, ch: char) {
-        let key = KeyInput {
+        self.send_key(KeyInput {
             key: Key::Char(ch),
             mods: Mods::default(),
             action: KeyAction::Press,
             text: Some(ch),
-        };
+        });
+    }
+
+    /// The chord this platform's default keymap puts `action` on.
+    fn chord(&mut self, action: Action) {
+        let chord = bindings::defaults_on(options().keymap, action)
+            .into_iter()
+            .next()
+            .expect("a default chord");
+        self.send_key(KeyInput {
+            key: chord.key,
+            mods: chord.mods,
+            action: KeyAction::Press,
+            text: None,
+        });
+    }
+
+    fn send_key(&mut self, key: KeyInput) {
         self.link
             .send(&ToBackend::Input {
                 input: Input::Key(key),
@@ -771,6 +798,69 @@ fn a_link_opened_behind_lands_in_the_window_it_was_clicked_in() {
     );
     a.quit();
     b.quit();
+    assert!(gone_within(backend, Duration::from_secs(10)));
+    stop_backend(backend);
+}
+
+/// With no `external-browser`, whether `alt+o` has a desktop to send a page
+/// to is each terminal's own answer, sent in its `open`, and not that of the
+/// terminal that happened to start the backend (#104): one window says there
+/// is no desktop, the other is handed the browser to start.
+#[test]
+fn two_windows_decide_the_desktop_by_their_own_terminal() {
+    if !engine_named() {
+        return;
+    }
+    let scratch = Scratch::new("display");
+    let page = serve();
+    let mut spawn = launcher(Duration::from_secs(15));
+    let mut desk = Front::open_with(
+        &mut spawn,
+        &scratch.0,
+        (80, 24),
+        std::slice::from_ref(&page),
+        false,
+        true,
+    );
+    let mut ssh = Front::open_with(
+        &mut spawn,
+        &scratch.0,
+        (80, 24),
+        std::slice::from_ref(&page),
+        false,
+        false,
+    );
+    let backend = desk.link.backend_pid;
+    assert_eq!(ssh.link.backend_pid, backend, "both reached one backend");
+    for front in [&mut desk, &mut ssh] {
+        assert!(
+            front.pump(PATIENCE, |f| f.frames.len() >= 3),
+            "the page painted"
+        );
+    }
+
+    ssh.chord(Action::OpenExternal);
+    assert!(
+        ssh.pump(PATIENCE, |f| f.says("no desktop here")),
+        "{}",
+        ssh.said()
+    );
+    assert!(ssh.helpers.is_empty(), "{:?}", ssh.helpers);
+
+    desk.chord(Action::OpenExternal);
+    assert!(
+        desk.pump(PATIENCE, |f| !f.helpers.is_empty()),
+        "no browser was asked for: {}",
+        desk.said()
+    );
+    match desk.helpers.as_slice() {
+        [Job::External { command: None, url }] => assert!(url.starts_with(&page), "{url}"),
+        other => panic!("not one browser: {other:?}"),
+    }
+    assert!(!desk.says("no desktop here"), "{}", desk.said());
+
+    desk.quit();
+    ssh.quit();
     assert!(gone_within(backend, Duration::from_secs(10)));
     stop_backend(backend);
 }

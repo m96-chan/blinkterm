@@ -736,6 +736,9 @@ pub fn run(options: Options, selected: registry::Selected) -> Result<(), String>
             problems,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             home_dir: upload::home(),
+            // This terminal's, for the backend to keep with the window: the
+            // backend's own environment is whichever terminal started it.
+            display: picker::has_display(|name| std::env::var(name).ok()),
         };
         link.open(open)?;
         drive(&mut term, &mut link, metrics, &mut launcher)

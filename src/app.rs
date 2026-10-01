@@ -553,8 +553,11 @@ pub(crate) struct Chrome {
     /// The programs the settings name to answer a file input instead of the
     /// row; none, and the row it is. See [`crate::picker`].
     pickers: Pickers,
-    /// Whether a picker with a window can open one here, read once at the
-    /// start: see [`picker::has_display`].
+    /// Whether a picker, a password command or a browser with a window can
+    /// open one: the terminal's answer, from its frontend's `open`
+    /// ([`crate::ipc::Open::display`]), and again from each `open` that
+    /// resumes the window. Not the backend's own environment, which is that
+    /// of whichever terminal started it (#104). See [`picker::has_display`].
     display: bool,
     /// The picker with a window that is open, if one is: one at a time, for
     /// whichever tab clicked. The terminal runs it ([`Terminal::start_helper`]);
@@ -792,12 +795,14 @@ impl Chrome {
             appearance,
             std::env::current_dir().ok(),
             upload::home(),
+            false,
         )
     }
 
     /// [`Chrome::new`] from the settings a frontend sent
-    /// ([`crate::ipc::WindowSettings`]), and its working directory and
-    /// `$HOME`.
+    /// ([`crate::ipc::WindowSettings`]), and its working directory, `$HOME`
+    /// and whether it has a display ([`crate::ipc::Open`]): nothing here is
+    /// read from this process's environment, which is the backend's.
     pub(crate) fn from_settings(
         id: WindowId,
         metrics: Metrics,
@@ -805,6 +810,7 @@ impl Chrome {
         appearance: Appearance,
         cwd: Option<PathBuf>,
         home_dir: Option<PathBuf>,
+        display: bool,
     ) -> Chrome {
         let options = settings;
         Chrome {
@@ -824,12 +830,14 @@ impl Chrome {
             search_url: options.search_url.clone(),
             navigation: None,
             save: None,
+            // A frontend always sends one, from its own locale; this is for
+            // settings a test made by hand.
             paper: options
                 .pdf_paper
                 .unwrap_or_else(|| save::Paper::from_locale(&save::Paper::locale())),
             upload_dir: None,
             pickers: options.pickers.clone(),
-            display: picker::has_display(|name| std::env::var(name).ok()),
+            display,
             picker: None,
             logins: options.logins.clone(),
             login: None,
@@ -1651,7 +1659,7 @@ pub(crate) fn start_profile(options: &Options, profile: Profile) -> Result<Profi
 /// A window as a frontend's `open` makes it: `first` its tabs — the
 /// engine's first, adopted, or a new engine window's ([`window_target`]) —
 /// laid out at `metrics`, with the settings, the route's cast and the
-/// working directory and `$HOME` of the terminal it is drawn on.
+/// working directory, `$HOME` and display of the terminal it is drawn on.
 pub(crate) fn new_window(
     id: WindowId,
     mut first: Tabs<Client>,
@@ -1676,6 +1684,7 @@ pub(crate) fn new_window(
         appearance,
         Some(open.cwd.clone()),
         open.home_dir.clone(),
+        open.display,
     );
     chrome.cast = motion::Cast {
         png: open.route.png,
@@ -2071,17 +2080,20 @@ pub(crate) fn suspend_window(term: &mut dyn Terminal, win: &mut Window) {
     hold_cast(win, true);
 }
 
-/// The terminal came back, at `metrics`: everything drawn again as after a
-/// resize, the page in front casting again at the size it is now.
+/// The terminal came back with `open`, at its metrics: everything drawn
+/// again as after a resize, the page in front casting again at the size it
+/// is now. It may be another terminal than the one that left — attached
+/// again over ssh, say — so whether it has a display is taken again too.
 pub(crate) fn resume_window(
     term: &mut dyn Terminal,
     win: &mut Window,
     shared: &mut Shared,
-    metrics: Metrics,
+    open: &crate::ipc::Open,
 ) -> Result<(), String> {
     let Window { tabs, chrome, .. } = win;
-    chrome.metrics = metrics;
-    chrome.scale = chrome.scale_choice.resolve(metrics.cell);
+    chrome.metrics = open.metrics;
+    chrome.display = open.display;
+    chrome.scale = chrome.scale_choice.resolve(open.metrics.cell);
     chrome.shape = Shape::Default;
     relayout(term, tabs, chrome, shared)
 }
@@ -6749,8 +6761,14 @@ enum LoginState {
 /// the page, so it works on a crashed page and behind a dialog. What is
 /// refused is refused on the row with nothing run: a page that is not
 /// `http`, `https` or `file`, and — with no `external-browser` set — a
-/// machine with no desktop to open it on. What is started is left to run and
-/// only ever reaped ([`external::reap`]).
+/// terminal with no desktop to open it on ([`Chrome::display`], the
+/// terminal's). What is started is left to run and only ever reaped
+/// ([`external::reap`]).
+///
+/// The command is planned here only to say no early; the frontend that runs
+/// it plans it again from `url` and `configured` with its own `$BROWSER`
+/// ([`crate::ipc::Job::External`]), so this process's `$BROWSER` is not
+/// read, and `argv` is made without one.
 fn open_external(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
@@ -6763,11 +6781,10 @@ fn open_external(
         note(tabs, why);
         return Ok(());
     }
-    let browser = std::env::var("BROWSER").ok();
     let plan = external::plan(
         chrome.external.as_ref(),
         cfg!(target_os = "macos"),
-        browser.as_deref(),
+        None,
         chrome.display,
     );
     let command = match plan {
@@ -6779,7 +6796,7 @@ fn open_external(
     };
     let job = Helper::External {
         argv: external::argv(&command, &url),
-        browser: external::browser_to_pass(browser.as_deref()),
+        browser: None,
         home: chrome.home_dir.clone(),
         url,
         configured: chrome.external.clone(),
@@ -12347,6 +12364,85 @@ mod tests {
         );
         drop(tabs);
         std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    /// A window as [`new_window`] makes one from a frontend's `open`, with
+    /// the defaults for settings and `display` what its terminal said.
+    fn window_from_open(id: WindowId, display: bool) -> Chrome {
+        let options = crate::options::resolve(
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+            crate::options::Settings::default(),
+        )
+        .expect("the defaults");
+        Chrome::from_settings(
+            id,
+            Metrics {
+                cols: 80,
+                rows: 24,
+                cell: (8, 16),
+            },
+            &crate::ipc::WindowSettings::from(&options),
+            Appearance::new(
+                crate::appearance::Choice::default(),
+                false,
+                crate::appearance::Alpha::Off,
+            ),
+            None,
+            None,
+            display,
+        )
+    }
+
+    #[test]
+    fn a_window_takes_its_display_from_open_not_the_backends_environment() {
+        // Whatever this process's `$DISPLAY` is, each window has what its
+        // terminal said.
+        for display in [true, false] {
+            assert_eq!(window_from_open(WINDOW, display).display, display);
+        }
+    }
+
+    #[test]
+    fn alt_o_with_no_browser_set_goes_by_the_windows_own_display() {
+        // Two windows on one profile, one in a terminal with a desktop and
+        // one in a terminal reached over ssh (#104).
+        let engine = FakeEngine::start();
+        let mut desk_tabs = Tabs::new(Tab::new("a", engine.page("S1"), "https://a.example/"));
+        let mut ssh_tabs = Tabs::new(Tab::new("b", engine.page("S2"), "https://b.example/"));
+        let mut desk = window_from_open(WindowId(1), true);
+        let mut ssh = window_from_open(WindowId(2), false);
+        desk.external = None;
+        ssh.external = None;
+
+        let mut term = FakeTerminal::default();
+        open_external(&mut term, &mut ssh_tabs, &mut ssh).expect("a key");
+        assert!(term.started.is_empty(), "{:?}", term.started);
+        assert_eq!(
+            ssh_tabs.active().and_then(|tab| tab.note.clone()),
+            Some(external::NO_DESKTOP.to_string())
+        );
+
+        let mut term = FakeTerminal::default();
+        open_external(&mut term, &mut desk_tabs, &mut desk).expect("a key");
+        match term.started.as_slice() {
+            [(
+                _,
+                Helper::External {
+                    url,
+                    configured: None,
+                    browser: None,
+                    ..
+                },
+            )] => assert_eq!(url, "https://a.example/"),
+            other => panic!("not one browser: {other:?}"),
+        }
+        let note = desk_tabs.active().and_then(|tab| tab.note.clone());
+        assert_eq!(note, Some(external::sent(None)));
+        assert!(
+            note.is_some_and(|note| note.contains("sent to the desktop browser")),
+            "the sentence for no browser set"
+        );
     }
 
     #[test]

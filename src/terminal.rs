@@ -113,7 +113,9 @@ pub enum Helper {
     /// started in `home`. Left to run, never answered. `url` and
     /// `configured` (`external-browser`) are what `argv` was made from, for
     /// a terminal in another process, which makes its own from them with its
-    /// own environment ([`crate::ipc::Job::External`]).
+    /// own environment ([`crate::ipc::Job::External`]). A window's logic
+    /// runs in the backend, which therefore makes `argv` without `$BROWSER`
+    /// and leaves `browser` empty: only the frontend's are the terminal's.
     External {
         argv: Vec<String>,
         browser: Option<String>,

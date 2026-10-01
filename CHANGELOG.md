@@ -78,6 +78,10 @@ flag, a different default, a raised Rust floor all do.
 
 ### Fixed
 
+- A second terminal on a profile decides file pickers, password commands
+  and `alt+o` by its own `$DISPLAY`, not the first terminal's, and `alt+s`
+  prints on its own locale's paper
+  ([#104](https://github.com/m96-chan/blinkterm/issues/104)).
 - Closing the terminal under a window — its tab or window closed, an ssh
   session dropped — no longer counts as `ctrl+q`: its tabs are offered at
   the next start, as a crash's are. Only `ctrl+q`, or `ctrl+w` on the last
