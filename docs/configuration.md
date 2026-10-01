@@ -266,7 +266,8 @@ session of its own and with no terminal, and it lives exactly as long as
 there is a window on its profile: the last window closed stops it, the
 engine with it. It is reached through `backend.sock` in the profile, a
 socket only you can use (see `SECURITY.md`); its standard error is
-`backend.log`, beside it, rewritten each time one starts. The lock is
+`backend.log`, beside it, started afresh each time one takes the profile,
+with the run before kept as `backend.log.1`. The lock is
 `blinkterm`'s own — an `flock` on `blinkterm.lock` in the profile — held by
 the backend, and a `blinkterm` from before this one, which holds the lock
 itself, is not something a new one can open a window in: the new one waits

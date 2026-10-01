@@ -489,6 +489,7 @@ fn two_frontends_starting_at_once_get_one_backend() {
         return;
     }
     let scratch = Scratch::new("at-once");
+    seed_log(&scratch.0);
     let page = serve();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let starts: Vec<_> = (0..2)
@@ -519,6 +520,13 @@ fn two_frontends_starting_at_once_get_one_backend() {
     assert_eq!(fronts[1].0.link.backend_pid, backend, "one backend");
     assert_eq!(fronts[1].0.link.generation, fronts[0].0.link.generation);
     assert_eq!(lock_holder(&scratch.0), Some(backend));
+    // One log, the winner's, and the run before it kept whole (#107).
+    assert_eq!(
+        std::fs::read_to_string(scratch.0.join(frontend::LOG_KEPT)).ok(),
+        Some("previous run\n".to_string())
+    );
+    let log = std::fs::read_to_string(scratch.0.join(frontend::LOG_FILE)).expect("a log");
+    assert!(!log.contains("previous run"), "{log:?}");
     // The candidate that lost has gone, having said busy.
     let started: Vec<u32> = fronts
         .iter()
@@ -544,6 +552,100 @@ fn two_frontends_starting_at_once_get_one_backend() {
     }
     assert!(gone_within(backend, Duration::from_secs(10)));
     stop_backend(backend);
+}
+
+/// The mode bits of `path`.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// A log as a previous backend left it.
+fn seed_log(dir: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all(dir).expect("the profile");
+    let mut log = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dir.join(frontend::LOG_FILE))
+        .expect("a log");
+    log.write_all(b"previous run\n").expect("written");
+}
+
+/// A candidate started while the profile is held — a second terminal on a
+/// running backend, here this test holding the lock in its place — says
+/// busy and leaves the log the holder writes to exactly as it was (#107).
+/// No engine: the candidate never gets as far as one.
+#[test]
+fn a_candidate_that_loses_the_lock_leaves_the_running_backends_log_alone() {
+    use blinkterm::frontend::{Launcher, Spawned};
+    use blinkterm::profile::{Profile, TakeAt};
+    let scratch = Scratch::new("log-loser");
+    let held = match Profile::try_take_at(scratch.0.clone(), None).expect("the profile") {
+        TakeAt::Taken(profile) => profile,
+        TakeAt::Held(pid) => panic!("held by {pid:?}"),
+    };
+    seed_log(&scratch.0);
+    let mut spawn = launcher(Duration::from_secs(1));
+    match spawn.spawn(Some(&scratch.0)).expect("a candidate") {
+        Spawned::Busy(pid) => assert_eq!(pid, Some(std::process::id())),
+        Spawned::Ready(_) => panic!("ready on a held profile"),
+        Spawned::Failed(why) => panic!("failed: {why}"),
+    }
+    let status = spawn.children[0].wait().expect("the candidate exits");
+    assert!(status.success(), "the candidate: {status}");
+    let log = scratch.0.join(frontend::LOG_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("the log"),
+        "previous run\n",
+        "the running backend's log was touched"
+    );
+    assert_eq!(mode_of(&log), 0o600);
+    assert!(
+        !scratch.0.join(frontend::LOG_KEPT).exists(),
+        "a loser rotated the log"
+    );
+    drop(held);
+}
+
+/// The candidate that takes the lock keeps the previous run's log as
+/// `backend.log.1` and writes its own to a fresh `backend.log` — even a
+/// start that fails, here on an engine that is not there, which is found out
+/// only after the lock. No engine needed.
+#[test]
+fn the_winner_rotates_the_log_and_keeps_the_previous_run() {
+    use blinkterm::frontend::{Launcher, Spawned};
+    let scratch = Scratch::new("log-winner");
+    seed_log(&scratch.0);
+    let mut spawn = launcher(Duration::from_secs(1));
+    spawn
+        .args
+        .extend(["--engine".to_string(), "/nonexistent/engine".to_string()]);
+    match spawn.spawn(Some(&scratch.0)).expect("a candidate") {
+        Spawned::Failed(why) => assert!(why.contains("not an executable"), "{why}"),
+        Spawned::Ready(_) => panic!("ready without an engine"),
+        Spawned::Busy(pid) => panic!("busy: {pid:?}"),
+    }
+    let _ = spawn.children[0].wait();
+    assert!(lock_free_within(&scratch.0, Duration::from_secs(5)));
+    let kept = scratch.0.join(frontend::LOG_KEPT);
+    assert_eq!(
+        std::fs::read_to_string(&kept).expect("the previous run's log"),
+        "previous run\n"
+    );
+    assert_eq!(mode_of(&kept), 0o600);
+    let log = scratch.0.join(frontend::LOG_FILE);
+    let text = std::fs::read_to_string(&log).expect("this run's log");
+    assert_eq!(mode_of(&log), 0o600);
+    assert!(!text.contains("previous run"), "not rotated: {text:?}");
+    // Its stderr went to the fresh file, not to the one it was started with.
+    assert!(text.contains("not an executable"), "{text:?}");
 }
 
 /// The frontend that started the backend leaving is one window closing:
