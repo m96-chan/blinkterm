@@ -1,9 +1,9 @@
 //! The loop that makes the other modules a browser.
 //!
-//! One thread, one `poll`, three descriptors: the terminal, the pipe the tab in
-//! front knocks on, and the pipe the browser connection knocks on. Everything
-//! else is a reaction to one of those being readable, which is what keeps this
-//! file a sequence of decisions rather than a scheduler. A background tab's
+//! One thread, one `poll`: each window's terminal, the pipe each window's tab
+//! in front knocks on, and the pipe the browser connection knocks on.
+//! Everything else is a reaction to one of those being readable, which is
+//! what keeps this file a sequence of decisions rather than a scheduler. A background tab's
 //! pipe is not polled — it has no screencast and nothing urgent to say — but
 //! its queue is drained every pass, so a page that renames itself or opens a
 //! dialog while it is not being looked at is still heard.
@@ -14,26 +14,27 @@
 //! happens to the frames that arrive faster than a pane can draw them, and
 //! what is on the screen in the moment between two tabs. And what happens
 //! when the engine itself dies under the loop: it is started again in place,
-//! on the same profile, and the tabs come back — see [`run`] and
-//! `relaunch`.
+//! on the same profile, and every window's tabs come back — see
+//! `relaunch_all`.
 //!
 //! The one that is not here is which format a frame comes in and which of two
 //! frames wins when they arrive out of order: that is [`crate::motion`],
 //! because it is a policy with a measurement behind it and it can be tested
 //! without an engine, a terminal or a pane.
 //!
-//! What the loop holds is in three parts, cut where #83's backend will cut
-//! them: a `Window` — its tabs, and everything else a window owns
-//! (`Chrome`: the row and whatever can have it, what is out with the page
-//! in front, the pointer, the motion policy, the layout) — beside the
-//! profile's `Shared` — the history, the bookmarks, the session file, the
-//! downloads, the blocker, who the engine says it is — and drawn through a
-//! [`Terminal`]. A pass is `prepare_window`, the poll, the terminal's
-//! input, and `pass_window`; `drive` is the loop of them for the one window
-//! and the one terminal ([`LocalTerminal`]) a run has today. Nothing below
-//! `drive` writes to the pane, decodes a frame or runs a helper program
-//! itself: it asks the terminal ([`crate::terminal`]), which is what lets the
-//! same window one day be drawn on a terminal in another process.
+//! What a window is drawn from is in three parts, cut where #83 cut them:
+//! a `Window` — its tabs, and everything else a window owns (`Chrome`: the
+//! row and whatever can have it, what is out with the page in front, the
+//! pointer, the motion policy, the layout) — beside the profile's `Shared` —
+//! the history, the bookmarks, the session file, the downloads, the blocker,
+//! who the engine says it is — and drawn through a [`Terminal`]. A pass is
+//! `prepare_window`, the poll, the terminal's input, and `pass_window`. The
+//! loop that runs those passes is the profile's backend's
+//! ([`crate::backend`]), for every window on the profile at once, each drawn
+//! on a terminal in another process; [`run`] here only decides which of the
+//! two processes this one is. Nothing below writes to a pane, decodes a
+//! frame or runs a helper program itself: it asks the terminal
+//! ([`crate::terminal`]).
 //!
 //! The other thing that is not here is the wheel's animation. It was, and a
 //! loop that spends nine milliseconds decoding a frame is a loop that sends a
@@ -698,10 +699,10 @@ pub(crate) const DISPOSITION_WITHIN: Duration = Duration::from_secs(2);
 /// on the pipe's reader thread, the site files every session is told, who
 /// the engine says it is, and how it is started again.
 ///
-/// One of these per profile, beside however many [`Window`]s: today one,
-/// and the backend #83 is building toward keeps one for all of them. The
-/// engine and the browser's client are not here yet; they stay beside it in
-/// [`run`] until there is a backend process to own them.
+/// One of these per profile, beside however many [`Window`]s: the
+/// profile's backend ([`crate::backend`]) keeps one for all of them. The
+/// engine and the browser's client stay beside it, in a [`Live`], because a
+/// relaunch replaces them and nothing here.
 pub(crate) struct Shared {
     /// The pages visited, which the url bar offers back; kept in the profile,
     /// or only in memory for a temporary one. See [`crate::history`].
@@ -1013,12 +1014,11 @@ impl Shared {
 
 /// One window: its tabs, and everything else it owns ([`Chrome`]), and
 /// the tabs as they were before the list last shrank ([`Shrunk`]) — what
-/// [`drive`] runs a pass of, through a [`Terminal`] and beside the
+/// the backend runs a pass of, through a [`Terminal`] and beside the
 /// profile's [`Shared`].
 ///
-/// A run has one. The backend #83 is building toward has one per terminal
-/// attached to it, each driven by the same two halves of a pass
-/// ([`prepare_window`], [`pass_window`]) that drive this one.
+/// A backend has one per terminal attached to it, each driven by the same
+/// two halves of a pass ([`prepare_window`], [`pass_window`]).
 pub(crate) struct Window {
     tabs: Tabs<Client>,
     chrome: Chrome,

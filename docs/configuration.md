@@ -109,7 +109,7 @@ keymap:
 
 | action | linux | mac | does |
 | --- | --- | --- | --- |
-| `quit` | `ctrl+q` | `ctrl+q` | quit |
+| `quit` | `ctrl+q` | `ctrl+q` | close this window |
 | `url` | `ctrl+l` | `ctrl+l` | type a url |
 | `reload` | `ctrl+r` | `ctrl+r` | reload |
 | `back` | `alt+left` | `cmd+[` | back |
@@ -242,24 +242,63 @@ default, rather than quietly making another identity the one a start opens:
 profiles or more, the status row shows the name of the one in use.
 
 `--temp-profile` makes a fresh profile under the system's temporary directory
-and removes it when `blinkterm` exits, including when it panics; one left by a
-`blinkterm` that was killed outright is removed by the next one.
+and removes it when that terminal's window closes, including when it panics;
+one left by a `blinkterm` that was killed outright is removed by the next one.
+It is the terminal's own: no other terminal can reach it.
 
-One `blinkterm` uses a profile at a time. A second one started on a profile
-that is in use is refused, and told which pid has it; it does not quietly fall
-back to a throwaway profile, because a login you thought was being kept and was
-not is worse than an error. To open a url in the one that has it, say so:
-`blinkterm --remote <url>` (see
-[Opening a url from another program](usage.md#opening-a-url-from-another-program)). The lock is `blinkterm`'s own — an `flock` on
-`blinkterm.lock` in the profile — because the headless shell has no lock of its
-own and will happily run two engines on one cookie database.
+### Several terminals on one profile
 
-A login survives a quit because the engine is asked to close
-(`Browser.close`) and waited for, which is when Chromium writes its cookie
-jar: measured against Chromium 141, that takes about two seconds, and every
-other way of stopping it — `SIGTERM` included — loses what was not yet
-written. So a `blinkterm` that is itself `SIGKILL`ed can lose the last thirty
-seconds or so of cookies, which is Chromium's own flush interval.
+A profile has one engine at a time — two Chromiums on one cookie database is
+how a profile is corrupted, and the headless shell has no lock of its own —
+and every terminal started on it shares that engine. The first `blinkterm`
+on a profile starts a background process for it, the profile's *backend*,
+which holds the profile, runs the engine and keeps every window's tabs; each
+terminal started on the profile after that, while it runs, opens a window of
+its own in it: its own tabs, its own tab in front, its own url bar and
+prompts, its own size, its own keys. The cookies, logins, history,
+bookmarks, zoom levels, permissions and downloads are the profile's, shared
+by every window on it. See
+[Several terminals, one profile](usage.md#several-terminals-one-profile) for
+what that looks like.
+
+The backend is the same program, started with an option nobody types, in a
+session of its own and with no terminal, and it lives exactly as long as
+there is a window on its profile: the last window closed stops it, the
+engine with it. It is reached through `backend.sock` in the profile, a
+socket only you can use (see `SECURITY.md`); its standard error is
+`backend.log`, beside it, rewritten each time one starts. The lock is
+`blinkterm`'s own — an `flock` on `blinkterm.lock` in the profile — held by
+the backend, and a `blinkterm` from before this one, which holds the lock
+itself, is not something a new one can open a window in: the new one waits
+for it for thirty seconds, then says which pid has the profile and what to
+do. While a backend is stopping, a terminal started on the profile waits for
+it to finish and then starts a fresh one.
+
+The settings a window is made with — the keys, the scale, the colour scheme,
+`--alpha`, normal mode, the search url, the paper, the home page, the file
+pickers, the password commands, the external browser — are each terminal's
+own, and two windows on one profile can differ in every one of them. The
+settings about the engine as a whole — the engine and its arguments
+(`engine`, `engine-arg`, `user-agent`, `proxy`, `mute`), `download-dir`,
+the block lists, the site files and the console — are the backend's, set by
+the first terminal; a later one that asks for different ones is refused,
+with the setting that differs named, rather than quietly given the others
+or restarting everybody's engine. Quit the profile's windows first, or use
+`--temp-profile` or another `--profile`.
+
+A backend that is itself killed outright leaves its engine's process group
+written in `engine.pgid` in the profile, and the next one to start on the
+profile kills whatever is left of that group before it starts an engine of
+its own.
+
+A login survives because, when the last window on a profile closes, the
+engine is asked to close (`Browser.close`) and waited for, which is when
+Chromium writes its cookie jar: measured against Chromium 141, that takes
+about two seconds, which the backend spends on its own after the terminal
+has been given back; every other way of stopping it — `SIGTERM` included —
+loses what was not yet written. So a backend that is itself `SIGKILL`ed can
+lose the last thirty seconds or so of cookies, which is Chromium's own flush
+interval.
 
 ### History
 
@@ -374,8 +413,8 @@ tab loads its page the first time you look at it, not all at once: the strip
 shows the saved titles straight away, and twenty tabs cost half a second of
 start rather than twenty pages fetched. At most 100 tabs are restored.
 
-After a run that did not end with a quit — a crash, a `kill -9`, the engine
-dying — the next start asks on the row: `restore 3 tabs from last time?
+After a window that did not end with a quit — a crash, a `kill -9`, the
+engine dying twice — the next start asks on the row: `restore 3 tabs from last time?
 y/n`. `y` or `enter` restores them; `n`, `esc`, or simply getting on with
 something else declines, and the question waits under anything else that
 wants the row. How a run that did not quit is known is the file's first line,
@@ -384,9 +423,17 @@ wants the row. How a run that did not quit is known is the file's first line,
 nothing.
 
 The tabs in the file are grouped under a line for the window they were in —
-`# window 1 live`, `closed` or `lost` — after a `# format: 2` line. A run has
-one window, so today the file has one group; the groups are there for the
-profile that serves several terminals at once. A file written by an older
-`blinkterm` reads as one group, and an older `blinkterm` reads this one as
-one window with every group's tabs, since every line this version adds
-starts with `#`.
+`# window 1 live`, `closed` or `lost` — after a `# format: 2` line: one group
+for each window that has had tabs, so that several terminals on one profile
+each come back as themselves. A window closed with `ctrl+q` is a `closed`
+group, which `--restore` reopens; a window whose terminal went away without
+a word (the terminal killed, an ssh link dropped) is kept for fifteen seconds
+in case it comes back, and is then a `lost` group, which the next window
+opened is offered. Each new window takes one group, the oldest first: a
+second `blinkterm --restore` on a profile whose first window restored one
+group restores the next, never the same one twice. A new window with nothing
+to restore records its tabs in a group of its own, beside the ones closed
+earlier while the backend ran; at most eight groups are kept. A file written
+by an older `blinkterm` reads as one group, and an older `blinkterm` reads
+this one as one window with every group's tabs, since every line this
+version adds starts with `#`.

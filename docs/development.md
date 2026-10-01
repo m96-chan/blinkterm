@@ -62,6 +62,33 @@ in mind while writing one: `Browser.getWindowForTarget` with an id the
 headless shell does not have crashes the whole engine, so ask through
 `app::window_of_target`, never directly.
 
+`tests/windows.rs` is #83 itself: several terminals on one profile. Each
+test starts the real backend the way a frontend does — `frontend::attach`
+with the `Spawn` launcher, this build's binary as `--serve-fd`, a scratch
+profile — and drives it with fake frontends: a connection each, made-up
+terminal sizes, frames acknowledged as a terminal would, and the row's bytes
+read for what they say. Two windows on one engine and one lock holder, each
+at its own size and with its own input; one closed and the other painting;
+the last one closed stopping the engine, the lock released and a cookie
+kept for the next start; `--remote` reaching the window used last; a second
+profile with an engine and a cookie jar of its own; a frontend that vanishes
+and whose tabs are offered to the next window after the grace; and a link
+middle-clicked in two windows at once landing in each window it was clicked
+in. Engine-gated like `tests/engine.rs`, one at a time:
+
+```sh
+BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
+  cargo test --release --test windows -- --test-threads=1
+```
+
+The grace a vanished frontend gets is fifteen seconds (`backend::GRACE`);
+the tests pass the hidden `--grace-ms <n>`, which only a run with
+`--serve-fd` accepts, to make it shorter. When a test leaves something
+running, or a real run misbehaves, the backend's standard error is
+`<profile>/backend.log`, rewritten by each backend a frontend starts: the
+engine's warnings, a window that lost its terminal, a page that was closed
+because no window could be shown to have asked for it.
+
 ## Checks
 
 What CI runs, and what to run before pushing:
@@ -76,8 +103,9 @@ cargo test --locked
 The lint set is a `[lints]` table in `Cargo.toml` rather than a list of flags
 in the workflow, so a laptop and a runner disagree about `-D warnings` and
 nothing else. The one worth knowing about is
-`clippy::undocumented_unsafe_blocks`: there are eighty-one `unsafe` blocks in
-`src/`, nearly all of them one-line `libc` calls, and each says what makes it
+`clippy::undocumented_unsafe_blocks`: there are ninety-eight `unsafe` blocks
+in `src/` (`grep -o 'unsafe {' src/*.rs | wc -l`, the unit tests' among
+them), nearly all of them one-line `libc` calls, and each says what makes it
 sound.
 
 CI also runs clippy, the unit tests and the real-engine suite on macOS. That

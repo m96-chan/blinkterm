@@ -15,7 +15,7 @@
 //!
 //! Each frontend that attaches opens one *window*: a [`crate::app`] window,
 //! its tabs, its row and prompts, its motion policy and its layout, exactly
-//! the window a run used to have, drawn through a [`RemoteTerminal`] that
+//! the window a run used to have, drawn through a `RemoteTerminal` that
 //! turns everything the window asks of a terminal into a message. The first
 //! window adopts the engine's first page; every later one is a page in an
 //! engine window of its own (`Target.createTarget {newWindow: true}`), which
@@ -52,7 +52,7 @@
 //! A frame goes to its frontend still encoded, numbered, and the frontend
 //! says when it has painted it ([`crate::ipc::ToBackend::Painted`]). At most
 //! [`IN_FLIGHT`] are out at once per window and a newer frame replaces one
-//! that is waiting ([`FrameQueue`]), so a slow terminal — an ssh link, a
+//! that is waiting (`FrameQueue`), so a slow terminal — an ssh link, a
 //! suspended `tmux` client — costs its own window frames and nothing else.
 //! On a paced route the engine's acknowledgement waits for the paint, as it
 //! did in one process. A window whose oldest frame has been out for
@@ -74,7 +74,7 @@
 //!
 //! The engine dying is every window's business at once: it is started again
 //! on the same profile without the lock ever being let go, and each window's
-//! tabs come back in it ([`crate::app::relaunch_all`]); a second death in a
+//! tabs come back in it (`app::relaunch_all`); a second death in a
 //! minute stops the backend, and every terminal is told why.
 //!
 //! A backend that is itself killed outright leaves its engine's group

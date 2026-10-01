@@ -392,7 +392,7 @@ pub const ACTIONS: [Row; 33] = [
         action: Action::Quit,
         keys: "ctrl+q",
         mac: "ctrl+q",
-        what: "quit",
+        what: "close this window",
     },
     Row {
         name: "url",

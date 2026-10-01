@@ -44,9 +44,9 @@
 //! *<TAB>https://c.example/<TAB>C
 //! ```
 //!
-//! A window today is the one terminal a run has, always [`WindowId`] 1; the
-//! groups are there so that one profile can serve several windows and each
-//! comes back as itself rather than as one long row of everybody's tabs. A
+//! A window is one terminal attached to the profile's backend
+//! ([`crate::backend`]); the groups are there so that each comes back as
+//! itself rather than as one long row of everybody's tabs. A
 //! group is [`GroupState::Live`] while its window is open,
 //! [`GroupState::Closed`] once it was closed by a quit, and
 //! [`GroupState::Lost`] when it went any other way. A `live` group read at
