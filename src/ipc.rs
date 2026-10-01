@@ -166,7 +166,9 @@ pub enum ToBackend {
     },
     /// A helper the backend asked for has finished.
     HelperDone { id: u64, outcome: Outcome },
-    /// This window is done.
+    /// This window is done. A [`CloseWhy::Quit`] leaves its tabs a closed
+    /// group, for `--restore`; any other reason leaves them lost, offered to
+    /// the next window.
     Close { why: CloseWhy },
     /// Are you there.
     Ping,
@@ -273,7 +275,9 @@ pub struct RouteFlags {
     pub every_nth: u32,
 }
 
-/// Why a frontend is closing its window.
+/// Why a frontend is closing its window. Only [`CloseWhy::Quit`] is a
+/// quit; the other two are a terminal gone, which the backend treats as a
+/// crash for the window's tabs: they are offered back at the next start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseWhy {
     /// The person quit it.

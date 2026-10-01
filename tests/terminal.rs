@@ -537,8 +537,169 @@ fn a_terminal_closed_or_killed_outright_costs_only_its_own_window() {
     );
     assert!(lock_free_within(&profile, Duration::from_secs(5)));
     let session = std::fs::read_to_string(profile.join("session")).expect("a session");
+    // Neither window quit: the one whose terminal hung up is as lost as the
+    // one whose frontend was killed (#106).
     assert!(
-        session.contains(" lost\n") && session.contains("/killed-pane\t"),
+        session.contains("/closed-pane\t")
+            && session.contains("/killed-pane\t")
+            && session.matches(" lost\n").count() == 2
+            && !session.contains(" closed\n"),
         "{session}"
     );
+}
+
+/// Wait up to `within` for `pid` to be gone, and say whether it is.
+fn gone_within(pid: u32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !alive(pid)
+}
+
+/// The rule for what is offered back (#106). The only window's terminal
+/// hangs up: that is not a quit, so the backend, with nothing left to serve,
+/// stops with the window's tabs a lost group, and the next window on the
+/// profile is offered them. Declined, and that window quit with `ctrl+q`:
+/// the start after it offers nothing, and `--restore` brings the quit
+/// window's tabs back.
+#[test]
+fn a_terminal_hung_up_is_offered_back_and_one_quit_with_ctrl_q_waits_for_restore() {
+    if !engine_named() {
+        return;
+    }
+    let scratch = Scratch::new("hangup");
+    let profile = scratch.0.join("profile");
+    let page = serve();
+    let start = |url: Option<&str>, restore: bool, what: &str| {
+        let mut args = vec![
+            "--no-config",
+            "--no-probe",
+            "--frames",
+            "raw",
+            "--tmux",
+            "off",
+            "--profile",
+            profile.to_str().unwrap(),
+        ];
+        if restore {
+            args.push("--restore");
+        }
+        args.extend(url);
+        Pane::start(scratch.command(&args, what))
+    };
+    // A pane quit with `ctrl+q`: status 0, and its backend — the only
+    // window was its — gone with the profile let go.
+    let quit = |pane: &mut Pane, backend: Option<u32>, what: &str| {
+        pane.pty.write(CTRL_Q);
+        pane.pump(Duration::from_secs(5), |p| p.pty.ended);
+        let status = pane.pty.exit_within(Duration::from_secs(5));
+        if status.and_then(|s| s.code()) != Some(0) {
+            stop(backend);
+        }
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(0),
+            "stderr: {}",
+            scratch.stderr(what)
+        );
+        let freed = lock_free_within(&profile, Duration::from_secs(15));
+        if !freed {
+            stop(backend);
+        }
+        assert!(freed, "the lock was not let go after {what}");
+    };
+
+    let mut hung = start(Some(&format!("{page}hung-pane")), false, "hung");
+    let up = hung.pump(PATIENCE, |p| {
+        p.row().contains("hung-pane") && p.pictures >= 3
+    });
+    let backend = lock_holder(&profile);
+    if !up {
+        stop(backend);
+    }
+    assert!(up, "row {:?}: {}", hung.row(), scratch.stderr("hung"));
+    let backend = backend.expect("a backend");
+    // Long enough for the session to have the window's tab.
+    hung.pump(Duration::from_secs(1), |_| false);
+
+    hung.pty.hang_up();
+    assert!(
+        hung.pty.exit_within(Duration::from_secs(5)).is_some(),
+        "the frontend outlived its terminal"
+    );
+    let stopped = gone_within(backend, Duration::from_secs(20));
+    if !stopped {
+        stop(Some(backend));
+    }
+    assert!(stopped, "the backend did not stop with no window left");
+    assert!(lock_free_within(&profile, Duration::from_secs(5)));
+    let session = std::fs::read_to_string(profile.join("session")).expect("a session");
+    assert!(
+        session.starts_with("# blinkterm session: open\n")
+            && session.contains(" lost\n")
+            && session.contains("/hung-pane\t")
+            && !session.contains(" closed\n"),
+        "a hang-up is not a quit: {session}"
+    );
+
+    // Offered back, and declined.
+    let mut next = start(Some(&format!("{page}next-pane")), false, "next");
+    let offered = next.pump(PATIENCE, |p| {
+        p.row().contains("restore 1 tab from last time?")
+    });
+    let backend = lock_holder(&profile);
+    if !offered {
+        stop(backend);
+    }
+    assert!(
+        offered,
+        "the hung-up window's tab was not offered: row {:?}: {}",
+        next.row(),
+        scratch.stderr("next")
+    );
+    next.pty.write(b"n");
+    let up = next.pump(PATIENCE, |p| {
+        p.row().contains("next-pane") && p.pictures >= 3
+    });
+    if !up {
+        stop(backend);
+    }
+    assert!(up, "row {:?}: {}", next.row(), scratch.stderr("next"));
+    next.pump(Duration::from_secs(1), |_| false);
+    quit(&mut next, backend, "next");
+
+    // A quit is not offered back.
+    let mut third = start(Some(&format!("{page}third-pane")), false, "third");
+    let mut asked = false;
+    let up = third.pump(PATIENCE, |p| {
+        asked |= p.row().contains("restore");
+        p.row().contains("third-pane") && p.pictures >= 3
+    });
+    third.pump(Duration::from_secs(1), |p| {
+        asked |= p.row().contains("restore");
+        false
+    });
+    let backend = lock_holder(&profile);
+    if !up || asked {
+        stop(backend);
+    }
+    assert!(up, "row {:?}: {}", third.row(), scratch.stderr("third"));
+    assert!(!asked, "a window quit with ctrl+q was offered back");
+    quit(&mut third, backend, "third");
+
+    // `--restore` brings the window that quit back.
+    let mut restored = start(None, true, "restored");
+    let up = restored.pump(PATIENCE, |p| p.row().contains("third-pane"));
+    let backend = lock_holder(&profile);
+    if !up {
+        stop(backend);
+    }
+    assert!(
+        up,
+        "--restore did not reopen the quit window: row {:?}: {}",
+        restored.row(),
+        scratch.stderr("restored")
+    );
+    quit(&mut restored, backend, "restored");
 }

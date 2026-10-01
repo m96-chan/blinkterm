@@ -76,6 +76,14 @@ flag, a different default, a raised Rust floor all do.
 - A site file that is refused is said on the first window's row and in
   `backend.log`, rather than in the shell before the page.
 
+### Fixed
+
+- Closing the terminal under a window — its tab or window closed, an ssh
+  session dropped — no longer counts as `ctrl+q`: its tabs are offered at
+  the next start, as a crash's are. Only `ctrl+q`, or `ctrl+w` on the last
+  tab, leaves tabs for `--restore` alone
+  ([#106](https://github.com/m96-chan/blinkterm/issues/106)).
+
 ## [0.4.0] - 2026-10-01
 
 ### Added
