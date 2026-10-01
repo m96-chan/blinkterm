@@ -76,6 +76,13 @@ flag, a different default, a raised Rust floor all do.
 - A site file that is refused is said on the first window's row and in
   `backend.log`, rather than in the shell before the page.
 
+### Fixed
+
+- A second terminal on a profile decides file pickers, password commands
+  and `alt+o` by its own `$DISPLAY`, not the first terminal's, and `alt+s`
+  prints on its own locale's paper
+  ([#104](https://github.com/m96-chan/blinkterm/issues/104)).
+
 ## [0.4.0] - 2026-10-01
 
 ### Added

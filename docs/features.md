@@ -218,7 +218,9 @@ settings because nothing can tell the two kinds apart from outside, and they
 need the opposite. With both set, the window is used where there is a
 display (`$DISPLAY` or `$WAYLAND_DISPLAY`, or a Mac not reached over ssh)
 and the terminal one elsewhere, so one settings file does for the desk and
-for ssh; with one set, that one. Both are options too, `--file-picker` and
+for ssh; with one set, that one. With several terminals on one profile, the
+display is that of the terminal the window is in, not of the one that
+started the profile. Both are options too, `--file-picker` and
 `--file-picker-terminal`.
 
 The command is split into words the way a shell splits it — quotes and
@@ -340,7 +342,9 @@ are only run where there is a desktop to open a window on — `$DISPLAY` or
 `$WAYLAND_DISPLAY` set, or a Mac not reached over ssh, the same rule the file
 picker has. Anywhere else nothing is run and the row says `no desktop here;
 alt+u copies the url`. Over ssh with X forwarding `$DISPLAY` is set, and the
-browser opens on the forwarded display.
+browser opens on the forwarded display. With several terminals on one
+profile, the desktop and `$BROWSER` are those of the terminal the window is
+in.
 
 A `$BROWSER` that is `blinkterm` itself — `blinkterm --remote`, as
 [Opening a url from another program](usage.md#opening-a-url-from-another-program)

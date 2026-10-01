@@ -1120,12 +1120,9 @@ impl Backend {
             slot.term.attach(conn, open.route);
             slot.suspended_since = None;
             slot.last_input = Instant::now();
-            if let Err(why) = app::resume_window(
-                &mut slot.term,
-                &mut slot.win,
-                &mut self.shared,
-                open.metrics,
-            ) {
+            if let Err(why) =
+                app::resume_window(&mut slot.term, &mut slot.win, &mut self.shared, &open)
+            {
                 eprintln!("blinkterm: resuming window {}: {why}", id.0);
             }
             return;
