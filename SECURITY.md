@@ -219,12 +219,17 @@ machine. It prints a warning when it does. Do not browse as root.
   history, so 0600 too, and never written for a `--temp-profile`
   ([#16](https://github.com/m96-chan/blinkterm/issues/16)). The session
   file, `session`, is the list of pages open, kept 0600 like the history and
-  never written for a `--temp-profile`; the bookmarks file is yours rather
-  than a profile's and lives beside the profiles, in
-  `$XDG_DATA_HOME/blinkterm/bookmarks`, 0600 — written under
-  `--temp-profile` too, but only when you press `ctrl+d`. Titles in both go
-  through the same plain-text filter as the row on the way in and on the way
-  out ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
+  never written for a `--temp-profile`; so is the bookmarks file,
+  `bookmarks`, 0600 in the profile beside the history, which a
+  `--temp-profile` keeps in memory and never writes. Each profile has its
+  own, so a page bookmarked under one identity is never offered under
+  another. The file every profile shared before,
+  `$XDG_DATA_HOME/blinkterm/bookmarks`, is copied into the `Default`
+  profile once, 0600, under that file's lock, and is left where it was —
+  delete it once no older blinkterm needs it; no other profile is given a
+  copy. Titles in both go through the same plain-text filter as the row on
+  the way in and on the way out
+  ([#18](https://github.com/m96-chan/blinkterm/issues/18)).
 
 - **Profiles and the registry.** `$XDG_DATA_HOME/blinkterm/profiles.json`,
   0600 in the 0700 data directory, lists the names of your profiles and their
