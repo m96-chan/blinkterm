@@ -63,6 +63,21 @@ machine. It prints a warning when it does. Do not browse as root.
   crash is trusted, and a temporary profile never has one
   ([#60](https://github.com/m96-chan/blinkterm/issues/60)).
 
+- **The backend socket (coming).** For several terminals on one profile
+  ([#83](https://github.com/m96-chan/blinkterm/issues/83)), the code for a
+  second socket, `<profile>/backend.sock`, is in `src/ipc.rs`; nothing listens
+  on it yet. It is bound the way the `--remote` socket is — only under the
+  profile lock, over whatever a crash left, 0600 inside the 0700 profile or
+  behind a symlink to a fresh 0700 directory of its own — and on top of the
+  directory's permissions every connection is checked with the kernel
+  (`SO_PEERCRED` on Linux, `getpeereid` on a Mac) and hung up on unless it
+  comes from the same user; where the peer cannot be asked, it is refused.
+  What it will accept is typed messages that drive one window, the way its
+  keyboard does: no CDP, no script, no command. Lengths are checked before
+  anything is held for a message, and a peer that stops reading is dropped
+  rather than buffered without end. This entry grows with the change that
+  starts using it.
+
 - **What gets written to your terminal.** A terminal executes the bytes it is
   sent, so anything page-derived that reaches the status row is a place where a
   page could try to speak to your terminal instead of to you. The row is the
