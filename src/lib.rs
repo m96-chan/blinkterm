@@ -179,6 +179,7 @@ pub mod strip;
 pub mod tablist;
 pub mod tabs;
 pub mod taken;
+pub mod terminal;
 pub mod text;
 pub mod tty;
 pub mod upload;
