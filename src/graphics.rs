@@ -138,6 +138,7 @@ use crate::fit::Cells;
 
 use crate::base64;
 use crate::route::{Payload, Placement, Route, Wrap};
+use crate::terminal::{Encoded, FrameOut};
 
 /// Base64 goes out in chunks, as the protocol asks.
 pub const CHUNK: usize = 4096;
@@ -831,6 +832,200 @@ impl Drop for Painter {
     fn drop(&mut self) {
         self.clean_up();
     }
+}
+
+/// The largest frame either decoder may produce, in bytes of pixels.
+///
+/// A frame is a pane, so this is never reached; it is the ceiling that stops
+/// a malformed header from asking for a gigabyte. Sixty-four megabytes is a
+/// 4096x4096 picture in RGBA, which is larger than any display tOS runs on.
+pub const FRAME_BUDGET: usize = 64 * 1024 * 1024;
+
+/// A [`Painter`] and what turns an encoded frame into what it sends: the
+/// decode, the chroma key under `--alpha`, the alpha's amount, and the fit of
+/// a still to the pane.
+///
+/// This is the half of the frame path that is the terminal's rather than the
+/// window's. The window decides *which* frame is worth painting — the motion
+/// policy, the still that lost to a newer frame, the list that has the rows —
+/// and hands over the engine's bytes as they came, base64 taken off
+/// ([`crate::terminal::FrameOut`]); everything from there to the bytes on the
+/// pseudoterminal is here. It used to be the tail of the loop's page events,
+/// and it moved so that a terminal on the far end of a socket can be sent the
+/// encoded frame — a JPEG of 185 kB rather than 2.9 MB of pixels — and do
+/// this beside its own pane.
+///
+/// What the canvas knows is fixed for the run: the route (whether a PNG goes
+/// to the terminal as it came), whether a page is painted on the key
+/// ([`crate::appearance::Appearance::keys`]) and the amount of `--alpha`.
+pub struct Canvas {
+    painter: Painter,
+    keyed: bool,
+    alpha: Option<u8>,
+    png_route: bool,
+}
+
+/// What one paint writes, in order: the placeholder cells as text, when the
+/// route draws with them and they are not on screen; then the frame, which
+/// `named` says names a shared memory object and so must be written as text
+/// is, never replaced unwritten (see [`crate::screen::Outbox`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Strokes {
+    pub placeholders: Vec<u8>,
+    pub bytes: Vec<u8>,
+    pub named: bool,
+}
+
+impl Canvas {
+    /// A canvas over `painter`, keying the page out when `keyed` and taking
+    /// it to `alpha` ([`crate::appearance::Alpha::scaling`]) when that is an
+    /// amount.
+    pub fn new(painter: Painter, keyed: bool, alpha: Option<u8>) -> Canvas {
+        let png_route = painter.route().payload == Payload::Png;
+        Canvas {
+            painter,
+            keyed,
+            alpha,
+            png_route,
+        }
+    }
+
+    pub fn route(&self) -> Route {
+        self.painter.route()
+    }
+
+    /// Whether a PNG goes to the terminal as the engine made it, rather than
+    /// decoded here: the route that sends the engine's PNG.
+    pub fn png_route(&self) -> bool {
+        self.png_route
+    }
+
+    /// [`Painter::clear`].
+    pub fn clear(&mut self) -> Vec<u8> {
+        self.painter.clear()
+    }
+
+    /// [`Painter::invalidate_placeholders`].
+    pub fn invalidate_placeholders(&mut self) {
+        self.painter.invalidate_placeholders();
+    }
+
+    /// The bytes that put `frame` on the screen; `None` for a frame that
+    /// would not decode.
+    ///
+    /// A JPEG is decoded — keyed as it is decoded under `--alpha`, RGBA with
+    /// the alpha written beside the colour, then despilled and taken to the
+    /// amount ([`crate::chroma`]). A PNG on the route that sends the engine's
+    /// PNG goes as it came: not decoded, and not fitted either — at a
+    /// fractional zoom it is a pixel or two off the pane and the terminal
+    /// resamples it, which is a little softness over a link against a PNG
+    /// encoder in this crate. Any other PNG is the lossless still, decoded
+    /// and fitted to `frame.pixels` ([`fitted_still`]).
+    ///
+    /// A frame that will not decode is nothing: one of them is a frame the
+    /// next one replaces in sixteen milliseconds. A run of them is a page
+    /// that looks frozen, which is what the engine test comparing the two
+    /// formats through both decoders exists to catch before a person meets
+    /// it. Whether a still that would not decode should be asked for again is
+    /// the window's question, which is why the `None` comes back.
+    pub fn paint(&mut self, frame: FrameOut<'_>) -> Option<Strokes> {
+        let FrameOut {
+            payload,
+            cells,
+            row,
+            pixels,
+            viewport_gen: _,
+        } = frame;
+        match payload {
+            Encoded::Png(png) if self.png_route => {
+                Some(self.put(cells, row, |painter, cells, row| {
+                    painter.png_frame(png, cells, row, 1)
+                }))
+            }
+            Encoded::Png(png) => {
+                let image = crate::png::decode(png, FRAME_BUDGET).ok()?;
+                let (pixels, (width, height)) = fitted_still(image, pixels, self.keyed, self.alpha);
+                Some(self.put(cells, row, |painter, cells, row| {
+                    painter.frame(Raw::rgba(&pixels, width, height), cells, row, 1)
+                }))
+            }
+            Encoded::Jpeg(jpeg) if self.keyed => {
+                let mut image =
+                    crate::jpeg::decode_rgba_with(jpeg, FRAME_BUDGET, crate::chroma::key_pixel)
+                        .ok()?;
+                crate::chroma::despill(&mut image.rgba, image.width, image.height);
+                if let Some(alpha) = self.alpha {
+                    scale_alpha(&mut image.rgba, alpha);
+                }
+                Some(self.put(cells, row, |painter, cells, row| {
+                    painter.frame(
+                        Raw::rgba(&image.rgba, image.width, image.height),
+                        cells,
+                        row,
+                        1,
+                    )
+                }))
+            }
+            Encoded::Jpeg(jpeg) => {
+                let image = crate::jpeg::decode(jpeg, FRAME_BUDGET).ok()?;
+                Some(self.put(cells, row, |painter, cells, row| {
+                    painter.frame(
+                        Raw::rgb(&image.rgb, image.width, image.height),
+                        cells,
+                        row,
+                        1,
+                    )
+                }))
+            }
+        }
+    }
+
+    /// The placeholders, then the frame `make` draws.
+    fn put(
+        &mut self,
+        cells: Cells,
+        row: u32,
+        make: impl FnOnce(&mut Painter, Cells, u32) -> Vec<u8>,
+    ) -> Strokes {
+        let placeholders = self.painter.placeholders(cells, row);
+        let named = self.painter.transport() == Transport::SharedMemory;
+        let bytes = make(&mut self.painter, cells, row);
+        Strokes {
+            placeholders,
+            bytes,
+            named,
+        }
+    }
+}
+
+/// A decoded still made ready to send: fitted to the pane, keyed if the page
+/// was painted on the key, and its alpha scaled under `--alpha` with an
+/// amount.
+///
+/// At a fractional level the engine's rounding leaves the still a pixel or
+/// two off the pane, and a picture that is not the pane's size is one the
+/// terminal resamples until the text goes soft. See [`crate::zoom::fit`]. The
+/// key and the scaling are done on whichever buffer comes out of that, in
+/// place, with no allocation; the key the same way as a moving frame's, so a
+/// page looks the same stopped as moving ([`crate::chroma`]).
+pub fn fitted_still(
+    image: crate::png::PngImage,
+    pane: (u32, u32),
+    keyed: bool,
+    scaling: Option<u8>,
+) -> (Vec<u8>, (u32, u32)) {
+    let (mut pixels, size) = match crate::zoom::fit(&image.rgba, image.width, image.height, 4, pane)
+    {
+        Some(fitted) => (fitted, pane),
+        None => (image.rgba, (image.width, image.height)),
+    };
+    if keyed {
+        crate::chroma::key(&mut pixels, size.0, size.1);
+    }
+    if let Some(alpha) = scaling {
+        scale_alpha(&mut pixels, alpha);
+    }
+    (pixels, size)
 }
 
 /// The control keys every frame carries.
@@ -1840,5 +2035,238 @@ pub(crate) mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("a directory to write in");
         dir
+    }
+
+    #[test]
+    fn a_still_under_an_amount_is_scaled_in_place_and_at_a_hundred_untouched() {
+        // 4x4, every pixel a colour of its own; the first clear, the second
+        // half-covered, the rest opaque.
+        let mut rgba: Vec<u8> = (0..16u8)
+            .flat_map(|i| [i * 10, i * 5, 255 - i * 10, 255])
+            .collect();
+        rgba[3] = 0;
+        rgba[7] = 128;
+        let still = || crate::png::PngImage {
+            width: 4,
+            height: 4,
+            rgba: rgba.clone(),
+        };
+        let alphas = |pixels: &[u8]| pixels.chunks(4).map(|p| p[3]).collect::<Vec<_>>();
+
+        let (pixels, size) = fitted_still(still(), (4, 4), false, None);
+        assert_eq!(size, (4, 4));
+        assert_eq!(pixels, rgba, "at 100 nothing is touched");
+
+        let (pixels, size) = fitted_still(still(), (4, 4), false, Some(179));
+        assert_eq!(size, (4, 4));
+        let mut expected = vec![179; 16];
+        expected[0] = 0;
+        expected[1] = 90;
+        assert_eq!(alphas(&pixels), expected);
+        for (after, before) in pixels.chunks(4).zip(rgba.chunks(4)) {
+            assert_eq!(after[..3], before[..3], "the colour as it was");
+        }
+
+        // A pane one pixel wider: zoom::fit's own buffer, scaled the same.
+        let (pixels, size) = fitted_still(still(), (5, 4), false, Some(179));
+        assert_eq!(size, (5, 4));
+        assert_eq!(pixels.len(), 5 * 4 * 4);
+        let alphas = alphas(&pixels);
+        assert_eq!(alphas[..2], [0, 90], "the first row's own pixels");
+        assert_eq!(alphas[4], 179, "the repeated edge, scaled once");
+        assert!(
+            alphas[5..].iter().all(|&a| a == 179),
+            "every other pixel opaque, at the amount: {alphas:?}"
+        );
+    }
+
+    #[test]
+    fn a_keyed_still_clears_the_key_and_then_takes_the_amount() {
+        // A row of four: the key, black, white, the key.
+        let still = crate::png::PngImage {
+            width: 4,
+            height: 1,
+            rgba: vec![
+                255, 0, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255, 255, 0, 255, 255,
+            ],
+        };
+        let (pixels, _) = fitted_still(still, (4, 1), true, Some(179));
+        assert_eq!(
+            pixels,
+            [0, 0, 0, 0, 0, 0, 0, 179, 255, 255, 255, 179, 0, 0, 0, 0],
+            "the key clear, the page at the amount"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The canvas: what the window hands over, made into what the painter
+    // sent before the decode moved here
+    // -----------------------------------------------------------------
+
+    /// A painter that cannot use shared memory, on `route`: every frame
+    /// inline, so that two of them make the same bytes for the same frame.
+    fn inline_painter(route: Route) -> Painter {
+        Painter::at_with(Path::new("/nonexistent-for-a-test"), route)
+    }
+
+    fn raw_route() -> Route {
+        Route::local(false)
+    }
+
+    fn png_route() -> Route {
+        Route {
+            placement: Placement::Direct,
+            wrap: Wrap::None,
+            ..tmux_route()
+        }
+    }
+
+    /// A frame as the window hands it over, at 10x5 cells from row 2.
+    fn frame_of(payload: Encoded<'_>, pixels: (u32, u32)) -> FrameOut<'_> {
+        FrameOut {
+            payload,
+            cells: cells(10, 5),
+            row: 2,
+            pixels,
+            viewport_gen: 0,
+        }
+    }
+
+    const JPEG: &[u8] = include_bytes!("../tests/jpeg/420.jpg");
+
+    #[test]
+    fn a_jpeg_frame_is_the_raw_frame_the_painter_made_of_its_decode() {
+        let mut canvas = Canvas::new(inline_painter(raw_route()), false, None);
+        let strokes = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+
+        let image = crate::jpeg::decode(JPEG, FRAME_BUDGET).expect("the fixture decodes");
+        let mut painter = inline_painter(raw_route());
+        let before = painter.frame(
+            Raw::rgb(&image.rgb, image.width, image.height),
+            cells(10, 5),
+            2,
+            1,
+        );
+        assert_eq!(strokes.bytes, before, "byte for byte what the loop sent");
+        assert!(strokes.placeholders.is_empty(), "placed at the cursor");
+        assert!(!strokes.named, "inline, written as text");
+        let bodies = apc_bodies(&strokes.bytes);
+        let control = String::from_utf8_lossy(&bodies[0]);
+        assert!(control.contains("f=24"), "RGB: {control}");
+        assert!(
+            control.contains(&format!("s={},v={}", image.width, image.height)),
+            "the picture's own size: {control}"
+        );
+    }
+
+    #[test]
+    fn a_keyed_jpeg_is_keyed_despilled_and_taken_to_the_amount() {
+        let mut canvas = Canvas::new(inline_painter(raw_route()), true, Some(179));
+        let strokes = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+
+        let mut image = crate::jpeg::decode_rgba_with(JPEG, FRAME_BUDGET, crate::chroma::key_pixel)
+            .expect("the fixture decodes");
+        crate::chroma::despill(&mut image.rgba, image.width, image.height);
+        scale_alpha(&mut image.rgba, 179);
+        let mut painter = inline_painter(raw_route());
+        let before = painter.frame(
+            Raw::rgba(&image.rgba, image.width, image.height),
+            cells(10, 5),
+            2,
+            1,
+        );
+        assert_eq!(strokes.bytes, before);
+        let bodies = apc_bodies(&strokes.bytes);
+        assert!(String::from_utf8_lossy(&bodies[0]).contains("f=32"));
+    }
+
+    #[test]
+    fn a_still_is_decoded_and_fitted_to_the_pane_where_pixels_go() {
+        let rgba: Vec<u8> = (0..16u8)
+            .flat_map(|i| [i * 10, i * 5, 255 - i * 10, 255])
+            .collect();
+        let png = crate::png::encode_rgba(4, 4, &rgba);
+        let mut canvas = Canvas::new(inline_painter(raw_route()), false, Some(179));
+        let strokes = canvas
+            .paint(frame_of(Encoded::Png(&png), (5, 4)))
+            .expect("it decodes");
+
+        let image = crate::png::decode(&png, FRAME_BUDGET).expect("ours decodes");
+        let (pixels, (width, height)) = fitted_still(image, (5, 4), false, Some(179));
+        let mut painter = inline_painter(raw_route());
+        let before = painter.frame(Raw::rgba(&pixels, width, height), cells(10, 5), 2, 1);
+        assert_eq!(strokes.bytes, before);
+        let control = String::from_utf8_lossy(&apc_bodies(&strokes.bytes)[0]).into_owned();
+        assert!(control.contains("s=5,v=4"), "fitted to the pane: {control}");
+    }
+
+    #[test]
+    fn a_png_on_the_png_route_goes_as_it_came() {
+        let png = png_1x1();
+        let mut canvas = Canvas::new(inline_painter(png_route()), false, None);
+        assert!(canvas.png_route());
+        let strokes = canvas
+            .paint(frame_of(Encoded::Png(&png), (80, 80)))
+            .expect("nothing to decode");
+        let mut painter = inline_painter(png_route());
+        assert_eq!(strokes.bytes, painter.png_frame(&png, cells(10, 5), 2, 1));
+        // Not even looked at: what the terminal makes of it is the
+        // terminal's.
+        let mut canvas = Canvas::new(inline_painter(png_route()), false, None);
+        assert!(canvas
+            .paint(frame_of(Encoded::Png(b"not a png"), (80, 80)))
+            .is_some());
+    }
+
+    #[test]
+    fn a_frame_that_will_not_decode_is_nothing() {
+        let mut canvas = Canvas::new(inline_painter(raw_route()), false, None);
+        assert_eq!(
+            canvas.paint(frame_of(Encoded::Jpeg(b"not a jpeg"), (80, 80))),
+            None
+        );
+        assert_eq!(
+            canvas.paint(frame_of(Encoded::Png(b"not a png"), (80, 80))),
+            None
+        );
+        let mut keyed = Canvas::new(inline_painter(raw_route()), true, None);
+        assert_eq!(
+            keyed.paint(frame_of(Encoded::Jpeg(&JPEG[..40]), (80, 80))),
+            None
+        );
+    }
+
+    #[test]
+    fn under_placeholders_the_cells_go_first_once_and_again_after_a_clear() {
+        let route = Route {
+            payload: Payload::Raw,
+            ..tmux_route()
+        };
+        let mut canvas = Canvas::new(inline_painter(route), false, None);
+        let first = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+        assert_eq!(
+            first.placeholders,
+            placeholder_pane(PLACEHOLDER_IMAGE_ID, cells(10, 5), 2)
+        );
+        let second = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+        assert!(second.placeholders.is_empty(), "already on the screen");
+        canvas.invalidate_placeholders();
+        let third = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+        assert_eq!(third.placeholders, first.placeholders, "written again");
+        canvas.clear();
+        let fourth = canvas
+            .paint(frame_of(Encoded::Jpeg(JPEG), (80, 80)))
+            .expect("it decodes");
+        assert_eq!(fourth.placeholders, first.placeholders, "and after a clear");
     }
 }

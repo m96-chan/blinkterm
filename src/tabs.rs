@@ -805,6 +805,14 @@ impl<C> Tabs<C> {
         Some(tab)
     }
 
+    /// Every tab, taken out of the list, which is left empty: what an engine
+    /// that died leaves of a window's tabs, all gone at once, while the
+    /// window waits for the new engine's first tab.
+    pub fn take_all(&mut self) -> Vec<Tab<C>> {
+        self.active = 0;
+        std::mem::take(&mut self.tabs)
+    }
+
     /// Forwards, wrapping. `false` when there is nowhere else to be.
     pub fn select_next(&mut self) -> bool {
         if self.tabs.len() < 2 {
