@@ -385,6 +385,15 @@ fifteen seconds and carries on in the same window, redrawn; keys typed
 while it was cut off are dropped rather than sent late. A different profile is a different backend with an engine of
 its own, sharing nothing.
 
+Which tabs are offered back follows one rule: only `ctrl+q`, or `ctrl+w` on
+the last tab, is a quit. A window closed that way is kept as a closed group,
+which the next start does not mention and `blinkterm --restore` reopens.
+Every other way a window goes — the terminal's tab or window closed under
+it, an ssh session dropped, the frontend killed — is not a quit, whether the
+backend hears a hang-up at once or notices only after the fifteen seconds:
+its tabs are a lost group, and the next window opened on the profile is
+offered them, exactly as after a crash.
+
 The settings that are about the engine as a whole (the engine, its
 arguments, the user agent, the proxy, the download directory, the block
 lists, the site files, the console) are set by the first terminal on a
@@ -395,7 +404,8 @@ named. Every other setting is each window's own. See
 When something goes wrong that the row cannot say, the backend's standard
 error is `backend.log` in the profile directory: the engine's own warnings,
 and a line for each window that lost its terminal or page that was closed
-because no window could be shown to have asked for it.
+because no window could be shown to have asked for it. The run before it is
+`backend.log.1`.
 
 ## Opening a url from another program
 
