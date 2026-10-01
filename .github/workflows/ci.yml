@@ -294,6 +294,14 @@ jobs:
         env:
           BLINKTERM_ENGINE: ${{ runner.temp }}/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell
           BLINKTERM_SHARED_RUNNER: 1
+      # Several terminals on one profile (#83): the failure modes against the
+      # real backend, the long profile path whose sockets need the private
+      # fallback (104 bytes is a Mac's limit, the reason the fallback exists),
+      # and the real binary in a pty.
+      - run: cargo test --release --locked --test hardening --test terminal -- --test-threads=1
+        env:
+          BLINKTERM_ENGINE: ${{ runner.temp }}/engine/chrome-headless-shell-mac-arm64/chrome-headless-shell
+          BLINKTERM_SHARED_RUNNER: 1
       # --install-engine for real, into a scratch directory, with the engine
       # above out of the environment: named explicitly for the same reason.
       - run: cargo test --release --locked --test install -- --test-threads=1
