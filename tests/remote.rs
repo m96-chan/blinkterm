@@ -118,6 +118,27 @@ fn with_nobody_running_and_no_terminal_a_sender_says_it_cannot_start_one() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A backend whose terminals have all gone — it is waiting out their grace —
+/// has nowhere to put a page, and says `nowhere`; the sender then starts a
+/// terminal of its own, as it does with nobody listening, and with no
+/// terminal to start one in says so.
+#[test]
+fn a_backend_with_no_window_answers_nowhere_and_the_sender_starts_one() {
+    let dir = scratch("nowhere");
+    let mut listener = Listener::bind(&dir).expect("listening");
+    let child = sender(&dir, &["example.com"]);
+    let delivery = first_delivery(&mut listener);
+    assert_eq!(delivery.lines, [Ok("https://example.com".to_string())]);
+    delivery.nowhere();
+    let output = child.wait_with_output().expect("it exits");
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("not a terminal"), "{stderr}");
+    assert!(stderr.contains(&dir.display().to_string()), "{stderr}");
+    drop(listener);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn remote_with_no_url_is_a_mistake_on_the_command_line() {
     let output = blinkterm(&["--no-config", "--remote"])

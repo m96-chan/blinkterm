@@ -1244,6 +1244,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pgid_marker_names_a_group_and_an_executable() {
+        assert_eq!(
+            parse_pgid_marker("4242\t1700000000\t/opt/chrome\n"),
+            Some((4242, PathBuf::from("/opt/chrome")))
+        );
+        assert_eq!(parse_pgid_marker(""), None);
+        assert_eq!(parse_pgid_marker("1\t0\t/x\n"), None, "never init's group");
+        assert_eq!(parse_pgid_marker("x\t0\t/x\n"), None);
+        assert_eq!(parse_pgid_marker("42\t0\t\n"), None);
+    }
+
+    /// What a backend killed outright leaves: a group still running on the
+    /// profile. The next backend's reap kills it and removes the marker; a
+    /// marker whose group is something else is only removed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_orphaned_engine_group_is_killed_and_a_stranger_left_alone() {
+        let dir = std::env::temp_dir().join(format!("blinkterm-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch profile");
+        // A stand-in engine: a shell whose command line names the profile.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30; true")
+            .arg(format!("--user-data-dir={}", dir.display()))
+            .stdin(Stdio::null());
+        let (mut child, target) = spawn_in_own_group(&mut command).expect("started");
+        let group = -target;
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(dir.join(PGID_FILE), format!("{group}\t0\t/bin/sh\n")).expect("marker");
+        assert_eq!(reap_orphan(&dir), Ok(()));
+        assert!(!dir.join(PGID_FILE).exists(), "the marker goes");
+        let status = child.wait().expect("reaped");
+        assert!(!status.success(), "it was killed: {status}");
+
+        // A group that is somebody else's: this test's own.
+        // SAFETY: `getpgrp(2)` takes nothing, reads no memory and cannot fail.
+        let ours = unsafe { libc::getpgrp() };
+        std::fs::write(dir.join(PGID_FILE), format!("{ours}\t0\t/bin/sh\n")).expect("marker");
+        assert_eq!(
+            reap_orphan(&dir),
+            Ok(()),
+            "and this test is still here to say so"
+        );
+        assert!(!dir.join(PGID_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_flags_are_the_ones_that_were_measured() {
         let plain = flags(false);
         let mut measured = vec![

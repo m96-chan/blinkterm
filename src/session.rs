@@ -264,6 +264,10 @@ enum Holder {
 struct Slot {
     holder: Holder,
     group: Group,
+    /// Its window went in this run: a group a window of this run closed or
+    /// lost, which a new window with nothing to restore must not take the
+    /// place of — it is the group a `--restore` or an offer is for.
+    went_here: bool,
 }
 
 /// The session file, the closed-tab stack, and what the last run left.
@@ -316,6 +320,7 @@ impl Session {
                 .map(|group| Slot {
                     holder: Holder::Unclaimed,
                     group,
+                    went_here: false,
                 })
                 .collect(),
             ..Session::in_memory()
@@ -494,7 +499,7 @@ impl Session {
             .or_else(|| {
                 self.slots
                     .iter()
-                    .position(|slot| slot.holder == Holder::Unclaimed)
+                    .position(|slot| slot.holder == Holder::Unclaimed && !slot.went_here)
             });
         let group = Group {
             state: GroupState::Live,
@@ -509,12 +514,33 @@ impl Session {
                 *slot = Slot {
                     holder: Holder::Window(window),
                     group,
+                    went_here: false,
                 };
             }
-            None => self.slots.push(Slot {
-                holder: Holder::Window(window),
-                group,
-            }),
+            None => {
+                // The file holds at most as many groups as are read back:
+                // past that, the oldest nobody holds goes, as the reader
+                // would drop it.
+                let unclaimed = self
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.holder == Holder::Unclaimed)
+                    .count();
+                if self.slots.len() >= MAX_GROUPS && unclaimed > 0 {
+                    if let Some(oldest) = self
+                        .slots
+                        .iter()
+                        .position(|slot| slot.holder == Holder::Unclaimed)
+                    {
+                        self.slots.remove(oldest);
+                    }
+                }
+                self.slots.push(Slot {
+                    holder: Holder::Window(window),
+                    group,
+                    went_here: false,
+                });
+            }
         }
         self.dirty = true;
         if self.due(now) {
@@ -626,6 +652,7 @@ impl Session {
             if slot.holder == Holder::Window(window) {
                 slot.holder = Holder::Unclaimed;
                 slot.group.state = how;
+                slot.went_here = true;
                 self.dirty = true;
             } else if slot.holder == Holder::Offered(window) {
                 slot.holder = Holder::Unclaimed;
@@ -687,6 +714,7 @@ fn claim(slot: &mut Slot, window: WindowId, dirty: &mut bool) -> Group {
     let was = slot.group.clone();
     slot.holder = Holder::Window(window);
     slot.group.state = GroupState::Live;
+    slot.went_here = false;
     // Written, even with the tabs unchanged: the group is live now, and a
     // crash from here on is this window's to be offered back.
     *dirty = true;
@@ -1076,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn open_windows_are_never_dropped_and_a_new_one_reuses_a_closed_ones_place() {
+    fn open_windows_are_never_dropped_and_past_the_cap_the_oldest_closed_group_goes() {
         let mut session = Session::in_memory();
         let t = Instant::now();
         let record = |session: &mut Session, n: u64| {
@@ -1092,13 +1120,24 @@ mod tests {
         assert_eq!(session.slots.len(), MAX_GROUPS + 1, "no open window goes");
         session.window_closed(WindowId(3));
         session.window_closed(WindowId(5));
-        // A new window takes the oldest unclaimed group's place.
+        // A new window does not take the place of a group closed in this
+        // run; past the cap, the oldest closed one goes to make room.
         record(&mut session, 50);
         assert_eq!(session.slots.len(), MAX_GROUPS + 1);
-        assert_eq!(session.slots[2].holder, Holder::Window(WindowId(50)));
+        assert_eq!(
+            session.slots.last().map(|slot| slot.holder),
+            Some(Holder::Window(WindowId(50)))
+        );
+        assert_eq!(
+            session.slots[3].group.snapshot.tabs[0].url,
+            "https://example.com/5"
+        );
         record(&mut session, 51);
         assert_eq!(session.slots.len(), MAX_GROUPS + 1);
-        assert_eq!(session.slots[4].holder, Holder::Window(WindowId(51)));
+        assert_eq!(
+            session.slots.last().map(|slot| slot.holder),
+            Some(Holder::Window(WindowId(51)))
+        );
         assert!(session
             .slots
             .iter()
@@ -1169,6 +1208,67 @@ mod tests {
         assert_eq!(
             next.next_group().map(|g| g.snapshot.tabs[0].url.as_str()),
             Some("https://old2.example/")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Several windows in one backend: a window closed, or lost, while the
+    /// backend runs keeps its group for `--restore` or the offer, and a new
+    /// window with nothing to restore records beside it rather than over
+    /// it; a group from a previous run is still the one it replaces.
+    #[test]
+    fn a_window_closed_in_this_run_keeps_its_group_from_the_next_new_window() {
+        let dir = scratch("this-run");
+        std::fs::write(
+            dir.join(FILE),
+            Session::render(&[group(GroupState::Closed, &["https://old.example/"])]),
+        )
+        .expect("the last run's");
+        let mut session = Session::load(&dir);
+        let t = Instant::now();
+        let (one, two, three) = (WindowId(1), WindowId(2), WindowId(3));
+        session.record_window(one, snapshot(&["https://one.example/"], 0), t);
+        session.record_window(two, snapshot(&["https://two.example/"], 0), t);
+        session.window_closed(one);
+        session.window_lost(two);
+        let saved = on_disk(&dir).expect("written");
+        assert_eq!(
+            first_urls(&saved),
+            ["https://one.example/", "https://two.example/"]
+        );
+        assert_eq!(states(&saved), [GroupState::Closed, GroupState::Lost]);
+        // A third window, with nothing to restore, is offered nothing for
+        // the closed group and records a group of its own.
+        assert_eq!(
+            plan_for_window(session.next_group(), false),
+            Plan::default()
+        );
+        session.record_window(three, snapshot(&["https://three.example/"], 0), t);
+        session.window_closed(three);
+        let saved = on_disk(&dir).expect("written");
+        assert_eq!(
+            first_urls(&saved),
+            [
+                "https://one.example/",
+                "https://two.example/",
+                "https://three.example/"
+            ]
+        );
+        assert_eq!(
+            states(&saved),
+            [GroupState::Closed, GroupState::Lost, GroupState::Closed]
+        );
+        // --restore takes them one window at a time, oldest first.
+        let mut next = Session::load(&dir);
+        assert_eq!(
+            next.take_group(WindowId(1))
+                .map(|g| g.snapshot.tabs[0].url.clone()),
+            Some("https://one.example/".to_string())
+        );
+        assert_eq!(
+            next.take_group(WindowId(2))
+                .map(|g| g.snapshot.tabs[0].url.clone()),
+            Some("https://two.example/".to_string())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

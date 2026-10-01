@@ -751,6 +751,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A backend with no terminal attached answers `nowhere`, which the
+    /// sender reads as nobody there: it starts a terminal of its own.
+    #[test]
+    fn nowhere_to_open_it_is_nobody_there_to_the_sender() {
+        let dir = scratch("nowhere");
+        let mut listener = Listener::bind(&dir).expect("bound");
+        let sender = {
+            let dir = dir.clone();
+            std::thread::spawn(move || deliver(&dir, &urls(&["example.com"])))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let delivery = loop {
+            let mut taken = listener.accept_ready().expect("accepting");
+            if !taken.is_empty() {
+                break taken.remove(0);
+            }
+            assert!(Instant::now() < deadline, "nobody connected");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        delivery.nowhere();
+        assert_eq!(sender.join().unwrap(), Ok(Delivered::NobodyThere));
+        drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn with_nobody_listening_deliver_says_so() {
         let dir = scratch("nobody");

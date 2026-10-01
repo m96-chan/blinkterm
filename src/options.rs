@@ -1345,6 +1345,37 @@ mod tests {
         parse_config(Path::new("/c"), text)
     }
 
+    /// The backend's hidden options: `--serve-fd` makes a run a backend,
+    /// and `--grace-ms` and `--profile-label` mean something only beside it.
+    #[test]
+    fn the_backends_options_are_hidden_and_need_serve_fd() {
+        let options = resolved(&[
+            "--profile",
+            "/p",
+            "--serve-fd",
+            "3",
+            "--grace-ms",
+            "250",
+            "--profile-label",
+            "Work",
+        ])
+        .expect("a backend");
+        assert_eq!(options.serve, Some(3));
+        assert_eq!(options.grace, Some(std::time::Duration::from_millis(250)));
+        assert_eq!(options.profile_label.as_deref(), Some("Work"));
+        assert_eq!(resolved(&[]).expect("a run").serve, None);
+        assert_eq!(
+            parsed(&["--grace-ms", "5"]).unwrap_err(),
+            "unknown option: --grace-ms"
+        );
+        assert_eq!(
+            parsed(&["--profile-label", "x"]).unwrap_err(),
+            "unknown option: --profile-label"
+        );
+        assert!(parsed(&["--serve-fd", "1"]).is_err(), "not stdout");
+        assert!(parsed(&["--serve-fd", "x"]).is_err());
+    }
+
     // The command line.
 
     #[test]
