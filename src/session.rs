@@ -440,6 +440,24 @@ impl Session {
             .map(|slot| &slot.group)
     }
 
+    /// The group a new window would be given or offered, for
+    /// [`plan_for_window`] with the same `restore`: with `--restore` the
+    /// oldest nobody has claimed ([`Session::next_group`]), whatever way it
+    /// ended; without, the oldest unclaimed one that was not closed — the one
+    /// [`Session::offer_group`] offers — so that a closed group, which waits
+    /// for a `--restore`, does not hide a lost one behind it. Falls back to
+    /// [`Session::next_group`] when every unclaimed group was closed.
+    pub fn next_group_for(&self, restore: bool) -> Option<&Group> {
+        if restore {
+            return self.next_group();
+        }
+        self.slots
+            .iter()
+            .find(|slot| slot.holder == Holder::Unclaimed && offerable(&slot.group))
+            .map(|slot| &slot.group)
+            .or_else(|| self.next_group())
+    }
+
     /// The oldest unclaimed group, for a restore into `window`: it is that
     /// window's now, and stays where it is in the file, live, with the tabs
     /// it had until the window records its own. `None` when there is none.
@@ -454,15 +472,16 @@ impl Session {
         Some(claim(slot, window, &mut self.dirty))
     }
 
-    /// Put the oldest unclaimed group to `window` as a question: it is
-    /// promised to that window, no other is offered it, and the window
-    /// records nothing until [`Session::take_offered`] — the file keeps
-    /// saying what is being offered. Nothing when there is no group.
+    /// Put the oldest unclaimed group that was not closed to `window` as a
+    /// question: it is promised to that window, no other is offered it, and
+    /// the window records nothing until [`Session::take_offered`] — the file
+    /// keeps saying what is being offered. Nothing when there is no such
+    /// group.
     pub fn offer_group(&mut self, window: WindowId) {
         if let Some(slot) = self
             .slots
             .iter_mut()
-            .find(|slot| slot.holder == Holder::Unclaimed)
+            .find(|slot| slot.holder == Holder::Unclaimed && offerable(&slot.group))
         {
             slot.holder = Holder::Offered(window);
         }
@@ -757,6 +776,12 @@ pub fn plan_for_window(saved_next: Option<&Group>, restore: bool) -> Plan {
         };
     }
     Plan::default()
+}
+
+/// Whether a window offers `group` without `--restore`: it has tabs, and
+/// its window did not quit.
+fn offerable(group: &Group) -> bool {
+    group.state != GroupState::Closed && !group.snapshot.tabs.is_empty()
 }
 
 /// The question on the row after an unclean exit.
@@ -1269,6 +1294,57 @@ mod tests {
             next.take_group(WindowId(2))
                 .map(|g| g.snapshot.tabs[0].url.clone()),
             Some("https://two.example/".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A window quit long ago, then a run crashed: a plain start offers the
+    /// crash's tabs, not nothing because the oldest group was closed, and
+    /// `--restore` still takes the oldest.
+    #[test]
+    fn a_closed_group_does_not_hide_a_lost_one_from_the_offer() {
+        let dir = scratch("closed-then-lost");
+        std::fs::write(
+            dir.join(FILE),
+            Session::render(&[
+                group(GroupState::Closed, &["https://quit.example/"]),
+                group(
+                    GroupState::Lost,
+                    &["https://a.example/", "https://b.example/"],
+                ),
+            ]),
+        )
+        .expect("two runs'");
+        let mut session = Session::load(&dir);
+        let next = session.next_group_for(false).expect("a group");
+        assert_eq!(next.snapshot.tabs[0].url, "https://a.example/");
+        assert_eq!(
+            plan_for_window(session.next_group_for(false), false).offer,
+            Some(Offer { tabs: 2 })
+        );
+        assert_eq!(
+            session
+                .next_group_for(true)
+                .map(|g| g.snapshot.tabs[0].url.as_str()),
+            Some("https://quit.example/")
+        );
+        session.offer_group(ONE);
+        let offered = session.take_offered(ONE).expect("the lost one");
+        assert_eq!(offered.snapshot.tabs[0].url, "https://a.example/");
+        // Only the closed one is left: nothing to offer, kept for --restore.
+        assert_eq!(
+            plan_for_window(session.next_group_for(false), false),
+            Plan::default()
+        );
+        session.offer_group(TWO);
+        assert_eq!(
+            session.take_offered(TWO),
+            None,
+            "a closed group is not offered"
+        );
+        assert_eq!(
+            session.take_group(TWO).map(|g| g.snapshot.tabs[0].url.clone()),
+            Some("https://quit.example/".to_string())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
