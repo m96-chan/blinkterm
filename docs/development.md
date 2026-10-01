@@ -72,9 +72,11 @@ at its own size and with its own input; one closed and the other painting;
 the last one closed stopping the engine, the lock released and a cookie
 kept for the next start; `--remote` reaching the window used last; a second
 profile with an engine and a cookie jar of its own; a frontend that vanishes
-and whose tabs are offered to the next window after the grace; and a link
+and whose tabs are offered to the next window after the grace; a link
 middle-clicked in two windows at once landing in each window it was clicked
-in. Engine-gated like `tests/engine.rs`, one at a time:
+in; and a link that drops taken back with `frontend::reattach` and the same
+nonce (#103): the same backend, nothing started, `opened` resumed, the same
+window with its tabs, and one window in the session. Engine-gated like `tests/engine.rs`, one at a time:
 
 ```sh
 BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
@@ -120,7 +122,15 @@ second pane on the same named profile gets its own row with the profile's
 name, closing one pane leaves the other drawing, and a pane whose terminal
 closes (the master end dropped, a hang-up) or whose frontend is killed costs
 only its own window — the last one after the full fifteen-second grace,
-which makes that test take about twenty seconds. On a Mac the frames go
+which makes that test take about twenty seconds — and a backend killed
+under a pane ends it at once, not after the fifteen seconds a frontend
+gives a backend that is still there, with the sentence and a status that
+is not success. The frontend's own taking back of a dropped link — its
+`resume`, with what was typed in the gap dropped — has no test that drives
+it: a real frontend's connection cannot be cut from outside without killing
+one end, and the pieces it is made of (`reattach`, `Link::dropped`, a
+`closed` read before the end) are tested in `src/frontend.rs` and
+`tests/windows.rs`. On a Mac the frames go
 inline (the tests set `SSH_CONNECTION`), because the terminal's reader looks
 for shared memory under `/dev/shm`. CI's macOS job runs both files beside the
 engine suite.

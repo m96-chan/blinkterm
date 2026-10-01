@@ -379,7 +379,10 @@ emulator killed, an ssh connection dropped — is kept for fifteen seconds,
 its page no longer painting, and then closed; its tabs are kept in the
 session as a lost window, and the next window opened on the profile is
 offered them (`restore 3 tabs from last time? y/n`). The other windows are
-not touched. A different profile is a different backend with an engine of
+not touched. The other way round, a terminal whose connection to the
+backend drops while the backend is still running reconnects within those
+fifteen seconds and carries on in the same window, redrawn; keys typed
+while it was cut off are dropped rather than sent late. A different profile is a different backend with an engine of
 its own, sharing nothing.
 
 The settings that are about the engine as a whole (the engine, its
@@ -493,7 +496,11 @@ What they mean, and what to do:
 - `the blinkterm serving <dir> stopped unexpectedly; what it said is in
   <dir>/backend.log` — the process holding the profile and the engine went
   without a word: killed, or crashed. Each window on the profile ends with
-  this; `backend.log` has its last words. The next start cleans up after it
+  this; `backend.log` has its last words. A window whose connection drops
+  while that process is still running tries for fifteen seconds to take
+  the window back, and carries on in it if it can; this is said at once
+  when nothing holds the profile any more, and otherwise once the fifteen
+  seconds are out. The next start cleans up after it
   — the old engine is stopped first if any of it is still running — and
   offers the tabs back.
 - `the blinkterm serving <dir> stopped: <why>` — it stopped on purpose,
