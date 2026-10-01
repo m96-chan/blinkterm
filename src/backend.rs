@@ -64,8 +64,14 @@
 //! page stops casting and the window waits [`GRACE`] for a frontend that
 //! resumes it by its nonce; after that its tabs are the session's lost group,
 //! offered to the next window, and the window goes. A frontend that says
-//! `close` — `ctrl+q`, a hang-up — closes its window at once and its tabs
-//! become a closed group for a later `--restore`. When no window is left and
+//! `close` closes its window at once, and what its tabs become depends on
+//! why: a hang-up, or its terminal's input ending, is the same vanishing as
+//! the silent kind, only heard sooner, so the group is lost and offered to
+//! the next window as after a crash. Only a quit — `ctrl+q`, the last tab
+//! closing — makes a closed group, left for a later `--restore`. Closing the
+//! terminal's tab, or losing the ssh session it ran in, is not a decision
+//! about the tabs, and the next start should not act as if it were (#106).
+//! When no window is left and
 //! nobody is attaching, the backend stops the way a run always stopped:
 //! the session written, the downloads cancelled, `Browser.close` and a wait
 //! for the cookie jar to be written, the sockets removed, and the profile
@@ -703,9 +709,12 @@ struct Attaching {
 
 /// Why a window is going.
 enum Going {
-    /// Its frontend asked: `ctrl+q`, a hang-up; or its last tab closed. The
-    /// group is closed.
+    /// The person quit it: `ctrl+q`, or its last tab closed. The group is
+    /// closed.
     Quit,
+    /// Its terminal went — a hang-up, or its input ended. Not a quit: the
+    /// group is lost, offered to the next window as after a crash.
+    HungUp,
     /// Something went wrong for it alone; its frontend is told why and its
     /// group is lost, to be offered again.
     Failed(String),
@@ -1321,8 +1330,11 @@ impl Backend {
                         }
                     },
                     ToBackend::Close { why } => {
-                        let _ = why == CloseWhy::Quit;
-                        going.push((index, Going::Quit));
+                        let going_how = match why {
+                            CloseWhy::Quit => Going::Quit,
+                            CloseWhy::Hangup | CloseWhy::Terminal => Going::HungUp,
+                        };
+                        going.push((index, going_how));
                         break;
                     }
                     ToBackend::Ping => slot.term.send(&ToFrontend::Pong),
@@ -1623,7 +1635,7 @@ impl Backend {
     }
 
     /// The windows at `going`, each told why and gone: a quit closes its
-    /// group, a failure leaves it lost.
+    /// group, a hang-up or a failure leaves it lost.
     fn close_windows(&mut self, mut going: Vec<(usize, Going)>) {
         going.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
         going.dedup_by_key(|(index, _)| *index);
@@ -1636,6 +1648,11 @@ impl Backend {
             let (sentence, exit) = match why {
                 Going::Quit => {
                     self.shared.session.window_closed(id);
+                    (String::new(), 0)
+                }
+                Going::HungUp => {
+                    eprintln!("blinkterm: window {} hung up; its tabs are saved", id.0);
+                    self.shared.session.window_lost(id);
                     (String::new(), 0)
                 }
                 Going::Failed(why) => {

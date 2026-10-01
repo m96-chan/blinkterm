@@ -430,7 +430,8 @@ each come back as themselves. A window closed with `ctrl+q` is a `closed`
 group, which `--restore` reopens; a window whose terminal went away without
 a word (the terminal killed, an ssh link dropped) is kept for fifteen seconds
 in case it comes back, and is then a `lost` group, which the next window
-opened is offered. Each new window takes one group, the oldest first: a
+opened is offered; a window whose terminal hung up on it (its tab or window
+closed, the ssh session ended) is a `lost` group at once. Each new window takes one group, the oldest first: a
 second `blinkterm --restore` on a profile whose first window restored one
 group restores the next, never the same one twice. A new window with nothing
 to restore records its tabs in a group of its own, beside the ones closed

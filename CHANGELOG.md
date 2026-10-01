@@ -78,6 +78,11 @@ flag, a different default, a raised Rust floor all do.
 
 ### Fixed
 
+- Closing the terminal under a window — its tab or window closed, an ssh
+  session dropped — no longer counts as `ctrl+q`: its tabs are offered at
+  the next start, as a crash's are. Only `ctrl+q`, or `ctrl+w` on the last
+  tab, leaves tabs for `--restore` alone
+  ([#106](https://github.com/m96-chan/blinkterm/issues/106)).
 - A second blinkterm started while a backend runs, or two started at once,
   no longer empties `backend.log`: only the backend that takes the profile
   starts a fresh log, and keeps the previous one as `backend.log.1`

@@ -382,6 +382,15 @@ offered them (`restore 3 tabs from last time? y/n`). The other windows are
 not touched. A different profile is a different backend with an engine of
 its own, sharing nothing.
 
+Which tabs are offered back follows one rule: only `ctrl+q`, or `ctrl+w` on
+the last tab, is a quit. A window closed that way is kept as a closed group,
+which the next start does not mention and `blinkterm --restore` reopens.
+Every other way a window goes — the terminal's tab or window closed under
+it, an ssh session dropped, the frontend killed — is not a quit, whether the
+backend hears a hang-up at once or notices only after the fifteen seconds:
+its tabs are a lost group, and the next window opened on the profile is
+offered them, exactly as after a crash.
+
 The settings that are about the engine as a whole (the engine, its
 arguments, the user agent, the proxy, the download directory, the block
 lists, the site files, the console) are set by the first terminal on a
