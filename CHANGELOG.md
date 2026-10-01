@@ -29,6 +29,18 @@ flag, a different default, a raised Rust floor all do.
   only forgets a `--dir` one. `blinkterm --remote --profile-name Work <url>`
   reaches the blinkterm on that profile, and `--remote` never asks
   ([#83](https://github.com/m96-chan/blinkterm/issues/83)).
+- **Several terminals, one profile.** Starting `blinkterm` in a second
+  terminal on a profile that is in use opens a window of its own there
+  instead of being refused: its own tabs, tab in front, url bar, prompts,
+  size and keys, with the profile's cookies, logins, history and bookmarks,
+  on the one engine the profile has. Each terminal is a window; closing one
+  leaves the others. The first terminal starts a background process for the
+  profile, its backend, which runs the engine and keeps the windows, and
+  which stops by itself — writing the cookie jar first — when the last
+  window closes; its standard error is `<profile>/backend.log`. A window
+  whose terminal vanishes is kept fifteen seconds, then closed, and its tabs
+  offered to the next window. A different profile is a different backend
+  and engine ([#83](https://github.com/m96-chan/blinkterm/issues/83)).
 
 ### Changed
 
@@ -43,8 +55,26 @@ flag, a different default, a raised Rust floor all do.
   before it wrote them to the shared file
   ([#83](https://github.com/m96-chan/blinkterm/issues/83)).
 - The session file groups its tabs under a `# window` line, after a
-  `# format: 2` line. Nothing changes in what is restored or offered; an
-  older blinkterm still reads the file.
+  `# format: 2` line, one group per window; `--restore` and the offer after
+  a crash take one group per new window, oldest first. An older blinkterm
+  still reads the file.
+- **`ctrl+q` closes this window**, not every window on the profile; the
+  last one closed stops the profile's engine as quitting did.
+- **`--remote` goes to the window used last** on the profile; a profile
+  whose windows have all lost their terminals answers `nowhere`, and the
+  sender starts a window of its own.
+- **Browser-wide settings are the first terminal's.** The engine and its
+  arguments, the user agent, the proxy, `--mute`, the download directory,
+  the block lists, the site files and the console are set by the terminal
+  that starts a profile's backend; a later terminal asking for different
+  ones is refused with the setting named. Every other setting is each
+  window's own.
+- A profile held by a `blinkterm` from before this one is waited for for
+  thirty seconds and then refused with the pid that holds it.
+- Quitting no longer waits the two seconds the engine takes to write its
+  cookie jar: the backend does that after the terminal is given back.
+- A site file that is refused is said on the first window's row and in
+  `backend.log`, rather than in the shell before the page.
 
 ## [0.4.0] - 2026-10-01
 

@@ -705,7 +705,7 @@ pub fn valid_id(id: &str) -> bool {
 pub fn new_id(taken: &[Entry]) -> String {
     let mut salt = 0u64;
     loop {
-        let id = random_hex().unwrap_or_else(|| {
+        let id = random_hex(6).unwrap_or_else(|| {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
@@ -720,9 +720,11 @@ pub fn new_id(taken: &[Entry]) -> String {
     }
 }
 
-/// Six random bytes as twelve hex characters, or `None`.
-fn random_hex() -> Option<String> {
-    let mut bytes = [0u8; 6];
+/// `count` random bytes from `/dev/urandom` as twice as many lowercase hex
+/// characters, or `None` when it cannot be read. Shared by the profile ids
+/// here and the window nonces of [`crate::ipc::new_nonce`].
+pub(crate) fn random_hex(count: usize) -> Option<String> {
+    let mut bytes = vec![0u8; count];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut bytes))
         .ok()?;

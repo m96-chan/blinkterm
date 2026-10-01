@@ -145,6 +145,14 @@ pub enum Choice {
     Pick,
 }
 
+/// What [`Profile::try_take_at`] found.
+#[derive(Debug)]
+pub enum TakeAt {
+    Taken(Profile),
+    /// Another process holds it; its pid, when it wrote one.
+    Held(Option<u32>),
+}
+
 /// A profile directory this program has the use of until the value is dropped.
 ///
 /// For a kept profile that means the lock; for a temporary one it means the
@@ -199,6 +207,30 @@ impl Profile {
             temporary: false,
             label,
         })
+    }
+
+    /// The profile at `dir`, made 0700 if it is not there, if nobody holds
+    /// it: [`TakeAt::Held`], with the holder's pid when it wrote one, when
+    /// somebody does. What a candidate backend tries first: losing is not an
+    /// error but a sign another backend is starting, which its frontend then
+    /// waits for ([`crate::frontend`]).
+    pub fn try_take_at(dir: PathBuf, label: Option<String>) -> Result<TakeAt, String> {
+        make_private_dir(&dir)?;
+        let mut file = match try_lock(&dir)? {
+            Tried::Taken(file) => file,
+            Tried::Held(pid) => return Ok(TakeAt::Held(pid)),
+        };
+        let _ = file
+            .set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)))
+            .and_then(|_| writeln!(file, "{}", std::process::id()))
+            .and_then(|()| file.flush());
+        Ok(TakeAt::Taken(Profile {
+            dir,
+            lock: Some(file),
+            temporary: false,
+            label,
+        }))
     }
 
     /// Where `choice` points, without making it or taking it; `None` for a

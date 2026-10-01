@@ -12,6 +12,9 @@ blinkterm https://example.com
 blinkterm localhost:3000       # this machine gets http://, everything else https://
 ```
 
+Start it again in another terminal and that terminal gets a window of its
+own — its own tabs, the same logins — on the same engine.
+
 ## Philosophy
 
 - **The engine renders, the terminal displays, and blinkterm is the wire
@@ -83,13 +86,14 @@ inside tmux (with `set -g allow-passthrough on`) and over ssh.
 | find in the page | `ctrl+f` | `ctrl+f` |
 | reader mode | `alt+r` | `cmd+shift+r` |
 | zoom in / out / reset | `alt+=` / `alt+-` / `alt+0` | `ctrl+=` / `ctrl+-` / `ctrl+0` |
-| quit | `ctrl+q` | `ctrl+q` |
+| close this window | `ctrl+q` | `ctrl+q` |
 
 The Mac keys arrive in a stock Kitty on macOS, where Kitty keeps most `cmd`
 chords and Option is not `alt`; they are the default there (`keymap = mac`),
 and [On a Mac](docs/usage.md#on-a-mac) has the rest.
 
-Everything else — named profiles (`blinkterm profiles`, `--profile-name`),
+Everything else — several terminals on one profile, named profiles
+(`blinkterm profiles`, `--profile-name`),
 history, bookmarks, downloads, ad blocking,
 password managers, the page's console, site styles and scripts, rebinding
 keys — is in the docs.
@@ -97,7 +101,7 @@ keys — is in the docs.
 ## Docs
 
 - [Installing](docs/install.md): the engine, per platform, and Homebrew
-- [Using blinkterm](docs/usage.md): every key, the status row, opening urls from other programs
+- [Using blinkterm](docs/usage.md): every key, the status row, several terminals on one profile, opening urls from other programs
 - [Settings and profiles](docs/configuration.md): the config file, rebinding keys, profiles, history, the session
 - [Features](docs/features.md): ad blocking, downloads, the console, uploads, password managers, the desktop browser, reader mode, sound and permissions, site styles and scripts
 - [How it works](docs/design.md): the numbers, terminals, tmux and ssh, what a page is told

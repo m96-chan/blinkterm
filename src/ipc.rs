@@ -9,8 +9,7 @@
 //! pickers, password commands, the external browser). This module is the
 //! wire between the two, and nothing else: the messages, their framing, the
 //! socket a backend listens on, and a writer that never blocks the loop that
-//! feeds it. Nothing in the binary uses it yet; the backend and the frontend
-//! that will are the next step.
+//! feeds it. [`crate::backend`] and [`crate::frontend`] are the two ends.
 //!
 //! # Framing
 //!
@@ -269,6 +268,9 @@ pub struct RouteFlags {
     pub png: bool,
     pub keyed: bool,
     pub alpha: Option<u8>,
+    /// The motion cast's `everyNthFrame`, from the frame-rate cap
+    /// ([`crate::route::Route::every_nth`]); 1 is every frame.
+    pub every_nth: u32,
 }
 
 /// Why a frontend is closing its window.
@@ -1156,6 +1158,7 @@ impl Wire for ToBackend {
                             ("png", Json::Bool(open.route.png)),
                             ("keyed", Json::Bool(open.route.keyed)),
                             ("alpha", open.route.alpha.map_or(Json::Null, Json::number)),
+                            ("every_nth", Json::number(open.route.every_nth)),
                         ]),
                     ),
                     ("pixel_mouse", Json::Bool(open.pixel_mouse)),
@@ -1258,6 +1261,9 @@ impl Wire for ToBackend {
                         png: boolean(route, "png")?,
                         keyed: boolean(route, "keyed")?,
                         alpha,
+                        every_nth: u32::try_from(whole(field(route, "every_nth")?, "every_nth")?)
+                            .map_err(|_| bad("every_nth"))?
+                            .max(1),
                     },
                     pixel_mouse: boolean(h, "pixel_mouse")?,
                     urls: strings(h, "urls")?,
@@ -1434,6 +1440,22 @@ impl Wire for ToFrontend {
             other => return Err(unknown(other)),
         })
     }
+}
+
+/// A fresh nonce for [`Open::nonce`]: eight bytes of `/dev/urandom`, or,
+/// where that cannot be read, the clock, the pid and a counter, which are
+/// unique enough for the windows of one machine's terminals.
+pub fn new_nonce() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::registry::random_hex(8).unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or_default();
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mixed = nanos ^ (u64::from(std::process::id()) << 32) ^ count.rotate_left(17);
+        format!("{mixed:016x}")
+    })
 }
 
 /// Whether `text` is a nonce as [`Open::nonce`] has it: sixteen lowercase
@@ -2174,6 +2196,7 @@ mod tests {
                 png: false,
                 keyed: true,
                 alpha: Some(40),
+                every_nth: 2,
             },
             pixel_mouse: true,
             urls: vec!["example.com".to_string(), "über.example/ü".to_string()],

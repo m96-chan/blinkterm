@@ -33,7 +33,7 @@
 | `alt+shift+r` | read the site styles and scripts again: the row says `site files: 2 styles, 1 script`; styles change the page where it stands, scripts from the next load. See [Site styles and scripts](features.md#site-styles-and-scripts) |
 | `alt+l` | fill the login form from your password manager: runs `password-command` for this page's host and puts what it printed into the password field and the user-name field before it, in the page or a same-origin frame; never submits; only on https or localhost. See [Filling a login from your password manager](features.md#filling-a-login-from-your-password-manager) |
 | `alt+r` | reader mode: the article alone — its title, byline, text, pictures and links — at a readable width, in the page's colour scheme; `alt+r` again puts the page back where it was. The row says `reader` while it is on, and a page with no article says `no article on this page`. See [Reader mode](features.md#reader-mode) |
-| `ctrl+q` | quit |
+| `ctrl+q` | close this window (the other windows on the profile stay) |
 | a page's dialog | its `alert`, `confirm`, `prompt` or "leave this page?" takes the top row: any key for an alert, `y`/`n` for a question, or type and `enter` for a prompt; `esc` says no |
 | a page's file input | click it: the row asks for a path — `tab` completes names, `~` is home, one path per `enter` when the page takes several and an empty `enter` sends them; `esc` sends nothing |
 | `esc` | while a page is fullscreen and nothing else has the row, leave fullscreen; while a page is loading, stop it |
@@ -339,15 +339,60 @@ tabs are back in the same order with the same one in front, loading again,
 the others loading when they are next looked at. What was being typed in the
 url bar stays; a download that was coming says it did not arrive, and scroll
 positions, form contents and a login made in the last half minute are lost,
-as with `--restore`. If it dies again within a minute, or cannot be started,
-`blinkterm` exits, and the message says how many tabs were saved and that
-`blinkterm --restore` reopens them; the next plain start offers to.
+as with `--restore`. Every window on the profile comes back with its own
+tabs. If it dies again within a minute, or cannot be started, every window
+on the profile closes, and the message says how many tabs were saved and
+that `blinkterm --restore` reopens them; the next plain start offers to.
 
 To know what is under the pointer the terminal is asked to report every
 mouse movement, not only presses (`?1003h`), so the page now sees the
 pointer move — hover styling and tooltips work — at the cost of one small
 command to the engine per screen refresh while it moves and nothing while
 it rests.
+
+## Several terminals, one profile
+
+Start `blinkterm` in a second terminal on a profile a first one is using and
+it opens a window of its own: the same cookies and logins, the same history
+and bookmarks, but its own tabs, its own tab in front, its own url bar and
+prompts, at its own size, answering its own keys. A third terminal is a third
+window. Closing one — `ctrl+q`, or closing the terminal — closes that window
+and nothing else; the others go on as they were.
+
+```sh
+blinkterm https://mail.example      # in one terminal
+blinkterm https://docs.example      # in another: a second window, same login
+```
+
+What does this is one background process per profile, its *backend*, which
+the first terminal starts and which runs the engine and keeps every window:
+one engine for the profile however many terminals are on it, as one cookie
+database needs. It has no terminal and no window of its own, and it stops by
+itself when the last window on the profile is closed — after asking the
+engine to write its cookies and waiting the two seconds or so that takes,
+which it does on its own once your terminal has been given back. So there is
+no daemon to manage and nothing left running. A terminal started while it is
+in those two seconds waits for it to finish, then starts a fresh one.
+
+A window whose terminal disappears without closing it — the terminal
+emulator killed, an ssh connection dropped — is kept for fifteen seconds,
+its page no longer painting, and then closed; its tabs are kept in the
+session as a lost window, and the next window opened on the profile is
+offered them (`restore 3 tabs from last time? y/n`). The other windows are
+not touched. A different profile is a different backend with an engine of
+its own, sharing nothing.
+
+The settings that are about the engine as a whole (the engine, its
+arguments, the user agent, the proxy, the download directory, the block
+lists, the site files, the console) are set by the first terminal on a
+profile; a second one asking for different ones is refused with the setting
+named. Every other setting is each window's own. See
+[Several terminals on one profile](configuration.md#several-terminals-on-one-profile).
+
+When something goes wrong that the row cannot say, the backend's standard
+error is `backend.log` in the profile directory: the engine's own warnings,
+and a line for each window that lost its terminal or page that was closed
+because no window could be shown to have asked for it.
 
 ## Opening a url from another program
 
@@ -364,7 +409,10 @@ git web--browse https://example.com
 
 `blinkterm --remote <url>…` hands the urls to the `blinkterm` already running
 on the same profile, which opens the first as a new tab in front and the rest
-behind it, and exits at once with 0. With none running it starts as usual,
+behind it — in the window you last typed in or clicked, when the profile has
+several — and exits at once with 0. A profile whose windows have all just
+lost their terminals has nowhere to put a page, says so (`nowhere`), and the
+sender starts a window of its own as if none were running. With none running it starts as usual,
 with those urls — so the same `$BROWSER` works whether one is open or not, as
 long as there is a terminal to start one in; with no terminal (a desktop's
 `xdg-open`) it says there is nobody to hand the url to, and exits 1.

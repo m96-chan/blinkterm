@@ -97,6 +97,10 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The schemes a sender may open: the ones a page from a link can be.
 pub const SCHEMES: [&str; 4] = ["http", "https", "file", "about"];
 
+/// The whole answer of a blinkterm with no window to open a url in: see
+/// [`Delivery::nowhere`].
+pub const NOWHERE: &str = "nowhere";
+
 /// The name the fallback directory starts with, so that the next bind can
 /// tell one it made from anything else a link could point into.
 const FALLBACK_PREFIX: &str = "blinkterm-sock-";
@@ -396,6 +400,14 @@ impl Delivery {
         }
     }
 
+    /// Say there is nowhere to open anything — a backend with no terminal
+    /// attached — and hang up: the sender starts a terminal of its own, as it
+    /// does with nobody listening at all ([`Delivered::NobodyThere`]).
+    pub fn nowhere(mut self) {
+        let _ = self.stream.write_all(format!("{NOWHERE}\n").as_bytes());
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
     /// Say what became of each line — `opened` is [`Delivery::lines`] after
     /// the opening, one for one — and hang up. A sender that has gone is not
     /// an error: the tabs are open whether it hears so or not.
@@ -532,6 +544,12 @@ pub fn deliver(profile: &Path, urls: &[String]) -> Result<Delivered, String> {
         if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
             return Ok(Delivered::NoAnswer);
         }
+    }
+    // A blinkterm with no terminal attached has nowhere to put a page, and
+    // says so before anything else: the sender starts one, as with nobody
+    // there.
+    if String::from_utf8_lossy(&answer).lines().next() == Some(NOWHERE) {
+        return Ok(Delivered::NobodyThere);
     }
     let replies: Vec<Checked> = String::from_utf8_lossy(&answer)
         .lines()
@@ -729,6 +747,31 @@ mod tests {
         };
         serve_once(&mut listener);
         assert_eq!(sender.join().unwrap(), Ok(Delivered::Opened));
+        drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A backend with no terminal attached answers `nowhere`, which the
+    /// sender reads as nobody there: it starts a terminal of its own.
+    #[test]
+    fn nowhere_to_open_it_is_nobody_there_to_the_sender() {
+        let dir = scratch("nowhere");
+        let mut listener = Listener::bind(&dir).expect("bound");
+        let sender = {
+            let dir = dir.clone();
+            std::thread::spawn(move || deliver(&dir, &urls(&["example.com"])))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let delivery = loop {
+            let mut taken = listener.accept_ready().expect("accepting");
+            if !taken.is_empty() {
+                break taken.remove(0);
+            }
+            assert!(Instant::now() < deadline, "nobody connected");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        delivery.nowhere();
+        assert_eq!(sender.join().unwrap(), Ok(Delivered::NobodyThere));
         drop(listener);
         std::fs::remove_dir_all(&dir).ok();
     }

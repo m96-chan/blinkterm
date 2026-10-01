@@ -86,7 +86,7 @@ pub const NORMAL_NOT_REMAPPABLE_YET: &str =
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
     /// The pages to open, one tab each, the first in front. Empty means
-    /// `home`. Not yet normalised: `app::drive` does that, as it did.
+    /// `home`. Not yet normalised: the window's backend does that.
     pub urls: Vec<String>,
     /// `home`: the page a run with no url opens. `about:blank` unless said.
     pub home: String,
@@ -154,6 +154,18 @@ pub struct Options {
     /// is not listened to, and `ctrl+shift+j` says so. See
     /// [`crate::console`].
     pub console: bool,
+    /// `--serve-fd <n>`, hidden: this process is a profile's backend, started
+    /// by a frontend with its end of a socket pair at descriptor `n`. Command
+    /// line only, and never typed by a person. See [`crate::backend`].
+    pub serve: Option<i32>,
+    /// `--grace-ms <n>`, hidden and only beside `--serve-fd`: how long a
+    /// window whose terminal vanished is kept for it to come back, for the
+    /// tests; [`crate::backend::GRACE`] otherwise.
+    pub grace: Option<std::time::Duration>,
+    /// `--profile-label <name>`, hidden and only beside `--serve-fd`: the
+    /// profile's name for the row, as the frontend that started the backend
+    /// resolved it ([`crate::registry::Selected::label`]).
+    pub profile_label: Option<String>,
 }
 
 /// What `main` was asked to do, once the command line has been read.
@@ -273,6 +285,11 @@ pub struct Settings {
     /// `--remote`. Command line only: it says what this one run is for, and
     /// a settings file that made every run a sender would never start one.
     pub remote: Option<bool>,
+    /// `--serve-fd`, `--grace-ms`, `--profile-label`: command line only,
+    /// hidden, a backend's. See [`Options::serve`].
+    pub serve_fd: Option<i32>,
+    pub grace_ms: Option<u64>,
+    pub profile_label: Option<String>,
 }
 
 impl Settings {
@@ -332,6 +349,9 @@ impl Settings {
             config: self.config.or(under.config),
             what: self.what.or(under.what),
             remote: self.remote.or(under.remote),
+            serve_fd: self.serve_fd.or(under.serve_fd),
+            grace_ms: self.grace_ms.or(under.grace_ms),
+            profile_label: self.profile_label.or(under.profile_label),
         }
     }
 }
@@ -636,6 +656,32 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
             once(&mut s.home, home.to_string(), "one home page at a time")?;
             continue;
         }
+        // The backend's own, hidden: see [`Options::serve`].
+        if let Some(text) = value_of(arg, "--serve-fd", &mut args) {
+            let fd = text
+                .parse::<i32>()
+                .ok()
+                .filter(|fd| *fd > 2)
+                .ok_or_else(|| format!("--serve-fd needs a descriptor above 2, not {text:?}"))?;
+            once(&mut s.serve_fd, fd, "--serve-fd once is enough")?;
+            continue;
+        }
+        if let Some(text) = value_of(arg, "--grace-ms", &mut args) {
+            let ms = text
+                .parse::<u64>()
+                .map_err(|_| format!("--grace-ms needs milliseconds, not {text:?}"))?;
+            once(&mut s.grace_ms, ms, "--grace-ms once is enough")?;
+            continue;
+        }
+        if let Some(label) = value_of(arg, "--profile-label", &mut args) {
+            let label = needed(label, "--profile-label needs a name")?;
+            once(
+                &mut s.profile_label,
+                label.to_string(),
+                "--profile-label once is enough",
+            )?;
+            continue;
+        }
         if let Some(path) = value_of(arg, "--config", &mut args) {
             let path = needed(path, "--config needs a path")?;
             config_choice(&mut s, ConfigChoice::At(PathBuf::from(path)))?;
@@ -696,6 +742,15 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
                 return Err(format!("unknown option: {arg}"));
             }
             _ => s.urls.push(arg.clone()),
+        }
+    }
+    // Hidden, and a backend's alone: to anything else they are no option.
+    if s.serve_fd.is_none() {
+        if s.grace_ms.is_some() {
+            return Err("unknown option: --grace-ms".to_string());
+        }
+        if s.profile_label.is_some() {
+            return Err("unknown option: --profile-label".to_string());
         }
     }
     if s.remote == Some(true) {
@@ -1128,6 +1183,9 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
         },
         external_browser: s.external_browser,
         console: s.console.unwrap_or(true),
+        serve: s.serve_fd,
+        grace: s.grace_ms.map(std::time::Duration::from_millis),
+        profile_label: s.profile_label,
     })
 }
 
@@ -1285,6 +1343,37 @@ mod tests {
 
     fn file(text: &str) -> Result<Settings, String> {
         parse_config(Path::new("/c"), text)
+    }
+
+    /// The backend's hidden options: `--serve-fd` makes a run a backend,
+    /// and `--grace-ms` and `--profile-label` mean something only beside it.
+    #[test]
+    fn the_backends_options_are_hidden_and_need_serve_fd() {
+        let options = resolved(&[
+            "--profile",
+            "/p",
+            "--serve-fd",
+            "3",
+            "--grace-ms",
+            "250",
+            "--profile-label",
+            "Work",
+        ])
+        .expect("a backend");
+        assert_eq!(options.serve, Some(3));
+        assert_eq!(options.grace, Some(std::time::Duration::from_millis(250)));
+        assert_eq!(options.profile_label.as_deref(), Some("Work"));
+        assert_eq!(resolved(&[]).expect("a run").serve, None);
+        assert_eq!(
+            parsed(&["--grace-ms", "5"]).unwrap_err(),
+            "unknown option: --grace-ms"
+        );
+        assert_eq!(
+            parsed(&["--profile-label", "x"]).unwrap_err(),
+            "unknown option: --profile-label"
+        );
+        assert!(parsed(&["--serve-fd", "1"]).is_err(), "not stdout");
+        assert!(parsed(&["--serve-fd", "x"]).is_err());
     }
 
     // The command line.
