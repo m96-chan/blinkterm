@@ -169,7 +169,9 @@ pub enum ToBackend {
     /// [`ToFrontend::Helper`], starts again, at the size of a
     /// [`ToBackend::Resize`] the frontend sends just before this.
     HelperDone { id: u64, outcome: Outcome },
-    /// This window is done.
+    /// This window is done. A [`CloseWhy::Quit`] leaves its tabs a closed
+    /// group, for `--restore`; any other reason leaves them lost, offered to
+    /// the next window.
     Close { why: CloseWhy },
     /// Are you there.
     Ping,
@@ -197,6 +199,13 @@ pub struct Open {
     /// The frontend's `$HOME`, when it has one: `~` in a path and a
     /// command. (Not [`WindowSettings::home`], which is a page.)
     pub home_dir: Option<PathBuf>,
+    /// Whether the terminal this window is drawn on can open a window of its
+    /// own — `$DISPLAY` or `$WAYLAND_DISPLAY`, or a Mac not reached over ssh:
+    /// [`crate::picker::has_display`] in the frontend's environment, not the
+    /// backend's. A backend started from a desktop serves a terminal reached
+    /// over ssh too, and the other way round; this is what decides, per
+    /// window, a picker's kind, a password command's and `alt+o` (#104).
+    pub display: bool,
 }
 
 /// What a backend says to a frontend.
@@ -280,7 +289,9 @@ pub struct RouteFlags {
     pub every_nth: u32,
 }
 
-/// Why a frontend is closing its window.
+/// Why a frontend is closing its window. Only [`CloseWhy::Quit`] is a
+/// quit; the other two are a terminal gone, which the backend treats as a
+/// crash for the window's tabs: they are offered back at the next start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseWhy {
     /// The person quit it.
@@ -407,6 +418,9 @@ pub struct WindowSettings {
     pub alpha: Alpha,
     pub normal_mode: bool,
     pub search_url: Option<String>,
+    /// `--pdf-paper`, else the frontend's locale's ([`Paper::locale`]): the
+    /// paper of the person at the terminal, not of whoever started the
+    /// backend. A frontend always says; `None` is for a test's settings.
     pub pdf_paper: Option<Paper>,
     /// The page a window with no url opens.
     pub home: String,
@@ -428,7 +442,13 @@ impl From<&Options> for WindowSettings {
             alpha: options.alpha,
             normal_mode: options.normal_mode,
             search_url: options.search_url.clone(),
-            pdf_paper: options.pdf_paper,
+            // Resolved here, on the frontend, so that the locale read is the
+            // terminal's (#104).
+            pdf_paper: Some(
+                options
+                    .pdf_paper
+                    .unwrap_or_else(|| Paper::from_locale(&Paper::locale())),
+            ),
             home: options.home.clone(),
             keymap: options.keymap,
             bindings: options.bindings.clone(),
@@ -1179,6 +1199,7 @@ impl Wire for ToBackend {
                         "home_dir",
                         open.home_dir.as_deref().map_or(Json::Null, path_json),
                     ),
+                    ("display", Json::Bool(open.display)),
                 ],
             ),
             ToBackend::Input { input, pixel_mouse } => header(
@@ -1280,6 +1301,7 @@ impl Wire for ToBackend {
                     problems: strings(h, "problems")?,
                     cwd: path_value(field(h, "cwd")?, "cwd")?,
                     home_dir: opt_path(h, "home_dir")?,
+                    display: boolean(h, "display")?,
                 }))
             }
             "input" => ToBackend::Input {
@@ -2215,6 +2237,7 @@ mod tests {
             home_dir: Some(PathBuf::from(std::ffi::OsString::from_vec(
                 b"/home/\xffodd".to_vec(),
             ))),
+            display: true,
         }
     }
 
@@ -2626,6 +2649,31 @@ mod tests {
             ..open()
         })));
         assert!(feed(open).contains("nonce"));
+    }
+
+    #[test]
+    fn open_carries_the_terminals_display() {
+        // The terminal's answer, not the backend's: it goes in `open` both
+        // ways, and an `open` that does not say is refused rather than
+        // guessed at (#104).
+        for display in [true, false] {
+            let sent = ToBackend::Open(Box::new(Open { display, ..open() }));
+            let framed = encode(&sent);
+            let header = String::from_utf8_lossy(&framed[8..]).to_string();
+            assert!(
+                header.contains(&format!(r#""display":{display}"#)),
+                "{header}"
+            );
+            let back: Vec<ToBackend> = Decoder::new().feed(&framed).expect("decoded");
+            assert_eq!(back, vec![sent]);
+
+            let without = header.replace(&format!(r#","display":{display}"#), "");
+            assert_ne!(without, header);
+            let refused = Decoder::new()
+                .feed::<ToBackend>(&raw(&without, b""))
+                .unwrap_err();
+            assert!(refused.contains("display"), "{refused}");
+        }
     }
 
     #[test]

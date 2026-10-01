@@ -78,11 +78,24 @@ flag, a different default, a raised Rust floor all do.
 
 ### Fixed
 
+- A second terminal on a profile decides file pickers, password commands
+  and `alt+o` by its own `$DISPLAY`, not the first terminal's, and `alt+s`
+  prints on its own locale's paper
+  ([#104](https://github.com/m96-chan/blinkterm/issues/104)).
 - A `file-picker-terminal` picker or a `password-command-terminal` command no
   longer leaves its window blank for five seconds afterwards: the backend
   holds that window's screencast while the helper has the terminal and paints
   a fresh frame as soon as it exits; other windows on the profile are
   unaffected ([#105](https://github.com/m96-chan/blinkterm/issues/105)).
+- Closing the terminal under a window — its tab or window closed, an ssh
+  session dropped — no longer counts as `ctrl+q`: its tabs are offered at
+  the next start, as a crash's are. Only `ctrl+q`, or `ctrl+w` on the last
+  tab, leaves tabs for `--restore` alone
+  ([#106](https://github.com/m96-chan/blinkterm/issues/106)).
+- A second blinkterm started while a backend runs, or two started at once,
+  no longer empties `backend.log`: only the backend that takes the profile
+  starts a fresh log, and keeps the previous one as `backend.log.1`
+  ([#107](https://github.com/m96-chan/blinkterm/issues/107)).
 
 ## [0.4.0] - 2026-10-01
 

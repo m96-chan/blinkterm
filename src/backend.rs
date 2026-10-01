@@ -77,8 +77,14 @@
 //! page stops casting and the window waits [`GRACE`] for a frontend that
 //! resumes it by its nonce; after that its tabs are the session's lost group,
 //! offered to the next window, and the window goes. A frontend that says
-//! `close` — `ctrl+q`, a hang-up — closes its window at once and its tabs
-//! become a closed group for a later `--restore`. When no window is left and
+//! `close` closes its window at once, and what its tabs become depends on
+//! why: a hang-up, or its terminal's input ending, is the same vanishing as
+//! the silent kind, only heard sooner, so the group is lost and offered to
+//! the next window as after a crash. Only a quit — `ctrl+q`, the last tab
+//! closing — makes a closed group, left for a later `--restore`. Closing the
+//! terminal's tab, or losing the ssh session it ran in, is not a decision
+//! about the tabs, and the next start should not act as if it were (#106).
+//! When no window is left and
 //! nobody is attaching, the backend stops the way a run always stopped:
 //! the session written, the downloads cancelled, `Browser.close` and a wait
 //! for the cookie jar to be written, the sockets removed, and the profile
@@ -97,8 +103,10 @@
 //! ([`crate::engine::reap_orphan`]).
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -109,6 +117,7 @@ use crate::cdp::Client;
 use crate::cdp::Event;
 use crate::engine;
 use crate::fit::Metrics;
+use crate::frontend::{LOG_FILE, LOG_KEPT};
 use crate::hover::Shape;
 use crate::ipc::{
     self, BrowserSettings, CloseWhy, FrameKind, Job, Outcome, Picked, RouteFlags, ToBackend,
@@ -808,9 +817,12 @@ struct Attaching {
 
 /// Why a window is going.
 enum Going {
-    /// Its frontend asked: `ctrl+q`, a hang-up; or its last tab closed. The
-    /// group is closed.
+    /// The person quit it: `ctrl+q`, or its last tab closed. The group is
+    /// closed.
     Quit,
+    /// Its terminal went — a hang-up, or its input ended. Not a quit: the
+    /// group is lost, offered to the next window as after a crash.
+    HungUp,
     /// Something went wrong for it alone; its frontend is told why and its
     /// group is lost, to be offered again.
     Failed(String),
@@ -944,7 +956,10 @@ fn start(
         Choice::Temporary => Profile::temporary()?,
         Choice::At(dir) => {
             match Profile::try_take_at(dir.clone(), options.profile_label.clone())? {
-                TakeAt::Taken(profile) => profile,
+                TakeAt::Taken(profile) => {
+                    take_log(profile.dir());
+                    profile
+                }
                 TakeAt::Held(pid) => {
                     let _ = pair.write_all(&ipc::encode(&ToFrontend::Busy {
                         pid: pid.unwrap_or(0),
@@ -973,6 +988,72 @@ fn generation() -> u64 {
         .map(|d| d.as_micros() as u64)
         .unwrap_or_default()
         & ((1 << 53) - 1)
+}
+
+/// Make the profile's log this backend's: the previous run's kept as
+/// [`LOG_KEPT`], a fresh [`LOG_FILE`] in its place, and this process's
+/// stderr moved there.
+///
+/// Every candidate a frontend starts appends to the log
+/// ([`crate::frontend::spawn_candidate`]), because until it holds the lock it
+/// cannot know whether a backend is running and writing there; truncating
+/// it then cut the running backend's log whenever a second terminal started
+/// on the profile (#107). Only the holder of the lock can tell that the log
+/// is no longer anybody's, so this is called right after the lock is taken
+/// and before anything else is said: an engine missing, a socket that will
+/// not bind, the engine's own stderr, all land in the fresh file.
+///
+/// Best effort: a profile whose log cannot be rotated is still served, and
+/// the sentence goes to the stderr this process was started with.
+fn take_log(dir: &Path) {
+    match rotate_log(dir) {
+        Ok(fresh) => {
+            // SAFETY: `dup2(2)` takes two descriptors and reads no memory;
+            // `fresh` was opened for this call and is open throughout it, and
+            // 2 is this process's stderr, which nothing here owns as a Rust
+            // value. No thread of this process is running yet — the reader
+            // of the engine's stderr starts with the engine, later — and
+            // `dup2` replaces 2 atomically besides, so a write cannot find it
+            // closed. `fresh` itself is closed when it is dropped; the copy
+            // at 2 stays.
+            if unsafe { libc::dup2(fresh.as_raw_fd(), 2) } < 0 {
+                eprintln!(
+                    "blinkterm: cannot move stderr to {}: {}",
+                    dir.join(LOG_FILE).display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        Err(why) => eprintln!(
+            "blinkterm: cannot rotate {}: {why}",
+            dir.join(LOG_FILE).display()
+        ),
+    }
+}
+
+/// [`LOG_FILE`] in `dir` renamed to [`LOG_KEPT`], replacing the one before,
+/// and a new empty [`LOG_FILE`], 0600, opened to write.
+///
+/// An empty log is not kept: the first start on a profile, or a run that
+/// said nothing, would otherwise replace a [`LOG_KEPT`] that does say
+/// something with nothing. The new file is opened with `truncate` rather
+/// than `create_new` because another frontend's candidate may have made an
+/// empty one, to append to, between the rename and the open; that one is
+/// simply taken over. Such a candidate loses the lock and so writes nothing.
+fn rotate_log(dir: &Path) -> std::io::Result<File> {
+    let log = dir.join(LOG_FILE);
+    match std::fs::metadata(&log) {
+        Ok(meta) if meta.len() > 0 => std::fs::rename(&log, dir.join(LOG_KEPT))?,
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&log)
 }
 
 impl Backend {
@@ -1228,12 +1309,9 @@ impl Backend {
             slot.term.attach(conn, open.route);
             slot.suspended_since = None;
             slot.last_input = Instant::now();
-            if let Err(why) = app::resume_window(
-                &mut slot.term,
-                &mut slot.win,
-                &mut self.shared,
-                open.metrics,
-            ) {
+            if let Err(why) =
+                app::resume_window(&mut slot.term, &mut slot.win, &mut self.shared, &open)
+            {
                 eprintln!("blinkterm: resuming window {}: {why}", id.0);
             }
             return;
@@ -1364,8 +1442,11 @@ impl Backend {
                         }
                     }
                     ToBackend::Close { why } => {
-                        let _ = why == CloseWhy::Quit;
-                        going.push((index, Going::Quit));
+                        let going_how = match why {
+                            CloseWhy::Quit => Going::Quit,
+                            CloseWhy::Hangup | CloseWhy::Terminal => Going::HungUp,
+                        };
+                        going.push((index, going_how));
                         break;
                     }
                     ToBackend::Ping => slot.term.send(&ToFrontend::Pong),
@@ -1701,7 +1782,7 @@ impl Backend {
     }
 
     /// The windows at `going`, each told why and gone: a quit closes its
-    /// group, a failure leaves it lost.
+    /// group, a hang-up or a failure leaves it lost.
     fn close_windows(&mut self, mut going: Vec<(usize, Going)>) {
         going.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
         going.dedup_by_key(|(index, _)| *index);
@@ -1714,6 +1795,11 @@ impl Backend {
             let (sentence, exit) = match why {
                 Going::Quit => {
                     self.shared.session.window_closed(id);
+                    (String::new(), 0)
+                }
+                Going::HungUp => {
+                    eprintln!("blinkterm: window {} hung up; its tabs are saved", id.0);
+                    self.shared.session.window_lost(id);
                     (String::new(), 0)
                 }
                 Going::Failed(why) => {
@@ -2259,5 +2345,39 @@ mod tests {
             outcome_for(Outcome::External(Err("no".to_string()))).err(),
             Some("no".to_string())
         );
+    }
+
+    #[test]
+    fn the_log_is_rotated_and_an_empty_one_does_not_replace_the_kept_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("blinkterm-unit-rotate-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        std::fs::write(dir.join(LOG_FILE), "previous run\n").expect("seeded");
+        let mut fresh = rotate_log(&dir).expect("rotated");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LOG_KEPT)).unwrap(),
+            "previous run\n"
+        );
+        assert_eq!(fresh.metadata().unwrap().len(), 0, "a fresh log");
+        assert_eq!(mode(&dir.join(LOG_FILE)), 0o600);
+        writeln!(fresh, "this run").expect("written");
+        drop(fresh);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LOG_FILE)).unwrap(),
+            "this run\n"
+        );
+
+        // A run that said nothing is not kept over one that did.
+        std::fs::write(dir.join(LOG_FILE), "").expect("emptied");
+        drop(rotate_log(&dir).expect("rotated again"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LOG_KEPT)).unwrap(),
+            "previous run\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
