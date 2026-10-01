@@ -96,8 +96,10 @@ something goes wrong: two terminals starting at once on a free profile, the
 frontend that started the backend leaving first, a frontend, the backend or
 the engine killed outright, a start during the last window's shutdown, a
 browser-wide setting that differs (a proxy), the socket and `engine.pgid` a
-crash leaves, a terminal that stops reading beside one that keeps up, and
-the cookie jar across a stop at the end of a grace. Like the window tests it
+crash leaves, a terminal that stops reading beside one that keeps up, a
+terminal handed to a `file-picker-terminal` picker beside one that keeps
+painting (its window's cast held, not stalled, and painted again as soon as
+the picker answers), and the cookie jar across a stop at the end of a grace. Like the window tests it
 starts the real backend through `frontend::attach` and drives it with fake
 frontends, with the hidden `--grace-ms` passed through to make the reconnect
 grace short. Some of it is done by force to make it certain: the engine is

@@ -36,11 +36,14 @@
 //! size and route, the urls — and then loops: the terminal's bytes are
 //! parsed here and sent as input, except a cell size, which is this side's;
 //! a resize is sent as one; the backend's bytes are written as they come,
-//! its frames painted and acknowledged, its helpers run. `ctrl+q` is the
-//! backend's to see, and closes this window only: the backend says `closed`
-//! and this process exits, leaving the other windows on the profile as they
-//! are. A frontend never touches the engine — not from a signal, not from
-//! its panic hook — because it is not this process's.
+//! its frames painted and acknowledged, its helpers run. A helper that
+//! takes the terminal runs inside the pass, and the terminal's size is said
+//! before its answer, which is what the backend lays the window out again
+//! at. `ctrl+q` is the backend's to see, and closes this window only: the
+//! backend says `closed` and this process exits, leaving the other windows
+//! on the profile as they are. A frontend never touches the engine — not
+//! from a signal, not from its panic hook — because it is not this
+//! process's.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -775,15 +778,13 @@ fn drive(
         if app::quit_requested() {
             return close(link, CloseWhy::Hangup);
         }
-        if let Some(now) = term.resized()? {
-            metrics = now;
-            viewport_gen = viewport_gen.wrapping_add(1);
-            relayout_due = true;
-            link.send(&ToBackend::Resize {
-                metrics,
-                viewport_gen,
-            })?;
-        }
+        report_size(
+            term,
+            link,
+            &mut metrics,
+            &mut viewport_gen,
+            &mut relayout_due,
+        )?;
         let mut watching = vec![term.input_fd(), link.fd()];
         watching.extend(term.helper_fds());
         let wait = if owed.is_some() {
@@ -855,7 +856,27 @@ fn drive(
                         }
                     }
                     ToFrontend::Helper { id, job } => {
-                        if let Some(answer) = start_job(term, &mut helpers, id, job)? {
+                        let in_terminal = matches!(
+                            &job,
+                            Job::Picker { terminal: true, .. } | Job::Login { terminal: true, .. }
+                        );
+                        let answer = start_job(term, &mut helpers, id, job)?;
+                        // One that had the terminal has exited by now. The
+                        // backend holds the window's cast until its answer,
+                        // and lays the window out again when it comes: at
+                        // the size the terminal is now, said first, and
+                        // here rather than at the top of the next pass,
+                        // which is after the answer (issue #105).
+                        if in_terminal {
+                            report_size(
+                                term,
+                                link,
+                                &mut metrics,
+                                &mut viewport_gen,
+                                &mut relayout_due,
+                            )?;
+                        }
+                        if let Some(answer) = answer {
                             link.send(&answer)?;
                         }
                     }
@@ -895,6 +916,28 @@ fn drive(
             })?;
         }
     }
+}
+
+/// The terminal's size, to the backend, if it is a different one or wants
+/// measuring again. Until the backend has laid the window out at it, a
+/// frame is of the old size and is dropped (`relayout_due`).
+fn report_size(
+    term: &mut LocalTerminal,
+    link: &mut Link,
+    metrics: &mut Metrics,
+    viewport_gen: &mut u32,
+    relayout_due: &mut bool,
+) -> Result<(), String> {
+    let Some(now) = term.resized()? else {
+        return Ok(());
+    };
+    *metrics = now;
+    *viewport_gen = viewport_gen.wrapping_add(1);
+    *relayout_due = true;
+    link.send(&ToBackend::Resize {
+        metrics: now,
+        viewport_gen: *viewport_gen,
+    })
 }
 
 /// One thing the terminal said: a cell size is this side's, a mode report
