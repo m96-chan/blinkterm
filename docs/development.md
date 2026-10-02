@@ -76,7 +76,8 @@ and whose tabs are offered to the next window after the grace; a link
 middle-clicked in two windows at once landing in each window it was clicked
 in; and a link that drops taken back with `frontend::reattach` and the same
 nonce (#103): the same backend, nothing started, `opened` resumed, the same
-window with its tabs, and one window in the session. Engine-gated like `tests/engine.rs`, one at a time:
+window with its tabs, and one window in the session. Engine-gated like
+`tests/engine.rs`, one at a time:
 
 ```sh
 BLINKTERM_ENGINE=/opt/chrome-headless-shell-linux64/chrome-headless-shell \
@@ -88,8 +89,9 @@ the tests pass the hidden `--grace-ms <n>`, which only a run with
 `--serve-fd` accepts, to make it shorter. When a test leaves something
 running, or a real run misbehaves, the backend's standard error is
 `<profile>/backend.log`, rotated by the backend that takes the profile lock
-(the run before is `backend.log.1`): the engine's warnings, a window that lost its terminal, a page that was closed
-because no window could be shown to have asked for it.
+(the run before is `backend.log.1`): the engine's warnings, a window that
+lost its terminal, a page that was closed because no window could be shown to
+have asked for it.
 
 ### Several terminals on one profile: the failure modes
 
@@ -101,18 +103,18 @@ browser-wide setting that differs (a proxy), the socket and `engine.pgid` a
 crash leaves, a terminal that stops reading beside one that keeps up, a
 terminal handed to a `file-picker-terminal` picker beside one that keeps
 painting (its window's cast held, not stalled, and painted again as soon as
-the picker answers), and the cookie jar across a stop at the end of a grace. Like the window tests it
-starts the real backend through `frontend::attach` and drives it with fake
-frontends, with the hidden `--grace-ms` passed through to make the reconnect
-grace short. Some of it is done by force to make it certain: the engine is
-stopped (`SIGSTOP`) so that a shutdown takes its whole close timeout and an
-attach is sure to land inside it, and a stand-in process group with
-`--user-data-dir=<profile>` on its command line plays the orphaned engine
-that `engine::reap_orphan` must kill (a real one cannot be kept: a stopped
-engine whose backend is killed is an orphaned process group with a stopped
-member, which the kernel ends with `SIGHUP`). One test there needs no
-engine and runs everywhere: a profile path longer than a socket address
-gets a private fallback for both sockets.
+the picker answers), and the cookie jar across a stop at the end of a grace.
+Like the window tests it starts the real backend through `frontend::attach`
+and drives it with fake frontends, with the hidden `--grace-ms` passed
+through to make the reconnect grace short. Some of it is done by force to
+make it certain: the engine is stopped (`SIGSTOP`) so that a shutdown takes
+its whole close timeout and an attach is sure to land inside it, and a
+stand-in process group with `--user-data-dir=<profile>` on its command line
+plays the orphaned engine that `engine::reap_orphan` must kill (a real one
+cannot be kept: a stopped engine whose backend is killed is an orphaned
+process group with a stopped member, which the kernel ends with `SIGHUP`).
+One test there needs no engine and runs everywhere: a profile path longer
+than a socket address gets a private fallback for both sockets.
 
 `tests/terminal.rs` runs the real binary in a pseudoterminal
 (`tests/support/pty.rs`: `openpty`, the child in a session of its own with
