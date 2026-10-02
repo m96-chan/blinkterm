@@ -93,6 +93,12 @@ flag, a different default, a raised Rust floor all do.
   holds that window's screencast while the helper has the terminal and paints
   a fresh frame as soon as it exits; other windows on the profile are
   unaffected ([#105](https://github.com/m96-chan/blinkterm/issues/105)).
+- A page that renames itself when its file input is answered — from the
+  input's `cancel` or `change` handler, whether the answer came from the
+  row, a `file-picker` window or a `file-picker-terminal` picker — now shows
+  the new title on the status row. The engine reports no title a script
+  sets, so the page is asked when it has been told, as it is after a dialog
+  ([#116](https://github.com/m96-chan/blinkterm/issues/116)).
 - Closing the terminal under a window — its tab or window closed, an ssh
   session dropped — no longer counts as `ctrl+q`: its tabs are offered at
   the next start, as a crash's are. Only `ctrl+q`, or `ctrl+w` on the last
