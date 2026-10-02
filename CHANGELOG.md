@@ -108,6 +108,10 @@ flag, a different default, a raised Rust floor all do.
   no longer empties `backend.log`: only the backend that takes the profile
   starts a fresh log, and keeps the previous one as `backend.log.1`
   ([#107](https://github.com/m96-chan/blinkterm/issues/107)).
+- A paste whose end never comes is given up on after two quiet seconds
+  whatever else the terminal is sending; the check used to run only on a
+  pass with nothing to read
+  ([#114](https://github.com/m96-chan/blinkterm/issues/114)).
 
 ## [0.4.0] - 2026-10-01
 
