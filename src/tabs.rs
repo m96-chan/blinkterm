@@ -45,6 +45,18 @@
 //! tab — event-driven rather than polled, and a background tab that never
 //! loads anything costs nothing at all.
 //!
+//! Re-measured against `chrome-headless-shell` 153 (#116), it is the same:
+//! a `document.title` set by a script, with no navigation, brings no
+//! `Target.targetInfoChanged` and no `Page` event either. So besides a load
+//! the page is asked at the two other moments this program knows a script
+//! of the page's has just run: after a dialog closes, since a script that
+//! carries on after `alert()` often renames the page, and after its file
+//! input is answered, since the input's `change` or `cancel` handler often
+//! does. A title set at any other moment — from a timer, say — is not seen
+//! until the next of those: there is nothing to hear it by short of a script
+//! of this program's own in every page reporting it, with `Runtime` enabled
+//! to carry the report, which is not done.
+//!
 //! # A link opened with a modifier has no opener
 //!
 //! A target the engine announces is a tab when the list does not have it

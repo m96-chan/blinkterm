@@ -93,6 +93,12 @@ flag, a different default, a raised Rust floor all do.
   holds that window's screencast while the helper has the terminal and paints
   a fresh frame as soon as it exits; other windows on the profile are
   unaffected ([#105](https://github.com/m96-chan/blinkterm/issues/105)).
+- A page that renames itself when its file input is answered — from the
+  input's `cancel` or `change` handler, whether the answer came from the
+  row, a `file-picker` window or a `file-picker-terminal` picker — now shows
+  the new title on the status row. The engine reports no title a script
+  sets, so the page is asked when it has been told, as it is after a dialog
+  ([#116](https://github.com/m96-chan/blinkterm/issues/116)).
 - Closing the terminal under a window — its tab or window closed, an ssh
   session dropped — no longer counts as `ctrl+q`: its tabs are offered at
   the next start, as a crash's are. Only `ctrl+q`, or `ctrl+w` on the last
@@ -102,6 +108,19 @@ flag, a different default, a raised Rust floor all do.
   no longer empties `backend.log`: only the backend that takes the profile
   starts a fresh log, and keeps the previous one as `backend.log.1`
   ([#107](https://github.com/m96-chan/blinkterm/issues/107)).
+- A page that changed while its lossless still was being taken at
+  `--scale 2`, or at a zoom other than 100%, could be left on the still from
+  before the change for as long as the page stayed quiet: the engine does not
+  cast a frame that lands while it is resizing the page for the still, nor
+  one that arrives while three frames are unacknowledged. The cast is now
+  started again once a still has put the page at rest, which makes the
+  engine send the page as it is. A page at rest costs one still and one
+  frame; on a Retina pane it may cost one still more than before
+  ([#113](https://github.com/m96-chan/blinkterm/issues/113)).
+- A paste whose end never comes is given up on after two quiet seconds
+  whatever else the terminal is sending; the check used to run only on a
+  pass with nothing to read
+  ([#114](https://github.com/m96-chan/blinkterm/issues/114)).
 
 ## [0.4.0] - 2026-10-01
 

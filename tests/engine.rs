@@ -2968,8 +2968,11 @@ enum FirstStill {
 
 /// The program's loop, cut down to what paints: frames told to the policy
 /// and painted when it says so, stills asked for when it says so and
-/// painted when it says so. A reply is read before the frames of the same
-/// pass, the order that makes the policy's job the hardest.
+/// painted when it says so, and the cast — JPEG at `css` — started again
+/// when a painted still has put the page at rest, as the program does (see
+/// "A frame the engine never sent" in [`motion`]). A reply is read before
+/// the frames of the same pass, the order that makes the policy's job the
+/// hardest.
 ///
 /// It runs for at least `run`, and then until the policy has been at rest
 /// for `tail`, so that a slow machine is given the time it needs rather than
@@ -2982,6 +2985,7 @@ fn run_the_rest_policy(
     run: Duration,
     tail: Duration,
     first: FirstStill,
+    css: (u32, u32),
 ) -> (Option<Vec<u8>>, usize) {
     let started = Instant::now();
     let give_up = started + run + Duration::from_secs(20);
@@ -3014,6 +3018,11 @@ fn run_the_rest_policy(
                 on_screen = None;
             }
         }
+        if rest.refresh_wanted() {
+            let _ = client.call("Page.stopScreencast", Json::empty());
+            cast(client, "jpeg", Some(motion::QUALITY), css.0, css.1);
+            rest.refreshed();
+        }
         if in_flight.is_none() && rest.wants_still(Instant::now()) {
             // The clock is read before the request, as the program reads it.
             let at = motion::now_seconds();
@@ -3043,6 +3052,12 @@ fn run_the_rest_policy(
 /// transparency, the policy run over it as the program runs it: the pane
 /// ends on a still, the still shows the late change, its forced-transparent
 /// parts are clear, and once the page is quiet no more stills are asked for.
+///
+/// At scale 2 the change can land while the engine is resizing the page for
+/// a still, and then the engine never casts it: with nothing else to go on
+/// the pane ended on the still from before the change, in CI and 7 runs in
+/// 20 on two busy cores (#113). What saves it is the cast started again at
+/// rest, which this runs as the program does.
 fn a_late_change_at_either_scale(first: FirstStill) {
     let Some((mut engine, mut client)) = connect() else {
         return;
@@ -3083,6 +3098,7 @@ fn a_late_change_at_either_scale(first: FirstStill) {
             Duration::from_secs(5),
             Duration::from_secs(2),
             first,
+            css,
         );
         let _ = client.call("Page.stopScreencast", Json::empty());
         let png = still.expect("the pane ends on a still, not a moving frame");
@@ -3112,7 +3128,6 @@ fn a_late_change_at_either_scale(first: FirstStill) {
 
 /// After a load that paints late: see [`a_late_change_at_either_scale`].
 #[test]
-#[ignore = "flaky: the scale 2 still can come before the late paint (#113)"]
 fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
     a_late_change_at_either_scale(FirstStill::Prompt);
 }
@@ -3126,6 +3141,113 @@ fn a_page_that_paints_late_ends_on_a_still_at_either_scale_and_stops_asking() {
 #[test]
 fn a_change_while_a_slow_still_is_out_ends_on_a_still_that_shows_it() {
     a_late_change_at_either_scale(FirstStill::Slow(Duration::from_millis(700)));
+}
+
+/// The screencast frames that arrive within `within`, read and **not**
+/// acknowledged: each one's session id and bytes.
+fn frames_unacknowledged(client: &mut Client, within: Duration) -> Vec<(i64, Vec<u8>)> {
+    let until = Instant::now() + within;
+    let mut frames = Vec::new();
+    while Instant::now() < until {
+        for event in client.events() {
+            if event.method != "Page.screencastFrame" {
+                continue;
+            }
+            let session = event.params.get("sessionId").and_then(Json::as_i64);
+            let data = event.params.get("data").and_then(Json::as_str);
+            if let (Some(session), Some(data)) = (session, data) {
+                if let Ok(bytes) = blinkterm::base64::decode(data.as_bytes()) {
+                    frames.push((session, bytes));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    frames
+}
+
+/// The engine fact the cast restarted at rest stands on (#113): a change
+/// captured while three frames are unacknowledged is dropped rather than
+/// kept for later, acknowledging them does not bring it back — the engine
+/// captures again only on damage — and `Page.startScreencast` sends exactly
+/// one frame of the page as it is. At scale 2, where it was found.
+#[test]
+fn a_change_cast_while_three_frames_are_unacknowledged_is_lost_until_the_cast_is_restarted() {
+    let Some((mut engine, mut client)) = connect() else {
+        return;
+    };
+    client
+        .call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    let css = (1600, 880);
+    client
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            Json::object(vec![
+                ("width", Json::number(css.0)),
+                ("height", Json::number(css.1)),
+                ("deviceScaleFactor", Json::number(2.0)),
+                ("mobile", Json::Bool(false)),
+            ]),
+        )
+        .expect("the scale");
+    cast(&mut client, "jpeg", Some(motion::QUALITY), css.0, css.1);
+    navigate(&mut client, ARTICLE).expect("the article loads");
+    assert_eq!(
+        wait_for_title(&mut client, "article", Duration::from_secs(15)),
+        "article"
+    );
+    // At rest: every frame acknowledged until a second goes by without one.
+    let settle = Instant::now() + Duration::from_secs(10);
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        if take_frames(&mut client).is_empty() || Instant::now() >= settle {
+            break;
+        }
+    }
+
+    // Three small changes, each one's frame read and left unacknowledged.
+    let mut out = Vec::new();
+    for n in 0..3 {
+        evaluate(
+            &mut client,
+            &format!("document.getElementById('t').firstChild.textContent='{n} changed'"),
+        );
+        let frames = frames_unacknowledged(&mut client, Duration::from_millis(500));
+        assert_eq!(frames.len(), 1, "change {n} is cast with {n} out");
+        out.extend(frames);
+    }
+    let last = out.last().map(|(_, bytes)| motion::Picture::of(bytes));
+
+    // A fourth change, with three out: never sent.
+    evaluate(&mut client, &LATE_BOX.replace(",700)", ",0)"));
+    let dropped = frames_unacknowledged(&mut client, Duration::from_secs(1));
+    assert!(dropped.is_empty(), "a frame with three out is dropped");
+    for (session, _) in &out {
+        let _ = client.notify(
+            "Page.screencastFrameAck",
+            Json::object(vec![("sessionId", Json::number(*session as f64))]),
+        );
+    }
+    let after_acks = frames_unacknowledged(&mut client, Duration::from_secs(1));
+    assert!(
+        after_acks.is_empty(),
+        "and acknowledging the three does not bring it back"
+    );
+
+    // The restart sends the page as it is: one frame, with the box.
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    cast(&mut client, "jpeg", Some(motion::QUALITY), css.0, css.1);
+    let restarted = frames_unacknowledged(&mut client, Duration::from_secs(1));
+    assert_eq!(restarted.len(), 1, "a restarted cast sends one frame");
+    assert_ne!(
+        Some(motion::Picture::of(&restarted[0].1)),
+        last,
+        "and it shows the change the engine never cast"
+    );
+    let _ = client.call("Page.stopScreencast", Json::empty());
+    client.close();
+    engine.kill();
 }
 
 /// One notch is an animation that arrives and stops.
