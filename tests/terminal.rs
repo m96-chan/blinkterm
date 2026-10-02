@@ -243,10 +243,6 @@ fn stop(pid: Option<u32>) {
 /// it started has written the profile out — the lock let go. The backend
 /// had no terminal while the frontend did.
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "flaky on macOS: the cut paste is not said within the wait (#114)"
-)]
 fn a_status_row_appears_and_ctrl_q_exits_0_and_releases_the_lock() {
     if !engine_named() {
         return;
@@ -302,13 +298,27 @@ fn a_status_row_appears_and_ctrl_q_exits_0_and_releases_the_lock() {
 
     // A paste whose end never comes is given up on by the frontend after two
     // quiet seconds, and the row — the backend's — says so.
+    //
+    // The wait is that idle and then room for the row's text to come down
+    // the pane behind frames: a text the backend queues while a frame is
+    // being written waits for it, and for at most one more (two are kept in
+    // flight). Over ssh, which is how a Mac runs this (see
+    // `Scratch::command`), a raw frame is some 470 KB of base64 inline;
+    // read as `Pty::read` reads, with poll(2), that is tens of milliseconds
+    // each, so the rest is slack for a runner that descheduled the program
+    // or this test for a while (#114).
+    let since = Instant::now();
     pane.pty.write(b"\x1b[200~half a paste");
+    let cut = pane.pump(
+        blinkterm::frontend::PASTE_IDLE + Duration::from_secs(8),
+        |p| p.row().contains("paste cut short"),
+    );
+    let after = since.elapsed();
+    eprintln!("paste cut said after {after:?}");
+    assert!(cut, "row {:?}", pane.row());
     assert!(
-        pane.pump(Duration::from_secs(6), |p| p
-            .row()
-            .contains("paste cut short")),
-        "row {:?}",
-        pane.row()
+        after >= blinkterm::frontend::PASTE_IDLE,
+        "cut after {after:?}, before the paste had been quiet for long"
     );
 
     pane.pty.write(CTRL_Q);

@@ -144,7 +144,11 @@ const CLOSE_WAIT: Duration = Duration::from_secs(1);
 /// through with a paste half-arrived; and it is a silence, not a total, so a
 /// 64 KiB paste that trickles in over a slow line for longer than this is
 /// not cut while it is still coming.
-const PASTE_IDLE: Duration = Duration::from_secs(2);
+///
+/// It is checked on every pass of the window's loop, whatever else the
+/// terminal sent on it, so a paste is given up on within a pass of this
+/// much silence.
+pub const PASTE_IDLE: Duration = Duration::from_secs(2);
 
 /// The longest and the shortest wait of a pass: the second while a frame
 /// is owed its acknowledgement, which nothing wakes the poll for.
@@ -898,13 +902,44 @@ enum Running {
     Login { tab: String, url: String },
 }
 
+/// The clock on a paste that is open: when the terminal last sent a byte
+/// of it.
+///
+/// Kept apart from the loop so that what it owes is plain arithmetic on
+/// instants, and a test can say so without a terminal.
+#[derive(Debug, Default, Clone, Copy)]
+struct PasteClock {
+    heard: Option<Instant>,
+}
+
+impl PasteClock {
+    /// The terminal has said something at `now`: the clock runs from here
+    /// if a paste is open after it, and stops if none is.
+    fn heard(&mut self, pasting: bool, now: Instant) {
+        self.heard = pasting.then_some(now);
+    }
+
+    /// Whether the open paste has been quiet for longer than `idle` at
+    /// `now`. True once: the clock stops with it, so the paste is given up
+    /// on once and not again until another is opened.
+    fn quiet(&mut self, idle: Duration, now: Instant) -> bool {
+        match self.heard {
+            Some(at) if now.saturating_duration_since(at) > idle => {
+                self.heard = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// What the window's loop keeps from one pass to the next, and across a
 /// link taken back.
 struct Driving {
     buf: [u8; 8192],
     metrics: Metrics,
     // When the terminal last sent a byte of a paste that is still open.
-    paste_heard: Option<Instant>,
+    paste: PasteClock,
     // The newest frame painted or dropped and not yet acknowledged.
     owed: Option<u64>,
     waited: Option<Duration>,
@@ -937,7 +972,7 @@ fn drive(
     let mut st = Driving {
         buf: [0u8; 8192],
         metrics,
-        paste_heard: None,
+        paste: PasteClock::default(),
         owed: None,
         waited: None,
         relayout_due: false,
@@ -968,7 +1003,7 @@ fn pass(
     let Driving {
         buf,
         metrics,
-        paste_heard,
+        paste,
         owed,
         waited,
         relayout_due,
@@ -994,7 +1029,7 @@ fn pass(
         match tty::read_available(term.input_fd(), buf) {
             Ok(ReadOutcome::Data(n)) => {
                 let inputs = term.parse(&buf[..n]);
-                *paste_heard = term.pasting().then(Instant::now);
+                paste.heard(term.pasting(), Instant::now());
                 let pixel_mouse = term.pixel_coordinates();
                 for input in inputs {
                     take_input(term, link, input, pixel_mouse, *metrics)?;
@@ -1007,19 +1042,21 @@ fn pass(
             Ok(ReadOutcome::WouldBlock) => {}
             Err(err) => return Err(format!("cannot read the terminal: {err}")),
         }
-    } else if paste_heard.is_some_and(|at| at.elapsed() > PASTE_IDLE) {
-        // A paste that was opened and has gone quiet: the end marker is
-        // not coming, and what arrived is half of something.
-        *paste_heard = None;
-        if term.abandon_paste() {
-            // The row is the backend's, so it is told to say so.
-            let pixel_mouse = term.pixel_coordinates();
-            take_input(term, link, Input::PasteCut, pixel_mouse, *metrics)?;
-        }
     } else if let Some(input) = term.flush() {
         // Nothing arrived, so a held escape was the Escape key after all.
         let pixel_mouse = term.pixel_coordinates();
         take_input(term, link, input, pixel_mouse, *metrics)?;
+    }
+    // Whatever the terminal had to say this pass: a paste that was opened
+    // and has gone quiet is given up on — the end marker is not coming, and
+    // what arrived is half of something. This was an arm of the chain above
+    // and ran only on a pass with nothing to read, so a terminal that kept
+    // the descriptor readable kept a half-arrived paste open for as long as
+    // it did.
+    if paste.quiet(PASTE_IDLE, Instant::now()) && term.abandon_paste() {
+        // The row is the backend's, so it is told to say so.
+        let pixel_mouse = term.pixel_coordinates();
+        take_input(term, link, Input::PasteCut, pixel_mouse, *metrics)?;
     }
     term.reap();
     launcher.reap();
@@ -1196,7 +1233,7 @@ fn resume(
     // this side was waiting for on the old link is coming. A paste still
     // arriving is the person's one paste, and goes when it ends, or is cut
     // as any other.
-    st.paste_heard = term.pasting().then(Instant::now);
+    st.paste.heard(term.pasting(), Instant::now());
     st.owed = None;
     st.waited = None;
     st.relayout_due = false;
@@ -1484,6 +1521,36 @@ fn printed(found: &login::Login) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paste_that_goes_quiet_is_given_up_on_once_and_a_byte_of_it_resets_the_clock() {
+        let idle = Duration::from_secs(2);
+        let t0 = Instant::now();
+        let mut paste = PasteClock::default();
+        paste.heard(true, t0);
+        assert!(!paste.quiet(idle, t0 + idle), "not before the idle is over");
+        // A byte of it, a second in: the silence starts again from there.
+        paste.heard(true, t0 + Duration::from_secs(1));
+        assert!(!paste.quiet(idle, t0 + Duration::from_millis(2500)));
+        assert!(paste.quiet(idle, t0 + Duration::from_millis(3100)));
+        // Given up on once; the clock stopped with it.
+        assert!(!paste.quiet(idle, t0 + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn nothing_is_owed_when_no_paste_is_open() {
+        let idle = Duration::from_secs(2);
+        let t0 = Instant::now();
+        let mut paste = PasteClock::default();
+        assert!(!paste.quiet(idle, t0 + Duration::from_secs(60)));
+        // A paste that ended stops the clock.
+        paste.heard(true, t0);
+        paste.heard(false, t0 + Duration::from_millis(10));
+        assert!(!paste.quiet(idle, t0 + Duration::from_secs(60)));
+        // An instant before the one heard is no silence at all.
+        paste.heard(true, t0 + Duration::from_secs(5));
+        assert!(!paste.quiet(idle, t0));
+    }
 
     fn words(list: &[&str]) -> Vec<String> {
         list.iter().map(|w| w.to_string()).collect()
