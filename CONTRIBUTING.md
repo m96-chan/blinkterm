@@ -49,6 +49,12 @@ because several of them assert on timings, and `--test-threads=1` because each
 starts an engine of its own and two painting at once make the scroll tests
 measure the machine instead of the program.
 
+One test in `tests/terminal.rs` cuts a real frontend's link to its backend
+from outside, with `pidfd_getfd(2)` on the frontend it started. That needs
+Linux 5.6 and Yama's `ptrace_scope` at 0 or 1; at 2 or 3, on a Mac, or in a
+container without `CAP_SYS_PTRACE`, it is refused and the test skips, saying
+so.
+
 No Chromium to hand? Push the branch — the `engine` and `mac` jobs run it
 against pinned Linux and macOS builds, and print which Chromium they used.
 

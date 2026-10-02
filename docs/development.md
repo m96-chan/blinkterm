@@ -129,12 +129,16 @@ only its own window — the last one after the full fifteen-second grace,
 which makes that test take about twenty seconds — and a backend killed
 under a pane ends it at once, not after the fifteen seconds a frontend
 gives a backend that is still there, with the sentence and a status that
-is not success. The frontend's own taking back of a dropped link — its
-`resume`, with what was typed in the gap dropped — has no test that drives
-it: a real frontend's connection cannot be cut from outside without killing
-one end, and the pieces it is made of (`reattach`, `Link::dropped`, a
-`closed` read before the end) are tested in `src/frontend.rs` and
-`tests/windows.rs`. On a Mac the frames go
+is not success. A link cut under a backend that is still there is taken
+back: the backend is stopped, the frontend's socket to it shut down from
+outside (`pidfd_getfd(2)` and `shutdown(2)`, Linux only, skipped where it
+is refused, failed where CI allows it), a key typed while the frontend
+waits for the backend to answer, and the backend let go; the same window
+comes back on the same backend and the key never reaches the page. A
+`--file-picker-terminal` picker that runs six seconds — past the backend's
+stall — leaves the pane unpainted while it runs and gets it a fresh frame
+within a second of exiting, and its empty answer is a `cancel` the page
+hears; that one takes about eight seconds. On a Mac the frames go
 inline (the tests set `SSH_CONNECTION`), because the terminal's reader looks
 for shared memory under `/dev/shm`. CI's macOS job runs both files beside the
 engine suite.
