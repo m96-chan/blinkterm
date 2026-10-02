@@ -108,6 +108,15 @@ flag, a different default, a raised Rust floor all do.
   no longer empties `backend.log`: only the backend that takes the profile
   starts a fresh log, and keeps the previous one as `backend.log.1`
   ([#107](https://github.com/m96-chan/blinkterm/issues/107)).
+- A page that changed while its lossless still was being taken at
+  `--scale 2`, or at a zoom other than 100%, could be left on the still from
+  before the change for as long as the page stayed quiet: the engine does not
+  cast a frame that lands while it is resizing the page for the still, nor
+  one that arrives while three frames are unacknowledged. The cast is now
+  started again once a still has put the page at rest, which makes the
+  engine send the page as it is. A page at rest costs one still and one
+  frame; on a Retina pane it may cost one still more than before
+  ([#113](https://github.com/m96-chan/blinkterm/issues/113)).
 
 ## [0.4.0] - 2026-10-01
 

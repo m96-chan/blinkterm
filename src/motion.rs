@@ -33,8 +33,10 @@
 //! **So: JPEG while the page is moving, PNG the moment it stops.** Text that
 //! is being read is always lossless; the lossy frames are only ever the ones
 //! scrolling past, which is exactly the trade VNC and RDP make and for the
-//! same reason. A page that never moves costs one still and then nothing at
-//! all — no screencast frames, no polling, no repainting.
+//! same reason. A page that never moves costs one still, one frame — the
+//! page as it is, from a cast started again once the still is up (see "A
+//! frame the engine never sent") — and then nothing at all: no polling, no
+//! repainting.
 //!
 //! # Still JPEG while it moves, in alpha mode — keyed
 //!
@@ -197,12 +199,51 @@
 //! [`SHUTTER_GRACE`]), so a page at scale 2 does not flash a JPEG between two
 //! stills; more are the page moving, and go up as it moves. Nothing is taken
 //! on trust, so the pane does not end on a still from before the last new
-//! picture. The one thing this cannot see is a page that changes back to a
+//! picture *the engine sent* — and it does not always send one, which is the
+//! next section. The one thing this cannot see is a page that changes back to a
 //! picture it was photographed with while a still of the change is being
 //! taken, with no frame painted in between: that still may show the change
 //! the page has already undone. A page doing that within a round trip of the
 //! engine is indistinguishable, frame for frame, from the engine's own two
 //! drawings above, and the loop is the worse of the two.
+//!
+//! # A frame the engine never sent
+//!
+//! All of that judges the frames that arrive, and the pane could still end on
+//! a still from before a change, because the change's frame never arrived.
+//! In CI the late-paint test asked for its stills at 265 and 618 ms, the page
+//! changed at 700 ms, the run ended at rest at 5 s, and the pane was the
+//! still from before the change — the same pixel in two runs. Locally, with
+//! the engine sharing two busy cores, it failed 7 runs in 20 the same way.
+//! Reading `chrome-headless-shell` 153's `page_handler.cc`, the engine drops
+//! a frame in two places:
+//!
+//! - `Page.captureScreenshot` under a device emulation whose scale is not the
+//!   widget's own — `--scale 2`, or a zoom other than 100%, which
+//!   [`crate::zoom`] sends as the scale — resizes the view up for the still
+//!   and back before it replies, and the first frame after each change of
+//!   surface size is swallowed: it asks for a refresh that does not reliably
+//!   come. The capturer only captures on damage, so a change that lands on
+//!   the restore is never cast.
+//! - At most two frames may be unacknowledged when one is captured
+//!   (`kMaxScreencastFramesInFlight`); a frame captured while three are out
+//!   is dropped, not kept for later.
+//!
+//! Neither is anything this program can see: a frame that does not come is
+//! the same as a page that did not change. What it can do is ask.
+//! `Page.startScreencast` resets the count in flight, takes the surface's
+//! size again, and sends exactly one frame of the page as it is, 10 to 50 ms
+//! later. So each time a painted still puts the tab at rest, the cast is
+//! stopped and started again once ([`Motion::refresh_wanted`]), and that
+//! frame is judged like any other: one that repeats the picture is nothing,
+//! and one that shows a change is held or painted and owes a still. Under
+//! the same contention that failed 7 in 20, that passed 15 of 15.
+//!
+//! It costs a frame per rest. At scale 1 the frame repeats the still's and
+//! is nothing more. At scale 2, where the engine draws a page at rest two
+//! ways by turns, the frame may be the other drawing, which owes a still of
+//! its own: a page that changed and then stopped took four or five stills in
+//! the measurements rather than two or three.
 //!
 //! The clock all of that is measured on is the wall clock:
 //! `Page.screencastFrame` carries `metadata.timestamp`, which CDP defines as
@@ -348,6 +389,9 @@ pub struct Motion {
     /// moved. A few at most: one, or two at scale 2, where the engine draws
     /// a page nothing is happening to in two ways by turns.
     photographed: Vec<Picture>,
+    /// A still has been painted since the cast was last started again. See
+    /// "A frame the engine never sent" above.
+    refresh_due: bool,
 }
 
 impl Motion {
@@ -367,6 +411,7 @@ impl Motion {
             shutter_left: 0,
             picture: None,
             photographed: Vec::new(),
+            refresh_due: false,
         }
     }
 
@@ -530,6 +575,7 @@ impl Motion {
         self.shutter_until = replied_at + took;
         self.shutter_left = SHUTTER_FRAMES - frames;
         self.still_up = true;
+        self.refresh_due = true;
         true
     }
 
@@ -549,6 +595,20 @@ impl Motion {
             self.still_up = true;
             self.remember_the_picture();
         }
+    }
+
+    /// Whether the cast should be started again: a still has just been
+    /// painted and the tab is at rest, so a change the engine never cast
+    /// would otherwise stay unseen for as long as the page stays quiet. See
+    /// "A frame the engine never sent" above.
+    pub fn refresh_wanted(&self) -> bool {
+        self.refresh_due && self.at_rest() && !self.in_flight
+    }
+
+    /// The cast was started again — or could not be, which is no reason to
+    /// keep trying. Its frame is judged like any other.
+    pub fn refreshed(&mut self) {
+        self.refresh_due = false;
     }
 
     /// Whether a still has been asked for and not yet answered.
@@ -1206,6 +1266,74 @@ mod tests {
         let moved = resting + Duration::from_secs(10);
         motion.motion_frame(Some(3000.0), changed(), moved);
         assert!(motion.wants_still(moved + QUIET));
+    }
+
+    /// A still painted at rest owes one restart of the cast, and the frame
+    /// that restart sends, repeating the page, leaves the rest alone.
+    #[test]
+    fn a_painted_still_at_rest_owes_one_refresh_and_a_repeat_keeps_the_rest() {
+        let start = Instant::now();
+        let mut motion = painted(start);
+        assert!(!motion.refresh_wanted(), "nothing painted, nothing owed");
+        let resting = start + REST_AFTER;
+        motion.still_requested(1000.3);
+        assert!(!motion.refresh_wanted(), "not while the still is out");
+        assert!(motion.still_arrived(1000.33));
+        assert!(motion.at_rest());
+        assert!(motion.refresh_wanted());
+        motion.refreshed();
+        assert!(!motion.refresh_wanted(), "once");
+
+        // The restarted cast's one frame: the page as it was.
+        let later = resting + Duration::from_millis(30);
+        assert!(!motion.motion_frame(Some(1000.36), page(), later));
+        assert!(motion.at_rest());
+        assert!(!motion.refresh_wanted());
+        assert!(!motion.wants_still(later + Duration::from_secs(3600)));
+    }
+
+    /// The change the engine never cast, shown by the restarted cast's
+    /// frame: held over the still, and another still is owed — whose own
+    /// rest owes one more restart.
+    #[test]
+    fn a_refresh_frame_that_shows_a_change_is_held_and_owes_a_still() {
+        let start = Instant::now();
+        let mut motion = painted(start);
+        let resting = start + REST_AFTER;
+        motion.still_requested(1000.3);
+        assert!(motion.still_arrived(1000.38));
+        assert!(motion.refresh_wanted());
+        motion.refreshed();
+
+        let refresh = resting + Duration::from_millis(100);
+        assert!(
+            !motion.motion_frame(Some(1000.4), changed(), refresh),
+            "held: inside the still's window"
+        );
+        assert!(!motion.at_rest());
+        assert!(!motion.refresh_wanted());
+        let quiet = refresh + REST_AFTER;
+        assert!(motion.wants_still(quiet));
+        motion.still_requested(1000.7);
+        assert!(motion.still_arrived(1000.75));
+        assert!(motion.at_rest());
+        assert!(motion.refresh_wanted(), "this rest is checked as well");
+        motion.refreshed();
+        assert!(!motion.motion_frame(Some(1000.8), changed(), quiet));
+        assert!(motion.at_rest());
+        assert!(!motion.wants_still(quiet + Duration::from_secs(3600)));
+    }
+
+    /// A still that failed painted nothing, so it owes no restart: the
+    /// screen is no newer than it was.
+    #[test]
+    fn a_failed_still_owes_no_refresh() {
+        let start = Instant::now();
+        let mut motion = painted(start);
+        motion.still_requested(1000.3);
+        motion.still_failed();
+        assert!(motion.at_rest());
+        assert!(!motion.refresh_wanted());
     }
 
     /// Two frames alike are one picture, and two that differ by a byte are
