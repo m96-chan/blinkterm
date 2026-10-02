@@ -374,16 +374,16 @@ which it does on its own once your terminal has been given back. So there is
 no daemon to manage and nothing left running. A terminal started while it is
 in those two seconds waits for it to finish, then starts a fresh one.
 
-A window whose terminal disappears without closing it — the terminal
-emulator killed, an ssh connection dropped — is kept for fifteen seconds,
-its page no longer painting, and then closed; its tabs are kept in the
-session as a lost window, and the next window opened on the profile is
-offered them (`restore 3 tabs from last time? y/n`). The other windows are
-not touched. The other way round, a terminal whose connection to the
-backend drops while the backend is still running reconnects within those
-fifteen seconds and carries on in the same window, redrawn; keys typed
-while it was cut off are dropped rather than sent late. A different profile is a different backend with an engine of
-its own, sharing nothing.
+A window whose terminal disappears without closing it — the terminal emulator
+killed, an ssh connection dropped — is kept for fifteen seconds, its page no
+longer painting, and then closed; its tabs are kept in the session as a lost
+window, and the next window opened on the profile is offered them
+(`restore 3 tabs from last time? y/n`). The other windows are not touched.
+The other way round, a terminal whose connection to the backend drops while
+the backend is still running reconnects within those fifteen seconds and
+carries on in the same window, redrawn; keys typed while it was cut off are
+dropped rather than sent late. A different profile is a different backend
+with an engine of its own, sharing nothing.
 
 Which tabs are offered back follows one rule: only `ctrl+q`, or `ctrl+w` on
 the last tab, is a quit. A window closed that way is kept as a closed group,
@@ -425,10 +425,11 @@ on the same profile, which opens the first as a new tab in front and the rest
 behind it — in the window you last typed in or clicked, when the profile has
 several — and exits at once with 0. A profile whose windows have all just
 lost their terminals has nowhere to put a page, says so (`nowhere`), and the
-sender starts a window of its own as if none were running. With none running it starts as usual,
-with those urls — so the same `$BROWSER` works whether one is open or not, as
-long as there is a terminal to start one in; with no terminal (a desktop's
-`xdg-open`) it says there is nobody to hand the url to, and exits 1.
+sender starts a window of its own as if none were running. With none running
+it starts as usual, with those urls — so the same `$BROWSER` works whether
+one is open or not, as long as there is a terminal to start one in; with no
+terminal (a desktop's `xdg-open`) it says there is nobody to hand the url to,
+and exits 1.
 
 The profile decides which `blinkterm` is reached, exactly as it decides which
 profile a start takes: `blinkterm --remote --profile ~/work-profile <url>`

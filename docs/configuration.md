@@ -415,13 +415,13 @@ shows the saved titles straight away, and twenty tabs cost half a second of
 start rather than twenty pages fetched. At most 100 tabs are restored.
 
 After a window that did not end with a quit — a crash, a `kill -9`, the
-engine dying twice — the next start asks on the row: `restore 3 tabs from last time?
-y/n`. `y` or `enter` restores them; `n`, `esc`, or simply getting on with
-something else declines, and the question waits under anything else that
-wants the row. How a run that did not quit is known is the file's first line,
-`# blinkterm session: open` until the run quits and writes `closed`.
-`--temp-profile` keeps the session in memory, for `ctrl+shift+t`, and writes
-nothing.
+engine dying twice — the next start asks on the row:
+`restore 3 tabs from last time? y/n`. `y` or `enter` restores them; `n`,
+`esc`, or simply getting on with something else declines, and the question
+waits under anything else that wants the row. How a run that did not quit is
+known is the file's first line, `# blinkterm session: open` until the run
+quits and writes `closed`. `--temp-profile` keeps the session in memory, for
+`ctrl+shift+t`, and writes nothing.
 
 The tabs in the file are grouped under a line for the window they were in —
 `# window 1 live`, `closed` or `lost` — after a `# format: 2` line: one group
@@ -431,11 +431,11 @@ group, which `--restore` reopens; a window whose terminal went away without
 a word (the terminal killed, an ssh link dropped) is kept for fifteen seconds
 in case it comes back, and is then a `lost` group, which the next window
 opened is offered; a window whose terminal hung up on it (its tab or window
-closed, the ssh session ended) is a `lost` group at once. Each new window takes one group, the oldest first: a
-second `blinkterm --restore` on a profile whose first window restored one
-group restores the next, never the same one twice. A new window with nothing
-to restore records its tabs in a group of its own, beside the ones closed
-earlier while the backend ran; at most eight groups are kept. A file written
-by an older `blinkterm` reads as one group, and an older `blinkterm` reads
-this one as one window with every group's tabs, since every line this
-version adds starts with `#`.
+closed, the ssh session ended) is a `lost` group at once. Each new window
+takes one group, the oldest first: a second `blinkterm --restore` on a
+profile whose first window restored one group restores the next, never the
+same one twice. A new window with nothing to restore records its tabs in a
+group of its own, beside the ones closed earlier while the backend ran; at
+most eight groups are kept. A file written by an older `blinkterm` reads as
+one group, and an older `blinkterm` reads this one as one window with every
+group's tabs, since every line this version adds starts with `#`.
