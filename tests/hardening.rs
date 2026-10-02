@@ -45,15 +45,17 @@ function f(){n=n>300?0:n+3;b.style.left=n+'px';requestAnimationFrame(f)}f();\
 </script></body>";
 
 /// A page that moves, and whose file input is clicked on a key — the key is
-/// the activation a chooser needs — and which goes to `/pick-cancelled` when
-/// the input hears `cancel`, so that the row's url says it did.
+/// the activation a chooser needs — and which renames itself `pick cancelled`
+/// when the input hears `cancel`, without going anywhere: the engine says
+/// nothing of a title a script sets, so the row shows it only if the page
+/// was asked after it was told (#116).
 const PICK: &str = "<!doctype html><title>pick ready</title>\
 <body style='margin:0;height:100vh;background:#fff'>\
 <input id=f type=file style='position:absolute;left:0;top:40px'>\
 <div id=b style='position:absolute;width:60px;height:30px;background:#33c'></div>\
 <script>\
 addEventListener('keydown',function(){f.click()});\
-f.addEventListener('cancel',function(){location.href='/pick-cancelled'});\
+f.addEventListener('cancel',function(){document.title='pick cancelled'});\
 var b=document.getElementById('b'),n=0;\
 function g(){n=n>300?0:n+3;b.style.left=n+'px';requestAnimationFrame(g)}g();\
 </script></body>";
@@ -205,6 +207,9 @@ struct Front {
     pickers: Vec<(u64, String, i64, bool)>,
     /// How many times it was told to clear the screen.
     cleared: usize,
+    /// Where in `text` the last clear came: what was drawn since is what is
+    /// on the screen.
+    since_clear: usize,
 }
 
 impl Front {
@@ -226,6 +231,7 @@ impl Front {
             closed: None,
             pickers: Vec::new(),
             cleared: 0,
+            since_clear: 0,
         })
     }
 
@@ -277,7 +283,10 @@ impl Front {
                         ..
                     },
             } => self.pickers.push((id, tab, node, terminal)),
-            ToFrontend::ClearScreen => self.cleared += 1,
+            ToFrontend::ClearScreen => {
+                self.cleared += 1;
+                self.since_clear = self.text.len();
+            }
             _ => {}
         }
     }
@@ -289,6 +298,11 @@ impl Front {
 
     fn says(&self, words: &str) -> bool {
         self.said().contains(words)
+    }
+
+    /// Whether `words` were drawn since the screen was last cleared.
+    fn shows(&self, words: &str) -> bool {
+        String::from_utf8_lossy(&self.text[self.since_clear..]).contains(words)
     }
 
     fn key(&mut self, ch: char) {
@@ -1361,7 +1375,8 @@ fn a_slow_frontend_bounds_its_own_frames_and_the_fast_one_keeps_its_rate() {
 /// rather than stalling it — no frame for the window while the terminal is
 /// the picker's, however long that is, and the other window on the profile
 /// painting throughout — and its answer lays the window out again and
-/// paints it at once.
+/// paints it at once. Issue #116: the row it is laid out with carries the
+/// title the page's `cancel` handler gave it.
 #[test]
 fn a_terminal_picker_holds_its_window_and_the_answer_paints_it_again() {
     if !engine_named() {
@@ -1449,10 +1464,12 @@ fn a_terminal_picker_holds_its_window_and_the_answer_paints_it_again() {
         took < Duration::from_secs(1) || !timed,
         "the window took {took:?} to paint again"
     );
+    // The page renamed itself from its `cancel` handler, and the row drawn
+    // after the clear says so (#116).
     assert!(
-        picking.pump(PATIENCE, |f| f.says("/pick-cancelled")),
-        "the page was not told: {}",
-        picking.said()
+        picking.pump(PATIENCE, |f| f.shows("pick cancelled")),
+        "the row does not show the page's new title: {}",
+        String::from_utf8_lossy(&picking.text[picking.since_clear..])
     );
     picking.frames = 0;
     assert!(
