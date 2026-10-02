@@ -656,6 +656,10 @@ pub(crate) struct Chrome {
     /// acknowledged once they have gone to the terminal. See
     /// [`tick_frames`].
     unacked: Option<Unacked>,
+    /// The page in front was told to stop casting by [`hold_cast`], and
+    /// nothing has started it again: a cast restarted at rest
+    /// ([`refresh_cast`]) would undo that.
+    cast_held: bool,
     /// How the motion cast is asked for; its size steps with `throttle`.
     cast: motion::Cast,
     /// Steps the cast's size down when frames wait on the link.
@@ -865,6 +869,7 @@ impl Chrome {
             layout: Layout::default(),
             allow: None,
             unacked: None,
+            cast_held: false,
             cast: motion::Cast::default(),
             throttle: motion::Throttle::default(),
             blocked_words: None,
@@ -2104,6 +2109,7 @@ pub(crate) fn lay_out_again(
     metrics: Metrics,
 ) -> Result<(), String> {
     let Window { tabs, chrome, .. } = win;
+    chrome.cast_held = false;
     chrome.metrics = metrics;
     chrome.scale = chrome.scale_choice.resolve(metrics.cell);
     chrome.shape = Shape::Default;
@@ -2131,6 +2137,7 @@ pub(crate) fn close_window(term: &mut dyn Terminal, win: &mut Window, browser: &
 pub(crate) fn hold_cast(win: &mut Window, held: bool) {
     let Window { tabs, chrome, .. } = win;
     let (pixels, cast) = (chrome.layout.pixels(chrome.metrics), chrome.cast);
+    chrome.cast_held = held;
     if let Some(tab) = tabs.active_mut().filter(|tab| !tab.is_crashed()) {
         let stopped = tab.dialog.is_some();
         if held {
@@ -5093,8 +5100,11 @@ fn asking(tabs: &Tabs<Client>) -> bool {
 /// This is the other half of [`crate::motion`]'s policy: the screencast is
 /// JPEG so that a scroll keeps up, and once it has stopped the text somebody
 /// is about to read is replaced with the PNG of the same page. It costs one
-/// `Page.captureScreenshot` per stop and nothing at all while the page stays
-/// still, so a static page is one still and then silence.
+/// `Page.captureScreenshot` per stop, and one restart of the cast once the
+/// still is up — the engine does not always send the frame of a change that
+/// lands while a still is being taken, and a restarted cast sends the page
+/// as it is ([`refresh_cast`]) — and nothing at all while the page stays
+/// still: a static page is one still, one frame, and then silence.
 ///
 /// Nothing here waits. The screenshot is 66 to 98 milliseconds of engine at a
 /// pane's size, and a loop that sat in a `call` for them would be a loop that
@@ -5110,8 +5120,39 @@ fn rest_shot(
     shared: &mut Shared,
 ) -> Result<(), String> {
     collect_still(term, tabs, chrome, shared)?;
+    refresh_cast(tabs, chrome);
     request_still(tabs, chrome);
     Ok(())
+}
+
+/// Start the cast again, once, when a painted still has put the page at
+/// rest, so that the engine sends one frame of the page as it is.
+///
+/// The engine drops a frame in two places, and a page that changed in one of
+/// them would otherwise stay on the still from before the change for as long
+/// as it stayed quiet: see "A frame the engine never sent" in [`motion`].
+/// The frame the restart brings is judged like any other — a repeat is
+/// nothing, a change owes another still.
+///
+/// Not while a dialog is open, the tab list is up, the renderer is dead, or
+/// the cast is held ([`hold_cast`]): the same reasons a still is not asked
+/// for, and a held cast is one somebody stopped on purpose. The restart is
+/// owed once either way, and a failure to send is not tried again: the next
+/// still that puts the page at rest owes another.
+fn refresh_cast(tabs: &mut Tabs<Client>, chrome: &mut Chrome) {
+    if !chrome.motion.refresh_wanted() {
+        return;
+    }
+    chrome.motion.refreshed();
+    if asking(tabs) || chrome.list.is_some() || chrome.cast_held {
+        return;
+    }
+    let (pixels, cast) = (chrome.layout.pixels(chrome.metrics), chrome.cast);
+    if let Some(tab) = tabs.active_mut().filter(|tab| !tab.is_crashed()) {
+        // Told rather than asked, as for a page behind a dialog: nothing
+        // here waits, and the two go out in order on the one connection.
+        let _ = restart_screencast(&mut tab.connection, pixels, true, cast);
+    }
 }
 
 /// Take the reply to the still, if it has come back.
