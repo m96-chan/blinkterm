@@ -117,6 +117,10 @@ flag, a different default, a raised Rust floor all do.
   engine send the page as it is. A page at rest costs one still and one
   frame; on a Retina pane it may cost one still more than before
   ([#113](https://github.com/m96-chan/blinkterm/issues/113)).
+- A paste whose end never comes is given up on after two quiet seconds
+  whatever else the terminal is sending; the check used to run only on a
+  pass with nothing to read
+  ([#114](https://github.com/m96-chan/blinkterm/issues/114)).
 
 ## [0.4.0] - 2026-10-01
 

@@ -6,6 +6,16 @@
 //! The pty is sized with `TIOCSWINSZ`, pixels included, so that a program
 //! that measures its cells from the window size (`--no-probe` does) gets a
 //! cell size without asking.
+//!
+//! The master end is read as soon as there is something on it, with
+//! `poll(2)`, not on a timer. A pty's buffer is small, and on macOS
+//! smaller: XNU stops a writer on the slave end at a high-water mark of
+//! about 1.2 KB and wakes it only once the master end has been drained
+//! below it. A reader that slept 5 ms whenever the master was empty so let
+//! through about 1.2 KB per sleep — one inline raw frame, some 470 KB of
+//! base64 at 15 frames a second, took one to two seconds to come down, and
+//! everything the program wrote after it waited behind it (#114). Linux's
+//! buffer is large enough that the sleep never showed.
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -123,12 +133,41 @@ impl Pty {
                 // Linux says EIO once every slave descriptor has closed.
                 Err(_) => self.ended = true,
             }
-            if !out.is_empty() || Instant::now() >= deadline {
+            let now = Instant::now();
+            if self.ended || !out.is_empty() || now >= deadline {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            let left = deadline - now;
+            self.wait_readable(left.min(Duration::from_millis(100)));
         }
         out
+    }
+
+    /// Wait up to `within` for the master end to have something to read,
+    /// or to have hung up; either way the next read says which.
+    fn wait_readable(&mut self, within: Duration) {
+        let Some(master) = self.master.as_ref() else {
+            return;
+        };
+        let mut fds = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = within.as_millis().clamp(1, 100) as libc::c_int;
+        // SAFETY: `poll(2)` reads and writes the one `pollfd` it is given, a
+        // live local, for the length of the call; the descriptor is
+        // `master`'s, open for the whole call.
+        let r = unsafe { libc::poll(&mut fds, 1, ms) };
+        if r < 0 {
+            if std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+                self.ended = true;
+            }
+        } else if fds.revents & libc::POLLNVAL != 0 {
+            // Not a descriptor poll will watch: fall back to a short sleep
+            // rather than spin.
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Type `bytes`.
