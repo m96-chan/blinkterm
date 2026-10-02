@@ -2673,6 +2673,12 @@ fn restart_screencast(
 /// [`crate::load`] for why that domain is not paid for. `None` means the page
 /// did not answer in time, and a tab keeps the name it had rather than losing
 /// it to a page that is busy.
+///
+/// Asked when the page says it has loaded, and at the moments a script is
+/// known to have just run that may well have renamed it: after a dialog
+/// closes, and after its file input is answered (`chooser_answered`,
+/// through [`page_title`]). A title set at any other moment — from a timer,
+/// say — is not seen until one of them comes round.
 pub fn page_loaded(client: &mut Client) -> Option<Loaded> {
     let answer = client
         .call_within(
@@ -3207,6 +3213,7 @@ fn chooser_opened(tab: &mut Tab<Client>, event: &Event, base: &Path, chrome: &Ch
                 chooser.session.as_deref(),
                 chooser.backend_node_id,
             );
+            chooser_answered(tab);
             tab.note = Some("a file picker is already open".to_string());
             return true;
         }
@@ -6418,6 +6425,9 @@ fn answer_dialog(
 ///
 /// Escaped, nothing is sent, and the page is told `cancel` the way a real
 /// chooser would tell it: [`cancel_chooser`].
+///
+/// Either way the page is then asked its title ([`chooser_answered`]), so
+/// that a handler that renamed it is on the row this redraw.
 fn answer_upload(
     term: &mut dyn Terminal,
     tabs: &mut Tabs<Client>,
@@ -6446,12 +6456,14 @@ fn answer_upload(
             let _ = tab
                 .connection
                 .notify_on(session.as_deref(), "DOM.setFileInputFiles", params);
+            chooser_answered(tab);
         }
         upload::Outcome::Cancel => {
             let node = prompt.chooser.backend_node_id;
             let session = prompt.chooser.session.clone();
             tab.upload = None;
             cancel_chooser(&mut tab.connection, session.as_deref(), node);
+            chooser_answered(tab);
         }
     }
     redraw_row(term, tabs, chrome, shared)?;
@@ -6509,6 +6521,32 @@ pub fn cancel_chooser(client: &mut Client, session: Option<&str>, backend_node_i
         "Runtime.releaseObject",
         Json::object(vec![("objectId", Json::string(object))]),
     );
+}
+
+/// The page has just been told about its file input — the files, or
+/// `cancel` — and a handler for either often renames the page, as one that
+/// carries on after a dialog does: it is asked what it is called now, for
+/// the row (#116).
+///
+/// Asked, because the engine says nothing of its own about a title a script
+/// sets: no `Target.targetInfoChanged`, no `Page` event, nothing (measured
+/// against `chrome-headless-shell` 153; see [`crate::tabs`]). Asked on the
+/// page's own session, after the command that told it: `change` and
+/// `cancel` are dispatched inside that command, so by the time the page
+/// reads the evaluation the handler has run and the answer is the renamed
+/// page — measured, with no wait between them. Only the title is taken: the
+/// document has not changed, so its status has not either.
+///
+/// Not of a page with a dialog up, which would not answer in time — a
+/// handler that called `alert()` has the row anyway, and the page is asked
+/// when the dialog closes — nor of one that has crashed or is dormant.
+fn chooser_answered(tab: &mut Tab<Client>) {
+    if tab.dialog.is_some() || tab.is_crashed() || tab.dormant {
+        return;
+    }
+    if let Some(title) = page_title(&mut tab.connection) {
+        tab.title = title;
+    }
 }
 
 /// Start the picker for the first tab that has a file input waiting for
@@ -6595,6 +6633,7 @@ fn start_picker(
                 chooser.session.as_deref(),
                 chooser.backend_node_id,
             );
+            chooser_answered(tab);
         }
     }
     redraw_row(term, tabs, chrome, shared)
@@ -6688,7 +6727,8 @@ pub fn open_delivered(
 /// A refusal is said on the row and the page is told `cancel`: the picker is
 /// closed, so the question is over, and a page with a spinner up for the
 /// input should hear that it is. A picker that broke is the same, with its
-/// own sentence.
+/// own sentence. Whichever it was, the page is then asked its title
+/// ([`chooser_answered`]).
 fn finish_picker(
     tabs: &mut Tabs<Client>,
     chrome: &mut Chrome,
@@ -6731,6 +6771,7 @@ fn finish_picker(
             cancel_chooser(&mut tab.connection, session, node);
         }
     }
+    chooser_answered(tab);
 }
 
 /// A file picker with a window, as the window knows it while the terminal
@@ -11979,6 +12020,25 @@ mod tests {
                 .map(|(_, params, session)| (params.clone(), session.clone()))
                 .collect()
         }
+
+        /// Whether the page on `S1` was asked its title — the evaluation
+        /// [`page_loaded`] sends — after the last `method` it was sent.
+        fn asked_title_after(&self, method: &str) -> bool {
+            std::thread::sleep(Duration::from_millis(50));
+            let heard = self.heard.lock().expect("the log");
+            let on_page = |session: &Option<String>| session.as_deref() == Some("S1");
+            let Some(told) = heard
+                .iter()
+                .rposition(|(sent, _, session)| sent == method && on_page(session))
+            else {
+                return false;
+            };
+            heard[told..].iter().any(|(sent, params, session)| {
+                sent == "Runtime.evaluate"
+                    && on_page(session)
+                    && params.get("expression").and_then(Json::as_str) == Some(load::LOADED)
+            })
+        }
     }
 
     impl Drop for FakeEngine {
@@ -12179,6 +12239,10 @@ mod tests {
             sent[0].0.get("backendNodeId").and_then(Json::as_i64),
             Some(7)
         );
+        assert!(
+            engine.asked_title_after("DOM.setFileInputFiles"),
+            "a `change` handler may have renamed it (#116)"
+        );
         drop(tabs);
         std::fs::remove_file(&file).ok();
         std::fs::remove_dir_all(&downloads).ok();
@@ -12246,8 +12310,117 @@ mod tests {
             Some(upload::sentence(std::slice::from_ref(&file)).as_str())
         );
         assert_eq!(engine.heard("DOM.setFileInputFiles").len(), 1);
+        assert!(
+            engine.asked_title_after("DOM.setFileInputFiles"),
+            "a `change` handler may have renamed it (#116)"
+        );
         drop(tabs);
         std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn the_page_is_asked_its_title_after_it_hears_cancel() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, mut shared, downloads) = fake_window("cancel-title", &engine);
+        tabs.active_mut().expect("a tab").picking = Some(picking(true));
+        chrome.picker = Some(PickerWait {
+            id: 5,
+            tab: "a".to_string(),
+            node: 7,
+        });
+        let mut term = FakeTerminal::default();
+        term.answers
+            .push((5, HelperOutcome::Picker(picker::Outcome::Cancel)));
+        pump_picker(&mut term, &mut tabs, &mut chrome, &mut shared, &[]).expect("a pass");
+        assert!(chrome.picker.is_none());
+        assert_eq!(engine.heard("DOM.resolveNode").len(), 1, "cancel told");
+        assert!(
+            engine.asked_title_after("DOM.resolveNode"),
+            "a `cancel` handler may have renamed it (#116)"
+        );
+        assert!(!term.written.is_empty(), "the row drawn again");
+        drop(tabs);
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_path_escaped_on_the_row_asks_the_title_too() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, mut shared, downloads) = fake_window("row-title", &engine);
+        let chooser = picking(true).chooser;
+        let mut term = FakeTerminal::default();
+
+        tabs.active_mut().expect("a tab").upload =
+            Some(Upload::new(chooser.clone(), PathBuf::from("/"), None));
+        answer_upload(
+            &mut term,
+            &mut tabs,
+            &mut chrome,
+            &mut shared,
+            key(Key::Escape, 0),
+        )
+        .expect("a key");
+        assert!(tabs.active().expect("a tab").upload.is_none());
+        assert!(
+            engine.asked_title_after("DOM.resolveNode"),
+            "escaped: told `cancel`, then asked"
+        );
+
+        // And the path confirmed, as well as escaped.
+        let file = chosen_file("row-title");
+        let dir = file.parent().expect("a directory").to_path_buf();
+        let name = file
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .to_string();
+        tabs.active_mut().expect("a tab").upload = Some(Upload::new(chooser, dir, None));
+        for c in name.chars() {
+            answer_upload(&mut term, &mut tabs, &mut chrome, &mut shared, typed(c)).expect("a key");
+        }
+        answer_upload(
+            &mut term,
+            &mut tabs,
+            &mut chrome,
+            &mut shared,
+            key(Key::Enter, 0),
+        )
+        .expect("a key");
+        assert!(tabs.active().expect("a tab").upload.is_none());
+        assert_eq!(engine.heard("DOM.setFileInputFiles").len(), 1);
+        assert!(
+            engine.asked_title_after("DOM.setFileInputFiles"),
+            "sent: then asked"
+        );
+        drop(tabs);
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(&downloads).ok();
+    }
+
+    #[test]
+    fn a_page_behind_a_dialog_is_not_asked() {
+        let engine = FakeEngine::start();
+        let (mut tabs, mut chrome, mut shared, downloads) = fake_window("dialog-title", &engine);
+        let alert = Json::parse(r#"{"type":"alert","message":"m","url":"u"}"#).expect("JSON");
+        let tab = tabs.active_mut().expect("a tab");
+        tab.picking = Some(picking(true));
+        tab.dialog = Dialog::opening(&alert);
+        chrome.picker = Some(PickerWait {
+            id: 6,
+            tab: "a".to_string(),
+            node: 7,
+        });
+        let mut term = FakeTerminal::default();
+        term.answers
+            .push((6, HelperOutcome::Picker(picker::Outcome::Cancel)));
+        pump_picker(&mut term, &mut tabs, &mut chrome, &mut shared, &[]).expect("a pass");
+        assert_eq!(engine.heard("DOM.resolveNode").len(), 1, "cancel told");
+        assert!(
+            engine.heard("Runtime.evaluate").is_empty(),
+            "a page with a dialog up would not answer in time"
+        );
+        drop(tabs);
         std::fs::remove_dir_all(&downloads).ok();
     }
 
