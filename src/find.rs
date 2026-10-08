@@ -102,6 +102,7 @@
 //! prompt and what the row says about the answer, so that all of it is
 //! tested without either. [`crate::app`] sends and collects.
 
+use crate::bindings::{Action as BoundAction, Bindings, LocalAction as Local, Lookup, Scope};
 use crate::input::{Key, KeyAction, KeyInput};
 use crate::json::Json;
 use crate::line::{Edit, Line};
@@ -422,29 +423,33 @@ impl Finder {
     /// The prompt's own keys first, and then the line's, so that the find
     /// prompt and the url bar agree about every key they share: a release or
     /// a modifier on its own does nothing; Escape closes; `ctrl+q` quits;
-    /// `enter` and `ctrl+g` go to the next match and, with shift, the one
-    /// before. Then [`Line::step`], where Up and `ctrl+p` are the previous
+    /// `enter` and `ctrl+g` go to the next match; `shift+enter` goes to
+    /// the one before. Kitty reserves `ctrl+shift+g`, so it is not a default. Then [`Line::step`], where Up and `ctrl+p` are the previous
     /// match and Down and `ctrl+n` the next — they walk a history in the url
     /// bar and there is none here — and any other key that changed the text is
     /// a search for it. `ctrl+f` is readline's forward-a-character in here,
     /// as it is in the url bar, rather than a second find: the line's rule,
     /// with no exception. A step on an empty needle asks nothing.
     pub fn step(&mut self, key: &KeyInput) -> Step {
+        self.step_bound(key, &Bindings::default())
+    }
+    pub fn step_bound(&mut self, key: &KeyInput, bindings: &Bindings) -> Step {
         if key.action == KeyAction::Release || matches!(key.key, Key::Other(_)) {
             return Step::Typing(None);
         }
-        let ctrl = key.mods.ctrl();
-        let alt = key.mods.alt();
-        let back = if key.mods.shift() { -1 } else { 1 };
-        match key.key {
-            Key::Escape => return Step::Close,
-            Key::Char('q') if ctrl => return Step::Quit,
-            Key::Enter => return Step::Typing(self.walk(back)),
-            Key::Char('g' | 'G') if ctrl && !alt => return Step::Typing(self.walk(back)),
+        match bindings.local(Scope::Find, key) {
+            Lookup::Unbound => return Step::Typing(None),
+            Lookup::Bound(BoundAction::Quit) => return Step::Quit,
+            Lookup::Bound(BoundAction::Local(Local::FindNext)) => {
+                return Step::Typing(self.walk(1))
+            }
+            Lookup::Bound(BoundAction::Local(Local::FindPrevious)) => {
+                return Step::Typing(self.walk(-1))
+            }
             _ => {}
         }
         let before = self.line.text().to_string();
-        match self.line.step(key) {
+        match self.line.step_bound(key, bindings, Scope::Find) {
             Edit::Previous => Step::Typing(self.walk(-1)),
             Edit::Next => Step::Typing(self.walk(1)),
             Edit::Typing | Edit::Inserted if self.line.text() != before => {
@@ -456,9 +461,10 @@ impl Finder {
             // Enter, Escape and `ctrl+q` were taken above and cannot come
             // back from the line; named so that a new edit is a compile error
             // here rather than a key that silently does nothing.
-            Edit::Typing | Edit::Inserted | Edit::Go | Edit::Cancel | Edit::Quit => {
-                Step::Typing(None)
-            }
+            Edit::Cancel => Step::Close,
+            Edit::Quit => Step::Quit,
+            Edit::Go => Step::Typing(self.walk(1)),
+            Edit::Typing | Edit::Inserted => Step::Typing(None),
         }
     }
 
@@ -644,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_and_ctrl_g_step_forward_and_with_shift_back() {
+    fn enter_and_ctrl_g_step_forward_shift_enter_back_and_reserved_ctrl_shift_g_is_unused() {
         let mut finder = Finder::open("");
         assert_eq!(finder.step(&key(Key::Enter, 0)), Step::Typing(None));
         assert_eq!(
@@ -663,11 +669,11 @@ mod tests {
         );
         assert_eq!(
             finder.step(&key(Key::Char('g'), Mods::CTRL | Mods::SHIFT)),
-            walk("fox", -1)
+            Step::Typing(None)
         );
         assert_eq!(
             finder.step(&key(Key::Char('G'), Mods::CTRL | Mods::SHIFT)),
-            walk("fox", -1)
+            Step::Typing(None)
         );
         assert_eq!(finder.step(&key(Key::Down, 0)), walk("fox", 1));
         assert_eq!(finder.step(&key(Key::Up, 0)), walk("fox", -1));
@@ -889,5 +895,22 @@ mod tests {
         // separator ends a line in older engines' string literals.
         assert!(!SCRIPT.contains(['\0', '\u{2028}', '\u{2029}']));
         assert!(SCRIPT.is_ascii());
+    }
+    #[test]
+    fn a_scoped_find_binding_walks_and_none_does_not_fall_back() {
+        use crate::bindings::Binding;
+        let bindings = Bindings::from_rows(vec![
+            Binding::parse("find.ctrl+n", "find-previous").unwrap(),
+            Binding::parse("find.ctrl+g", "none").unwrap(),
+        ]);
+        let mut finder = Finder::open("fox");
+        assert_eq!(
+            finder.step_bound(&key(Key::Char('n'), Mods::CTRL), &bindings),
+            walk("fox", -1)
+        );
+        assert_eq!(
+            finder.step_bound(&key(Key::Char('g'), Mods::CTRL), &bindings),
+            Step::Typing(None)
+        );
     }
 }

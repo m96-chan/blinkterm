@@ -65,16 +65,44 @@ keyboard protocol and SGR mouse reporting: Kitty, WezTerm, Ghostty, or a
 [tOS](https://github.com/m96-chan/tOS) pane. It runs on Linux and macOS,
 inside tmux (with `set -g allow-passthrough on`) and over ssh.
 
-| | |
-| --- | --- |
-| `ctrl+l` | type a url |
-| `ctrl+t` / `ctrl+w` | new tab / close tab |
-| `ctrl+tab`, `alt+1` … `alt+9` | switch tabs |
-| `alt+left` / `alt+right` | back / forward |
-| `ctrl+r` | reload |
-| `ctrl+f` | find in the page |
-| `alt+=` / `alt+-` / `alt+0` | zoom in / out / reset |
-| `ctrl+q` | quit |
+The default keymap is `mac` on macOS and `linux` elsewhere; select either
+with `--keymap mac|linux` or `keymap = mac|linux` in the settings file.
+These defaults avoid stock Kitty 0.45 reserved shortcuts; the mac set
+requires no Option keys.
+
+| action | Linux | macOS |
+| --- | --- | --- |
+| quit | `ctrl+q` | `ctrl+q` |
+| type a url | `ctrl+l` | `ctrl+l` |
+| reload | `ctrl+r` | `ctrl+r` |
+| back | `alt+left` | `cmd+[` |
+| forward | `alt+right` | `cmd+]` |
+| a new tab | `ctrl+t` | `ctrl+t` |
+| close this tab | `ctrl+w` | `ctrl+w` |
+| the next tab | `ctrl+]` | `ctrl+]` |
+| the tab before | `ctrl+[` | `ctrl+[` |
+| the nth tab | `alt+1 .. alt+8` | `ctrl+1 .. ctrl+8` |
+| zoom in | `alt+=`, `ctrl+=` | `ctrl+=` |
+| zoom out | `alt+-`, `ctrl+-` | `ctrl+-` |
+| back to 100% | `alt+0`, `ctrl+0` | `ctrl+0` |
+| find in the page | `ctrl+f` | `ctrl+f` |
+| copy the selection, or the line being typed | `alt+c` | `ctrl+c` |
+| copy the url | `alt+u` | `ctrl+;` |
+
+For Command-L/R/F, add `map cmd+l`, `map cmd+r`, `map cmd+f` to `kitty.conf`
+to free Kitty's shortcuts, then bind them in blinkterm:
+
+```ini
+keymap = mac
+key.cmd+l = url
+key.cmd+r = reload
+key.cmd+f = find
+key.line.ctrl+a = line-home
+key.normal.shift+j = scroll-bottom
+key.prompt.ctrl+w = none
+```
+
+See [all defaults and scoped bindings](docs/configuration.md#rebinding-keys).
 
 Everything else — profiles, history, bookmarks, downloads, ad blocking,
 password managers, rebinding keys — is in the docs.

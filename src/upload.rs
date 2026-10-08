@@ -48,6 +48,7 @@
 //! what completes and what is refused are decided in one place, and the
 //! tests run against directories of their own rather than the machine's.
 
+use crate::bindings::{Action as BoundAction, Bindings, LocalAction as Local, Lookup, Scope};
 use std::path::{Component, Path, PathBuf};
 
 use crate::input::{Key, KeyAction, KeyInput};
@@ -183,16 +184,30 @@ impl Upload {
     /// because the paths a person uploaded are a record, and a record is a
     /// thing `SECURITY.md` would have to list.
     pub fn step(&mut self, key: &KeyInput, fs: &dyn Dir) -> Outcome {
+        self.step_bound(key, fs, &Bindings::default())
+    }
+    pub fn step_bound(&mut self, key: &KeyInput, fs: &dyn Dir, bindings: &Bindings) -> Outcome {
         if key.action == KeyAction::Release || matches!(key.key, Key::Other(_)) {
             return Outcome::Waiting;
         }
         self.message = None;
-        let plain = !key.mods.ctrl() && !key.mods.alt() && !key.mods.shift();
-        if key.key == Key::Tab && plain && self.line.hint().is_empty() {
-            self.complete(fs);
-            return Outcome::Waiting;
+        match bindings.local(Scope::Upload, key) {
+            Lookup::Unbound => return Outcome::Waiting,
+            Lookup::Bound(BoundAction::Quit) => return Outcome::Quit,
+            Lookup::Bound(BoundAction::Local(Local::UploadComplete))
+                if self.line.hint().is_empty() =>
+            {
+                self.complete(fs);
+                return Outcome::Waiting;
+            }
+            Lookup::Bound(BoundAction::Local(Local::UploadComplete)) => {
+                self.line.apply(crate::line::Action::TakeHint);
+                self.offer(fs);
+                return Outcome::Waiting;
+            }
+            _ => {}
         }
-        match self.line.step(key) {
+        match self.line.step_bound(key, bindings, Scope::Upload) {
             Edit::Inserted => {
                 self.offer(fs);
                 Outcome::Waiting

@@ -1,49 +1,7 @@
-//! `key.<chord> = <action>`: what a person may rebind, and how a chord is
-//! spelled.
-//!
-//! The keys this program keeps for itself are a `match` in `app.rs`
-//! (`command`), and it stays one: it reads shift only where shift matters and
-//! answers more spellings than anybody writes down, which a table of exact
-//! rows would have to list one by one. So what a config file says about keys
-//! is kept beside that function rather than instead of it — a list of rows,
-//! looked up first, whose answer is a command, "not a command even if the
-//! built-in table says so", or nothing said, in which case the built-in table
-//! answers as it always did. That is [`Lookup`], and `app::keyed` is where it
-//! is asked: every place a key becomes a command asks it there.
-//!
-//! [`ACTIONS`] is the other half: every command with a name, the chords the
-//! built-in table answers it on, and a half-line of what it does. `--help`'s
-//! list of actions is made from it ([`help`]), and tests hold `docs/configuration.md`'s
-//! rebinding table and `command` itself to it, so that a command added
-//! without a name, or a default key changed in one place only, fails `cargo
-//! test` rather than a person reading the help.
-//!
-//! # A chord needs ctrl, alt or super
-//!
-//! A bare letter, or a shifted one, is the page's by this program's first
-//! rule: every unmodified key goes to the page, so that a text field is a
-//! text field. A `key.` line must not be able to take `j` from every field by
-//! a typo, so [`Binding::parse`] refuses a chord without ctrl, alt or super —
-//! shift is not enough, `shift+a` is a capital A — unless its key is one of
-//! `f1`…`f24`, which no field types with and which is where `f5` for reload
-//! lives. [`Chord::parse`] itself stays the spelling parser, permissive, so
-//! that the rule is one sentence in one place.
-//!
-//! # A chord is exact
-//!
-//! [`Chord::matches`] wants the same key and the same four modifier bits,
-//! no more and no fewer. The built-in table reads shift only for `tab`, `t`,
-//! `a`, `s` and the page keys, and a table of rows has to be either exact or a
-//! language; a row for `ctrl+tab` that also caught `ctrl+shift+tab` would
-//! take the previous-tab key away with the next-tab one. So `key.ctrl+= =
-//! none` frees `ctrl+=` and leaves `ctrl+shift+=` zooming in, as the built-in
-//! table has it. Caps lock and num lock, which the Kitty protocol reports as
-//! modifier bits too, are not part of any chord and are ignored.
-//!
-//! `+` is the separator, so a chord that means the `+` key spells it `plus`;
-//! and a space cannot be written at the end of a line that is trimmed, so it
-//! is `space`. Everything else that is one character is itself: `alt+=`,
-//! `ctrl+-`, `ctrl+/`.
+//! Platform defaults and scoped `key.<scope>.<chord> = <action>` overrides.
+//! Chords compare all four modifiers exactly; lock bits are ignored. Global
+//! bindings require ctrl, alt or super (or a function key), so ordinary typing
+//! still belongs to the page. Scoped bindings may use bare letters.
 
 use crate::input::{Key, KeyAction, KeyInput, Mods};
 
@@ -72,7 +30,7 @@ const NAMED: [(&str, Key); 16] = [
     ("space", Key::Char(' ')),
 ];
 
-/// A key with its modifiers, as written: `ctrl+shift+tab`, `alt+=`, `f5`.
+/// A key with its modifiers, as written: `ctrl+[`, `alt+=`, `f5`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chord {
     pub mods: Mods,
@@ -228,6 +186,8 @@ pub enum Action {
     /// `alt+b`: blocking off for the site in front, or on again. See
     /// [`crate::block`].
     Block,
+    /// An action belonging to an editor or an interaction scope.
+    Local(LocalAction),
 }
 
 /// One row of [`ACTIONS`]: the name a `key.` line gives, the action, the
@@ -297,7 +257,7 @@ pub const ACTIONS: [Row; 29] = [
     Row {
         name: "reopen-tab",
         action: Action::ReopenTab,
-        keys: "ctrl+shift+t, alt+t",
+        keys: "alt+t",
         what: "reopen the tab closed last",
     },
     Row {
@@ -309,13 +269,13 @@ pub const ACTIONS: [Row; 29] = [
     Row {
         name: "next-tab",
         action: Action::NextTab,
-        keys: "ctrl+tab",
+        keys: "ctrl+]",
         what: "the next tab",
     },
     Row {
         name: "previous-tab",
         action: Action::PreviousTab,
-        keys: "ctrl+shift+tab",
+        keys: "ctrl+[",
         what: "the tab before",
     },
     Row {
@@ -333,25 +293,25 @@ pub const ACTIONS: [Row; 29] = [
     Row {
         name: "list-tabs",
         action: Action::ListTabs,
-        keys: "ctrl+shift+a, alt+a",
+        keys: "alt+a",
         what: "the tab list",
     },
     Row {
         name: "history",
         action: Action::History,
-        keys: "ctrl+shift+h, alt+h",
+        keys: "alt+h",
         what: "the history list",
     },
     Row {
         name: "move-tab-left",
         action: Action::MoveTabLeft,
-        keys: "ctrl+shift+pageup, alt+shift+pageup",
+        keys: "alt+shift+pageup",
         what: "move this tab left",
     },
     Row {
         name: "move-tab-right",
         action: Action::MoveTabRight,
-        keys: "ctrl+shift+pagedown, alt+shift+pagedown",
+        keys: "alt+shift+pagedown",
         what: "move this tab right",
     },
     Row {
@@ -428,6 +388,296 @@ pub const ACTIONS: [Row; 29] = [
     },
 ];
 
+/// The default set is selected independently of the terminal's host OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keymap {
+    Mac,
+    Linux,
+}
+impl Default for Keymap {
+    fn default() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Mac
+        } else {
+            Self::Linux
+        }
+    }
+}
+impl Keymap {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "mac" => Ok(Self::Mac),
+            "linux" => Ok(Self::Linux),
+            _ => Err(format!("keymap: {value:?}; expected mac or linux")),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mac => "mac",
+            Self::Linux => "linux",
+        }
+    }
+}
+
+/// A local interaction. URL, find, prompt, upload and lists inherit line edits;
+/// history also inherits list navigation. An explicit override always wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scope {
+    #[default]
+    Global,
+    Line,
+    Url,
+    Find,
+    List,
+    History,
+    Dialog,
+    Prompt,
+    Upload,
+    Normal,
+    Hints,
+    Page,
+}
+impl Scope {
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "line" => Self::Line,
+            "url" => Self::Url,
+            "find" => Self::Find,
+            "list" => Self::List,
+            "history" => Self::History,
+            "dialog" => Self::Dialog,
+            "prompt" => Self::Prompt,
+            "upload" => Self::Upload,
+            "normal" => Self::Normal,
+            "hints" => Self::Hints,
+            "page" => Self::Page,
+            _ => return None,
+        })
+    }
+    fn parents(self) -> &'static [Self] {
+        match self {
+            Self::History => &[Self::List, Self::Line],
+            Self::Prompt => &[Self::Dialog, Self::Line],
+            Self::Url | Self::Find | Self::List | Self::Upload => &[Self::Line],
+            _ => &[],
+        }
+    }
+    fn accepts(self, action: LocalAction) -> bool {
+        let owner = action.scope();
+        self == owner || self.parents().contains(&owner)
+    }
+}
+
+/// Actions applied directly, without synthesizing keyboard events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalAction {
+    LineHome,
+    LineEnd,
+    LineLeft,
+    LineRight,
+    LineWordLeft,
+    LineWordRight,
+    LineDeleteBack,
+    LineDeleteForward,
+    LineDeleteWordBack,
+    LineDeleteWordForward,
+    LineKillStart,
+    LineKillEnd,
+    LineHint,
+    LinePrevious,
+    LineNext,
+    Accept,
+    Cancel,
+    FindNext,
+    FindPrevious,
+    ListPrevious,
+    ListNext,
+    ListPageUp,
+    ListPageDown,
+    HistoryNewTab,
+    HistoryForget,
+    DialogAccept,
+    DialogDismiss,
+    UploadComplete,
+    Hints,
+    HintsNewTab,
+    ScrollDown,
+    ScrollUp,
+    HalfDown,
+    HalfUp,
+    TopPrefix,
+    ScrollTop,
+    ScrollBottom,
+    Back,
+    Forward,
+    Reload,
+    Url,
+    NewTab,
+    Find,
+    Insert,
+    HintsCancel,
+    HintsBackspace,
+    PageEscape,
+}
+const LOCAL_ACTIONS: &[(&str, LocalAction)] = &[
+    ("line-home", LocalAction::LineHome),
+    ("line-end", LocalAction::LineEnd),
+    ("line-left", LocalAction::LineLeft),
+    ("line-right", LocalAction::LineRight),
+    ("line-word-left", LocalAction::LineWordLeft),
+    ("line-word-right", LocalAction::LineWordRight),
+    ("line-delete-back", LocalAction::LineDeleteBack),
+    ("line-delete-forward", LocalAction::LineDeleteForward),
+    ("line-delete-word-back", LocalAction::LineDeleteWordBack),
+    (
+        "line-delete-word-forward",
+        LocalAction::LineDeleteWordForward,
+    ),
+    ("line-kill-start", LocalAction::LineKillStart),
+    ("line-kill-end", LocalAction::LineKillEnd),
+    ("line-hint", LocalAction::LineHint),
+    ("line-previous", LocalAction::LinePrevious),
+    ("line-next", LocalAction::LineNext),
+    ("accept", LocalAction::Accept),
+    ("cancel", LocalAction::Cancel),
+    ("find-next", LocalAction::FindNext),
+    ("find-previous", LocalAction::FindPrevious),
+    ("list-previous", LocalAction::ListPrevious),
+    ("list-next", LocalAction::ListNext),
+    ("list-page-up", LocalAction::ListPageUp),
+    ("list-page-down", LocalAction::ListPageDown),
+    ("history-new-tab", LocalAction::HistoryNewTab),
+    ("history-forget", LocalAction::HistoryForget),
+    ("dialog-accept", LocalAction::DialogAccept),
+    ("dialog-dismiss", LocalAction::DialogDismiss),
+    ("upload-complete", LocalAction::UploadComplete),
+    ("hints", LocalAction::Hints),
+    ("hints-new-tab", LocalAction::HintsNewTab),
+    ("scroll-down", LocalAction::ScrollDown),
+    ("scroll-up", LocalAction::ScrollUp),
+    ("half-down", LocalAction::HalfDown),
+    ("half-up", LocalAction::HalfUp),
+    ("top-prefix", LocalAction::TopPrefix),
+    ("scroll-top", LocalAction::ScrollTop),
+    ("scroll-bottom", LocalAction::ScrollBottom),
+    ("back", LocalAction::Back),
+    ("forward", LocalAction::Forward),
+    ("reload", LocalAction::Reload),
+    ("url", LocalAction::Url),
+    ("new-tab", LocalAction::NewTab),
+    ("find", LocalAction::Find),
+    ("insert", LocalAction::Insert),
+    ("hints-cancel", LocalAction::HintsCancel),
+    ("hints-backspace", LocalAction::HintsBackspace),
+    ("page-escape", LocalAction::PageEscape),
+];
+impl LocalAction {
+    fn scope(self) -> Scope {
+        use LocalAction::*;
+        match self {
+            FindNext | FindPrevious => Scope::Find,
+            ListPrevious | ListNext | ListPageUp | ListPageDown => Scope::List,
+            HistoryNewTab | HistoryForget => Scope::History,
+            DialogAccept | DialogDismiss => Scope::Dialog,
+            UploadComplete => Scope::Upload,
+            HintsCancel | HintsBackspace => Scope::Hints,
+            PageEscape => Scope::Page,
+            Hints | HintsNewTab | ScrollDown | ScrollUp | HalfDown | HalfUp | TopPrefix
+            | ScrollTop | ScrollBottom | Back | Forward | Reload | Url | NewTab | Find | Insert => {
+                Scope::Normal
+            }
+            _ => Scope::Line,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        LOCAL_ACTIONS
+            .iter()
+            .find(|(_, a)| *a == self)
+            .map_or("", |(name, _)| *name)
+    }
+}
+
+/// Exact local builtin chords. Text entry and hint label typing are fallback
+/// behaviors, not commands; an explicit `none` runs before those fallbacks.
+pub const LOCAL_DEFAULTS: &[(Scope, &str, LocalAction)] = &[
+    (Scope::Line, "home, ctrl+a", LocalAction::LineHome),
+    (Scope::Line, "end, ctrl+e", LocalAction::LineEnd),
+    (Scope::Line, "left, ctrl+b", LocalAction::LineLeft),
+    (Scope::Line, "right, ctrl+f", LocalAction::LineRight),
+    (
+        Scope::Line,
+        "alt+b, alt+left, ctrl+left",
+        LocalAction::LineWordLeft,
+    ),
+    (
+        Scope::Line,
+        "alt+f, alt+right, ctrl+right",
+        LocalAction::LineWordRight,
+    ),
+    (
+        Scope::Line,
+        "backspace, ctrl+h",
+        LocalAction::LineDeleteBack,
+    ),
+    (
+        Scope::Line,
+        "delete, ctrl+d",
+        LocalAction::LineDeleteForward,
+    ),
+    (
+        Scope::Line,
+        "ctrl+w, alt+backspace, ctrl+backspace",
+        LocalAction::LineDeleteWordBack,
+    ),
+    (
+        Scope::Line,
+        "alt+d, alt+delete, ctrl+delete",
+        LocalAction::LineDeleteWordForward,
+    ),
+    (Scope::Line, "ctrl+u", LocalAction::LineKillStart),
+    (Scope::Line, "ctrl+k", LocalAction::LineKillEnd),
+    (Scope::Line, "tab", LocalAction::LineHint),
+    (Scope::Line, "up, ctrl+p", LocalAction::LinePrevious),
+    (Scope::Line, "down, ctrl+n", LocalAction::LineNext),
+    (Scope::Line, "enter", LocalAction::Accept),
+    (Scope::Line, "esc", LocalAction::Cancel),
+    (Scope::Find, "enter, ctrl+g", LocalAction::FindNext),
+    (Scope::Find, "shift+enter", LocalAction::FindPrevious),
+    (Scope::List, "pageup", LocalAction::ListPageUp),
+    (Scope::List, "pagedown", LocalAction::ListPageDown),
+    (
+        Scope::History,
+        "ctrl+enter, alt+enter",
+        LocalAction::HistoryNewTab,
+    ),
+    (Scope::History, "shift+delete", LocalAction::HistoryForget),
+    (
+        Scope::Dialog,
+        "enter, y, shift+y",
+        LocalAction::DialogAccept,
+    ),
+    (Scope::Dialog, "esc, n, shift+n", LocalAction::DialogDismiss),
+    (Scope::Upload, "tab", LocalAction::UploadComplete),
+    (Scope::Normal, "f", LocalAction::Hints),
+    (Scope::Normal, "shift+f", LocalAction::HintsNewTab),
+    (Scope::Normal, "j", LocalAction::ScrollDown),
+    (Scope::Normal, "k", LocalAction::ScrollUp),
+    (Scope::Normal, "d", LocalAction::HalfDown),
+    (Scope::Normal, "u", LocalAction::HalfUp),
+    (Scope::Normal, "g", LocalAction::TopPrefix),
+    (Scope::Normal, "shift+g", LocalAction::ScrollBottom),
+    (Scope::Normal, "shift+h", LocalAction::Back),
+    (Scope::Normal, "shift+l", LocalAction::Forward),
+    (Scope::Normal, "r", LocalAction::Reload),
+    (Scope::Normal, "o", LocalAction::Url),
+    (Scope::Normal, "shift+o", LocalAction::NewTab),
+    (Scope::Normal, "/", LocalAction::Find),
+    (Scope::Normal, "i", LocalAction::Insert),
+    (Scope::Hints, "esc", LocalAction::HintsCancel),
+    (Scope::Hints, "backspace", LocalAction::HintsBackspace),
+    (Scope::Page, "esc", LocalAction::PageEscape),
+];
+
 /// The rows with one name each: every row but `tab-1 .. tab-8`.
 fn named_rows() -> impl Iterator<Item = &'static Row> {
     ACTIONS.iter().filter(|row| row.name != TAB_NAMES)
@@ -463,6 +713,9 @@ impl Action {
 
     /// The name `parse` reads.
     pub fn name(self) -> String {
+        if let Action::Local(action) = self {
+            return action.name().to_string();
+        }
         if let Action::Tab(n) = self {
             return format!("tab-{n}");
         }
@@ -484,48 +737,119 @@ impl Action {
     }
 }
 
-/// The chords the built-in table answers `action` on, as [`ACTIONS`] lists
-/// them: its row's `keys` parsed, and `alt+n` for `tab-n`.
-///
-/// Nothing in the program asks this — the built-in table is `app::command`,
-/// which is a `match` — but the tests on both sides do, `docs/configuration.md`'s
-/// table here and `command` itself in `app.rs`, and it is one function for both.
+/// Linux default chords, for documentation and compatibility checks.
+/// Runtime lookup uses the selected keymap through [`default_action`].
 pub fn defaults(action: Action) -> Vec<Chord> {
-    if let Action::Tab(n) = action {
-        return Chord::parse(&format!("alt+{n}")).into_iter().collect();
-    }
-    ACTIONS
-        .iter()
-        .filter(|row| row.action == action)
-        .flat_map(|row| row.keys.split(','))
-        .filter_map(|spelled| Chord::parse(spelled).ok())
-        .collect()
+    default_chords(Keymap::Linux, action)
 }
 
-/// The `actions:` block `--help` prints after its `keys:`: a name and its
-/// default chords per row, and what a chord may be.
-///
-/// What each does is not printed: the `keys:` block above it has already
-/// said, in more words than half a line.
-pub fn help() -> String {
-    let width = ACTIONS.iter().map(|row| row.name.len()).max().unwrap_or(0);
-    let mut out =
-        String::from("\nactions (key.<chord> = <action> in the settings file; none unbinds):\n");
-    for row in &ACTIONS {
-        out.push_str(&format!("  {:<width$}  {}\n", row.name, row.keys));
+pub fn default_keys(keymap: Keymap, action: Action) -> String {
+    if keymap == Keymap::Linux {
+        if let Action::Tab(n) = action {
+            return format!("alt+{n}");
+        }
+        return ACTIONS
+            .iter()
+            .find(|r| r.action == action)
+            .map_or(String::new(), |r| r.keys.to_string());
     }
-    out.push_str(
-        "A chord is ctrl, alt, shift or super joined with + to a key: a character,\n\
-         plus, space, tab, enter, esc, backspace, insert, delete, up, down, left,\n\
-         right, home, end, pageup, pagedown or f1..f24; it needs ctrl, alt or super\n\
-         unless it is an f-key.\n",
+    match action {
+        Action::Quit => "ctrl+q",
+        Action::EditUrl => "ctrl+l",
+        Action::Reload => "ctrl+r",
+        Action::Back => "super+[",
+        Action::Forward => "super+]",
+        Action::NewTab => "ctrl+t",
+        Action::CloseTab => "ctrl+w",
+        Action::ReopenTab => "ctrl+y",
+        Action::Bookmark => "super+d",
+        Action::PreviousTab => "ctrl+[",
+        Action::NextTab => "ctrl+]",
+        Action::Tab(n) => return format!("ctrl+{n}"),
+        Action::LastTab => "ctrl+9",
+        Action::ListTabs => "ctrl+e",
+        Action::History => "ctrl+h",
+        Action::MoveTabLeft => "ctrl+pageup",
+        Action::MoveTabRight => "ctrl+pagedown",
+        Action::ZoomIn => "ctrl+=",
+        Action::ZoomOut => "ctrl+-",
+        Action::ZoomReset => "ctrl+0",
+        Action::Find => "ctrl+f",
+        Action::Permissions => "ctrl+p",
+        Action::Block => "ctrl+b",
+        Action::FillLogin => "ctrl+g",
+        Action::Copy => "ctrl+c",
+        Action::CopyUrl => "ctrl+;",
+        Action::SavePdf => "ctrl+s",
+        Action::SaveScreenshot => "ctrl+shift+d",
+        Action::ToggleNormal => "ctrl+.",
+        Action::Local(_) => "",
+    }
+    .to_string()
+}
+pub fn default_chords(keymap: Keymap, action: Action) -> Vec<Chord> {
+    default_keys(keymap, action)
+        .split(',')
+        .filter_map(|s| Chord::parse(s).ok())
+        .collect()
+}
+pub fn default_action(keymap: Keymap, input: &KeyInput) -> Option<Action> {
+    if input.action == KeyAction::Release {
+        return None;
+    }
+    Action::every()
+        .into_iter()
+        .find(|a| default_chords(keymap, *a).iter().any(|c| c.matches(input)))
+}
+pub fn help() -> String {
+    help_for(Keymap::default())
+}
+pub fn help_for(keymap: Keymap) -> String {
+    let mut out = format!(
+        "\nactions (key.<chord> = <action>; none unbinds; keymap={}):\n",
+        keymap.name()
     );
+    for row in &ACTIONS {
+        let keys = if matches!(row.action, Action::Tab(_)) {
+            format!(
+                "{}+1 .. {}+8",
+                if keymap == Keymap::Mac { "ctrl" } else { "alt" },
+                if keymap == Keymap::Mac { "ctrl" } else { "alt" }
+            )
+        } else {
+            default_keys(keymap, row.action)
+        };
+        out.push_str(&format!("  {:<18} {}  {}\n", row.name, keys, row.what));
+    }
+    out.push_str("Platform default: mac on macOS, linux elsewhere. --keymap mac|linux selects it.\nA chord joins ctrl, alt, shift or super (cmd) with + to a character, plus,\nspace, tab, enter, esc, backspace, insert, delete, arrows, home, end,\npageup, pagedown or f1..f24. Global keys need ctrl, alt or super, or an f-key.\nScoped keys may be bare: key.<scope>.<chord> = <action> or none.\nScopes: line, url, find, list, history, dialog, prompt, upload, normal, hints, page.\n");
+    for scope in [
+        Scope::Line,
+        Scope::Find,
+        Scope::List,
+        Scope::History,
+        Scope::Dialog,
+        Scope::Upload,
+        Scope::Normal,
+        Scope::Hints,
+        Scope::Page,
+    ] {
+        out.push_str(&format!(
+            "  {scope:?}: {}\n",
+            LOCAL_ACTIONS
+                .iter()
+                .filter(|(_, a)| a.scope() == scope)
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     out
 }
 
 /// One line of the file: `None` is `= none`, the chord unbound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
+    pub scope: Scope,
     pub chord: Chord,
     pub action: Option<Action>,
 }
@@ -536,10 +860,16 @@ impl Binding {
     /// that it has ctrl, alt or super or is an f-key (see the module's
     /// section on it), then the action.
     pub fn parse(chord: &str, value: &str) -> Result<Binding, String> {
+        let (scope, chord) = match chord.split_once('.') {
+            Some((name, chord)) if Scope::parse(name).is_some() => {
+                (Scope::parse(name).unwrap_or_default(), chord)
+            }
+            _ => (Scope::Global, chord),
+        };
         let written = chord.trim();
         let chord = Chord::parse(written).map_err(|why| format!("key.{why}"))?;
         let held = chord.mods.0 & (Mods::CTRL | Mods::ALT | Mods::SUPER) != 0;
-        if !held && !matches!(chord.key, Key::Function(_)) {
+        if scope == Scope::Global && !held && !matches!(chord.key, Key::Function(_)) {
             return Err(format!(
                 "key.{written}: a key with no ctrl, alt or super is the page's; add one, or use f1..f24"
             ));
@@ -547,9 +877,24 @@ impl Binding {
         let action = if value.trim().eq_ignore_ascii_case("none") {
             None
         } else {
-            Some(Action::parse(value)?)
+            Some(if scope == Scope::Global {
+                Action::parse(value)?
+            } else if value.trim() == "quit" {
+                Action::Quit
+            } else {
+                let action = LOCAL_ACTIONS
+                    .iter()
+                    .find(|(name, action)| *name == value.trim() && scope.accepts(*action))
+                    .map(|(_, a)| *a)
+                    .ok_or_else(|| format!("{value:?} is not an action for {scope:?}"))?;
+                Action::Local(action)
+            })
         };
-        Ok(Binding { chord, action })
+        Ok(Binding {
+            scope,
+            chord,
+            action,
+        })
     }
 }
 
@@ -560,6 +905,7 @@ impl Binding {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Bindings {
     rows: Vec<Binding>,
+    pub keymap: Keymap,
 }
 
 /// What the rows say about one key.
@@ -576,7 +922,10 @@ pub enum Lookup {
 
 impl Bindings {
     pub fn from_rows(rows: Vec<Binding>) -> Bindings {
-        Bindings { rows }
+        Bindings {
+            rows,
+            keymap: Keymap::default(),
+        }
     }
 
     /// What the rows say about `input`. A release is never a command, as the
@@ -586,13 +935,79 @@ impl Bindings {
         if input.action == KeyAction::Release {
             return Lookup::Default;
         }
-        match self.rows.iter().rev().find(|row| row.chord.matches(input)) {
+        match self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.scope == Scope::Global && row.chord.matches(input))
+        {
             Some(Binding {
                 action: Some(action),
                 ..
             }) => Lookup::Bound(*action),
             Some(Binding { action: None, .. }) => Lookup::Unbound,
             None => Lookup::Default,
+        }
+    }
+
+    /// Explicit local override, then inherited common edits. `none` consumes
+    /// the key before either the builtin or ordinary text insertion.
+    pub fn scoped(&self, scope: Scope, input: &KeyInput) -> Lookup {
+        if input.action == KeyAction::Release {
+            return Lookup::Default;
+        }
+        for scope in std::iter::once(scope).chain(scope.parents().iter().copied()) {
+            if let Some(row) = self
+                .rows
+                .iter()
+                .rev()
+                .find(|row| row.scope == scope && row.chord.matches(input))
+            {
+                return row.action.map_or(Lookup::Unbound, Lookup::Bound);
+            }
+        }
+        Lookup::Default
+    }
+    /// Local override first, inherited overrides next, then exact builtin.
+    /// Global `none` suppresses a local fallback too (notably the quit key).
+    pub fn local(&self, scope: Scope, input: &KeyInput) -> Lookup {
+        let explicit = self.scoped(scope, input);
+        if explicit != Lookup::Default {
+            return explicit;
+        }
+        if self.lookup(input) == Lookup::Unbound {
+            return Lookup::Unbound;
+        }
+        if input.action == KeyAction::Release {
+            return Lookup::Default;
+        }
+        for current in std::iter::once(scope).chain(scope.parents().iter().copied()) {
+            // A prompt's dialog confirmation letters are ordinary text.
+            if scope == Scope::Prompt && current == Scope::Dialog {
+                continue;
+            }
+            for (owner, keys, action) in LOCAL_DEFAULTS {
+                if *owner == current
+                    && keys
+                        .split(',')
+                        .filter_map(|k| Chord::parse(k).ok())
+                        .any(|c| c.matches(input))
+                {
+                    return Lookup::Bound(Action::Local(*action));
+                }
+            }
+        }
+        Lookup::Default
+    }
+    pub fn with_keymap(mut self, keymap: Keymap) -> Self {
+        self.keymap = keymap;
+        self
+    }
+    pub fn action(&self, input: &KeyInput) -> Option<Action> {
+        match self.lookup(input) {
+            Lookup::Bound(a) => Some(a),
+            Lookup::Unbound => None,
+            Lookup::Default => default_action(self.keymap, input),
         }
     }
 
@@ -649,31 +1064,18 @@ mod tests {
 
     #[test]
     fn the_help_lists_every_action_once_with_its_default_chords() {
-        let help = help();
-        let lines: Vec<&str> = help
-            .lines()
-            .skip_while(|line| !line.starts_with("actions"))
-            .skip(1)
-            .take(ACTIONS.len())
-            .collect();
-        assert_eq!(lines.len(), ACTIONS.len());
-        for (line, row) in lines.iter().zip(&ACTIONS) {
-            let line = line.trim();
-            assert!(line.starts_with(row.name), "{line} for {}", row.name);
-            assert!(line.ends_with(row.keys), "{line} for {}", row.name);
+        for keymap in [Keymap::Mac, Keymap::Linux] {
+            let help = help_for(keymap);
+            for row in &ACTIONS {
+                assert!(
+                    help.lines().any(|l| l.trim().starts_with(row.name)),
+                    "{}",
+                    row.name
+                );
+            }
+            assert!(help.contains("Scopes: line"));
+            assert!(help.contains(&format!("keymap={}", keymap.name())));
         }
-        for row in &ACTIONS {
-            let named = help
-                .lines()
-                .filter(|line| line.trim().split("  ").next() == Some(row.name))
-                .count();
-            assert_eq!(named, 1, "{}", row.name);
-        }
-        assert!(
-            help.trim_end()
-                .ends_with("it needs ctrl, alt or super\nunless it is an f-key."),
-            "{help}"
-        );
     }
 
     /// The rows of `docs/configuration.md`'s `### Rebinding keys` table, each cell with
@@ -711,7 +1113,7 @@ mod tests {
                 .collect();
             let wanted: Vec<String> = defaults(row.action).iter().map(Chord::spell).collect();
             assert_eq!(written, wanted, "{}", row.name);
-            assert_eq!(cells[2], row.what, "{}", row.name);
+            assert_eq!(cells[3], row.what, "{}", row.name);
         }
     }
 
@@ -859,6 +1261,7 @@ mod tests {
 
     fn row(chord: &str, action: Option<Action>) -> Binding {
         Binding {
+            scope: Scope::Global,
             chord: Chord::parse(chord).expect(chord),
             action,
         }
@@ -922,5 +1325,55 @@ mod tests {
         );
         let why = Binding::parse("ctrl+a", "bookmarks").expect_err("not an action");
         assert!(why.starts_with("\"bookmarks\" is not an action"), "{why}");
+    }
+    #[test]
+    fn both_platform_tables_cover_every_action_with_exact_non_conflicting_chords() {
+        for keymap in [Keymap::Mac, Keymap::Linux] {
+            let mut used = Vec::new();
+            for action in Action::every() {
+                let defaults = default_chords(keymap, action);
+                assert!(!defaults.is_empty(), "{keymap:?} {action:?}");
+                for chord in defaults {
+                    assert!(!used.contains(&chord), "duplicate {}", chord.spell());
+                    assert!(
+                        crate::kitty_keys::collision(&chord, true).is_none(),
+                        "{keymap:?}: {}",
+                        chord.spell()
+                    );
+                    assert_eq!(
+                        default_action(keymap, &key(chord.key, chord.mods.0)),
+                        Some(action)
+                    );
+                    used.push(chord);
+                }
+            }
+        }
+        for (_, keys, _) in LOCAL_DEFAULTS {
+            for chord in keys.split(',').map(|k| Chord::parse(k).expect(k)) {
+                assert!(
+                    crate::kitty_keys::collision(&chord, true).is_none(),
+                    "local {}",
+                    chord.spell()
+                );
+            }
+        }
+    }
+    #[test]
+    fn scopes_validate_actions_and_specific_overrides_beat_common_edits() {
+        let bindings = Bindings::from_rows(vec![
+            Binding::parse("line.ctrl+a", "line-end").unwrap(),
+            Binding::parse("url.ctrl+a", "line-home").unwrap(),
+        ]);
+        assert_eq!(
+            bindings.scoped(Scope::Url, &key(Key::Char('a'), Mods::CTRL)),
+            Lookup::Bound(Action::Local(LocalAction::LineHome))
+        );
+        assert_eq!(
+            bindings.scoped(Scope::Find, &key(Key::Char('a'), Mods::CTRL)),
+            Lookup::Bound(Action::Local(LocalAction::LineEnd))
+        );
+        assert!(Binding::parse("normal.j", "scroll-top").is_ok());
+        assert!(Binding::parse("line.j", "scroll-top").is_err());
+        assert!(Binding::parse("j", "reload").is_err());
     }
 }

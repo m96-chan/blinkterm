@@ -409,6 +409,10 @@ pub fn print_engine(options: &Options) -> bool {
 pub fn report(options: &Options, provenance: &Provenance) -> bool {
     println!("blinkterm {}", env!("CARGO_PKG_VERSION"));
     config_line(provenance);
+    say("keymap", options.bindings.keymap.name());
+    for warning in crate::kitty_keys::warnings(&options.bindings, cfg!(target_os = "macos")) {
+        say("key warning", &warning);
+    }
     let engine_ok = engine_lines(options, provenance);
     profile_line(&options.profile);
     match download::prepare(options.download.clone()) {

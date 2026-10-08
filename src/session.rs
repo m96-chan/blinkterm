@@ -480,16 +480,21 @@ impl Offer {
 
     /// What `key` says to the question.
     pub fn reply(&self, key: &KeyInput) -> Reply {
+        self.reply_bound(key, &crate::bindings::Bindings::default())
+    }
+    pub fn reply_bound(&self, key: &KeyInput, bindings: &crate::bindings::Bindings) -> Reply {
+        use crate::bindings::{Action, LocalAction, Lookup, Scope};
+        match bindings.local(Scope::Dialog, key) {
+            Lookup::Unbound => return Reply::Waiting,
+            Lookup::Bound(Action::Local(LocalAction::DialogAccept)) => return Reply::Yes,
+            Lookup::Bound(Action::Local(LocalAction::DialogDismiss)) => return Reply::No,
+            _ => {}
+        }
         if key.action == KeyAction::Release {
             return Reply::Waiting;
         }
-        let plain = !key.mods.ctrl() && !key.mods.alt() && !key.mods.meta();
         match key.key {
             Key::Other(_) => Reply::Waiting,
-            Key::Enter if plain => Reply::Yes,
-            Key::Char('y' | 'Y') if plain => Reply::Yes,
-            Key::Escape => Reply::No,
-            Key::Char('n' | 'N') if plain => Reply::No,
             _ => Reply::Pass,
         }
     }

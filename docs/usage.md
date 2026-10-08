@@ -2,21 +2,26 @@
 
 ## Keys
 
+The table below uses the Linux keymap. macOS selects `mac` by default;
+see [both default sets](configuration.md#rebinding-keys) and use
+`--keymap mac|linux` to select either. All commands and editing keys can
+be rebound or disabled with scoped settings.
+
 | | |
 | --- | --- |
 | `ctrl+l` | type a url. In the url bar, `←`/`→`, `home`/`end`, `ctrl+a`/`ctrl+e` and `alt+b`/`alt+f` (or `ctrl+←`/`ctrl+→`) move; `ctrl+w`/`alt+backspace` and `alt+d` delete a word; `ctrl+u`/`ctrl+k` delete to either end; `↑`/`↓` walk the pages visited; a dim suggestion after what you typed is taken with `tab` or `→` |
-| `ctrl+f` | find in the page. Type and the matches are highlighted as you go, the current one in orange and scrolled into view; the row says `3/17`. `enter`/`ctrl+g`/`↓` next, `shift+enter`/`ctrl+shift+g`/`↑` previous; the same editing keys as the url bar; `esc` closes and clears. The next `ctrl+f` offers the last needle again |
+| `ctrl+f` | find in the page. Type and the matches are highlighted as you go, the current one in orange and scrolled into view; the row says `3/17`. `enter`/`ctrl+g`/`↓` next, `shift+enter`/`↑` previous; the same editing keys as the url bar; `esc` closes and clears. The next `ctrl+f` offers the last needle again |
 | `ctrl+r` | reload; a page whose renderer crashed comes back with it |
 | `alt+left` / `alt+right` | back and forward |
 | `ctrl+t` | a new tab, with the cursor in the url bar |
 | `ctrl+w` | close this tab; closing the last one quits |
-| `ctrl+shift+t` / `alt+t` | reopen the tab closed last, and the one before it on the next press (up to twenty, this run). `alt+t` is there because `ctrl+shift+t` is `ctrl+t` in a terminal without the Kitty keyboard protocol, and never reaches a tOS pane, whose compositor takes it for a workspace |
+| `alt+t` | reopen the tab closed last, and the one before it on the next press (up to twenty, this run) |
 | `ctrl+d` | bookmark this page; again to remove the bookmark |
-| `ctrl+tab` / `ctrl+shift+tab` | the next tab, the one before |
+| `ctrl+]` / `ctrl+[` | the next tab, the one before |
 | `alt+1` … `alt+8`, `alt+9` | the nth tab, the last tab |
-| `ctrl+shift+a` (or `alt+a`) | the tab list: type to filter by title or url, `↑`/`↓` to pick, `enter` to switch, `esc` to close |
-| `ctrl+shift+h` (or `alt+h`) | the history list: every page visited, newest first, `title — url` and when; type words in any order to filter by title or url, `↑`/`↓` to pick, `enter` opens it here, `alt+enter`/`ctrl+enter` (or a middle click) in a new tab, `shift+delete` forgets it, `esc` closes. See [History](configuration.md#history) |
-| `ctrl+shift+pageup` / `pagedown` (or `alt+shift+pageup` / `pagedown`) | move this tab left or right |
+| `alt+a` | the tab list: type to filter by title or url, `↑`/`↓` to pick, `enter` to switch, `esc` to close |
+| `alt+h` | the history list: every page visited, newest first, `title — url` and when; type words in any order to filter by title or url, `↑`/`↓` to pick, `enter` opens it here, `alt+enter`/`ctrl+enter` (or a middle click) in a new tab, `shift+delete` forgets it, `esc` closes. See [History](configuration.md#history) |
+| `alt+shift+pageup` / `pagedown` | move this tab left or right |
 | middle click or `ctrl`+click on a link | open it in a tab behind this one |
 | `alt+=` / `alt+-` | zoom in and out (`ctrl+=` / `ctrl+-` where your terminal lets them through) |
 | `alt+0` / `ctrl+0` | back to 100% |
@@ -40,21 +45,18 @@ new window gets a new tab, and the tab is switched to.
 
 With more tabs than the row can name, the strip shows a run of them around
 the one in front and `+N` at either end for how many are past it; it scrolls
-when the tab in front reaches an edge. The list (`ctrl+shift+a`) shows all of
-them. Kitty and Ghostty keep `ctrl+shift+a` for themselves and every terminal
-keeps `ctrl+shift+pageup`/`pagedown` — Kitty and tOS for the scrollback,
-WezTerm and Ghostty for their own tabs — so each has an `alt` form that
-reaches the program everywhere. Ghostty also keeps `alt+1`..`alt+9` for its
-tabs; its `alt+9` is its last tab, as it is here. A middle or `ctrl` click
+when the tab in front reaches an edge. The list (`alt+a` on Linux,
+`ctrl+e` on macOS) shows all of them. A middle or `ctrl` click
 opens a link behind the current tab, as a desktop browser does; a link that
 asks for a window (`target=_blank`) still comes to the front.
 
-`ctrl+c` and `ctrl+v` are the page's own: they copy and paste within the
+With the Linux keymap, `ctrl+c` and `ctrl+v` are the page's own: they copy and paste within the
 engine, not with your clipboard. Your terminal's paste key (`ctrl+shift+v`, a
 middle click) is how text gets in, and `alt+c` is how it gets out. A paste
 reaches the page as text, never as keys, so the newlines in it do not submit
 a form; one over 64 KiB is refused whole rather than cut. Copying goes out as
-OSC 52, which your terminal may need to be told to allow.
+OSC 52, which your terminal may need to be told to allow. The mac keymap
+uses `ctrl+c` to copy to the host clipboard and `ctrl+;` to copy the URL.
 
 The url bar is asked about every key first while it is open, so `alt+←`/`→`
 are back and forward only when it is closed — in the bar they move by a word —

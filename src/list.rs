@@ -10,7 +10,10 @@
 //! looked at a tab. What differs between the two lists is what a row is, how
 //! a filter matches one, and what picking it does, and each owner keeps those.
 
-use crate::input::{Key, KeyAction, KeyInput};
+use crate::bindings::{Action as BoundAction, Bindings, LocalAction as Local, Lookup, Scope};
+#[cfg(test)]
+use crate::input::Key;
+use crate::input::{KeyAction, KeyInput};
 use crate::line::{Edit, Line};
 
 /// The filter and the pick while a list is open.
@@ -78,26 +81,45 @@ impl List {
     /// new list and the first of them is the best answer to what was just
     /// typed; a move of the cursor leaves it alone.
     pub fn step(&mut self, key: &KeyInput, count: usize, page: usize) -> Step {
+        self.step_bound(key, count, page, &Bindings::default(), Scope::List)
+    }
+    pub fn step_bound(
+        &mut self,
+        key: &KeyInput,
+        count: usize,
+        page: usize,
+        bindings: &Bindings,
+        scope: Scope,
+    ) -> Step {
         if key.action == KeyAction::Release {
             return Step::Typing;
         }
         // Where the pick is now, which is where a move starts from.
         let at = self.picked(count).unwrap_or(0);
         let last = count.saturating_sub(1);
-        let plain = !key.mods.ctrl() && !key.mods.alt();
-        match key.key {
-            Key::PageUp if plain => {
+        match bindings.local(scope, key) {
+            Lookup::Unbound => return Step::Typing,
+            Lookup::Bound(BoundAction::Quit) => return Step::Quit,
+            Lookup::Bound(BoundAction::Local(Local::ListPageUp)) => {
                 self.picked = at.saturating_sub(page.max(1));
                 return Step::Typing;
             }
-            Key::PageDown if plain => {
+            Lookup::Bound(BoundAction::Local(Local::ListPageDown)) => {
                 self.picked = (at + page.max(1)).min(last);
+                return Step::Typing;
+            }
+            Lookup::Bound(BoundAction::Local(Local::ListPrevious)) => {
+                self.picked = at.saturating_sub(1);
+                return Step::Typing;
+            }
+            Lookup::Bound(BoundAction::Local(Local::ListNext)) => {
+                self.picked = (at + 1).min(last);
                 return Step::Typing;
             }
             _ => {}
         }
         let before = self.line.text().to_string();
-        match self.line.step(key) {
+        match self.line.step_bound(key, bindings, scope) {
             Edit::Go => Step::Pick(self.picked(count)),
             Edit::Cancel => Step::Close,
             Edit::Quit => Step::Quit,

@@ -17,6 +17,7 @@
 //! history list shares; what is the tab list's own is what a match is and
 //! that a pick names a tab by its place in the strip.
 
+use crate::bindings::{Bindings, Scope};
 use std::borrow::Cow;
 
 pub use crate::list::{Step, Window};
@@ -109,7 +110,20 @@ impl TabList {
     /// how many rows the list has on the screen. See [`List::step`] for the
     /// keys; a [`Step::Pick`] here carries the strip index.
     pub fn step(&mut self, key: &KeyInput, matched: &[usize], page: usize) -> Step {
-        strip_index(self.list.step(key, matched.len(), page), matched)
+        self.step_bound(key, matched, page, &Bindings::default())
+    }
+    pub fn step_bound(
+        &mut self,
+        key: &KeyInput,
+        matched: &[usize],
+        page: usize,
+        bindings: &Bindings,
+    ) -> Step {
+        strip_index(
+            self.list
+                .step_bound(key, matched.len(), page, bindings, Scope::List),
+            matched,
+        )
     }
 
     /// A click on the `row`th visible row (from zero), with `shown` the

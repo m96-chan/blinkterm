@@ -36,6 +36,7 @@
 //! page, because Tab and Enter are how a page is walked without a mouse
 //! today and a page's `ctrl` shortcuts are the page's.
 
+use crate::bindings::{Action as BoundAction, Bindings, LocalAction as Local, Lookup, Scope};
 use crate::input::{Key, KeyAction, KeyInput};
 
 /// How far `gg`/`G` ask the page to go: past any page's end, clamped by the
@@ -69,6 +70,8 @@ pub enum Action {
     Page,
     /// A letter with no binding, or the first `g`: swallowed.
     Nothing,
+    /// A scoped quit command.
+    Quit,
     Scroll(Scroll),
     /// `f`/`F`: show hints; `true` opens links in a new tab.
     Hints {
@@ -122,56 +125,73 @@ impl Mode {
     /// A pending `g` is forgotten by every press that is not the second `g`,
     /// and that press is handled as itself.
     pub fn step(&mut self, key: &KeyInput) -> Action {
+        self.step_bound(key, &Bindings::default())
+    }
+    pub fn step_bound(&mut self, key: &KeyInput, bindings: &Bindings) -> Action {
         if !self.normal {
             return Action::Page;
         }
-        let release = key.action == KeyAction::Release;
-        let pending_g = if release {
-            false
-        } else {
-            std::mem::take(&mut self.pending_g)
-        };
-        if key.mods.ctrl() || key.mods.alt() || key.mods.meta() {
-            return Action::Page;
+        // Legacy terminals encode a shifted letter as an uppercase character.
+        // Normalize that spelling for lookup without changing the event sent
+        // to the page or synthesizing an event for an action.
+        let mut spelled = key.clone();
+        if !key.mods.ctrl() && !key.mods.alt() && !key.mods.meta() {
+            if let Key::Char(c) = key.key {
+                let c = key.text.unwrap_or(c);
+                if c.is_ascii_uppercase() {
+                    spelled.mods = spelled.mods.with(crate::input::Mods::SHIFT);
+                }
+            }
         }
-        let Key::Char(c) = key.key else {
-            return Action::Page;
-        };
-        let c = match key.text {
-            Some(text) => text,
-            None if key.mods.shift() => c.to_ascii_uppercase(),
-            None => c,
-        };
+        let release = key.action == KeyAction::Release;
+        // Lookup the press spelling on release to suppress exactly the keys
+        // this scope owns. Releasing the first g must keep the pending prefix.
         if release {
-            return if c == ' ' {
-                Action::Page
-            } else {
+            spelled.action = KeyAction::Press;
+        }
+        let action = bindings.local(Scope::Normal, &spelled);
+        if release {
+            return if action != Lookup::Default
+                || matches!(key.key, Key::Char(c) if c != ' ' && !key.mods.ctrl() && !key.mods.alt() && !key.mods.meta())
+            {
                 Action::Nothing
+            } else {
+                Action::Page
             };
         }
-        match c {
-            // Space is a named key as far as a page is concerned: it pages
-            // down, or presses the button that has focus.
-            ' ' => Action::Page,
-            'f' => Action::Hints { new_tab: false },
-            'F' => Action::Hints { new_tab: true },
-            'j' => Action::Scroll(Scroll::Notch(1)),
-            'k' => Action::Scroll(Scroll::Notch(-1)),
-            'd' => Action::Scroll(Scroll::HalfPage(1)),
-            'u' => Action::Scroll(Scroll::HalfPage(-1)),
-            'g' if pending_g => Action::Scroll(Scroll::End(-1)),
-            'g' => {
+        let pending = std::mem::take(&mut self.pending_g);
+        match action {
+            Lookup::Unbound => Action::Nothing,
+            Lookup::Bound(BoundAction::Local(action)) => self.apply(action, pending),
+            Lookup::Bound(BoundAction::Quit) => Action::Quit,
+            _ if matches!(key.key, Key::Char(c) if c != ' ' && !key.mods.ctrl() && !key.mods.alt() && !key.mods.meta()) => {
+                Action::Nothing
+            }
+            _ => Action::Page,
+        }
+    }
+    fn apply(&mut self, action: Local, pending: bool) -> Action {
+        match action {
+            Local::Hints => Action::Hints { new_tab: false },
+            Local::HintsNewTab => Action::Hints { new_tab: true },
+            Local::ScrollDown => Action::Scroll(Scroll::Notch(1)),
+            Local::ScrollUp => Action::Scroll(Scroll::Notch(-1)),
+            Local::HalfDown => Action::Scroll(Scroll::HalfPage(1)),
+            Local::HalfUp => Action::Scroll(Scroll::HalfPage(-1)),
+            Local::TopPrefix if pending => Action::Scroll(Scroll::End(-1)),
+            Local::TopPrefix => {
                 self.pending_g = true;
                 Action::Nothing
             }
-            'G' => Action::Scroll(Scroll::End(1)),
-            'H' => Action::Back,
-            'L' => Action::Forward,
-            'r' => Action::Reload,
-            'o' => Action::OpenUrl,
-            'O' => Action::NewTab,
-            '/' => Action::Find,
-            'i' => Action::Insert,
+            Local::ScrollTop => Action::Scroll(Scroll::End(-1)),
+            Local::ScrollBottom => Action::Scroll(Scroll::End(1)),
+            Local::Back => Action::Back,
+            Local::Forward => Action::Forward,
+            Local::Reload => Action::Reload,
+            Local::Url => Action::OpenUrl,
+            Local::NewTab => Action::NewTab,
+            Local::Find => Action::Find,
+            Local::Insert => Action::Insert,
             _ => Action::Nothing,
         }
     }
@@ -341,5 +361,34 @@ mod tests {
         mode.insert();
         assert_eq!(mode.word(), None);
         assert_eq!(mode.step(&typed('j')), Action::Page);
+    }
+    #[test]
+    fn scoped_actions_keep_release_repeat_legacy_shift_and_prefix_semantics() {
+        use crate::bindings::Binding;
+        let bindings = Bindings::from_rows(vec![
+            Binding::parse("normal.g", "none").unwrap(),
+            Binding::parse("normal.shift+j", "scroll-bottom").unwrap(),
+            Binding::parse("normal.shift+q", "quit").unwrap(),
+        ]);
+        let mut mode = Mode::starting(true);
+        assert_eq!(mode.step_bound(&typed('g'), &bindings), Action::Nothing);
+        assert_eq!(mode.step_bound(&typed('g'), &bindings), Action::Nothing);
+        assert_eq!(mode.word(), Some("normal"));
+        assert_eq!(
+            mode.step_bound(&typed('J'), &bindings),
+            Action::Scroll(Scroll::End(1))
+        );
+        assert_eq!(mode.step_bound(&typed('Q'), &bindings), Action::Quit);
+        let mut released = typed('J');
+        released.action = KeyAction::Release;
+        assert_eq!(mode.step_bound(&released, &bindings), Action::Nothing);
+        let mut repeated = typed('J');
+        repeated.action = KeyAction::Repeat;
+        assert_eq!(
+            mode.step_bound(&repeated, &bindings),
+            Action::Scroll(Scroll::End(1))
+        );
+        mode.insert();
+        assert_eq!(mode.step_bound(&typed('J'), &bindings), Action::Page);
     }
 }

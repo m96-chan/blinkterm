@@ -71,60 +71,136 @@ nothing else, for scripts.
 
 ### Rebinding keys
 
-`key.<chord> = <action>` in the settings file puts an action on a key, and
-`key.<chord> = none` takes a key back for the page:
+The platform default is `keymap = mac` on macOS and `keymap = linux` elsewhere.
+`--keymap mac|linux` overrides the file. Both sets avoid stock Kitty 0.45
+shortcuts; the mac set uses Control for most commands and Command where
+Kitty leaves it free. Option is not required on macOS.
 
-    key.f5 = reload
-    key.ctrl+b = back
-    key.ctrl+w = none
+`key.<chord> = <action>` overrides the selected default; `none` gives that
+global chord to the page. These remain plain `name = value` settings, with
+no TOML sections:
 
-| action | default | does |
-| --- | --- | --- |
-| `quit` | `ctrl+q` | quit |
-| `url` | `ctrl+l` | type a url |
-| `reload` | `ctrl+r` | reload |
-| `back` | `alt+left` | back |
-| `forward` | `alt+right` | forward |
-| `new-tab` | `ctrl+t` | a new tab |
-| `close-tab` | `ctrl+w` | close this tab |
-| `reopen-tab` | `ctrl+shift+t`, `alt+t` | reopen the tab closed last |
-| `bookmark` | `ctrl+d` | bookmark this page, or remove the bookmark |
-| `next-tab` | `ctrl+tab` | the next tab |
-| `previous-tab` | `ctrl+shift+tab` | the tab before |
-| `tab-1` … `tab-8` | `alt+1` … `alt+8` | the nth tab |
-| `last-tab` | `alt+9` | the last tab |
-| `list-tabs` | `ctrl+shift+a`, `alt+a` | the tab list |
-| `history` | `ctrl+shift+h`, `alt+h` | the history list |
-| `move-tab-left` | `ctrl+shift+pageup`, `alt+shift+pageup` | move this tab left |
-| `move-tab-right` | `ctrl+shift+pagedown`, `alt+shift+pagedown` | move this tab right |
-| `zoom-in` | `alt+=`, `ctrl+=` | zoom in |
-| `zoom-out` | `alt+-`, `ctrl+-` | zoom out |
-| `zoom-reset` | `alt+0`, `ctrl+0` | back to 100% |
-| `find` | `ctrl+f` | find in the page |
-| `permissions` | `alt+p` | allow this site the camera, microphone, location, notifications or clipboard |
-| `block` | `alt+b` | stop blocking ads and trackers on this site, or start again |
-| `fill-login` | `alt+l` | fill the login form from your password manager |
-| `copy` | `alt+c` | copy the selection, or the line being typed |
-| `copy-url` | `alt+u` | copy the url |
-| `save-pdf` | `alt+s` | save this page as a PDF |
-| `save-screenshot` | `alt+shift+s` | save the whole page as a picture |
-| `normal-mode` | `ctrl+.` | normal mode on or off |
+```ini
+keymap = mac
+key.f5 = reload
+key.ctrl+w = none
+key.line.ctrl+a = line-home
+key.find.ctrl+n = find-next
+key.normal.shift+j = scroll-bottom
+key.prompt.ctrl+w = none
+key.history.shift+delete = none
+key.url.enter = none
+key.hints.esc = none
+```
 
-A chord is `ctrl`, `alt`, `shift` or `super` joined with `+` to a key — a
-character, or `plus`, `space`, `tab`, `enter`, `esc`, `backspace`,
-`insert`, `delete`, the arrows, `home`, `end`, `pageup`, `pagedown`,
-`f1`…`f24` — and needs `ctrl`, `alt` or `super` unless it is an f-key: a
-bare letter is the page's, always. A chord is exact: `ctrl+tab` is not
-`ctrl+shift+tab`, and `key.ctrl+= = none` leaves `ctrl+shift+=` zooming in.
-A bound key is taken from every page — `key.ctrl+b = back` is no longer an
-editor's bold. The editing keys of the url bar, the find prompt, the tab
-list, the history list and a dialog are not remappable, and `copy`, `copy-url` and `quit` are
-the only actions that reach through them, on whatever keys they are. A
-later line for the same chord replaces an earlier one; binding a chord the
-program already used moves nothing else, so `key.ctrl+t = quit` leaves
-`new-tab` on no key. Normal mode's letters are not affected by `key.` lines:
-`key.ctrl+r = none` leaves `r` as reload. `blinkterm --help` lists the
-actions too.
+| action | Linux default | macOS default | does |
+| --- | --- | --- | --- |
+| `quit` | `ctrl+q` | `ctrl+q` | quit |
+| `url` | `ctrl+l` | `ctrl+l` | type a url |
+| `reload` | `ctrl+r` | `ctrl+r` | reload |
+| `back` | `alt+left` | `cmd+[` | back |
+| `forward` | `alt+right` | `cmd+]` | forward |
+| `new-tab` | `ctrl+t` | `ctrl+t` | a new tab |
+| `close-tab` | `ctrl+w` | `ctrl+w` | close this tab |
+| `reopen-tab` | `alt+t` | `ctrl+y` | reopen the tab closed last |
+| `bookmark` | `ctrl+d` | `cmd+d` | bookmark this page, or remove the bookmark |
+| `next-tab` | `ctrl+]` | `ctrl+]` | the next tab |
+| `previous-tab` | `ctrl+[` | `ctrl+[` | the tab before |
+| `tab-1 .. tab-8` | `alt+1 .. alt+8` | `ctrl+1 .. ctrl+8` | the nth tab |
+| `last-tab` | `alt+9` | `ctrl+9` | the last tab |
+| `list-tabs` | `alt+a` | `ctrl+e` | the tab list |
+| `history` | `alt+h` | `ctrl+h` | the history list |
+| `move-tab-left` | `alt+shift+pageup` | `ctrl+pageup` | move this tab left |
+| `move-tab-right` | `alt+shift+pagedown` | `ctrl+pagedown` | move this tab right |
+| `zoom-in` | `alt+=`, `ctrl+=` | `ctrl+=` | zoom in |
+| `zoom-out` | `alt+-`, `ctrl+-` | `ctrl+-` | zoom out |
+| `zoom-reset` | `alt+0`, `ctrl+0` | `ctrl+0` | back to 100% |
+| `find` | `ctrl+f` | `ctrl+f` | find in the page |
+| `permissions` | `alt+p` | `ctrl+p` | allow this site the camera, microphone, location, notifications or clipboard |
+| `block` | `alt+b` | `ctrl+b` | stop blocking ads and trackers on this site, or start again |
+| `fill-login` | `alt+l` | `ctrl+g` | fill the login form from your password manager |
+| `copy` | `alt+c` | `ctrl+c` | copy the selection, or the line being typed |
+| `copy-url` | `alt+u` | `ctrl+;` | copy the url |
+| `save-pdf` | `alt+s` | `ctrl+s` | save this page as a PDF |
+| `save-screenshot` | `alt+shift+s` | `ctrl+shift+d` | save the whole page as a picture |
+| `normal-mode` | `ctrl+.` | `ctrl+.` | normal mode on or off |
+
+Chords join `ctrl`, `alt` (`opt`), `shift`, `super` (`cmd` or `meta`) with `+`
+to a character or `plus`, `space`, `tab`, `enter`, `esc`, `backspace`,
+`insert`, `delete`, arrows, `home`, `end`, `pageup`, `pagedown`, `f1`…`f24`.
+They match modifiers exactly: `ctrl+=` does not also bind `ctrl+shift+=`.
+Lock bits are ignored. Global bindings need Control, Alt or Command, or an
+f-key, so bare letters still type into the page. Scoped bindings may use
+bare or shifted letters. A later line replaces an earlier line for the same
+scope and chord; rebinding one chord leaves the action's other chords alone.
+
+For Option chords when using the Linux set on macOS, Kitty can send Left
+Option as Alt with `macos_option_as_alt left`. To restore the old tab-switch
+chords, first free them in Kitty:
+
+```conf
+macos_option_as_alt left
+map ctrl+tab
+map ctrl+shift+tab
+```
+
+Then configure blinkterm:
+
+```ini
+key.ctrl+tab = next-tab
+key.ctrl+shift+tab = previous-tab
+```
+
+### Scoped editing and normal-mode keys
+
+`key.<scope>.<chord> = <action>` changes only that interaction. `none` consumes
+the key without editing, inserting text, or falling back to its default.
+The most specific scope wins over common editing and global copy/quit.
+`url`, `find`, `list`, `history`, `prompt` and `upload` inherit `line` edits;
+`history` also inherits `list`, and `prompt` inherits explicit `dialog`
+overrides. Prompt text does not inherit confirmation-letter defaults.
+
+| scope | actions |
+| --- | --- |
+| line (also URL, find, list, history, prompt, upload) | `line-home`, `line-end`, `line-left`, `line-right`, `line-word-left`, `line-word-right`, `line-delete-back`, `line-delete-forward`, `line-delete-word-back`, `line-delete-word-forward`, `line-kill-start`, `line-kill-end`, `line-hint`, `line-previous`, `line-next`, `accept`, `cancel` |
+| find | `find-next`, `find-previous` |
+| list (also history) | `list-previous`, `list-next`, `list-page-up`, `list-page-down` |
+| history | `history-new-tab`, `history-forget` |
+| dialog (also explicit prompt overrides and the restore offer) | `dialog-accept`, `dialog-dismiss` |
+| upload | `upload-complete` |
+| normal | `hints`, `hints-new-tab`, `scroll-down`, `scroll-up`, `half-down`, `half-up`, `top-prefix`, `scroll-top`, `scroll-bottom`, `back`, `forward`, `reload`, `url`, `new-tab`, `find`, `insert` |
+| hints | `hints-cancel`, `hints-backspace` |
+| page | `page-escape` (leave fullscreen or stop loading) |
+
+`quit` is also available in every scope. Normal-mode `top-prefix` is the
+first `g` of `gg`; `scroll-top` jumps there in one press. Outside normal
+mode its bare bindings never take typing from the page. Global `copy`,
+`copy-url` and `quit` reach through editors unless a scoped binding overrides
+them. In dialogs and uploads, tab commands still work as before.
+
+`blinkterm --help` lists the platform defaults and scoped action names;
+`blinkterm --keymap linux --help` shows the Linux set without reading config.
+`blinkterm --doctor` warns about effective custom chords reserved by stock
+Kitty 0.45, naming the Kitty action and the `map <chord>` line that frees it.
+Warnings use the host OS, independently of the selected keymap. Overridden
+lines and `none` do not warn; custom Kitty configurations are not inspected.
+
+To choose Command-L/R/F despite Kitty's stock reservations, first add to
+`kitty.conf` and reload Kitty's configuration:
+
+```conf
+map cmd+l
+map cmd+r
+map cmd+f
+```
+
+Then add to blinkterm's config:
+
+```ini
+key.cmd+l = url
+key.cmd+r = reload
+key.cmd+f = find
+```
 
 ## Profiles
 
@@ -171,7 +247,7 @@ when last — a page that loaded, not one that failed, and not `about:` or
 keeps the last 2000 pages. `--temp-profile` keeps it in memory for the run and
 writes none. Nothing else reads it.
 
-`ctrl+shift+h` (or `alt+h`) lists it over the screen, newest first: each row
+`alt+h` (Linux) or `ctrl+h` (macOS) lists it over the screen, newest first: each row
 says when — `just now`, `3 hours ago`, `2 weeks ago` — then the title and the
 url, with a `*` after the date for a page you have bookmarked too. Type
 words, in any order, and the list keeps the pages with every one of them in
@@ -267,5 +343,5 @@ y/n`. `y` or `enter` restores them; `n`, `esc`, or simply getting on with
 something else declines, and the question waits under anything else that
 wants the row. How a run that did not quit is known is the file's first line,
 `# blinkterm session: open` until the run quits and writes `closed`.
-`--temp-profile` keeps the session in memory, for `ctrl+shift+t`, and writes
+`--temp-profile` keeps the session in memory, for reopening closed tabs, and writes
 nothing.

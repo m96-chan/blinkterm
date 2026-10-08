@@ -101,8 +101,11 @@ pub struct View {
 /// The key table, apart from the line it acts on, so that which keys mean
 /// what is one `match` and what each one does is another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Action {
+pub enum Action {
     Insert(char),
+    Accept,
+    Cancel,
+    Quit,
     DeleteBack,
     DeleteForward,
     Left,
@@ -138,51 +141,54 @@ impl Action {
     /// one key away. A key that is not here does nothing in the line, and
     /// does not reach the page or the tab commands either.
     fn of(key: &KeyInput) -> Action {
-        let ctrl = key.mods.ctrl();
-        let alt = key.mods.alt();
-        match key.key {
-            Key::Char(c) if ctrl && !alt => match c {
-                'a' => Action::Home,
-                'e' => Action::End,
-                'b' => Action::Left,
-                'f' => Action::Right,
-                'h' => Action::DeleteBack,
-                'd' => Action::DeleteForward,
-                'w' => Action::DeleteWordBack,
-                'u' => Action::KillToStart,
-                'k' => Action::KillToEnd,
-                'p' => Action::Previous,
-                'n' => Action::Next,
-                _ => Action::Nothing,
-            },
-            Key::Char(c) if alt && !ctrl => match c {
-                'b' => Action::WordLeft,
-                'f' => Action::WordRight,
-                'd' => Action::DeleteWordForward,
-                _ => Action::Nothing,
-            },
-            Key::Backspace if ctrl || alt => Action::DeleteWordBack,
-            Key::Backspace => Action::DeleteBack,
-            Key::Delete if ctrl || alt => Action::DeleteWordForward,
-            Key::Delete => Action::DeleteForward,
-            Key::Left if ctrl || alt => Action::WordLeft,
-            Key::Left => Action::Left,
-            Key::Right if ctrl || alt => Action::WordRight,
-            Key::Right => Action::Right,
-            Key::Home => Action::Home,
-            Key::End => Action::End,
-            Key::Tab if !ctrl && !alt && !key.mods.shift() => Action::TakeHint,
-            Key::Up if !ctrl && !alt => Action::Previous,
-            Key::Down if !ctrl && !alt => Action::Next,
-            // A key that typed something, with no ctrl or alt on it: shift
-            // and super are how a capital or a symbol is reached. A character
-            // that is not plain text is not typed at all — see the module.
-            _ if !ctrl && !alt => match key.text {
-                Some(c) if text::is_plain(c) => Action::Insert(c),
-                _ => Action::Nothing,
-            },
-            _ => Action::Nothing,
+        Self::bound(
+            key,
+            &crate::bindings::Bindings::default(),
+            crate::bindings::Scope::Line,
+        )
+    }
+    fn bound(
+        key: &KeyInput,
+        bindings: &crate::bindings::Bindings,
+        scope: crate::bindings::Scope,
+    ) -> Action {
+        use crate::bindings::{Action as Bound, LocalAction as L, Lookup};
+        match bindings.local(scope, key) {
+            Lookup::Unbound => return Action::Nothing,
+            Lookup::Bound(Bound::Quit) => return Action::Quit,
+            Lookup::Bound(Bound::Local(action)) => {
+                return match action {
+                    L::LineHome => Action::Home,
+                    L::LineEnd => Action::End,
+                    L::LineLeft => Action::Left,
+                    L::LineRight => Action::Right,
+                    L::LineWordLeft => Action::WordLeft,
+                    L::LineWordRight => Action::WordRight,
+                    L::LineDeleteBack => Action::DeleteBack,
+                    L::LineDeleteForward => Action::DeleteForward,
+                    L::LineDeleteWordBack => Action::DeleteWordBack,
+                    L::LineDeleteWordForward => Action::DeleteWordForward,
+                    L::LineKillStart => Action::KillToStart,
+                    L::LineKillEnd => Action::KillToEnd,
+                    L::LineHint => Action::TakeHint,
+                    L::LinePrevious => Action::Previous,
+                    L::LineNext => Action::Next,
+                    L::Accept => Action::Accept,
+                    L::Cancel => Action::Cancel,
+                    _ => Action::Nothing,
+                }
+            }
+            _ => {}
         }
+        if bindings.action(key) == Some(Bound::Quit) {
+            return Action::Quit;
+        }
+        if !key.mods.ctrl() && !key.mods.alt() && !key.mods.meta() {
+            if let Some(c) = key.text.filter(|c| text::is_plain(*c)) {
+                return Action::Insert(c);
+            }
+        }
+        Action::Nothing
     }
 }
 
@@ -310,15 +316,34 @@ impl Line {
         if key.action == KeyAction::Release || matches!(key.key, Key::Other(_)) {
             return Edit::Typing;
         }
-        match key.key {
-            Key::Escape => return Edit::Cancel,
-            Key::Enter => return Edit::Go,
-            Key::Char('q') if key.mods.ctrl() => return Edit::Quit,
+        self.apply(Action::of(key))
+    }
+
+    pub fn step_bound(
+        &mut self,
+        key: &KeyInput,
+        bindings: &crate::bindings::Bindings,
+        scope: crate::bindings::Scope,
+    ) -> Edit {
+        if key.action == KeyAction::Release || matches!(key.key, Key::Other(_)) {
+            return Edit::Typing;
+        }
+        if bindings.local(scope, key) == crate::bindings::Lookup::Unbound {
+            return Edit::Typing;
+        }
+        self.apply(Action::bound(key, bindings, scope))
+    }
+
+    /// Apply an editor command without inventing a keyboard event.
+    pub fn apply(&mut self, action: Action) -> Edit {
+        match action {
+            Action::Accept => return Edit::Go,
+            Action::Cancel => return Edit::Cancel,
+            Action::Quit => return Edit::Quit,
             _ => {}
         }
         let whole = std::mem::take(&mut self.whole);
         let hint = std::mem::take(&mut self.hint);
-        let action = Action::of(key);
         if whole {
             return self.step_selected(action);
         }
@@ -349,7 +374,8 @@ impl Line {
             Action::KillToEnd => self.delete(self.cursor..end),
             Action::Previous => return Edit::Previous,
             Action::Next => return Edit::Next,
-            Action::TakeHint | Action::Nothing => {}
+            Action::TakeHint | Action::Nothing | Action::Accept | Action::Cancel | Action::Quit => {
+            }
         }
         Edit::Typing
     }
@@ -376,7 +402,8 @@ impl Line {
             Action::Right | Action::End | Action::WordRight => self.cursor = self.text.len(),
             Action::Previous => return Edit::Previous,
             Action::Next => return Edit::Next,
-            Action::TakeHint | Action::Nothing => {}
+            Action::TakeHint | Action::Nothing | Action::Accept | Action::Cancel | Action::Quit => {
+            }
         }
         Edit::Typing
     }
@@ -1098,5 +1125,33 @@ mod tests {
         check(&line);
         // And a room of nothing is a room of one: the cursor is somewhere.
         assert_eq!(holding(mixed).view(0).cursor, 0);
+    }
+    #[test]
+    fn scoped_none_preserves_selection_hint_and_blocks_quit_and_text() {
+        use crate::bindings::{Binding, Bindings, Scope};
+        let bindings = Bindings::from_rows(vec![
+            Binding::parse("url.enter", "none").unwrap(),
+            Binding::parse("ctrl+q", "none").unwrap(),
+            Binding::parse("url.x", "none").unwrap(),
+        ]);
+        let mut line = Line::selected("old");
+        assert_eq!(
+            line.step_bound(&key(Key::Enter, 0), &bindings, Scope::Url),
+            Edit::Typing
+        );
+        assert!(line.whole());
+        assert_eq!(
+            line.step_bound(&ctrl('q'), &bindings, Scope::Url),
+            Edit::Typing
+        );
+        assert!(line.whole());
+        line.step_bound(&typed('x'), &bindings, Scope::Url);
+        assert_eq!(line.text(), "old");
+        line.step_bound(&typed('y'), &bindings, Scope::Url);
+        assert_eq!(line.text(), "y");
+        line.suggest(Some("yes".to_string()));
+        let hint = line.hint().to_string();
+        line.step_bound(&key(Key::Enter, 0), &bindings, Scope::Url);
+        assert_eq!(line.hint(), hint);
     }
 }

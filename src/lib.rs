@@ -173,3 +173,6 @@ pub mod zoom;
 
 pub use json::Json;
 pub use options::Options;
+
+/// Stock Kitty shortcut reservations for keybinding diagnostics.
+pub mod kitty_keys;

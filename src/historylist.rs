@@ -26,16 +26,18 @@
 //!
 //! Three keys are the list's own, taken before the filter's line sees them,
 //! because [`Line`] would read them as something else: `alt+enter` and
-//! `ctrl+enter` open the pick in a new tab (Enter with any modifier is `Go`
-//! to the line), and `shift+delete` forgets it (a delete forward to the
+//! `ctrl+enter` open the pick in a new tab, and `shift+delete` forgets it (a delete forward to the
 //! line). Two for a new tab because each is taken by a terminal somewhere —
 //! WezTerm keeps `alt+enter` for full screen, Ghostty on Linux keeps
 //! `ctrl+enter` — and a middle click on a row does the same, for a terminal
-//! that sends neither. `ctrl+shift+delete` forgets too, since some keyboards
-//! and terminals only give shift+delete with it.
+//! that sends neither. The former `ctrl+shift+delete` alias is reserved by
+//! stock Kitty for resetting the terminal, so it is no longer a default.
 
+use crate::bindings::{Action as BoundAction, Bindings, LocalAction as Local, Lookup, Scope};
 use crate::history;
-use crate::input::{Key, KeyAction, KeyInput};
+#[cfg(test)]
+use crate::input::Key;
+use crate::input::{KeyAction, KeyInput};
 use crate::line::Line;
 use crate::list::{self, List, Window};
 use crate::text;
@@ -180,28 +182,36 @@ impl HistoryList {
     /// (see the module's docs for why they have to be); everything else is
     /// [`List::step`]'s, with a pick turned into the page to open here.
     pub fn step(&mut self, key: &KeyInput, page: usize) -> Step {
+        self.step_bound(key, page, &Bindings::default())
+    }
+    pub fn step_bound(&mut self, key: &KeyInput, page: usize, bindings: &Bindings) -> Step {
         if key.action == KeyAction::Release {
             return Step::Typing;
         }
         self.notice = None;
         let matched = self.matches();
         let pick = self.picked(matched.len()).map(|at| matched[at]);
-        match key.key {
-            Key::Enter if key.mods.alt() || key.mods.ctrl() => {
+        match bindings.local(Scope::History, key) {
+            Lookup::Unbound => return Step::Typing,
+            Lookup::Bound(BoundAction::Quit) => return Step::Quit,
+            Lookup::Bound(BoundAction::Local(Local::HistoryNewTab)) => {
                 return match pick {
                     Some(index) => self.opening(index, true),
                     None => Step::Close,
-                };
+                }
             }
-            Key::Delete if key.mods.shift() => {
+            Lookup::Bound(BoundAction::Local(Local::HistoryForget)) => {
                 return match pick {
                     Some(index) => Step::Forget(self.rows[index].url.clone()),
                     None => Step::Typing,
-                };
+                }
             }
             _ => {}
         }
-        match self.list.step(key, matched.len(), page) {
+        match self
+            .list
+            .step_bound(key, matched.len(), page, bindings, Scope::History)
+        {
             list::Step::Typing => Step::Typing,
             list::Step::Close | list::Step::Pick(None) => Step::Close,
             list::Step::Pick(Some(at)) => self.opening(matched[at], false),
@@ -429,11 +439,8 @@ mod tests {
             list.step(&key(Key::Enter, Mods::CTRL), 5),
             open(changelog, true)
         );
-        // Shift alone is still Enter: here.
-        assert_eq!(
-            list.step(&key(Key::Enter, Mods::SHIFT), 5),
-            open(changelog, false)
-        );
+        // Unlisted modifier combinations have no implicit alias.
+        assert_eq!(list.step(&key(Key::Enter, Mods::SHIFT), 5), Step::Typing);
         // A release is nothing at all.
         let mut release = key(Key::Enter, Mods::ALT);
         release.action = KeyAction::Release;
@@ -441,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_delete_and_ctrl_shift_delete_forget_the_pick_and_the_pick_stays_on_the_next_row() {
+    fn shift_delete_forgets_the_pick_but_kitty_reserved_ctrl_shift_delete_does_not() {
         let mut list = HistoryList::open(&four());
         list.step(&key(Key::Down, 0), 5);
         let mail = "https://mail.example/inbox";
@@ -464,7 +471,7 @@ mod tests {
         assert_eq!(list.picked(3), Some(1), "on the row that was after it");
         assert_eq!(
             list.step(&key(Key::Delete, Mods::SHIFT | Mods::CTRL), 5),
-            Step::Forget("https://docs.example/changelog".to_string())
+            Step::Typing
         );
         list.forgotten("https://docs.example/changelog");
         list.forgotten("https://news.example/rust-release");

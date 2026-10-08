@@ -39,7 +39,7 @@ use crate::fit::Metrics;
 use crate::tty::{self, ReadOutcome};
 
 use crate::appearance::Appearance;
-use crate::bindings::{Action, Bindings, Lookup};
+use crate::bindings::{Action, Bindings, LocalAction, Lookup, Scope};
 use crate::block::{self, Blocker, Unblocked};
 use crate::bookmarks::{Bookmarks, Toggled};
 use crate::cdp::{Client, Event, Notifier, Pending};
@@ -55,7 +55,9 @@ use crate::history::{self, History};
 use crate::historylist::{self, HistoryList};
 use crate::hover::{self, Shape};
 use crate::identity::Identity;
-use crate::input::{Input, Key, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
+#[cfg(test)]
+use crate::input::Key;
+use crate::input::{Input, KeyAction, KeyInput, MouseInput, MouseKind, Parser};
 use crate::json::Json;
 use crate::keys;
 use crate::line::{Edit, Line};
@@ -910,8 +912,12 @@ impl Allow {
     }
 
     /// One key: the part of [`edit_allow`] that talks to nothing.
+    #[cfg(test)]
     fn step(&mut self, key: &KeyInput) -> AllowStep {
-        match self.line.step(key) {
+        self.step_bound(key, &Bindings::default())
+    }
+    fn step_bound(&mut self, key: &KeyInput, bindings: &Bindings) -> AllowStep {
+        match self.line.step_bound(key, bindings, Scope::Line) {
             Edit::Cancel => AllowStep::Cancel,
             Edit::Quit => AllowStep::Quit,
             Edit::Go => match permissions::parse_words(self.line.text()) {
@@ -4530,7 +4536,10 @@ fn handle_input(
                 Some(RowOwner::Offer(_))
             );
             if let Some(offer) = chrome.offer.filter(|_| offered) {
-                match offer.reply(&key) {
+                if chrome.bindings.scoped(Scope::Dialog, &key) == Lookup::Bound(Action::Quit) {
+                    return Ok(false);
+                }
+                match offer.reply_bound(&key, &chrome.bindings) {
                     Reply::Waiting => return Ok(true),
                     Reply::Yes => {
                         decline_or_restore(pane, tabs, browser, chrome, true)?;
@@ -4549,6 +4558,9 @@ fn handle_input(
             // are for now — though not with this key, which was typed at a
             // label and not at a question nobody had seen yet.
             if chrome.hinting.is_some() {
+                if chrome.bindings.scoped(Scope::Hints, &key) == Lookup::Bound(Action::Quit) {
+                    return Ok(false);
+                }
                 let owned = row_owner(
                     tabs,
                     chrome.bar.as_ref(),
@@ -4558,7 +4570,8 @@ fn handle_input(
                     chrome.offer.as_ref(),
                 )
                 .is_some();
-                let own_key = keyed(&chrome.bindings, &key).is_some();
+                let own_key = chrome.bindings.scoped(Scope::Hints, &key) == Lookup::Default
+                    && keyed(&chrome.bindings, &key).is_some();
                 if !own_key && !owned {
                     return hint_key(pane, tabs, browser, chrome, key);
                 }
@@ -4569,7 +4582,25 @@ fn handle_input(
                 }
             }
             let was = tabs.active_target().map(str::to_string);
-            let command = keyed(&chrome.bindings, &key);
+            let scope = if chrome.hinting.is_some() {
+                Scope::Hints
+            } else if let Some(dialog) = tabs.active().and_then(|t| t.dialog.as_ref()) {
+                if dialog.typing() {
+                    Scope::Prompt
+                } else {
+                    Scope::Dialog
+                }
+            } else if tabs.active().is_some_and(|t| t.upload.is_some()) {
+                Scope::Upload
+            } else if chrome.mode.word().is_some() {
+                Scope::Normal
+            } else {
+                Scope::Page
+            };
+            let command = interaction_command(&chrome.bindings, scope, &key);
+            if scope == Scope::Page && chrome.bindings.scoped(scope, &key) == Lookup::Unbound {
+                return Ok(true);
+            }
             if asking(tabs) {
                 // The page is waiting on an answer. The tab keys still work,
                 // because leaving the question where it is — or closing the
@@ -4626,11 +4657,12 @@ fn handle_input(
             // program's own commands become that command, and run its arm
             // below unchanged.
             let before = chrome.mode.word();
-            let action = chrome.mode.step(&key);
+            let action = chrome.mode.step_bound(&key, &chrome.bindings);
             if chrome.mode.word() != before {
                 redraw_row(pane, tabs, chrome)?;
             }
             let command = command.or(match action {
+                normal::Action::Quit => Some(Command::Quit),
                 normal::Action::Back => Some(Command::Back),
                 normal::Action::Forward => Some(Command::Forward),
                 normal::Action::Reload => Some(Command::Reload),
@@ -4900,23 +4932,24 @@ fn handle_input(
                             .active()
                             .is_some_and(|tab| tab.loading && accepts_input(tab));
                         let fullscreen = tabs.active().is_some_and(|tab| tab.fullscreen);
-                        let escape = (key.key == Key::Escape && key.action != KeyAction::Release)
-                            .then(|| {
-                                escapes(
-                                    row_owner(
-                                        tabs,
-                                        chrome.bar.as_ref(),
-                                        chrome.find.as_ref(),
-                                        chrome.list.as_ref(),
-                                        chrome.allow.as_ref(),
-                                        chrome.offer.as_ref(),
-                                    )
-                                    .as_ref(),
-                                    chrome.hinting.is_some(),
-                                    fullscreen,
-                                    loading,
+                        let escape = (chrome.bindings.local(Scope::Page, &key)
+                            == Lookup::Bound(Action::Local(LocalAction::PageEscape)))
+                        .then(|| {
+                            escapes(
+                                row_owner(
+                                    tabs,
+                                    chrome.bar.as_ref(),
+                                    chrome.find.as_ref(),
+                                    chrome.list.as_ref(),
+                                    chrome.allow.as_ref(),
+                                    chrome.offer.as_ref(),
                                 )
-                            });
+                                .as_ref(),
+                                chrome.hinting.is_some(),
+                                fullscreen,
+                                loading,
+                            )
+                        });
                         if escape == Some(Escapes::Fullscreen) {
                             // The page's own Escape does not leave it in a
                             // headless engine; this does, and the watch
@@ -5211,10 +5244,9 @@ fn answer_dialog(
     let Some(dialog) = tab.dialog.as_mut() else {
         return Ok(true);
     };
-    match dialog.step(&key) {
+    match dialog.step_bound(&key, &chrome.bindings) {
         Answer::Waiting => {}
-        Answer::Quit if quits(&chrome.bindings, &key) => return Ok(false),
-        Answer::Quit => {}
+        Answer::Quit => return Ok(false),
         answer => {
             let params = dialog.reply(answer);
             let stay = dialog.kind == Kind::BeforeUnload && answer == Answer::Dismiss;
@@ -5252,10 +5284,9 @@ fn answer_upload(
     let Some(prompt) = tab.upload.as_mut() else {
         return Ok(true);
     };
-    match prompt.step(&key, &upload::Disk) {
+    match prompt.step_bound(&key, &upload::Disk, &chrome.bindings) {
         upload::Outcome::Waiting => {}
-        upload::Outcome::Quit if quits(&chrome.bindings, &key) => return Ok(false),
-        upload::Outcome::Quit => {}
+        upload::Outcome::Quit => return Ok(false),
         upload::Outcome::Send => {
             let params = prompt.reply();
             tab.note = Some(prompt.sentence());
@@ -5990,168 +6021,14 @@ pub fn stop(tab: &mut Tab<Client>) {
     }
 }
 
-/// Which keys this program answers, and which it hands to the page.
-///
-/// The tab keys are the ones a browser has taught everybody — `ctrl+t`,
-/// `ctrl+w`, `ctrl+tab`, `alt+1`..`alt+9` — and every one of them was checked
-/// against `compositor/tos-session/src/keys.rs` before being taken, because a
-/// key the compositor binds is a key that never reaches a pane at all. What
-/// the compositor has near these: `ctrl+shift+t` opens a workspace,
-/// `ctrl+shift+w` closes a pane, `ctrl+alt+shift+t` renames a workspace,
-/// `ctrl+shift+1`..`9` and `super+1`..`9` select workspaces, `ctrl+a` is the
-/// leader and `ctrl+space` opens the input method. None of those is one of
-/// these: the compositor's tab-ish keys all carry shift or super, and this
-/// program's all carry neither. `alt` it uses for nothing at all, which is why
-/// the digits are there rather than on ctrl, where `ctrl+1` would be a key a
-/// page can legitimately be sent.
-///
-/// `ctrl+tab` reaches the pane as `CSI 9;5u` and `ctrl+shift+tab` as
-/// `CSI 9;6u`, because this program asks for the Kitty keyboard protocol's
-/// disambiguate flag (`screen::KEYBOARD_FLAGS`) and `tos_input::encode` sends
-/// a modified tab in the protocol's form rather than as a bare `\t`. In a
-/// terminal that does not speak it, ctrl+tab arrives as a plain tab and goes
-/// to the page — which is the right failure, since the page is where tab
-/// usually belongs.
-///
-/// Copying is `alt+c` and `alt+u`, not `ctrl+shift+c`, because a key the
-/// terminal never sends is not a key this program can bind. Every terminal it
-/// runs in takes `ctrl+shift+c` and `ctrl+shift+v` for its own copy and paste
-/// before a pane sees a byte: Kitty, WezTerm and Ghostty on Linux, and tOS
-/// since #153 (`compositor/tos-session/src/keys.rs`, where "a program in a
-/// pane can no longer be sent ctrl+shift+c or ctrl+shift+v by any means").
-/// That is also how a paste gets in: the terminal's own paste key sends it,
-/// bracketed, and it goes wherever the typing is — see [`paste`]. `ctrl+c`
-/// and `ctrl+v` stay the page's, as they were: the engine copies and pastes
-/// within itself with them, which is how a page expects them to work, and a
-/// page's editor would lose them otherwise. `ctrl+y` is an editor's redo and
-/// `ctrl+insert` is WezTerm's copy. `alt` is the modifier this program
-/// already uses for its own movement and the compositor uses for nothing, and
-/// `alt+letter` is left to the program by Kitty, WezTerm and Ghostty alike.
-/// What it shadows on a page is an `accesskey` on `c` or `u`, on the same
-/// terms `alt+1`..`alt+9` already shadow the digits.
-///
-/// Saving is `alt+s`, and the whole page as a picture `alt+shift+s`, not
-/// `ctrl+s`: in a terminal that does not speak the Kitty protocol `ctrl+s`
-/// is XOFF, and the terminal stops. `alt+s` shadows an `accesskey` on `s`,
-/// on the terms `alt+c` does.
-///
-/// Find is `ctrl+f` because that is the reflex, and the compositor binds
-/// nothing on it. What it shadows is a page's own `ctrl+f` handler, which in
-/// a headless engine opened nothing anyway. Inside a line being typed it is
-/// readline's forward-a-character, because the line is asked first.
-///
-/// Zoom is on both. `ctrl+=`, `ctrl+-` and `ctrl+0` are the browser's reflex
-/// and are bound, but only some terminals let them through: Kitty passes them
-/// (its own font size is `ctrl+shift+=`) and so does tOS, whose compositor
-/// binds `=` only under its `ctrl+a` leader; WezTerm and Ghostty keep them
-/// for their own font size by default, and a legacy terminal sends `ctrl+=`
-/// as a bare `=`. `alt+=`, `alt+-` and `alt+0` are the program's own, on the
-/// modifier it already uses for back, forward, tabs and copying, and pass
-/// through every one of them and over any ssh. `+` and `_` are the same keys
-/// shifted, and `ctrl+_` is what a legacy terminal sends for `ctrl+-`
-/// (`0x1f`). `ctrl+0` is the one ctrl-digit taken, because no page has ever
-/// been sent it by a browser; `ctrl+1`..`ctrl+9` stay the page's. What the
-/// alt forms shadow is an `accesskey` on `=`, `-` or `0`.
-///
-/// The tab keys past the digits argue the same way, and more strongly,
-/// because delivery is not the question — every chord below arrives
-/// distinctly under the flags this program pushes — but whether the terminal
-/// keeps the key for itself, and each default table was read:
-///
-/// | chord | tOS | Kitty | WezTerm | Ghostty (Linux) |
-/// | --- | --- | --- | --- | --- |
-/// | `ctrl+shift+pageup`/`pagedown` | scrolls a page | scrolls a page | moves its tab | moves its tab |
-/// | `ctrl+shift+a` | free | a chord prefix (opacity) | free | select all |
-/// | `alt+9` | free | free | free | its last tab |
-/// | `alt+shift+pageup`/`pagedown` | free | free | free | free |
-/// | `alt+a` | free | free | free | free |
-/// | `ctrl+shift+h` | free | scrollback in a pager | free | free |
-/// | `alt+h` | free | free | free | free |
-///
-/// So `ctrl+shift+pageup`/`pagedown`, which move the tab in front in Chrome,
-/// reach the pane in none of the four, and `ctrl+shift+a`, Chrome's tab
-/// search, in two. They are bound all the same, for a person who has rebound
-/// their terminal, and each has an `alt` form that reaches the program
-/// everywhere: `alt+a` for the list, `alt+shift+pageup`/`pagedown` for the
-/// move. `ctrl+a` without shift stays the page's select-all, and `alt+shift+a`
-/// is nobody's. The history list is the same pair on `h`: `ctrl+shift+h`
-/// after the tab list's chord, and `alt+h`, which is the one that arrives
-/// in Kitty and in a legacy terminal, where `ctrl+h` is the byte backspace
-/// sends and `ctrl+shift+h` is that byte too. `alt+9` is the last tab rather than the ninth, as it is in
-/// Chrome, Firefox and Ghostty — whose own `alt+9` means the same, so the
-/// meaning agrees even where the key does not arrive.
-///
-/// `ctrl+d` is a browser's bookmark key, and what it shadows is a page's own
-/// `ctrl+d`, which in a headless engine did nothing anyway; inside a line
-/// being typed it is readline's delete-after, because the line is asked
-/// first. Reopening a closed tab is `ctrl+shift+t`, the reflex, which a
-/// terminal speaking the Kitty keyboard protocol sends as `ctrl+t` with
-/// shift — and which is also two things it cannot be: in a legacy terminal
-/// it is the byte `ctrl+t` sends, a new tab, and in a tOS pane it never
-/// arrives, because the compositor takes it for a workspace, as above. So it
-/// is `alt+t` as well, on the modifier the compositor leaves alone, which is
-/// the precedent the zoom keys set; what that shadows is an `accesskey` on
-/// `t`.
-///
-/// This is the built-in table, and the one the README documents; the settings
-/// file's `key.` lines are asked before it, by [`keyed`], and every caller
-/// goes through that. What the file may name is [`crate::bindings::ACTIONS`],
-/// which the tests hold to this `match` in both directions.
+/// Linux defaults, used by the compatibility tests independently of their
+/// host OS. Runtime dispatch uses the selected table in `Bindings`.
+/// Defaults live in bindings.rs so help, configuration and runtime agree.
+/// Reserved Kitty shortcuts are absent; people who free one in Kitty may
+/// explicitly bind it in their blinkterm settings.
+#[cfg(test)]
 fn command(key: &KeyInput) -> Option<Command> {
-    if key.action == KeyAction::Release {
-        return None;
-    }
-    if key.mods.ctrl() && !key.mods.alt() {
-        return match key.key {
-            Key::Char('q') => Some(Command::Quit),
-            Key::Char('l') => Some(Command::EditUrl),
-            Key::Char('r') => Some(Command::Reload),
-            Key::Char('t' | 'T') if key.mods.shift() => Some(Command::ReopenTab),
-            Key::Char('t') => Some(Command::NewTab),
-            Key::Char('d') => Some(Command::Bookmark),
-            Key::Char('w') => Some(Command::CloseTab),
-            Key::Char('f') => Some(Command::Find),
-            Key::Char('a' | 'A') if key.mods.shift() => Some(Command::ListTabs),
-            Key::Char('h' | 'H') if key.mods.shift() => Some(Command::History),
-            Key::PageUp if key.mods.shift() => Some(Command::MoveTab(-1)),
-            Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
-            Key::Tab if key.mods.shift() => Some(Command::PreviousTab),
-            Key::Tab => Some(Command::NextTab),
-            Key::Char('=' | '+') => Some(Command::ZoomIn),
-            Key::Char('-' | '_') => Some(Command::ZoomOut),
-            Key::Char('0') => Some(Command::ZoomReset),
-            Key::Char('.') => Some(Command::ToggleNormal),
-            _ => None,
-        };
-    }
-    if key.mods.alt() && !key.mods.ctrl() {
-        return match key.key {
-            Key::Left => Some(Command::Back),
-            Key::Right => Some(Command::Forward),
-            Key::Char('9') => Some(Command::LastTab),
-            Key::Char(digit @ '1'..='8') => Some(Command::SelectTab(digit as usize - '0' as usize)),
-            Key::Char('a') if !key.mods.shift() => Some(Command::ListTabs),
-            Key::Char('h') if !key.mods.shift() => Some(Command::History),
-            Key::PageUp if key.mods.shift() => Some(Command::MoveTab(-1)),
-            Key::PageDown if key.mods.shift() => Some(Command::MoveTab(1)),
-            Key::Char('c') => Some(Command::CopySelection),
-            Key::Char('u') => Some(Command::CopyUrl),
-            // `ESC S` is how a terminal without the Kitty protocol says
-            // alt+shift+s: the capital, with no shift bit.
-            Key::Char('S') => Some(Command::SaveScreenshot),
-            Key::Char('s') if key.mods.shift() => Some(Command::SaveScreenshot),
-            Key::Char('s') => Some(Command::SavePdf),
-            Key::Char('p') => Some(Command::Permissions),
-            Key::Char('b') => Some(Command::Block),
-            Key::Char('l') => Some(Command::FillLogin),
-            Key::Char('t') => Some(Command::ReopenTab),
-            Key::Char('=' | '+') => Some(Command::ZoomIn),
-            Key::Char('-' | '_') => Some(Command::ZoomOut),
-            Key::Char('0') => Some(Command::ZoomReset),
-            _ => None,
-        };
-    }
-    None
+    crate::bindings::default_action(crate::bindings::Keymap::Linux, key).map(command_of)
 }
 
 /// What `key` is, with the person's `key.` lines asked first: a chord they
@@ -6163,11 +6040,19 @@ fn command(key: &KeyInput) -> Option<Command> {
 /// With no `key.` lines every key is `Lookup::Default`, and this is
 /// [`command`].
 fn keyed(bindings: &Bindings, key: &KeyInput) -> Option<Command> {
-    match bindings.lookup(key) {
-        Lookup::Bound(action) => Some(command_of(action)),
-        Lookup::Unbound => None,
-        Lookup::Default => command(key),
+    bindings.action(key).map(command_of)
+}
+
+/// A scoped override precedes global commands, including copy and quit.
+fn interaction_command(bindings: &Bindings, scope: Scope, key: &KeyInput) -> Option<Command> {
+    match bindings.scoped(scope, key) {
+        Lookup::Bound(Action::Quit) => Some(Command::Quit),
+        Lookup::Default => keyed(bindings, key),
+        _ => None,
     }
+}
+fn hints_cancel(bindings: &Bindings, key: &KeyInput) -> bool {
+    bindings.local(Scope::Hints, key) == Lookup::Bound(Action::Local(LocalAction::HintsCancel))
 }
 
 /// The one place the file's names and the loop's commands meet. Exhaustive,
@@ -6175,6 +6060,7 @@ fn keyed(bindings: &Bindings, key: &KeyInput) -> Option<Command> {
 /// command without a name, is a test.
 fn command_of(action: Action) -> Command {
     match action {
+        Action::Local(_) => unreachable!("local actions are handled in their scope"),
         Action::Quit => Command::Quit,
         Action::EditUrl => Command::EditUrl,
         Action::Reload => Command::Reload,
@@ -6218,6 +6104,7 @@ fn command_of(action: Action) -> Command {
 /// be asked about too: in a dialog the `match` on the command takes it first,
 /// but on the row [`row_command`] passes everything but the copy keys and
 /// quit to the line, and `key.ctrl+q = back` must not quit from the url bar.
+#[cfg(test)]
 fn quits(bindings: &Bindings, key: &KeyInput) -> bool {
     matches!(
         bindings.lookup(key),
@@ -6326,16 +6213,21 @@ fn edit_url(
         .as_ref()
         .map(|bar| bar.line.text().to_string())
         .unwrap_or_default();
-    if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed)? {
+    if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed, Scope::Url)? {
         return Ok(going);
     }
     let Some(bar) = chrome.bar.as_mut() else {
         return Ok(true);
     };
-    match bar_step(bar, &chrome.history, &chrome.bookmarks, &key) {
+    match bar_step_bound(
+        bar,
+        &chrome.history,
+        &chrome.bookmarks,
+        &key,
+        &chrome.bindings,
+    ) {
         Edit::Typing | Edit::Inserted | Edit::Previous | Edit::Next => {}
-        Edit::Quit if quits(&chrome.bindings, &key) => return Ok(false),
-        Edit::Quit => {}
+        Edit::Quit => return Ok(false),
         Edit::Cancel => chrome.bar = None,
         Edit::Go => {
             let url = destination(bar.line.text(), chrome.search_url.as_deref());
@@ -6381,7 +6273,14 @@ fn through_row(
     bindings: &Bindings,
     key: &KeyInput,
     typed: &str,
+    scope: Scope,
 ) -> Result<Option<bool>, String> {
+    if bindings.scoped(scope, key) == Lookup::Bound(Action::Quit) {
+        return Ok(Some(false));
+    }
+    if bindings.scoped(scope, key) != Lookup::Default {
+        return Ok(None);
+    }
     match row_command(bindings, key) {
         Some(Command::Quit) => Ok(Some(false)),
         Some(Command::CopySelection) => {
@@ -6568,16 +6467,15 @@ fn edit_allow(
         .as_ref()
         .map(|allow| allow.line.text().to_string())
         .unwrap_or_default();
-    if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed)? {
+    if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed, Scope::Line)? {
         return Ok(going);
     }
     let Some(allow) = chrome.allow.as_mut() else {
         return Ok(true);
     };
-    match allow.step(&key) {
+    match allow.step_bound(&key, &chrome.bindings) {
         AllowStep::Typing => {}
-        AllowStep::Quit if quits(&chrome.bindings, &key) => return Ok(false),
-        AllowStep::Quit => {}
+        AllowStep::Quit => return Ok(false),
         AllowStep::Cancel => chrome.allow = None,
         AllowStep::Apply(set) => {
             let origin = std::mem::take(&mut allow.origin);
@@ -6834,8 +6732,8 @@ fn hint_key(
     };
     let (context, new_tab) = (hinting.context, hinting.new_tab);
     let step = match hinting.hints.as_mut() {
-        Some(hints) => hints.step(&key),
-        None if key.key == Key::Escape && key.action != KeyAction::Release => hints::Typed::Cancel,
+        Some(hints) => hints.step_bound(&key, &chrome.bindings),
+        None if hints_cancel(&chrome.bindings, &key) => hints::Typed::Cancel,
         None => hints::Typed::Nothing,
     };
     match step {
@@ -7097,18 +6995,17 @@ fn edit_find(
         .as_ref()
         .map(|find| find.finder.line.text().to_string())
         .unwrap_or_default();
-    if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed)? {
+    if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed, Scope::Find)? {
         return Ok(going);
     }
     let Some(find) = chrome.find.as_mut() else {
         return Ok(true);
     };
-    match find.finder.step(&key) {
+    match find.finder.step_bound(&key, &chrome.bindings) {
         find::Step::Typing(None) => {}
         find::Step::Typing(Some(ask)) => find.want(ask),
         find::Step::Close => close_find(tabs, chrome),
-        find::Step::Quit if quits(&chrome.bindings, &key) => return Ok(false),
-        find::Step::Quit => {}
+        find::Step::Quit => return Ok(false),
     }
     pump_find(tabs, chrome);
     redraw_row(pane, tabs, chrome)?;
@@ -7279,7 +7176,18 @@ fn edit_list(
         .as_ref()
         .map(|list| list.line().text().to_string())
         .unwrap_or_default();
-    if let Some(going) = through_row(pane, tabs, &chrome.bindings, &key, &typed)? {
+    if let Some(going) = through_row(
+        pane,
+        tabs,
+        &chrome.bindings,
+        &key,
+        &typed,
+        if matches!(chrome.list, Some(Overlay::History(_))) {
+            Scope::History
+        } else {
+            Scope::List
+        },
+    )? {
         return Ok(going);
     }
     let page = chrome.metrics.usable_rows() as usize;
@@ -7287,19 +7195,11 @@ fn edit_list(
         None => Ok(true),
         Some(Overlay::Tabs(list)) => {
             let matched: Vec<usize> = list.matches(tabs).iter().map(|entry| entry.index).collect();
-            let step = match list.step(&key, &matched, page) {
-                tablist::Step::Quit if !quits(&chrome.bindings, &key) => tablist::Step::Typing,
-                step => step,
-            };
+            let step = list.step_bound(&key, &matched, page, &chrome.bindings);
             list_step(pane, tabs, browser, chrome, step)
         }
         Some(Overlay::History(list)) => {
-            let step = match list.step(&key, page) {
-                historylist::Step::Quit if !quits(&chrome.bindings, &key) => {
-                    historylist::Step::Typing
-                }
-                step => step,
-            };
+            let step = list.step_bound(&key, page, &chrome.bindings);
             history_step(pane, tabs, browser, chrome, step)
         }
     }
@@ -7629,9 +7529,20 @@ fn note(tabs: &mut Tabs<Client>, sentence: impl Into<String>) {
 /// bookmarks and then the pages that match what was typed when the walk
 /// began; any edit that changes the text ends the walk, so that the next Up
 /// walks what is there now.
+#[cfg(test)]
 fn bar_step(bar: &mut UrlBar, history: &History, bookmarks: &Bookmarks, key: &KeyInput) -> Edit {
+    bar_step_bound(bar, history, bookmarks, key, &Bindings::default())
+}
+
+fn bar_step_bound(
+    bar: &mut UrlBar,
+    history: &History,
+    bookmarks: &Bookmarks,
+    key: &KeyInput,
+    bindings: &Bindings,
+) -> Edit {
     let before = bar.line.text().len();
-    let edit = bar.line.step(key);
+    let edit = bar.line.step_bound(key, bindings, Scope::Url);
     match edit {
         Edit::Inserted => {
             bar.walk = None;
@@ -8102,6 +8013,7 @@ mod tests {
                 .map(|(chord, action)| crate::bindings::Binding::parse(chord, action).expect(chord))
                 .collect(),
         )
+        .with_keymap(crate::bindings::Keymap::Linux)
     }
 
     /// Every press worth asking the built-in table about: each printable
@@ -8169,7 +8081,7 @@ mod tests {
 
     #[test]
     fn an_empty_table_leaves_every_key_the_built_in_table_s() {
-        let empty = Bindings::default();
+        let empty = Bindings::from_rows(vec![]).with_keymap(crate::bindings::Keymap::Linux);
         for press in every_press() {
             assert_eq!(keyed(&empty, &press), command(&press), "{press:?}");
         }
@@ -8239,7 +8151,10 @@ mod tests {
     fn an_unbound_ctrl_q_no_longer_quits_from_a_line_or_a_dialog() {
         let ctrl_q = key(Key::Char('q'), Mods::CTRL);
         assert!(!quits(&bound(&[("ctrl+q", "none")]), &ctrl_q));
-        assert!(quits(&Bindings::default(), &ctrl_q));
+        assert!(quits(
+            &Bindings::from_rows(vec![]).with_keymap(crate::bindings::Keymap::Linux),
+            &ctrl_q
+        ));
         assert!(quits(&bound(&[("ctrl+q", "quit")]), &ctrl_q));
         // Taken for something else, it is not quit on the row either, where
         // only the copy keys and quit reach past the line.
@@ -8286,9 +8201,12 @@ mod tests {
             command(&key(Key::Char('w'), Mods::CTRL)),
             Some(Command::CloseTab)
         );
-        assert_eq!(command(&key(Key::Tab, Mods::CTRL)), Some(Command::NextTab));
         assert_eq!(
-            command(&key(Key::Tab, Mods::CTRL | Mods::SHIFT)),
+            command(&key(Key::Char(']'), Mods::CTRL)),
+            Some(Command::NextTab)
+        );
+        assert_eq!(
+            command(&key(Key::Char('['), Mods::CTRL)),
             Some(Command::PreviousTab)
         );
         for n in 1..=8usize {
@@ -8330,23 +8248,16 @@ mod tests {
                 Some(Command::SelectTab(_))
             ));
         }
-        // The list: Chrome's chord in either spelling a terminal may send
-        // it, and the `alt` form every terminal lets through.
-        for (k, mods) in [
-            (Key::Char('a'), Mods::CTRL | Mods::SHIFT),
-            (Key::Char('A'), Mods::CTRL | Mods::SHIFT),
-            (Key::Char('a'), Mods::ALT),
-        ] {
-            assert_eq!(command(&key(k, mods)), Some(Command::ListTabs), "{k:?}");
-        }
-        // The history list: the same pair on `h`.
-        for (k, mods) in [
-            (Key::Char('h'), Mods::CTRL | Mods::SHIFT),
-            (Key::Char('H'), Mods::CTRL | Mods::SHIFT),
-            (Key::Char('h'), Mods::ALT),
-        ] {
-            assert_eq!(command(&key(k, mods)), Some(Command::History), "{k:?}");
-        }
+        // Kitty keeps the ctrl+shift alias; only the Alt form is a default.
+        assert_eq!(
+            command(&key(Key::Char('a'), Mods::ALT)),
+            Some(Command::ListTabs)
+        );
+        // The history list uses Alt too.
+        assert_eq!(
+            command(&key(Key::Char('h'), Mods::ALT)),
+            Some(Command::History)
+        );
         // `ctrl+h` is backspace's byte in a legacy terminal, the page's
         // anyway, and `alt+shift+h` is nobody's.
         for (k, mods) in [
@@ -8363,7 +8274,8 @@ mod tests {
         ] {
             assert_eq!(command(&key(k, mods)), None, "{k:?} {mods}");
         }
-        for mods in [Mods::CTRL | Mods::SHIFT, Mods::ALT | Mods::SHIFT] {
+        {
+            let mods = Mods::ALT | Mods::SHIFT;
             assert_eq!(command(&key(Key::PageUp, mods)), Some(Command::MoveTab(-1)));
             assert_eq!(
                 command(&key(Key::PageDown, mods)),
@@ -8394,8 +8306,8 @@ mod tests {
         assert_eq!(survives(Key::Char('q'), Mods::CTRL), Some(true));
         assert_eq!(survives(Key::Char('t'), Mods::CTRL), Some(true));
         assert_eq!(survives(Key::Char('w'), Mods::CTRL), Some(true));
-        assert_eq!(survives(Key::Tab, Mods::CTRL), Some(true));
-        assert_eq!(survives(Key::Tab, Mods::CTRL | Mods::SHIFT), Some(true));
+        assert_eq!(survives(Key::Char(']'), Mods::CTRL), Some(true));
+        assert_eq!(survives(Key::Char('['), Mods::CTRL), Some(true));
         for n in 1..=9u8 {
             assert_eq!(
                 survives(Key::Char((b'0' + n) as char), Mods::ALT),
@@ -8405,15 +8317,9 @@ mod tests {
         // The list and moving a tab: going elsewhere, and reordering around
         // the question, do nothing to the page that is asking.
         assert_eq!(survives(Key::Char('a'), Mods::ALT), Some(true));
-        assert_eq!(
-            survives(Key::Char('a'), Mods::CTRL | Mods::SHIFT),
-            Some(true)
-        );
+        assert_eq!(survives(Key::Char('a'), Mods::CTRL | Mods::SHIFT), None);
         assert_eq!(survives(Key::PageUp, Mods::ALT | Mods::SHIFT), Some(true));
-        assert_eq!(
-            survives(Key::PageDown, Mods::CTRL | Mods::SHIFT),
-            Some(true)
-        );
+        assert_eq!(survives(Key::PageDown, Mods::ALT | Mods::SHIFT), Some(true));
         // Things done to the page that is asking wait until it has an answer.
         assert_eq!(survives(Key::Char('l'), Mods::CTRL), Some(false));
         assert_eq!(survives(Key::Char('r'), Mods::CTRL), Some(false));
@@ -8436,7 +8342,7 @@ mod tests {
             (Key::Char('q'), Mods::CTRL),
             (Key::Char('t'), Mods::CTRL),
             (Key::Char('w'), Mods::CTRL),
-            (Key::Tab, Mods::CTRL),
+            (Key::Char(']'), Mods::CTRL),
             (Key::Char('2'), Mods::ALT),
             (Key::Char('u'), Mods::ALT),
         ] {
@@ -8577,11 +8483,11 @@ mod tests {
         );
         assert_eq!(
             command(&key(Key::Char('t'), Mods::CTRL | Mods::SHIFT)),
-            Some(Command::ReopenTab)
+            None
         );
         assert_eq!(
             command(&key(Key::Char('T'), Mods::CTRL | Mods::SHIFT)),
-            Some(Command::ReopenTab),
+            None,
             "a terminal that reports the shifted key"
         );
         // The form a tOS pane and a legacy terminal can send.
@@ -8972,26 +8878,19 @@ mod tests {
 
     #[test]
     fn the_zoom_keys_are_the_browsers_and_the_ones_every_terminal_lets_through() {
-        for mods in [Mods::CTRL, Mods::ALT, Mods::CTRL | Mods::SHIFT] {
+        for mods in [Mods::CTRL, Mods::ALT] {
             for (c, wanted) in [
                 ('=', Command::ZoomIn),
-                ('+', Command::ZoomIn),
                 ('-', Command::ZoomOut),
-                ('_', Command::ZoomOut),
                 ('0', Command::ZoomReset),
             ] {
-                assert_eq!(
-                    command(&key(Key::Char(c), mods)),
-                    Some(wanted),
-                    "{c} {mods:?}"
-                );
+                assert_eq!(command(&key(Key::Char(c), mods)), Some(wanted));
             }
         }
-        // `ctrl+-` in a legacy terminal is `0x1f`, which is ctrl+_.
-        match Parser::new().feed(&[0x1f]).as_slice() {
-            [Input::Key(legacy)] => assert_eq!(command(legacy), Some(Command::ZoomOut)),
-            other => panic!("{other:?}"),
-        }
+        assert_eq!(
+            command(&key(Key::Char('='), Mods::CTRL | Mods::SHIFT)),
+            None
+        );
         // Unmodified they are typing, both at once is the page's, and the
         // other ctrl-digits stay the page's.
         assert_eq!(command(&key(Key::Char('='), 0)), None);
@@ -9062,9 +8961,9 @@ mod tests {
             command(&key(Key::Char('s'), Mods::ALT | Mods::SHIFT)),
             Some(Command::SaveScreenshot)
         );
-        // `ESC S`, a terminal without the Kitty protocol's alt+shift+s.
+        // Uppercase protocol spelling with the explicit Shift bit.
         assert_eq!(
-            command(&key(Key::Char('S'), Mods::ALT)),
+            command(&key(Key::Char('S'), Mods::ALT | Mods::SHIFT)),
             Some(Command::SaveScreenshot)
         );
         // ctrl+s is XOFF where the Kitty protocol is not spoken, and `s` is
@@ -9109,12 +9008,18 @@ mod tests {
         assert_eq!(command(&key(Key::Char('b'), 0)), None);
         // On the row, alt+b is the line's: a word back, as in a shell.
         assert_eq!(
-            row_command(&Bindings::default(), &key(Key::Char('b'), Mods::ALT)),
+            row_command(
+                &Bindings::from_rows(vec![]).with_keymap(crate::bindings::Keymap::Linux),
+                &key(Key::Char('b'), Mods::ALT)
+            ),
             None
         );
         for press in every_press() {
             if command(&press) == Some(Command::Block) {
-                assert_eq!(press.key, Key::Char('b'), "{press:?}");
+                assert!(
+                    matches!(press.key, Key::Char(c) if c.eq_ignore_ascii_case(&'b')),
+                    "{press:?}"
+                );
                 assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
             }
         }
@@ -9140,7 +9045,10 @@ mod tests {
         // table reads no shift, as for the other alt letters.
         for press in every_press() {
             if command(&press) == Some(Command::Permissions) {
-                assert_eq!(press.key, Key::Char('p'), "{press:?}");
+                assert!(
+                    matches!(press.key, Key::Char(c) if c.eq_ignore_ascii_case(&'p')),
+                    "{press:?}"
+                );
                 assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
             }
         }
@@ -9163,7 +9071,10 @@ mod tests {
         assert_eq!(command(&key(Key::Char('l'), 0)), None);
         for press in every_press() {
             if command(&press) == Some(Command::FillLogin) {
-                assert_eq!(press.key, Key::Char('l'), "{press:?}");
+                assert!(
+                    matches!(press.key, Key::Char(c) if c.eq_ignore_ascii_case(&'l')),
+                    "{press:?}"
+                );
                 assert!(press.mods.alt() && !press.mods.ctrl(), "{press:?}");
             }
         }
@@ -9824,5 +9735,48 @@ mod tests {
         };
         assert_eq!(at(1.0), (20.0, 8.0));
         assert_eq!(at(2.0), (10.0, 4.0));
+    }
+    #[test]
+    fn local_overrides_precede_global_copy_quit_and_pending_hint_cancel() {
+        let bindings = bound(&[
+            ("ctrl+c", "copy"),
+            ("ctrl+x", "quit"),
+            ("url.ctrl+c", "none"),
+            ("url.ctrl+x", "none"),
+            ("normal.x", "quit"),
+            ("hints.x", "quit"),
+            ("page.ctrl+x", "quit"),
+            ("hints.esc", "none"),
+            ("hints.ctrl+z", "hints-cancel"),
+        ]);
+        assert_eq!(
+            interaction_command(&bindings, Scope::Url, &key(Key::Char('c'), Mods::CTRL)),
+            None
+        );
+        assert_eq!(
+            interaction_command(&bindings, Scope::Url, &key(Key::Char('x'), Mods::CTRL)),
+            None
+        );
+        for scope in [Scope::Normal, Scope::Hints] {
+            assert_eq!(
+                interaction_command(&bindings, scope, &key(Key::Char('x'), 0)),
+                Some(Command::Quit)
+            );
+        }
+        assert_eq!(
+            interaction_command(&bindings, Scope::Page, &key(Key::Char('x'), Mods::CTRL)),
+            Some(Command::Quit)
+        );
+        assert!(!hints_cancel(&bindings, &key(Key::Escape, 0)));
+        assert!(hints_cancel(&bindings, &key(Key::Char('z'), Mods::CTRL)));
+        let mac = Bindings::default().with_keymap(crate::bindings::Keymap::Mac);
+        assert_eq!(
+            row_command(&mac, &key(Key::Char('c'), Mods::CTRL)),
+            Some(Command::CopySelection)
+        );
+        assert_eq!(
+            row_command(&mac, &key(Key::Char(';'), Mods::CTRL)),
+            Some(Command::CopyUrl)
+        );
     }
 }

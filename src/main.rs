@@ -92,7 +92,7 @@ options:
   --no-block       block nothing, whatever block-list says
   --home <url>     the page opened when no url is given (default: about:blank)
   --restore        reopen the tabs the last run had
-  --normal-mode    start in normal mode (ctrl+., below)
+  --keymap <mac|linux>  select platform default keys\n  --normal-mode    start in normal mode (ctrl+., below)
   --config <path>  read settings from <path> instead of
                    $XDG_CONFIG_HOME/blinkterm/config (~/.config/blinkterm/config)
   --no-config      read no settings file
@@ -151,46 +151,14 @@ come in tmux's own encoding. Over ssh, frames go as PNG and come as fast as
 the link carries them.
 
 keys:
-  ctrl+l         type a url; in the url bar, left/right, home/end, ctrl+a/e
-                 and alt+b/f move, ctrl+w and alt+d delete a word, ctrl+u/k
-                 to either end, up/down walk the pages visited, and tab takes
-                 the suggestion
-  ctrl+r         reload
-  alt+left/right back and forward
-  ctrl+t         a new tab, with the cursor in the url bar
-  ctrl+w         close this tab; closing the last one quits
-  ctrl+shift+t   reopen the last tab closed (alt+t where the terminal or the
-                 compositor keeps ctrl+shift+t)
-  ctrl+d         bookmark this page, or remove the bookmark
-  ctrl+tab       the next tab, ctrl+shift+tab the one before
-  alt+1 .. alt+8 the nth tab; alt+9 the last tab
-  ctrl+shift+a   the tab list (alt+a too): type to filter, up/down to pick,
-                 enter to switch, esc to close
-  ctrl+shift+h   the history list (alt+h too): type words to filter, enter
-                 opens here, alt+enter or ctrl+enter in a new tab,
-                 shift+delete forgets the page
-  ctrl+shift+pageup/pagedown
-                 move this tab left, right (alt+shift+pageup/pagedown too)
-  middle click or ctrl+click on a link
-                 open it in a tab behind this one
-  alt+= / alt+-  zoom in, out (ctrl+= / ctrl+- where the terminal lets them
-                 through); alt+0 / ctrl+0 back to 100%
-  ctrl+.         normal mode on or off; in it the letters are keys: f labels
-                 what can be clicked and typing a label clicks it (F opens a
-                 link in a tab behind), j/k scroll a notch, d/u half a
-                 screen, gg/G to the ends, H/L back and forward, r reload,
-                 o the url bar, O a new tab, / find, i back to the page
-  alt+p          allow this site camera, microphone, location, notifications
-                 or clipboard: type the words, enter sets exactly those
-  alt+s          save this page as a PDF in the download directory
-  alt+shift+s    save the whole page as a picture (PNG) there
-  alt+b          stop blocking ads and trackers on this site, or start again
-                 (in the url bar alt+b is still a word back)
-  esc            leave a page's fullscreen; stop a page that is loading
-  ctrl+q         quit
-  a dialog       takes the top row: any key, y/n, or type and enter; esc is no
-Everything else goes to the page. A link that asks for a new window gets a
-new tab, and the tab is switched to.
+  Platform defaults: mac on macOS, linux elsewhere; --keymap mac|linux
+  selects the default set. The actions below list its exact chords.
+  Unmodified typing goes to the page in insert mode. Normal mode uses
+  f/F for hints, j/k for scrolling, d/u for half pages, gg/G for ends,
+  H/L back/forward, r reload, o/O URL/new tab, / find, i insert mode.
+  Editors use arrows and readline keys, enter to accept, esc to cancel.
+  Scoped key.<scope>.<chord> settings can rebind or disable these keys.
+
 ";
 
 fn main() -> ExitCode {
@@ -207,8 +175,8 @@ fn main() -> ExitCode {
         }
     };
     let options = match invocation {
-        Invocation::Help => {
-            print!("{USAGE}{}", blinkterm::bindings::help());
+        Invocation::Help(keymap) => {
+            print!("{USAGE}{}", blinkterm::bindings::help_for(keymap));
             return ExitCode::SUCCESS;
         }
         Invocation::Version => {

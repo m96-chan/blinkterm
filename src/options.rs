@@ -50,7 +50,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::appearance;
-use crate::bindings::{Binding, Bindings};
+use crate::bindings::{Binding, Bindings, Keymap};
 use crate::block;
 use crate::download;
 use crate::engine;
@@ -66,16 +66,9 @@ use crate::zoom::Scale;
 /// produce a hundred line errors.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 
-/// What [`parse_config`] says about a `normal.` line.
-///
-/// The letters of normal mode are a small language rather than a table — `gg`
-/// is two keys, and half of them are not commands but things the loop does
-/// to the page — so rebinding them is a design of its own. The shape is kept
-/// for it, `normal.<key> = <action>`, and refused with a sentence now, so
-/// that a file written ahead of it says what is wrong rather than "unknown
-/// setting".
+/// The obsolete `normal.<key>` spelling has a specific migration message.
 pub const NORMAL_NOT_REMAPPABLE_YET: &str =
-    "normal-mode letters are not remappable yet; key.<chord> is for the program's own keys";
+    "use key.normal.<chord> = <action> to rebind normal-mode letters";
 
 /// Everything `app::run` is told. Every field is concrete: the folding of the
 /// three sources has already happened.
@@ -140,7 +133,7 @@ pub struct Options {
 /// What `main` was asked to do, once the command line has been read.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Invocation {
-    Help,
+    Help(Keymap),
     Version,
     /// `--print-engine`: name the engine the search finds, and stop.
     PrintEngine(Options),
@@ -224,6 +217,7 @@ pub struct Settings {
     pub password_command_terminal: Option<picker::Command>,
     /// File only: a binding is not a one-run thing.
     pub bindings: Vec<Binding>,
+    pub keymap: Option<Keymap>,
     /// Command line only.
     pub config: Option<ConfigChoice>,
     /// Command line only.
@@ -282,6 +276,7 @@ impl Settings {
                 .password_command_terminal
                 .or(under.password_command_terminal),
             bindings,
+            keymap: self.keymap.or(under.keymap),
             config: self.config.or(under.config),
             what: self.what.or(under.what),
             remote: self.remote.or(under.remote),
@@ -383,11 +378,28 @@ fn needed<'a>(value: &'a str, needed: &str) -> Result<&'a str, String> {
 ///
 /// Every word that is not an option is a url, one tab each; `--` ends the
 /// options, so a url that starts with `-` can still be given.
+fn help_keymap(args: &[String]) -> Result<Option<Keymap>, String> {
+    let mut chosen = None;
+    let mut args = args.iter().take_while(|a| *a != "--");
+    while let Some(arg) = args.next() {
+        let value = if arg == "--keymap" {
+            Some(args.next().ok_or("--keymap needs mac or linux")?.as_str())
+        } else {
+            arg.strip_prefix("--keymap=")
+        };
+        if let Some(value) = value {
+            chosen = Some(Keymap::parse(value)?);
+        }
+    }
+    Ok(chosen)
+}
+
 pub fn parse_args(args: &[String]) -> Result<Settings, String> {
     let options = args.iter().take_while(|arg| *arg != "--");
     for arg in options {
         if arg == "-h" || arg == "--help" {
             return Ok(Settings {
+                keymap: help_keymap(args)?,
                 what: Some(What::Help),
                 ..Settings::default()
             });
@@ -409,6 +421,11 @@ pub fn parse_args(args: &[String]) -> Result<Settings, String> {
         if arg == "--" {
             s.urls.extend(args.by_ref().cloned());
             break;
+        }
+        if let Some(value) = value_of(arg, "--keymap", &mut args) {
+            let keymap = Keymap::parse(needed(value, "--keymap needs mac or linux")?)?;
+            once(&mut s.keymap, keymap, "--keymap once is enough")?;
+            continue;
         }
         if let Some(dir) = value_of(arg, "--download-dir", &mut args) {
             let dir = needed(
@@ -654,7 +671,7 @@ pub fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<Settings, String>
 }
 
 /// The keys a settings line may have, besides `key.<chord>`.
-const KEYS: [&str; 29] = [
+const KEYS: [&str; 30] = [
     "home",
     "profile",
     "temp-profile",
@@ -672,6 +689,7 @@ const KEYS: [&str; 29] = [
     "mute",
     "restore",
     "normal-mode",
+    "keymap",
     "tmux",
     "frames",
     "fps",
@@ -782,6 +800,7 @@ pub fn parse_config(path: &Path, text: &str) -> Result<Settings, String> {
             "proxy" => s.proxy = Some(parse_proxy(key, value).map_err(at)?),
             "mute" => s.mute = Some(parse_bool(key, value).map_err(at)?),
             "restore" => s.restore = Some(parse_bool(key, value).map_err(at)?),
+            "keymap" => s.keymap = Some(Keymap::parse(value).map_err(at)?),
             "normal-mode" => s.normal_mode = Some(parse_bool(key, value).map_err(at)?),
             "tmux" => s.tmux = Some(route::Choice::parse(value).map_err(at)?),
             "frames" => s.frames = Some(route::Frames::parse(value).map_err(at)?),
@@ -822,7 +841,12 @@ fn split_setting(line: &str) -> Option<(&str, &str)> {
     loop {
         let at = from + line[from..].find('=')?;
         let before = &line[..at];
-        let chord = before.strip_prefix("key.");
+        let chord = before
+            .strip_prefix("key.")
+            .map(|text| match text.split_once('.') {
+                Some((scope, chord)) if crate::bindings::Scope::parse(scope).is_some() => chord,
+                _ => text,
+            });
         let inside_chord = chord.is_some_and(|chord| chord.is_empty() || chord.ends_with('+'));
         if !inside_chord {
             return Some((before.trim(), line[at + 1..].trim()));
@@ -906,7 +930,7 @@ pub fn resolve(cli: Settings, env: Settings, file: Settings) -> Result<Options, 
         },
         restore: s.restore.unwrap_or(false),
         normal_mode: s.normal_mode.unwrap_or(false),
-        bindings: Bindings::from_rows(s.bindings),
+        bindings: Bindings::from_rows(s.bindings).with_keymap(s.keymap.unwrap_or_default()),
         route: route::Choices {
             tmux: s.tmux.unwrap_or_default(),
             frames: s.frames.unwrap_or_default(),
@@ -1007,7 +1031,7 @@ fn home_expanded(mut settings: Settings, home: Option<&Path>) -> Settings {
 pub fn invocation(args: &[String]) -> Result<Invocation, String> {
     let cli = parse_args(args)?;
     match cli.what {
-        Some(What::Help) => return Ok(Invocation::Help),
+        Some(What::Help) => return Ok(Invocation::Help(cli.keymap.unwrap_or_default())),
         Some(What::Version) => return Ok(Invocation::Version),
         _ => {}
     }
@@ -2208,6 +2232,7 @@ mod tests {
     #[test]
     fn bindings_come_from_the_file_alone() {
         let row = Binding {
+            scope: crate::bindings::Scope::Global,
             chord: Chord::parse("alt+b").expect("a chord"),
             action: Some(Action::Back),
         };
@@ -2278,5 +2303,26 @@ mod tests {
             resolved(&[]).expect("defaults").route,
             route::Choices::default()
         );
+    }
+    #[test]
+    fn keymap_and_scoped_equals_parse_as_plain_settings_and_help_does_not_read_config() {
+        let file = parse_config(
+            Path::new("/c"),
+            "keymap = linux\nkey.url.ctrl+= = line-end\nkey.url.= = none\n",
+        )
+        .unwrap();
+        assert_eq!(file.keymap, Some(Keymap::Linux));
+        assert_eq!(file.bindings.len(), 2);
+        assert_eq!(file.bindings[1].chord.key, crate::input::Key::Char('='));
+        let args = [
+            "--config",
+            "/missing",
+            "--unknown",
+            "--keymap",
+            "mac",
+            "--help",
+        ]
+        .map(str::to_string);
+        assert_eq!(invocation(&args), Ok(Invocation::Help(Keymap::Mac)));
     }
 }

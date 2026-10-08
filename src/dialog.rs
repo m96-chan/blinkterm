@@ -24,6 +24,7 @@
 //! every one of those can be tested a key at a time; [`crate::app`] does the
 //! talking and [`crate::screen`] the drawing.
 
+use crate::bindings::{Action as BoundAction, Bindings, LocalAction as Local, Lookup, Scope};
 use crate::input::{Key, KeyAction, KeyInput};
 use crate::json::Json;
 use crate::line::{Edit, Line};
@@ -128,25 +129,43 @@ impl Dialog {
     /// of its own: somebody reaching for shift to type a capital into a prompt
     /// has not answered anything yet.
     pub fn step(&mut self, key: &KeyInput) -> Answer {
+        self.step_bound(key, &Bindings::default())
+    }
+    pub fn step_bound(&mut self, key: &KeyInput, bindings: &Bindings) -> Answer {
         if key.action == KeyAction::Release || matches!(key.key, Key::Other(_)) {
             return Answer::Waiting;
         }
-        if key.key == Key::Char('q') && key.mods.ctrl() {
+        let scope = if self.kind == Kind::Prompt {
+            Scope::Prompt
+        } else {
+            Scope::Dialog
+        };
+        let local = if self.kind == Kind::Alert {
+            bindings.scoped(scope, key)
+        } else {
+            bindings.local(scope, key)
+        };
+        if bindings.lookup(key) == Lookup::Unbound && local == Lookup::Default {
+            return Answer::Waiting;
+        }
+        match local {
+            Lookup::Unbound => return Answer::Waiting,
+            Lookup::Bound(BoundAction::Quit) => return Answer::Quit,
+            Lookup::Bound(BoundAction::Local(Local::DialogAccept | Local::Accept)) => {
+                return Answer::Accept
+            }
+            Lookup::Bound(BoundAction::Local(Local::DialogDismiss | Local::Cancel)) => {
+                return Answer::Dismiss
+            }
+            _ => {}
+        }
+        if bindings.action(key) == Some(BoundAction::Quit) {
             return Answer::Quit;
         }
         match self.kind {
             Kind::Alert => Answer::Accept,
-            Kind::Confirm | Kind::BeforeUnload => {
-                let plain = !key.mods.ctrl() && !key.mods.alt();
-                match key.key {
-                    Key::Enter => Answer::Accept,
-                    Key::Escape => Answer::Dismiss,
-                    Key::Char('y' | 'Y') if plain => Answer::Accept,
-                    Key::Char('n' | 'N') if plain => Answer::Dismiss,
-                    _ => Answer::Waiting,
-                }
-            }
-            Kind::Prompt => match self.line.step(key) {
+            Kind::Confirm | Kind::BeforeUnload => Answer::Waiting,
+            Kind::Prompt => match self.line.step_bound(key, bindings, Scope::Prompt) {
                 Edit::Typing | Edit::Inserted | Edit::Previous | Edit::Next => Answer::Waiting,
                 Edit::Go => Answer::Accept,
                 Edit::Cancel => Answer::Dismiss,
@@ -509,5 +528,28 @@ mod tests {
             prompt.reply(Answer::Accept).to_string(),
             r#"{"accept":true,"promptText":""}"#
         );
+    }
+    #[test]
+    fn scoped_none_precedes_alert_fallback_and_global_quit() {
+        use crate::bindings::Binding;
+        let bindings = Bindings::from_rows(vec![
+            Binding::parse("dialog.x", "none").unwrap(),
+            Binding::parse("ctrl+q", "none").unwrap(),
+            Binding::parse("prompt.ctrl+w", "none").unwrap(),
+        ]);
+        let mut alert = of("alert");
+        assert_eq!(alert.step_bound(&typed('x'), &bindings), Answer::Waiting);
+        assert_eq!(
+            alert.step_bound(&key(Key::Char('q'), Mods::CTRL), &bindings),
+            Answer::Waiting
+        );
+        let mut prompt = of("prompt");
+        let text = prompt.line.text().to_string();
+        assert_eq!(
+            prompt.step_bound(&key(Key::Char('w'), Mods::CTRL), &bindings),
+            Answer::Waiting
+        );
+        assert_eq!(prompt.line.text(), text);
+        assert!(prompt.line.whole());
     }
 }

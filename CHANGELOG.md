@@ -12,6 +12,12 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- Platform keymaps: macOS defaults avoid stock Kitty 0.45 reserved shortcuts
+  and require no Option keys. Select `keymap = mac|linux` or `--keymap mac|linux`; every
+  built-in editor, list, dialog, hint and normal-mode key can be rebound or
+  disabled with scoped `key.<scope>.<chord>` settings. `--doctor` diagnoses
+  custom stock-Kitty shortcut collisions ([#80](https://github.com/m96-chan/blinkterm/issues/80)).
+
 - `--alpha` (`alpha = true` in the config file) has the engine paint nothing
   behind a page, so where a page has no background of its own the terminal's
   shows through; a page with a background is unchanged. It is transparent
@@ -22,6 +28,14 @@ flag, a different default, a raised Rust floor all do.
   ([#79](https://github.com/m96-chan/blinkterm/issues/79)).
 
 ### Changed
+
+- Linux tab switching uses `ctrl+]` / `ctrl+[` instead of Kitty's reserved
+  `ctrl+tab` / `ctrl+shift+tab`. Reserved `ctrl+shift+t/a/h/pageup/pagedown`
+  aliases were removed; use the existing `alt+t/a/h/shift+pageup/shift+pagedown`
+  equivalents. Chords now match modifiers exactly, removing implicit Shift
+  aliases. Find's previous match is `shift+enter` or Up rather than Kitty's
+  `ctrl+shift+g`; forgetting history uses `shift+delete`, with the reserved
+  `ctrl+shift+delete` alias removed.
 
 - The README is short now: a screenshot, the philosophy, how to install and
   how to build. The full manual moved to `docs/`: installing, keys and use,

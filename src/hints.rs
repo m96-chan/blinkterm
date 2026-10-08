@@ -63,6 +63,7 @@
 //! The hrefs are the only strings read off the page, and they go to the
 //! engine, never to the terminal: the row says a count.
 
+use crate::bindings::{Action as BoundAction, Bindings, LocalAction as Local, Lookup, Scope};
 use crate::input::{Key, KeyAction, KeyInput};
 use crate::json::Json;
 use crate::text;
@@ -361,18 +362,24 @@ impl Hints {
     /// letter that would leave no label matching is not taken, so one wrong
     /// key costs nothing and the next right one carries on.
     pub fn step(&mut self, key: &KeyInput) -> Typed {
+        self.step_bound(key, &Bindings::default())
+    }
+    pub fn step_bound(&mut self, key: &KeyInput, bindings: &Bindings) -> Typed {
         if key.action == KeyAction::Release {
             return Typed::Nothing;
         }
-        match key.key {
-            Key::Escape => Typed::Cancel,
-            Key::Backspace if key.mods.ctrl() || key.mods.alt() || key.mods.meta() => {
-                Typed::Nothing
+        match bindings.local(Scope::Hints, key) {
+            Lookup::Unbound => return Typed::Nothing,
+            Lookup::Bound(BoundAction::Local(Local::HintsCancel)) => return Typed::Cancel,
+            Lookup::Bound(BoundAction::Local(Local::HintsBackspace)) => {
+                return match self.typed.pop() {
+                    Some(_) => Typed::Narrowed(self.remaining()),
+                    None => Typed::Nothing,
+                }
             }
-            Key::Backspace => match self.typed.pop() {
-                Some(_) => Typed::Narrowed(self.remaining()),
-                None => Typed::Nothing,
-            },
+            _ => {}
+        }
+        match key.key {
             Key::Char(c) if !key.mods.ctrl() && !key.mods.alt() && !key.mods.meta() => {
                 let c = key.text.unwrap_or(c).to_ascii_lowercase();
                 if !ALPHABET.contains(c) {
