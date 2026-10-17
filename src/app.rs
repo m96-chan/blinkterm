@@ -773,6 +773,11 @@ pub(crate) struct Shared {
     /// How every engine is started — path, `--engine-arg`s, user agent,
     /// proxy — the first and each one after a death.
     launch: crate::engine::Launch,
+    /// Which kind of Chromium the engine is, for what the allow line says
+    /// about a camera or a microphone ([`permissions::applied`]). Fixed for
+    /// the run: an engine started again after a death is the same
+    /// executable.
+    engine_kind: crate::engine::Kind,
     /// When the engine was last started again: see [`Relaunches`].
     pub(crate) relaunches: Relaunches,
 }
@@ -978,11 +983,13 @@ impl Shared {
     /// one. The allowances come in already read, because the engine was told
     /// them before there was a `Shared` ([`boot`]), and so do the blocker and
     /// its exceptions, the site files and the console's recorder, for the
-    /// same reason; and who the engine says it is, which [`boot`] worked out.
+    /// same reason; and who the engine says it is, which [`boot`] worked out,
+    /// and what kind of engine it is.
     #[allow(clippy::too_many_arguments)]
     fn new(
         options: &Options,
         profile: &Profile,
+        engine_kind: crate::engine::Kind,
         downloads_dir: PathBuf,
         identity: Identity,
         allowed: Allowed,
@@ -1020,6 +1027,7 @@ impl Shared {
             console,
             downloads_dir,
             launch: options.engine.clone(),
+            engine_kind,
             relaunches: Relaunches::default(),
         }
     }
@@ -1640,6 +1648,7 @@ pub(crate) fn start_profile(options: &Options, profile: Profile) -> Result<Profi
     let mut shared = Shared::new(
         options,
         engine.profile(),
+        engine.kind(),
         downloads_dir,
         identity,
         allowed,
@@ -8084,9 +8093,10 @@ fn edit_allow(
                 // the allowance for the one that comes after.
                 let _ = browser.notify(method, params);
             }
+            let applied = permissions::applied(&origin, &set, shared.engine_kind);
             let sentence = match shared.allowed.set(&origin, &set) {
-                Ok(()) => permissions::applied(&origin, &set),
-                Err(why) => format!("{}; {why}", permissions::applied(&origin, &set)),
+                Ok(()) => applied,
+                Err(why) => format!("{applied}; {why}"),
             };
             note(tabs, sentence);
         }
@@ -10566,6 +10576,7 @@ mod tests {
         let shared = Shared::new(
             &options,
             &profile,
+            crate::engine::Kind::Full,
             downloads.clone(),
             Identity::new(None, None, "C"),
             Allowed::in_memory(),

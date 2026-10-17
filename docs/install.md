@@ -191,3 +191,20 @@ against the shell's 0.5 GB over 7. When a site refuses the shell, name the
 full one: `--engine /usr/bin/chromium`, `$BLINKTERM_ENGINE`, or `engine =`
 in the settings. `--doctor` prints which kind the search found and, under a
 shell, the one-line consequence.
+
+The camera and the microphone are the other difference. A full Chrome or
+Chromium has them to give a page you have allowed with `alt+p` (see
+[Sound, permissions and fullscreen](features.md#sound-permissions-and-fullscreen));
+the shell has no capture backend at all, and `--doctor` and the allow line
+say so. On Linux, capture through a full engine wants
+`libpulse0` for the microphone and read access to `/dev/video*` for the
+camera (the `video` group on most distributions). On a Mac the camera and
+microphone are guarded by the system's privacy settings, which attribute the
+request to the application responsible for the process, and the engine is a
+child of your terminal: so it is the terminal — Kitty, Ghostty, WezTerm,
+Terminal.app — that has to be allowed under System Settings → Privacy &
+Security → Camera and → Microphone, and a terminal that was never allowed,
+or was denied the once it asked, looks to the page like a machine with no
+camera. This was not measured on a Mac in the change that wrote it; if your
+Mac behaves otherwise, [#124](https://github.com/m96-chan/blinkterm/issues/124)
+is where to say so.

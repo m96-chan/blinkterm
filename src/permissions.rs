@@ -33,13 +33,33 @@
 //! `denied` *for that origin* rather than left to the browser-wide deny,
 //! which would not override a grant made earlier.
 //!
-//! What a grant does is the engine's business. On the headless shell it
-//! makes the clipboard API work, into the engine's own clipboard, and makes
-//! a site believe it may use a camera, a microphone and a location it then
-//! cannot find; `Notification.permission` stays `denied` whatever is set,
-//! because the service behind it is not in the shell. On a Chromium with a
-//! webcam it is the switch a call page needs. Nothing here is a `call`: the
-//! browser connection answers these at once and the answer says nothing.
+//! What a grant does is the engine's business, and it differs by the kind
+//! of engine ([`crate::engine::Kind`]). On the headless shell it makes the
+//! clipboard API work, into the engine's own clipboard, and makes a site
+//! believe it may use a camera, a microphone and a location it then cannot
+//! find: measured on `chrome-headless-shell` 153 with `camera microphone`
+//! granted, `navigator.permissions.query` says `granted`,
+//! `enumerateDevices()` lists one unlabelled placeholder per kind — the
+//! same three a denied page gets — and `getUserMedia()` rejects every
+//! constraint with `NotSupportedError: Not supported`, the engine's stderr
+//! saying why: `WebContentsDelegate::RequestMediaAccessPermission: Not
+//! supported`. The shell's delegate has no capture to offer, so the flag
+//! that gives a full Chrome a fake camera
+//! (`--use-fake-device-for-media-stream`) changes nothing there either
+//! ([#124](https://github.com/m96-chan/blinkterm/issues/124)).
+//! `Notification.permission` stays `denied` whatever is set, because the
+//! service behind it is not in the shell. On a full Chrome or Chromium under
+//! the same flags the grant is the switch a call page needs: measured on
+//! Chrome for Testing's `chrome` 153 and Google Chrome 154 on a Linux with a
+//! webcam and PulseAudio, the same page lists every device by name and
+//! `getUserMedia({audio: true, video: true})` answers a stream with a live
+//! track of each; denied, it is `NotAllowedError: Permission denied` and
+//! the three placeholders. `--mute-audio` changes none of that. So the row
+//! says, when `camera` or `microphone` is typed on a shell, that the engine
+//! has none to give ([`applied`]): the grant still goes, so that the site
+//! hears yes and stops asking, but the person is not told it worked.
+//! Nothing here is a `call`: the browser connection answers these at once
+//! and the answer says nothing.
 //!
 //! # The file
 //!
@@ -59,6 +79,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::engine::Kind;
 use crate::json::Json;
 use crate::text;
 
@@ -437,13 +458,31 @@ pub fn words(set: &[Permission]) -> String {
 
 /// `allowed https://meet.example: camera, microphone`, or `nothing allowed
 /// for https://meet.example` for an empty set.
-pub fn applied(origin: &str, set: &[Permission]) -> String {
+///
+/// On an engine that cannot capture ([`Kind::is_shell`]) a camera or a
+/// microphone in `set` adds `(this engine has no camera or microphone)` —
+/// naming only the words typed — because the grant is sent and the site
+/// hears yes, and without the note the row would be reporting a success
+/// the page is about to contradict. See the module's section on what a
+/// grant does.
+pub fn applied(origin: &str, set: &[Permission], kind: Kind) -> String {
     let origin = text::sanitize(origin);
     if set.is_empty() {
         return format!("nothing allowed for {origin}");
     }
     let words: Vec<&str> = set.iter().map(|permission| permission.word()).collect();
-    format!("allowed {origin}: {}", words.join(", "))
+    let mut sentence = format!("allowed {origin}: {}", words.join(", "));
+    if kind.is_shell() {
+        let missing: Vec<&str> = set
+            .iter()
+            .filter(|permission| matches!(permission, Permission::Camera | Permission::Microphone))
+            .map(|permission| permission.word())
+            .collect();
+        if !missing.is_empty() {
+            sentence.push_str(&format!(" (this engine has no {})", missing.join(" or ")));
+        }
+    }
+    sentence
 }
 
 /// `not a permission: mic; they are camera, microphone, location,
@@ -760,17 +799,64 @@ mod tests {
     #[test]
     fn the_sentences_are_the_origin_and_the_words_and_carry_nothing_a_terminal_executes() {
         assert_eq!(
-            applied("https://meet.example", &[Camera, Microphone, Location]),
+            applied(
+                "https://meet.example",
+                &[Camera, Microphone, Location],
+                Kind::Full
+            ),
             "allowed https://meet.example: camera, microphone, location"
         );
         assert_eq!(
-            applied("https://meet.example", &[]),
+            applied("https://meet.example", &[], Kind::Full),
+            "nothing allowed for https://meet.example"
+        );
+        assert_eq!(
+            applied("https://meet.example", &[], Kind::HeadlessShell),
             "nothing allowed for https://meet.example"
         );
         let pasted = refused("mic\x1b]52;c;aGk=\x07");
         assert!(!pasted.chars().any(char::is_control), "{pasted:?}");
         assert!(pasted.starts_with("not a permission: mic]52;c;aGk=;"));
         assert_eq!(NO_ORIGIN, "this page has no origin to allow");
+    }
+
+    /// A shell has no camera or microphone to give, and the row says so
+    /// beside the words typed — only those two, and only on a shell.
+    #[test]
+    fn on_a_shell_a_camera_or_microphone_is_allowed_with_the_note_that_the_engine_has_none() {
+        assert_eq!(
+            applied(
+                "https://meet.example",
+                &[Camera, Microphone, Location],
+                Kind::HeadlessShell
+            ),
+            "allowed https://meet.example: camera, microphone, location \
+             (this engine has no camera or microphone)"
+        );
+        assert_eq!(
+            applied("https://meet.example", &[Camera], Kind::ContentShell),
+            "allowed https://meet.example: camera (this engine has no camera)"
+        );
+        assert_eq!(
+            applied(
+                "https://meet.example",
+                &[Microphone, Clipboard],
+                Kind::HeadlessShell
+            ),
+            "allowed https://meet.example: microphone, clipboard (this engine has no microphone)"
+        );
+        assert_eq!(
+            applied(
+                "https://meet.example",
+                &[Location, Clipboard],
+                Kind::HeadlessShell
+            ),
+            "allowed https://meet.example: location, clipboard"
+        );
+        assert_eq!(
+            applied("https://meet.example", &[Camera, Microphone], Kind::Full),
+            "allowed https://meet.example: camera, microphone"
+        );
     }
 
     #[test]
