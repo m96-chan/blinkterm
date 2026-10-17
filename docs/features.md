@@ -453,12 +453,39 @@ The words are `camera`, `microphone`, `location`, `notifications` and
 denies the rest, and the allowance is remembered in the profile (see
 [Permissions](configuration.md#permissions)). A page with no origin — `about:blank`, a
 `data:` or `file:` url — has nothing to allow. What a grant buys is the
-engine's: on `chrome-headless-shell` it makes the clipboard API work, into
-the engine's own clipboard rather than yours, and lets a site believe it may
-use a camera, microphone or location that the shell then cannot find — a
-full Chromium with a webcam uses them. No headless engine shows a
-notification, whatever is allowed; the word is there so that a site stops
-asking.
+engine's, and it depends on which engine it is
+([#124](https://github.com/m96-chan/blinkterm/issues/124)):
+
+- On `chrome-headless-shell` (and Debian's `chromium-shell`) a grant makes
+  the clipboard API work, into the engine's own clipboard rather than yours,
+  and lets a site believe it may use a camera, microphone or location that
+  the shell then cannot find. The shell has no capture backend: measured on
+  153 with `camera microphone` allowed, `navigator.permissions.query` says
+  `granted`, `enumerateDevices()` lists one unlabelled placeholder per kind
+  — the same three a denied page gets — and `getUserMedia()` rejects with
+  `NotSupportedError: Not supported`, whatever the machine has plugged in.
+  A call page (Meet, Jitsi) shows "no camera found". So when you type
+  `camera` or `microphone` on a shell, the row says so beside the words —
+  `allowed https://meet.example: camera, microphone (this engine has no
+  camera or microphone)` — and so does `--doctor` under the engine. The
+  grant still goes, so that the site hears yes and stops asking.
+- On a full Chrome or Chromium (`--engine /usr/bin/google-chrome-stable`,
+  your distribution's `chromium`, or on a Mac the one in `/Applications`,
+  which the search finds by itself) a grant is the switch a call page
+  needs: measured on Chrome for Testing's `chrome` 153 and Google Chrome
+  154 on a Linux with a webcam and PulseAudio, the same page lists every
+  device by name and `getUserMedia({audio: true, video: true})` answers a
+  stream with a live track of each. `--mute` does not touch capture. On
+  Linux that takes `libpulse0` (or PipeWire's compatibility library) for
+  the microphone and read access to `/dev/video*` for the camera; on a Mac
+  see [the engine](install.md#the-engine) for the permission macOS asks of
+  the terminal.
+- `--engine-arg=--use-fake-device-for-media-stream` gives a full engine a
+  fake camera and microphone in place of the machine's, for driving a call
+  page in a test; it is never on by default, and the shell ignores it.
+
+No headless engine shows a notification, whatever is allowed; the word is
+there so that a site stops asking.
 
 **Fullscreen**: when the page in front takes something fullscreen — a
 video's button, a slide deck — the status row goes and the page gets every
