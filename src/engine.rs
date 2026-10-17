@@ -876,9 +876,21 @@ pub(crate) fn is_executable(path: &Path) -> bool {
 ///
 /// It is the only signal this list changes. `navigator.plugins` is still
 /// empty, `window.chrome` still missing and `Notification.permission` still
-/// `denied`, because those follow from running headless and no switch moves
-/// them; a page that reads them still sees a headless browser, which is what
-/// this is.
+/// `denied`, because those follow from running the *shell* and no switch
+/// moves them; a page that reads them still sees a headless browser, which
+/// is what this is. A full Chrome under this same list reports all three as
+/// a desktop Chrome does ([`Kind`], and `docs/design.md` for the table).
+///
+/// `--disable-gpu` stays for every [`Kind`]. It was the question in
+/// [#125](https://github.com/m96-chan/blinkterm/issues/125): whether the
+/// software WebGL a page sees (`SwiftShader`) is this flag's doing on a
+/// full engine. Measured on Chrome for Testing's `chrome` 153 and Google
+/// Chrome 154 with the flag taken out: the same `ANGLE (Google, Vulkan
+/// 1.3.0 (SwiftShader Device …))` renderer string, the same 14 processes,
+/// the same memory, the same 0.10 s to answer. Under
+/// `--ozone-platform=headless` there is no GPU to offer either way, so the
+/// flag changes nothing a page can read, and the combination that was
+/// measured to start reliably is kept.
 pub fn flags(as_root: bool) -> Vec<&'static str> {
     let mut flags = vec![
         "--headless",

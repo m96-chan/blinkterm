@@ -123,18 +123,74 @@ navigator.languages   ja-JP, ja, en
   53 ms heard, which a page could measure. `console = false` (or
   `--no-console`) leaves `Runtime` and `Log` off.
 
-Three things still say "headless", and nothing here changes them:
-`navigator.plugins` is empty, `window.chrome` is missing, and
-`Notification.permission` is `denied`. That is not something to hide. This
-is a headless browser, and a site that challenges it on those grounds will
-keep doing so. Only the one false claim is corrected. There is no
-fingerprint spoofing, and none is planned.
+What still says "headless" is the engine, and which engine. Measured on
+2026-10-18 with the program's own flags, on a page the identity override
+has reached, `chrome-headless-shell` 153 against Chrome for Testing's
+`chrome` 153 and Google Chrome 154, both full browsers under the same
+`--headless`:
 
-A full Chrome (`engine = …`) reports those three the way a desktop Chrome
-does. It also costs five to six times the memory: 13 processes and 1.6 GB
-against the headless shell's 4 and 282 MB, measured on one page. That is why
-the headless shell stays first in the search. The measurements are in
-[#48](https://github.com/m96-chan/blinkterm/issues/48).
+```
+                              chrome-headless-shell   full Chrome / Chromium
+window.chrome                 undefined               object
+navigator.plugins.length      0                       5
+navigator.mimeTypes.length    0                       2
+navigator.pdfViewerEnabled    false                   true
+speechSynthesis voices        0                       0 (CfT) / 19 (Chrome 154)
+window.outerWidth × Height    800 × 600 (= screen)    780 × 580
+permissions.query(notif.)     prompt                  denied
+Notification.permission       denied                  denied
+UNMASKED_RENDERER_WEBGL       SwiftShader             SwiftShader
+navigator.webdriver           false                   false
+userAgentData.brands          Chromium, blinkterm, GREASE — both
+```
+
+The left column is what the shell is: `//content/shell` with the old
+headless renderer, which has no `window.chrome`, no plugins, no PDF viewer
+and no window to have an outer size. The right column is a shipping
+browser with no window, and every one of those reads as a desktop Chrome
+does. WebGL is software on both — `--ozone-platform=headless` has no GPU to
+offer, and dropping `--disable-gpu` on the full engine changed nothing that
+was measured: the same SwiftShader string, the same 14 processes, the same
+memory (see `engine::flags`). Nothing here hides any of it. This is a
+headless browser, and a site that challenges it on those grounds will keep
+doing so. Only the one false claim is corrected. There is no fingerprint
+spoofing, and none is planned.
+
+What the gates made of each, the same day, from a residential connection:
+
+- `chatgpt.com` loaded and offered a chat on all three engines, with no
+  unsupported-browser banner, no Cloudflare interstitial and no challenge.
+  The refusal [#125](https://github.com/m96-chan/blinkterm/issues/125)
+  reports was not reproduced; what a gate decides depends on more than the
+  browser, and the tells above are what it would read when it does.
+- `bot.sannysoft.com`: the shell fails six rows (`window.chrome`, the
+  `PluginArray`, the headless `chrome`, `permissions` and `iframe` checks,
+  and the SwiftShader renderer) and warns on one; a full engine fails only
+  the renderer.
+- `nowsecure.nl`'s Turnstile checkbox, clicked as a click from the pane is
+  sent (`Input.dispatchMouseEvent`), said "success" on all three. That is
+  one widget in test mode, and not a measurement of what a managed
+  challenge makes of events that arrive with no mouse movement before them.
+- `abrahamjuliot.github.io/creepjs` rates the shell "88% like headless" and
+  a full engine "50% like headless", "33% headless" and "0% stealth" for
+  both — the last being the point.
+
+One tell is this program's own, on both engines: a service worker is a
+target of its own, the identity is sent per page session, so a worker that
+reads `navigator.userAgent` sees the engine's `HeadlessChrome/…` while its
+page sees `Chrome/…`. A dedicated worker made by the page inherits the
+page's (measured, a `Blob` worker). That is for a later issue.
+
+A full Chrome (`--engine`, or `engine =`) is what passes where the shell
+does not, and it costs more. Unpacked, Chrome for Testing's `chrome` is
+393 MB to the shell's 261 MB. Started, on one blank page: 14 processes and
+1.4 GB of resident memory summed over them against the shell's 7 and
+0.5 GB; on `chatgpt.com`, 17 and 1.9 GB against 7 and 0.6 GB. It answers
+on its pipe in 0.10 s to the shell's 0.03 s. Three times the memory and
+twice the processes is why the shell stays the default and what
+`--install-engine` fetches; the full engine is already in the search, after
+it (see [How the engine is looked for](install.md#how-the-engine-is-looked-for)),
+and `--doctor` says which one a run would get.
 
 What you add yourself is told as little. A site style (see
 [Site styles and scripts](features.md#site-styles-and-scripts)) is one entry

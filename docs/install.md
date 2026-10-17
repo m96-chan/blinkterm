@@ -180,3 +180,14 @@ asks the Keychain for its cookie key in a dialog nobody can see. Debian's
 the pipe whatever it is told, answers a page's dialogs itself, and does not
 close when asked, so a kept profile is not flushed. It renders pages; it does
 not keep the promises below.
+
+`chrome-headless-shell` is first, and it is the smaller engine: no
+`window.chrome`, no plugins, no PDF viewer, no camera or microphone, and a
+renderer some bot gates refuse (see
+[Sites that refuse a headless engine](features.md#sites-that-refuse-a-headless-engine)).
+A full Chrome or Chromium under the same flags has all of those and costs
+three times the memory — measured, 1.4 GB over 14 processes on one page
+against the shell's 0.5 GB over 7. When a site refuses the shell, name the
+full one: `--engine /usr/bin/chromium`, `$BLINKTERM_ENGINE`, or `engine =`
+in the settings. `--doctor` prints which kind the search found and, under a
+shell, the one-line consequence.
