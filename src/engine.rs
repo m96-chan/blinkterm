@@ -163,6 +163,77 @@ pub const BUNDLES: [&str; 4] = [
 /// The environment variable that overrides the search.
 pub const ENGINE_ENV: &str = "BLINKTERM_ENGINE";
 
+/// Which kind of Chromium an engine is, told by the name of its executable.
+///
+/// The three differ where a page can tell and where `--doctor` has to say
+/// so. Chrome for Testing's `chrome-headless-shell` (`headless_shell` in
+/// Chromium's own tree) is the old headless mode kept as a program of its
+/// own after Chrome 132 dropped it: `//content/shell` with no window system,
+/// no audio or video capture backend, and a renderer that is not a shipping
+/// Chrome's — no `window.chrome`, no plugins, no `speechSynthesis` voices
+/// ([#124](https://github.com/m96-chan/blinkterm/issues/124),
+/// [#125](https://github.com/m96-chan/blinkterm/issues/125)). Debian's
+/// `chromium-shell` is `content_shell`, which [`CANDIDATES`] says why it is
+/// last. Everything else — `chromium`, `google-chrome`, an app bundle — is
+/// the full browser, and `--headless` on it is the new headless mode: the
+/// real renderer with no window, which keeps the capture stack.
+///
+/// By the file's name and not by asking the engine, because the name is
+/// known before the engine is started, which is when [`flags`] needs it. The
+/// engine does say too, after the fact: measured, `Browser.getVersion`'s
+/// product is `HeadlessChrome/153.0.8010.52` from the shell and
+/// `Chrome/153.0.8010.52` from Chrome for Testing's `chrome` under the same
+/// `--headless`, which is what `--doctor` prints beside this. A shell
+/// renamed to something else is told apart wrongly, and the cost of that is
+/// a wrong sentence from `--doctor` and the allow line, not a wrong page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// `chrome-headless-shell` or `headless_shell`.
+    HeadlessShell,
+    /// `chromium-shell` or `content_shell`.
+    ContentShell,
+    /// A full Chrome or Chromium.
+    Full,
+}
+
+impl Kind {
+    /// By the executable's file name; a path with no name is [`Kind::Full`].
+    pub fn of(path: &Path) -> Kind {
+        match path.file_name().and_then(OsStr::to_str) {
+            Some("chrome-headless-shell" | "headless_shell") => Kind::HeadlessShell,
+            Some("chromium-shell" | "content_shell") => Kind::ContentShell,
+            _ => Kind::Full,
+        }
+    }
+
+    /// Whether this is one of the two shells rather than the full browser:
+    /// the ones with no camera or microphone to give.
+    pub fn is_shell(self) -> bool {
+        !matches!(self, Kind::Full)
+    }
+
+    /// What to call it in a sentence.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::HeadlessShell => "chrome-headless-shell",
+            Kind::ContentShell => "chromium-shell",
+            Kind::Full => "a full Chromium",
+        }
+    }
+
+    /// The one-line consequence `--doctor` prints under the engine, or
+    /// `None` for a full browser, about which there is nothing to warn.
+    pub fn caveat(self) -> Option<&'static str> {
+        match self {
+            Kind::Full => None,
+            _ => Some(
+                "a headless shell: it has no camera or microphone to give a page, and \
+                 some bot checks refuse it; a full Chrome or Chromium (--engine) has both",
+            ),
+        }
+    }
+}
+
 /// The engine arguments `--engine-arg` refuses, each with why; see the
 /// module's section on them.
 ///
@@ -862,6 +933,8 @@ pub struct Engine {
     /// The executable that was started, for the marker a backend leaves in
     /// the profile ([`write_pgid_marker`]).
     path: PathBuf,
+    /// Which kind of Chromium `path` is, by its name; see [`Kind`].
+    kind: Kind,
 }
 
 /// What an [`Engine`] is without its profile: everything that dies with the
@@ -999,11 +1072,13 @@ impl Engine {
                 timeout.as_secs()
             ));
         }
+        let kind = Kind::of(&path);
         Ok(Engine {
             process,
             profile,
             agent,
             path,
+            kind,
         })
     }
 
@@ -1028,6 +1103,11 @@ impl Engine {
     /// The executable that was started.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Which kind of Chromium this is, by the name of what was started.
+    pub fn kind(&self) -> Kind {
+        self.kind
     }
 
     /// The profile it was started with.
@@ -1119,6 +1199,7 @@ impl Engine {
             profile,
             agent: _,
             path: _,
+            kind: _,
         } = self;
         process.stop();
         profile
@@ -1255,6 +1336,40 @@ pub fn first_page(reply: &Json) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kind_is_told_by_the_executables_name_and_only_the_shells_have_a_caveat() {
+        use std::path::Path;
+        assert_eq!(
+            Kind::of(Path::new(
+                "/opt/chrome-headless-shell-linux64/chrome-headless-shell"
+            )),
+            Kind::HeadlessShell
+        );
+        assert_eq!(Kind::of(Path::new("headless_shell")), Kind::HeadlessShell);
+        assert_eq!(
+            Kind::of(Path::new("/usr/bin/chromium-shell")),
+            Kind::ContentShell
+        );
+        assert_eq!(Kind::of(Path::new("/usr/bin/chromium")), Kind::Full);
+        assert_eq!(
+            Kind::of(Path::new("/usr/bin/google-chrome-stable")),
+            Kind::Full
+        );
+        assert_eq!(
+            Kind::of(Path::new(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            )),
+            Kind::Full
+        );
+        assert_eq!(Kind::of(Path::new("/")), Kind::Full);
+        assert!(Kind::HeadlessShell.is_shell());
+        assert!(Kind::ContentShell.is_shell());
+        assert!(!Kind::Full.is_shell());
+        assert!(Kind::HeadlessShell.caveat().is_some());
+        assert!(Kind::Full.caveat().is_none());
+        assert_eq!(Kind::Full.name(), "a full Chromium");
+    }
 
     #[test]
     fn a_command_line_names_its_profile_as_a_word_or_inside_a_title() {
