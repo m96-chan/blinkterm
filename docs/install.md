@@ -181,13 +181,22 @@ the pipe whatever it is told, answers a page's dialogs itself, and does not
 close when asked, so a kept profile is not flushed. It renders pages; it does
 not keep the promises below.
 
-A full Chrome or Chromium differs from the headless shell in two ways you
-can see. It has a camera and a microphone to give a page that you have
-allowed them with `alt+p` (see
+`chrome-headless-shell` is first, and it is the smaller engine: no
+`window.chrome`, no plugins, no PDF viewer, no camera or microphone, and a
+renderer some bot gates refuse (see
+[Sites that refuse a headless engine](features.md#sites-that-refuse-a-headless-engine)).
+A full Chrome or Chromium under the same flags has all of those and costs
+three times the memory — measured, 1.4 GB over 14 processes on one page
+against the shell's 0.5 GB over 7. When a site refuses the shell, name the
+full one: `--engine /usr/bin/chromium`, `$BLINKTERM_ENGINE`, or `engine =`
+in the settings. `--doctor` prints which kind the search found and, under a
+shell, the one-line consequence.
+
+The camera and the microphone are the other difference. A full Chrome or
+Chromium has them to give a page you have allowed with `alt+p` (see
 [Sound, permissions and fullscreen](features.md#sound-permissions-and-fullscreen));
-the shell has no capture backend at all, and `--doctor` says so under the
-engine. And it costs about five times the memory, which is why the shell
-stays first in the search. On Linux, capture through a full engine wants
+the shell has no capture backend at all, and `--doctor` and the allow line
+say so. On Linux, capture through a full engine wants
 `libpulse0` for the microphone and read access to `/dev/video*` for the
 camera (the `video` group on most distributions). On a Mac the camera and
 microphone are guarded by the system's privacy settings, which attribute the

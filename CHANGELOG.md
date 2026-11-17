@@ -21,7 +21,9 @@ flag, a different default, a raised Rust floor all do.
   camera or microphone)` — rather than reporting a success the page is
   about to contradict; the grant is still sent so the site stops asking.
   On a full Chrome or Chromium the same grant now measurably gives a call
-  page the machine's camera and microphone
+  page the machine's camera and microphone. The docs carry a measured table
+  of what a page is told on each engine, what the common bot gates made of
+  them, and what the full engine costs
   ([#124](https://github.com/m96-chan/blinkterm/issues/124),
   [#125](https://github.com/m96-chan/blinkterm/issues/125)).
 - **Named profiles.** Profiles have names now, as in Chrome: `blinkterm

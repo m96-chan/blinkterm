@@ -497,6 +497,31 @@ back and the page is a row shorter until it closes: a `confirm()` in a
 fullscreen video is still answered on the row. Link hints and normal mode
 work in fullscreen as anywhere.
 
+## Sites that refuse a headless engine
+
+A site with a bot gate in front — a Cloudflare challenge, a "browser not
+supported" page, a login that never finishes — may be reading the engine,
+not a setting. `chrome-headless-shell`, the engine `--install-engine`
+fetches, is the old headless renderer with no `window.chrome`, no plugins,
+no PDF viewer and a software WebGL, and a gate that reads those sees a
+headless browser, which is what it is. Nothing in `blinkterm` hides them:
+the one untrue claim, `navigator.webdriver`, is turned off, and the rest is
+told as it is (see [What a page is told](design.md#what-a-page-is-told) for
+the measured table).
+
+A full Chrome or Chromium under the same flags reports every one of those
+as a desktop Chrome does, and passes the checks the shell fails — measured
+against `bot.sannysoft.com`, where the shell fails six rows and a full
+engine one, the software renderer, which no flag changes without a GPU.
+Name it with `--engine /usr/bin/chromium` (or `engine =` in the settings);
+on a Mac, Google Chrome in `/Applications` is found by itself once no shell
+is installed. It costs three times the memory. `--doctor` says which kind
+of engine a run would start and, under a shell, what that means.
+
+A gate that still refuses is reading something else — the connection, the
+account, the day — and `alt+o` opens the page in the desktop browser, which
+is the escape hatch, not the fix.
+
 ## Site styles and scripts
 
 A terminal pane is narrow, its font is not the one a site was designed
