@@ -180,3 +180,22 @@ asks the Keychain for its cookie key in a dialog nobody can see. Debian's
 the pipe whatever it is told, answers a page's dialogs itself, and does not
 close when asked, so a kept profile is not flushed. It renders pages; it does
 not keep the promises below.
+
+A full Chrome or Chromium differs from the headless shell in two ways you
+can see. It has a camera and a microphone to give a page that you have
+allowed them with `alt+p` (see
+[Sound, permissions and fullscreen](features.md#sound-permissions-and-fullscreen));
+the shell has no capture backend at all, and `--doctor` says so under the
+engine. And it costs about five times the memory, which is why the shell
+stays first in the search. On Linux, capture through a full engine wants
+`libpulse0` for the microphone and read access to `/dev/video*` for the
+camera (the `video` group on most distributions). On a Mac the camera and
+microphone are guarded by the system's privacy settings, which attribute the
+request to the application responsible for the process, and the engine is a
+child of your terminal: so it is the terminal — Kitty, Ghostty, WezTerm,
+Terminal.app — that has to be allowed under System Settings → Privacy &
+Security → Camera and → Microphone, and a terminal that was never allowed,
+or was denied the once it asked, looks to the page like a machine with no
+camera. This was not measured on a Mac in the change that wrote it; if your
+Mac behaves otherwise, [#124](https://github.com/m96-chan/blinkterm/issues/124)
+is where to say so.

@@ -505,6 +505,12 @@ fn engine_lines(options: &Options, provenance: &Provenance) -> bool {
                 "answered on its pipe in {:.2} s: {product}",
                 took.as_secs_f64()
             ));
+            // Which kind it is and what that costs (#124, #125): the product
+            // above says `HeadlessChrome` or `Chrome`, and not what follows
+            // from the difference.
+            if let Some(caveat) = engine::Kind::of(&path).caveat() {
+                more(caveat);
+            }
             true
         }
         Err(why) => {

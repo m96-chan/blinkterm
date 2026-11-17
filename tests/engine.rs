@@ -10142,6 +10142,93 @@ fn a_fresh_engine_says_denied_to_every_page_and_granted_to_an_origin_the_person_
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// What `getUserMedia` answers after a grant, and what `enumerateDevices`
+/// lists: `ok audio:live video:live`, or the error's name and message.
+fn capture(client: &mut Client) -> (String, String) {
+    let devices = evaluate_awaited(
+        client,
+        "navigator.mediaDevices.enumerateDevices().then(function (ds) { \
+         return ds.map(function (d) { return d.kind + '=' + JSON.stringify(d.label); }).join(' '); }, \
+         function (e) { return e.name + ': ' + e.message; })",
+    );
+    let stream = evaluate_awaited(
+        client,
+        "navigator.mediaDevices.getUserMedia({audio: true, video: true}).then(function (s) { \
+         var tracks = s.getTracks(); \
+         var words = tracks.map(function (t) { return t.kind + ':' + t.readyState; }); \
+         tracks.forEach(function (t) { t.stop(); }); \
+         return 'ok ' + words.join(' '); }, \
+         function (e) { return e.name + ': ' + e.message; })",
+    );
+    match (devices, stream) {
+        (Json::String(devices), Json::String(stream)) => (devices, stream),
+        other => panic!("no answer about capture: {other:?}"),
+    }
+}
+
+/// A camera and a microphone the person allowed reach the page only on a
+/// full engine (#124). The engine is started with
+/// `--use-fake-device-for-media-stream`, which gives a full Chrome a fake
+/// camera and a fake microphone whatever the machine has, so the capture
+/// path is proved on a runner with neither; and which a headless shell
+/// ignores, because its delegate has no capture to offer — the proof that
+/// what the shell lacks is the backend, not a device. Measured on
+/// `chrome-headless-shell` 153, with and without the flag, muted or not:
+/// `permissions.query` says `granted`, `enumerateDevices` lists one
+/// unlabelled placeholder per kind (what a denied page gets), and every
+/// `getUserMedia` is `NotSupportedError: Not supported`. On Chrome for
+/// Testing's `chrome` 153 and Google Chrome 154 under this program's flags
+/// the same grant lists the devices by name and the stream has a live track
+/// of each kind — the machine's own without the flag, the fake ones with it.
+/// Which of the two this run proves is printed, since CI runs the shell.
+#[test]
+fn a_granted_camera_and_microphone_reach_the_page_only_on_a_full_engine() {
+    let launch = engine::Launch {
+        args: vec!["--use-fake-device-for-media-stream".to_string()],
+        ..engine::Launch::default()
+    };
+    let Some((mut engine, mut browser, mut page)) = launched(&launch) else {
+        return;
+    };
+    let origin = permissions::origin_of(&serve()).expect("an origin");
+    for (method, params) in permissions::opening_commands(&Allowed::in_memory()) {
+        browser.notify(method, params).expect("told");
+    }
+    for (method, params) in
+        permissions::origin_commands(&origin, &[Permission::Camera, Permission::Microphone])
+    {
+        browser.notify(method, params).expect("told");
+    }
+    page.call("Page.enable", Json::empty())
+        .expect("Page.enable");
+    land_on(&mut page, &format!("{origin}/plain"), "plain");
+    let wanted = "camera=granted microphone=granted";
+    assert_eq!(
+        states_become(&mut page, &["camera", "microphone"], wanted),
+        wanted
+    );
+    let (devices, stream) = capture(&mut page);
+    eprintln!("{:?}: devices {devices}; stream {stream}", engine.kind());
+    if engine.kind().is_shell() {
+        assert!(
+            stream.starts_with("NotSupportedError"),
+            "a shell has no capture to offer: {stream}"
+        );
+        assert!(
+            devices.split(' ').all(|device| device.ends_with("=\"\"")),
+            "a shell lists only unlabelled placeholders: {devices}"
+        );
+    } else {
+        assert_eq!(stream, "ok audio:live video:live");
+        assert!(
+            devices.contains("audioinput=\"Fake") && devices.contains("videoinput=\"fake"),
+            "a full engine lists the fake devices by name: {devices}"
+        );
+    }
+    page.close();
+    engine.kill();
+}
+
 /// The isolated world a watch is armed in, made as `app` makes it.
 fn fullscreen_world(client: &mut Client) -> i64 {
     let tree = client

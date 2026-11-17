@@ -12,6 +12,18 @@ flag, a different default, a raised Rust floor all do.
 
 ### Added
 
+- **The engine's kind, and what it cannot do.** `--doctor` says under the
+  engine when it is a headless shell (`chrome-headless-shell`,
+  `chromium-shell`): it has no camera or microphone to give a page, and some
+  bot checks refuse it; a full Chrome or Chromium has both. The allow line
+  says the same when `camera` or `microphone` is typed on a shell —
+  `allowed https://meet.example: camera, microphone (this engine has no
+  camera or microphone)` — rather than reporting a success the page is
+  about to contradict; the grant is still sent so the site stops asking.
+  On a full Chrome or Chromium the same grant now measurably gives a call
+  page the machine's camera and microphone
+  ([#124](https://github.com/m96-chan/blinkterm/issues/124),
+  [#125](https://github.com/m96-chan/blinkterm/issues/125)).
 - **Named profiles.** Profiles have names now, as in Chrome: `blinkterm
   profiles create Work` makes a new identity — its own cookies, logins,
   history and saved tabs — and `blinkterm --profile-name Work` opens it.
